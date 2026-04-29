@@ -1,21 +1,27 @@
 """
-T-002: Regression snapshot harness for the AWS Cost Optimization Scanner.
+T-002 + T-003: Regression snapshot harness and AWS mock surface.
 
 Provides:
 - Golden fixture loading (JSON + HTML)
 - Frozen clock (freezegun) pinned to capture timestamp
 - Normalizers for timestamp, account_id, filename, and currency comparison
+- stubbed_aws fixture combining moto.mock_aws with Stubber fallback
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict
+from unittest.mock import MagicMock
 
+import boto3
 import pytest
+from botocore.stub import Stubber
 from freezegun import freeze_time
+from moto import mock_aws
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 GOLDEN_JSON = FIXTURES_DIR / "golden_scan_results.json"
@@ -142,3 +148,136 @@ def frozen_time(capture_timestamp: str):
     """Freeze the clock to the capture timestamp for every test in the session."""
     with freeze_time(capture_timestamp):
         yield
+
+
+# ---------------------------------------------------------------------------
+# T-003: AWS mock surface (moto + Stubber)
+# ---------------------------------------------------------------------------
+
+# Services that moto does NOT implement — need Stubber fallback
+_STUBBER_SERVICES: Dict[str, Dict[str, Any]] = {
+    "cost-optimization-hub": {
+        "api_calls": {
+            "ListRecommendations": {"items": [], "nextToken": None},
+            "GetRecommendation": {
+                "recommendationId": "stub-id",
+                "currentResourceType": "Ec2Instance",
+                "recommendedResourceType": "Ec2Instance",
+                "estimatedMonthlySavings": {"currency": "USD", "value": 0.0},
+            },
+        },
+    },
+    "compute-optimizer": {
+        "api_calls": {
+            "GetEC2InstanceRecommendations": {
+                "instanceRecommendations": [],
+                "nextToken": None,
+            },
+            "GetEBSVolumeRecommendations": {
+                "volumeRecommendations": [],
+                "nextToken": None,
+            },
+            "GetRDSDatabaseRecommendations": {
+                "rdsDBRecommendations": [],
+                "nextToken": None,
+            },
+        },
+    },
+}
+
+
+def _attach_stubbers(session: boto3.Session, region: str) -> Dict[str, Stubber]:
+    """Attach Stubbers to session clients for services moto doesn't cover.
+
+    Args:
+        session: boto3 session (already inside mock_aws context)
+        region: AWS region for client creation
+
+    Returns:
+        Dict mapping service names to their Stubber instances.
+    """
+    stubbers: Dict[str, Stubber] = {}
+
+    for service_name, config in _STUBBER_SERVICES.items():
+        try:
+            client = session.client(service_name, region_name=region)
+            stubber = Stubber(client)
+            for operation_name, response in config["api_calls"].items():
+                stubber.add_response(operation_name, response)
+            stubber.activate()
+            stubbers[service_name] = stubber
+        except Exception:
+            pass
+
+    return stubbers
+
+
+@pytest.fixture()
+def stubbed_aws():
+    """Combine moto mock_aws with Stubber fallback for uncovered clients.
+
+    Yields a configured boto3.Session with all clients pre-mocked.
+    Works with no AWS credentials, no network.
+
+    Usage::
+
+        def test_something(stubbed_aws):
+            optimizer = CostOptimizer('us-east-1')
+            results = optimizer.scan_region()
+    """
+    env_backup: Dict[str, str | None] = {}
+    for key in (
+        "AWS_PROFILE",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_DEFAULT_REGION",
+        "AWS_REGION",
+    ):
+        env_backup[key] = os.environ.pop(key, None)
+
+    os.environ["AWS_ACCESS_KEY_ID"] = "testing"
+    os.environ["AWS_SECRET_ACCESS_KEY"] = "testing"
+    os.environ["AWS_SECURITY_TOKEN"] = "testing"
+    os.environ["AWS_SESSION_TOKEN"] = "testing"
+    os.environ["AWS_DEFAULT_REGION"] = "us-east-1"
+
+    mock_ctx = mock_aws()
+    mock_ctx.__enter__()
+
+    from tests.fixtures.aws_state.us_east_1 import seed_all
+
+    resource_ids = seed_all()
+
+    session = boto3.Session(region_name="us-east-1")
+
+    stubbers = _attach_stubbers(session, "us-east-1")
+
+    class _StubbedSession:
+        """Wrapper providing the session and metadata for test assertions."""
+
+        def __init__(
+            self,
+            boto_session: boto3.Session,
+            resources: Dict[str, Any],
+            stubber_map: Dict[str, Stubber],
+        ) -> None:
+            self.session = boto_session
+            self.resources = resources
+            self.stubbers = stubber_map
+
+    yield _StubbedSession(session, resource_ids, stubbers)
+
+    for stubber in stubbers.values():
+        try:
+            stubber.deactivate()
+        except Exception:
+            pass
+
+    mock_ctx.__exit__(None, None, None)
+
+    for key, original_value in env_backup.items():
+        if original_value is not None:
+            os.environ[key] = original_value
+        else:
+            os.environ.pop(key, None)

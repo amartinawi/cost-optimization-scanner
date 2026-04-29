@@ -1,0 +1,9 @@
+{
+  "recommendationId": "stub-id",
+  "currentResourceType": "Ec2Instance",
+  "recommendedResourceType": "Ec2Instance",
+  "estimatedMonthlySavings": {
+    "currency": "USD",
+    "value": 0.0
+  }
+}
