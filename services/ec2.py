@@ -1,0 +1,763 @@
+"""EC2 compute optimization checks.
+
+Extracted from CostOptimizer EC2-related methods as free functions.
+This module will later become Ec2Module (T-316) implementing ServiceModule.
+"""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime, timedelta
+from typing import Any
+
+from botocore.exceptions import ClientError  # type: ignore[import-untyped]
+
+from core.scan_context import ScanContext
+
+
+def get_ec2_instance_count(ctx: ScanContext) -> int:
+    """Get total EC2 instance count in region.
+
+    Uses pagination to support accounts with unlimited instances.
+    Counts all instances across all reservations regardless of state.
+
+    Returns:
+        Total number of EC2 instances in the region.
+        Returns 0 on errors (with warning messages).
+    """
+    print("🔍 [services/ec2.py] EC2 module active")
+    ec2 = ctx.client("ec2")
+    try:
+        paginator = ec2.get_paginator("describe_instances")
+        count = 0
+        for page in paginator.paginate():
+            for reservation in page.get("Reservations", []):
+                count += len(reservation["Instances"])
+        return count
+    except ClientError as e:
+        error_code = e.response["Error"]["Code"]
+        if error_code == "UnauthorizedOperation":
+            print("Warning: Missing IAM permission for describe_instances")
+        elif error_code == "RequestLimitExceeded":
+            print("Warning: Rate limit exceeded for describe_instances (retries exhausted)")
+        else:
+            print(f"Warning: Could not get EC2 instance count: {e}")
+        return 0
+    except Exception as e:
+        print(f"Warning: Unexpected error getting EC2 instance count: {e}")
+        return 0
+
+
+def _is_eks_nodegroup_asg(asg_name: str, tags: dict[str, str]) -> bool:
+    """Determine if an ASG is an EKS node group.
+
+    EKS node groups have specific naming patterns and tags:
+    - Names often contain 'eks-', 'nodegroup', or cluster names
+    - Tags include kubernetes.io/cluster/<cluster-name>
+    - Tags include eks:nodegroup-name
+    """
+    try:
+        eks_patterns = ["eks-", "nodegroup", "node-group", "ng-"]
+
+        if any(pattern in asg_name.lower() for pattern in eks_patterns):
+            return True
+
+        for key in tags:
+            key_lower = key.lower()
+
+            if key_lower.startswith("kubernetes.io/cluster/"):
+                return True
+            if key_lower == "eks:nodegroup-name":
+                return True
+            if key_lower == "eks:cluster-name":
+                return True
+            if "nodegroup" in key_lower:
+                return True
+
+        return False
+
+    except Exception as e:
+        print(f"⚠️ Error checking EKS nodegroup for {asg_name}: {str(e)}")
+        return False
+
+
+def get_enhanced_ec2_checks(
+    ctx: ScanContext,
+    pricing_multiplier: float,
+) -> dict[str, Any]:
+    """Get enhanced EC2 cost optimization checks."""
+    ec2 = ctx.client("ec2")
+    cloudwatch = ctx.client("cloudwatch", ctx.region)
+    autoscaling = ctx.client("autoscaling", ctx.region)
+    checks: dict[str, list[dict[str, Any]]] = {
+        "idle_instances": [],
+        "rightsizing_opportunities": [],
+        "previous_generation": [],
+        "auto_scaling_missing": [],
+        "stopped_instances": [],
+        "dedicated_hosts": [],
+        "burstable_credits": [],
+    }
+
+    try:
+        paginator = ec2.get_paginator("describe_instances")
+
+        for page in paginator.paginate():
+            for reservation in page["Reservations"]:
+                for instance in reservation["Instances"]:
+                    instance_id = instance["InstanceId"]
+                    instance_type = instance["InstanceType"]
+                    state = instance["State"]["Name"]
+
+                    if state == "running":
+                        try:
+                            end_time = datetime.now(UTC)
+                            start_time = end_time - timedelta(days=7)
+
+                            cpu_response = cloudwatch.get_metric_statistics(
+                                Namespace="AWS/EC2",
+                                MetricName="CPUUtilization",
+                                Dimensions=[{"Name": "InstanceId", "Value": instance_id}],
+                                StartTime=start_time,
+                                EndTime=end_time,
+                                Period=3600,
+                                Statistics=["Average", "Maximum"],
+                            )
+
+                            if cpu_response.get("Datapoints"):
+                                avg_cpu = sum(dp["Average"] for dp in cpu_response["Datapoints"]) / len(
+                                    cpu_response["Datapoints"]
+                                )
+                                max_cpu = max(dp["Maximum"] for dp in cpu_response["Datapoints"])
+
+                                if avg_cpu < 5 and max_cpu < 10:
+                                    checks["idle_instances"].append(
+                                        {
+                                            "InstanceId": instance_id,
+                                            "InstanceType": instance_type,
+                                            "AvgCPU": f"{avg_cpu:.1f}%",
+                                            "MaxCPU": f"{max_cpu:.1f}%",
+                                            "Recommendation": (
+                                                f"Instance shows very low utilization"
+                                                f" (avg: {avg_cpu:.1f}%,"
+                                                f" max: {max_cpu:.1f}%)"
+                                                " - consider terminating or"
+                                                " downsizing"
+                                            ),
+                                            "EstimatedSavings": ("Up to 100% if terminated, 50-70% if downsized"),
+                                            "CheckCategory": "Idle Instances",
+                                        }
+                                    )
+                                elif avg_cpu < 20 and max_cpu < 40:
+                                    checks["rightsizing_opportunities"].append(
+                                        {
+                                            "InstanceId": instance_id,
+                                            "InstanceType": instance_type,
+                                            "AvgCPU": f"{avg_cpu:.1f}%",
+                                            "MaxCPU": f"{max_cpu:.1f}%",
+                                            "Recommendation": (
+                                                f"Low utilization"
+                                                f" (avg: {avg_cpu:.1f}%,"
+                                                f" max: {max_cpu:.1f}%)"
+                                                " - consider smaller instance"
+                                                " type"
+                                            ),
+                                            "EstimatedSavings": ("30-50% cost reduction with proper rightsizing"),
+                                            "CheckCategory": ("Rightsizing Opportunities"),
+                                        }
+                                    )
+
+                        except Exception:
+                            checks["rightsizing_opportunities"].append(
+                                {
+                                    "InstanceId": instance_id,
+                                    "InstanceType": instance_type,
+                                    "Recommendation": (
+                                        "Enable detailed CloudWatch monitoring"
+                                        " to analyze utilization for"
+                                        " rightsizing opportunities"
+                                    ),
+                                    "EstimatedSavings": (
+                                        "Enable monitoring first - potential 30-70% savings with proper rightsizing"
+                                    ),
+                                    "CheckCategory": "Monitoring Required",
+                                }
+                            )
+
+                        try:
+                            asg_response = autoscaling.describe_auto_scaling_instances(InstanceIds=[instance_id])
+                            if not asg_response.get("AutoScalingInstances"):
+                                instance_name = ""
+                                for tag in instance.get("Tags", []):
+                                    if tag["Key"] == "Name":
+                                        instance_name = tag["Value"]
+                                        break
+
+                                if any(
+                                    keyword in instance_name.lower()
+                                    for keyword in [
+                                        "web",
+                                        "app",
+                                        "api",
+                                        "service",
+                                        "worker",
+                                    ]
+                                ):
+                                    checks["auto_scaling_missing"].append(
+                                        {
+                                            "InstanceId": instance_id,
+                                            "InstanceType": instance_type,
+                                            "InstanceName": instance_name,
+                                            "Recommendation": (
+                                                "Consider adding to Auto Scaling"
+                                                " Group for high availability and"
+                                                " cost optimization"
+                                            ),
+                                            "EstimatedSavings": (
+                                                "Improved availability and potential Spot instance usage"
+                                            ),
+                                            "CheckCategory": ("Auto Scaling Missing"),
+                                        }
+                                    )
+                        except Exception:
+                            pass
+
+                        if instance_type.startswith("t2."):
+                            checks["previous_generation"].append(
+                                {
+                                    "InstanceId": instance_id,
+                                    "InstanceType": instance_type,
+                                    "Recommendation": (
+                                        f"Consider migrating to"
+                                        f" {instance_type.replace('t2.', 't3.')}"
+                                        " for better cost efficiency"
+                                    ),
+                                    "EstimatedSavings": ("Potential cost reduction with better performance per dollar"),
+                                    "CheckCategory": ("Previous Generation Migration"),
+                                }
+                            )
+
+                        if instance.get("Placement", {}).get("Tenancy") == "dedicated":
+                            checks["dedicated_hosts"].append(
+                                {
+                                    "InstanceId": instance_id,
+                                    "Tenancy": "dedicated",
+                                    "Recommendation": ("Review dedicated tenancy necessity"),
+                                    "EstimatedSavings": ("Significant cost reduction if shared tenancy acceptable"),
+                                }
+                            )
+
+                        if instance_type.startswith(("t2.", "t3.", "t4g.")):
+                            try:
+                                end_time = datetime.now(UTC)
+                                start_time = end_time - timedelta(days=7)
+
+                                credit_response = cloudwatch.get_metric_statistics(
+                                    Namespace="AWS/EC2",
+                                    MetricName="CPUCreditBalance",
+                                    Dimensions=[
+                                        {
+                                            "Name": "InstanceId",
+                                            "Value": instance_id,
+                                        }
+                                    ],
+                                    StartTime=start_time,
+                                    EndTime=end_time,
+                                    Period=3600,
+                                    Statistics=["Average", "Minimum"],
+                                )
+
+                                cpu_response = cloudwatch.get_metric_statistics(
+                                    Namespace="AWS/EC2",
+                                    MetricName="CPUUtilization",
+                                    Dimensions=[
+                                        {
+                                            "Name": "InstanceId",
+                                            "Value": instance_id,
+                                        }
+                                    ],
+                                    StartTime=start_time,
+                                    EndTime=end_time,
+                                    Period=3600,
+                                    Statistics=["Average", "Maximum"],
+                                )
+
+                                credit_datapoints = credit_response.get("Datapoints", [])
+                                cpu_datapoints = cpu_response.get("Datapoints", [])
+
+                                if credit_datapoints and cpu_datapoints:
+                                    _avg_credits = sum(dp["Average"] for dp in credit_datapoints) / len(
+                                        credit_datapoints
+                                    )
+                                    min_credits = min(dp["Minimum"] for dp in credit_datapoints)
+                                    avg_cpu = sum(dp["Average"] for dp in cpu_datapoints) / len(cpu_datapoints)
+                                    max_cpu = max(dp["Maximum"] for dp in cpu_datapoints)
+
+                                    if min_credits < 10 and avg_cpu > 40:
+                                        pass
+                                    elif min_credits < 10:
+                                        recommendation = (
+                                            f"CloudWatch shows credit exhaustion"
+                                            f" (min: {min_credits:.1f})"
+                                            f" despite low CPU"
+                                            f" (avg: {avg_cpu:.1f}%)"
+                                            " - consider smaller fixed"
+                                            " instance"
+                                        )
+                                        savings = "Potential 20-40% cost reduction with smaller fixed instances"
+
+                                        checks["burstable_credits"].append(
+                                            {
+                                                "InstanceId": instance_id,
+                                                "InstanceType": instance_type,
+                                                "Recommendation": recommendation,
+                                                "CheckCategory": ("Burstable Instance Optimization"),
+                                                "EstimatedSavings": savings,
+                                                "ActionRequired": (
+                                                    "Enable detailed CloudWatch monitoring if not already enabled"
+                                                ),
+                                            }
+                                        )
+
+                                    elif avg_cpu > 40:
+                                        pass
+                                else:
+                                    recommendation = (
+                                        "Enable detailed CloudWatch monitoring for accurate burstable instance analysis"
+                                    )
+                                    savings = "CloudWatch detailed monitoring required for assessment"
+
+                                    checks["burstable_credits"].append(
+                                        {
+                                            "InstanceId": instance_id,
+                                            "InstanceType": instance_type,
+                                            "Recommendation": recommendation,
+                                            "CheckCategory": ("Burstable Instance Optimization"),
+                                            "EstimatedSavings": savings,
+                                            "ActionRequired": (
+                                                "Enable detailed CloudWatch monitoring if not already enabled"
+                                            ),
+                                        }
+                                    )
+
+                            except Exception:
+                                recommendation = (
+                                    "Enable detailed CloudWatch monitoring to"
+                                    " analyze CPU credit usage and determine"
+                                    " optimal instance type"
+                                )
+                                savings = "CloudWatch detailed monitoring required for accurate rightsizing"
+
+                                checks["burstable_credits"].append(
+                                    {
+                                        "InstanceId": instance_id,
+                                        "InstanceType": instance_type,
+                                        "Recommendation": recommendation,
+                                        "CheckCategory": ("Burstable Instance Optimization"),
+                                        "EstimatedSavings": savings,
+                                        "ActionRequired": (
+                                            "Enable detailed CloudWatch monitoring if not already enabled"
+                                        ),
+                                    }
+                                )
+
+                    elif state == "stopped":
+                        checks["stopped_instances"].append(
+                            {
+                                "InstanceId": instance_id,
+                                "InstanceType": instance_type,
+                                "State": state,
+                                "Recommendation": (
+                                    "Stopped instance already saves compute"
+                                    " costs. Terminate to also eliminate EBS"
+                                    " storage costs"
+                                ),
+                                "CheckCategory": "Stopped Instances",
+                                "EstimatedSavings": ("EBS storage costs only (compute already saved)"),
+                            }
+                        )
+
+    except Exception as e:
+        print(f"Warning: Could not perform enhanced EC2 checks: {e}")
+
+    recommendations: list[dict[str, Any]] = []
+    for _category, items in checks.items():
+        for item in items:
+            item["CheckCategory"] = item.get(
+                "CheckCategory",
+                _category.replace("_", " ").title(),
+            )
+            recommendations.append(item)
+
+    return {"recommendations": recommendations, **checks}
+
+
+def get_compute_optimizer_recommendations(
+    ctx: ScanContext,
+) -> list[dict[str, Any]]:
+    """Get EC2 recommendations from Compute Optimizer."""
+    compute_optimizer = ctx.client("compute-optimizer")
+    recommendations: list[dict[str, Any]] = []
+    try:
+        response = compute_optimizer.get_ec2_instance_recommendations()
+        recommendations.extend(response["instanceRecommendations"])
+
+        while response.get("nextToken"):
+            response = compute_optimizer.get_ec2_instance_recommendations(nextToken=response["nextToken"])
+            recommendations.extend(response["instanceRecommendations"])
+    except Exception as e:
+        print(f"Warning: Compute Optimizer not available: {e}")
+        if "OptInRequiredException" in str(e) or "not registered" in str(e):
+            opt_in_recommendation = {
+                "ResourceId": "compute-optimizer-service",
+                "ResourceType": "Service Configuration",
+                "Issue": "AWS Compute Optimizer not enabled",
+                "Recommendation": ("Enable AWS Compute Optimizer for EC2 recommendations"),
+                "EstimatedMonthlySavings": ("Variable - up to 25% on EC2 instances"),
+                "Action": ("Go to AWS Compute Optimizer console and opt-in to receive EC2 rightsizing recommendations"),
+                "Priority": "Medium",
+                "Service": "Compute Optimizer",
+            }
+            recommendations.append(opt_in_recommendation)
+    return recommendations
+
+
+def get_auto_scaling_checks(ctx: ScanContext) -> dict[str, Any]:
+    """Category 5: Auto Scaling Groups optimization checks."""
+    ec2 = ctx.client("ec2")
+    autoscaling = ctx.client("autoscaling")
+    checks: dict[str, list[dict[str, Any]]] = {
+        "static_asgs": [],
+        "never_scaling_asgs": [],
+        "nonprod_24x7_asgs": [],
+        "oversized_instances": [],
+        "missing_scale_in_policies": [],
+    }
+
+    try:
+        asg_response = autoscaling.describe_auto_scaling_groups()
+        asgs = asg_response.get("AutoScalingGroups", [])
+
+        for asg in asgs:
+            asg_name = asg.get("AutoScalingGroupName")
+            min_size = asg.get("MinSize", 0)
+            max_size = asg.get("MaxSize", 0)
+            desired_capacity = asg.get("DesiredCapacity", 0)
+
+            tags = {tag["Key"]: tag["Value"] for tag in asg.get("Tags", [])}
+            environment = tags.get("Environment", "").lower()
+
+            if min_size == desired_capacity == max_size and min_size > 0:
+                is_eks_nodegroup = _is_eks_nodegroup_asg(asg_name, tags)
+
+                if is_eks_nodegroup:
+                    checks["static_asgs"].append(
+                        {
+                            "AutoScalingGroupName": asg_name,
+                            "MinSize": min_size,
+                            "MaxSize": max_size,
+                            "DesiredCapacity": desired_capacity,
+                            "Recommendation": (
+                                "EKS node group with static sizing - consider"
+                                " enabling Cluster Autoscaler or Karpenter for"
+                                " dynamic scaling"
+                            ),
+                            "EstimatedSavings": (
+                                "Potential 20-40% savings through dynamic scaling based on workload demand"
+                            ),
+                            "Action": (
+                                "1. Install Cluster Autoscaler or Karpenter\n"
+                                "2. Configure node group for scaling"
+                                " (increase max_size)\n"
+                                "3. Set appropriate scaling policies\n"
+                                "4. Monitor workload patterns for"
+                                " optimization"
+                            ),
+                            "CheckCategory": "EKS Static Node Groups",
+                        }
+                    )
+                else:
+                    checks["static_asgs"].append(
+                        {
+                            "AutoScalingGroupName": asg_name,
+                            "MinSize": min_size,
+                            "MaxSize": max_size,
+                            "DesiredCapacity": desired_capacity,
+                            "Recommendation": (
+                                "ASG not configured for scaling - consider fixed EC2 instances or enable scaling"
+                            ),
+                            "EstimatedSavings": (
+                                "Remove ASG overhead, use Reserved Instances, or enable dynamic scaling"
+                            ),
+                            "Action": (
+                                "1. Evaluate if scaling is needed\n"
+                                "2. If no scaling needed: replace with fixed"
+                                " EC2 instances + Reserved Instances\n"
+                                "3. If scaling needed: configure min/max"
+                                " capacity and scaling policies"
+                            ),
+                            "CheckCategory": "Static Auto Scaling Groups",
+                        }
+                    )
+
+            if environment in ["dev", "test", "development", "staging"] and min_size > 0:
+                checks["nonprod_24x7_asgs"].append(
+                    {
+                        "AutoScalingGroupName": asg_name,
+                        "Environment": environment,
+                        "MinSize": min_size,
+                        "Recommendation": ("Non-prod ASG running 24/7 - implement shutdown schedule"),
+                        "EstimatedSavings": ("65-75% savings with 12-hour daily shutdown"),
+                        "CheckCategory": "Non-Prod 24/7 ASGs",
+                    }
+                )
+
+            launch_template = asg.get("LaunchTemplate")
+            _launch_config = asg.get("LaunchConfigurationName")
+
+            if launch_template:
+                try:
+                    lt_response = ec2.describe_launch_template_versions(
+                        LaunchTemplateId=launch_template["LaunchTemplateId"],
+                        Versions=[launch_template.get("Version", "$Latest")],
+                    )
+                    lt_data = lt_response["LaunchTemplateVersions"][0]["LaunchTemplateData"]
+                    instance_type = lt_data.get("InstanceType")
+
+                    if instance_type and any(size in instance_type for size in ["xlarge", "2xlarge", "4xlarge"]):
+                        checks["oversized_instances"].append(
+                            {
+                                "AutoScalingGroupName": asg_name,
+                                "InstanceType": instance_type,
+                                "Recommendation": ("Large instance type in ASG - verify rightsizing"),
+                                "EstimatedSavings": ("Potential 20-50% savings with rightsizing"),
+                                "CheckCategory": "Oversized ASG Instances",
+                            }
+                        )
+
+                except Exception as e:
+                    print(f"Warning: Could not analyze launch template for {asg_name}: {e}")
+
+            try:
+                policies_response = autoscaling.describe_policies(AutoScalingGroupName=asg_name)
+                policies = policies_response.get("ScalingPolicies", [])
+
+                scale_out_policies = [p for p in policies if p.get("ScalingAdjustment", 0) > 0]
+                scale_in_policies = [p for p in policies if p.get("ScalingAdjustment", 0) < 0]
+
+                if scale_out_policies and not scale_in_policies:
+                    checks["missing_scale_in_policies"].append(
+                        {
+                            "AutoScalingGroupName": asg_name,
+                            "ScaleOutPolicies": len(scale_out_policies),
+                            "ScaleInPolicies": len(scale_in_policies),
+                            "Recommendation": ("ASG has scale-out but no scale-in policies"),
+                            "EstimatedSavings": ("Prevent cost accumulation from scaling events"),
+                            "CheckCategory": "Missing Scale-In Policies",
+                        }
+                    )
+
+            except Exception as e:
+                print(f"Warning: Could not get Auto Scaling policies: {e}")
+
+    except Exception as e:
+        print(f"Warning: Could not perform Auto Scaling checks: {e}")
+
+    recommendations: list[dict[str, Any]] = []
+    for _category, items in checks.items():
+        for item in items:
+            recommendations.append(item)
+
+    return {"recommendations": recommendations, **checks}
+
+
+def get_advanced_ec2_checks(
+    ctx: ScanContext,
+    pricing_multiplier: float,
+    fast_mode: bool,
+) -> dict[str, Any]:
+    """Category 6: EC2 Advanced optimization checks."""
+    ec2 = ctx.client("ec2")
+    ctx.client("cloudwatch", ctx.region)
+    checks: dict[str, list[dict[str, Any]]] = {
+        "no_network_traffic": [],
+        "cron_job_instances": [],
+        "batch_job_instances": [],
+        "monitoring_only_instances": [],
+        "underutilized_instance_store": [],
+        "oversized_root_volumes": [],
+    }
+
+    try:
+        paginator = ec2.get_paginator("describe_instances")
+
+        for page in paginator.paginate():
+            for reservation in page["Reservations"]:
+                for instance in reservation["Instances"]:
+                    instance_id = instance["InstanceId"]
+                    instance_type = instance.get("InstanceType", "unknown")
+                    state = instance.get("State", {}).get("Name", "unknown")
+
+                    if state != "running":
+                        continue
+
+                    tags = {tag["Key"]: tag["Value"] for tag in instance.get("Tags", [])}
+                    name = tags.get("Name", instance_id)
+
+                    if any(
+                        keyword in name.lower()
+                        for keyword in [
+                            "cron",
+                            "batch",
+                            "job",
+                            "scheduler",
+                        ]
+                    ):
+                        checks["cron_job_instances"].append(
+                            {
+                                "InstanceId": instance_id,
+                                "InstanceType": instance_type,
+                                "Name": name,
+                                "Recommendation": ("Consider Lambda, EventBridge, or Batch for cron jobs"),
+                                "EstimatedSavings": ("80-95% cost reduction vs always-on EC2"),
+                                "CheckCategory": "Cron Job Instances",
+                            }
+                        )
+
+                    if any(
+                        keyword in name.lower()
+                        for keyword in [
+                            "monitor",
+                            "nagios",
+                            "zabbix",
+                            "prometheus",
+                        ]
+                    ):
+                        checks["monitoring_only_instances"].append(
+                            {
+                                "InstanceId": instance_id,
+                                "InstanceType": instance_type,
+                                "Name": name,
+                                "Recommendation": (
+                                    "Consider CloudWatch, managed monitoring, or containerized solution"
+                                ),
+                                "EstimatedSavings": ("Reduce infrastructure overhead"),
+                                "CheckCategory": ("Monitoring-Only Instances"),
+                            }
+                        )
+
+                    for bdm in instance.get("BlockDeviceMappings", []):
+                        if bdm.get("DeviceName") in [
+                            "/dev/sda1",
+                            "/dev/xvda",
+                        ]:
+                            ebs = bdm.get("Ebs", {})
+                            volume_id = ebs.get("VolumeId")
+
+                            if volume_id:
+                                try:
+                                    volume_response = ec2.describe_volumes(VolumeIds=[volume_id])
+                                    volume = volume_response["Volumes"][0]
+                                    size_gb = volume.get("Size", 0)
+
+                                    if size_gb > 100:
+                                        checks["oversized_root_volumes"].append(
+                                            {
+                                                "InstanceId": instance_id,
+                                                "InstanceType": instance_type,
+                                                "RootVolumeSize": f"{size_gb}GB",
+                                                "VolumeId": volume_id,
+                                                "Recommendation": (
+                                                    f"Root volume ({size_gb}GB)"
+                                                    " may be oversized -"
+                                                    " consider reducing or using"
+                                                    " separate data volumes"
+                                                ),
+                                                "EstimatedSavings": (
+                                                    f"${(size_gb - 20) * 0.10:.2f}"
+                                                    "/month if reduced to 20GB"
+                                                    " + separate data volume"
+                                                ),
+                                                "CheckCategory": ("Oversized Root Volumes"),
+                                            }
+                                        )
+
+                                except Exception as e:
+                                    print(f"Warning: Could not get volume details for {volume_id}: {e}")
+
+                    if any(
+                        family in instance_type
+                        for family in [
+                            "m5d",
+                            "c5d",
+                            "r5d",
+                            "i3",
+                            "i4i",
+                        ]
+                    ) and not any(
+                        keyword in name.lower()
+                        for keyword in [
+                            "database",
+                            "cache",
+                            "storage",
+                            "data",
+                            "analytics",
+                        ]
+                    ):
+                        checks["underutilized_instance_store"].append(
+                            {
+                                "InstanceId": instance_id,
+                                "InstanceType": instance_type,
+                                "Name": name,
+                                "Recommendation": (
+                                    "Instance has local storage but"
+                                    " workload may not require it -"
+                                    " consider non-storage optimized"
+                                    " type"
+                                ),
+                                "EstimatedSavings": ("10-20% cost reduction with equivalent non-storage instance type"),
+                                "CheckCategory": ("Underutilized Instance Store"),
+                            }
+                        )
+
+                    if (
+                        any(
+                            keyword in name.lower()
+                            for keyword in [
+                                "batch",
+                                "job",
+                                "worker",
+                                "process",
+                            ]
+                        )
+                        and "web" not in name.lower()
+                    ):
+                        checks["batch_job_instances"].append(
+                            {
+                                "InstanceId": instance_id,
+                                "InstanceType": instance_type,
+                                "Name": name,
+                                "Recommendation": ("Consider AWS Batch with Spot instances for batch workloads"),
+                                "EstimatedSavings": ("60-90% cost reduction with Spot instances in Batch"),
+                                "CheckCategory": "Batch Job Instances",
+                            }
+                        )
+                        checks["underutilized_instance_store"].append(
+                            {
+                                "InstanceId": instance_id,
+                                "InstanceType": instance_type,
+                                "Name": name,
+                                "Recommendation": ("Instance type includes instance store - verify utilization"),
+                                "EstimatedSavings": ("Switch to non-storage optimized if unused"),
+                                "CheckCategory": ("Underutilized Instance Store"),
+                            }
+                        )
+
+    except Exception as e:
+        print(f"Warning: Could not perform Advanced EC2 checks: {e}")
+
+    recommendations: list[dict[str, Any]] = []
+    for _category, items in checks.items():
+        for item in items:
+            recommendations.append(item)
+
+    return {"recommendations": recommendations, **checks}
