@@ -1,1 +1,3 @@
-ALL_MODULES: list = []
+from typing import Any
+
+ALL_MODULES: list[Any] = []

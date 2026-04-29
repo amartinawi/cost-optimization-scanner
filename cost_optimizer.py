@@ -45,6 +45,7 @@ import argparse
 import re
 
 from core.scan_context import ScanContext
+from services.ami import compute_ami_checks as _ami_compute
 from core.client_registry import ClientRegistry
 from core.session import AwsSessionFactory
 
@@ -3316,7 +3317,7 @@ class CostOptimizer:
 
         # AMI lifecycle management checks
         if should_scan_service("ami"):
-            ami_checks = self.get_ami_checks()
+            ami_checks = _ami_compute(self._ctx, self.pricing_multiplier)
         else:
             ami_checks = {"recommendations": []}
 
