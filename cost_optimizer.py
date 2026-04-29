@@ -83,6 +83,14 @@ from services.rds import (
     get_rds_compute_optimizer_recommendations as _rds_compute_optimizer_recs,
     get_rds_instance_count as _rds_instance_count,
 )
+from services.glue import (
+    GLUE_OPTIMIZATION_DESCRIPTIONS as _GLUE_DESCRIPTIONS,
+    get_enhanced_glue_checks as _glue_enhanced_checks,
+)
+from services.dms import (
+    DMS_OPTIMIZATION_DESCRIPTIONS as _DMS_DESCRIPTIONS,
+    get_enhanced_dms_checks as _dms_enhanced_checks,
+)
 from services.mediastore import (
     MEDIASTORE_OPTIMIZATION_DESCRIPTIONS as _MEDIASTORE_DESCRIPTIONS,
     get_enhanced_mediastore_checks as _mediastore_enhanced_checks,
@@ -99,6 +107,10 @@ from services.transfer_svc import get_enhanced_transfer_checks as _transfer_enha
 from services.redshift import (
     REDSHIFT_OPTIMIZATION_DESCRIPTIONS as _REDSHIFT_DESCRIPTIONS,
     get_enhanced_redshift_checks as _redshift_enhanced_checks,
+)
+from services.lightsail import (
+    LIGHTSAIL_OPTIMIZATION_DESCRIPTIONS as _LIGHTSAIL_DESCRIPTIONS,
+    get_enhanced_lightsail_checks as _lightsail_enhanced_checks,
 )
 from services.athena import get_enhanced_athena_checks as _athena_enhanced_checks
 from services.batch_svc import (
@@ -4150,8 +4162,8 @@ class CostOptimizer:
         # Lightsail scanning
         if should_scan_service("lightsail"):
             print("💡 Scanning Lightsail instances and optimization opportunities...")
-            enhanced_lightsail_checks = self.get_enhanced_lightsail_checks()
-            lightsail_descriptions = self.get_lightsail_optimization_descriptions()
+            enhanced_lightsail_checks = _lightsail_enhanced_checks(self._ctx)
+            lightsail_descriptions = _LIGHTSAIL_DESCRIPTIONS
         else:
             print("⏭️ Skipping Lightsail analysis...")
             enhanced_lightsail_checks = {"recommendations": []}
@@ -4170,8 +4182,8 @@ class CostOptimizer:
         # DMS scanning
         if should_scan_service("dms"):
             print("🔄 Scanning Database Migration Service optimization...")
-            enhanced_dms_checks = self.get_enhanced_dms_checks()
-            dms_descriptions = self.get_dms_optimization_descriptions()
+            enhanced_dms_checks = _dms_enhanced_checks(self._ctx)
+            dms_descriptions = _DMS_DESCRIPTIONS
         else:
             print("⏭️ Skipping DMS analysis...")
             enhanced_dms_checks = {"recommendations": []}
@@ -4240,8 +4252,8 @@ class CostOptimizer:
         # Glue scanning
         if should_scan_service("glue"):
             print("🔧 Scanning AWS Glue ETL optimization...")
-            enhanced_glue_checks = self.get_enhanced_glue_checks()
-            glue_descriptions = self.get_glue_optimization_descriptions()
+            enhanced_glue_checks = _glue_enhanced_checks(self._ctx)
+            glue_descriptions = _GLUE_DESCRIPTIONS
         else:
             print("⏭️ Skipping Glue analysis...")
             enhanced_glue_checks = {"recommendations": []}
