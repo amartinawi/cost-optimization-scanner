@@ -1,0 +1,573 @@
+{
+  "account_id": "123456789012",
+  "region": "us-east-1",
+  "profile": "test-profile",
+  "scan_time": "2026-04-29T10:30:00+00:00",
+  "scan_warnings": [],
+  "permission_issues": [],
+  "services": {
+    "ec2": {
+      "service_name": "EC2",
+      "instance_count": 12,
+      "total_recommendations": 5,
+      "total_monthly_savings": 387.50,
+      "sources": {
+        "cost_optimization_hub": {
+          "count": 0,
+          "recommendations": []
+        },
+        "compute_optimizer": {
+          "count": 0,
+          "recommendations": []
+        },
+        "enhanced_checks": {
+          "count": 5,
+          "recommendations": [
+            {
+              "Resource": "i-0a1b2c3d4e5f67890",
+              "InstanceType": "t2.medium",
+              "State": "running",
+              "Recommendation": "Upgrade from t2.medium to t3.medium for better performance and lower cost",
+              "EstimatedSavings": "$15.20/month",
+              "CheckCategory": "Previous Generation Upgrade"
+            },
+            {
+              "Resource": "i-0b2c3d4e5f6789012",
+              "InstanceType": "m5.xlarge",
+              "State": "running",
+              "CPUAverage": "4.2%",
+              "NetworkIO": "Low",
+              "Recommendation": "Consider rightsizing m5.xlarge - CPU average 4.2% is below 10% threshold",
+              "EstimatedSavings": "$122.40/month",
+              "CheckCategory": "Rightsizing"
+            },
+            {
+              "Resource": "i-0c3d4e5f678901234",
+              "InstanceType": "t3.small",
+              "State": "running",
+              "CPUCredits": "12 of 144",
+              "Recommendation": "Burstable instance running low on CPU credits (8.3% remaining) - consider switching to unlimited mode or larger instance",
+              "EstimatedSavings": "$8.50/month",
+              "CheckCategory": "Burstable Performance"
+            },
+            {
+              "Resource": "i-0d4e5f67890123456",
+              "InstanceType": "t2.large",
+              "State": "stopped",
+              "Recommendation": "Stopped instance detected - consider terminating if no longer needed",
+              "EstimatedSavings": "$62.40/month",
+              "CheckCategory": "Stopped Instances"
+            },
+            {
+              "Resource": "i-0e5f6789012345678",
+              "InstanceType": "c5.2xlarge",
+              "State": "running",
+              "CPUAverage": "2.1%",
+              "NetworkIO": "Very Low",
+              "CloudWatchMetrics": {
+                "CPUUtilization": {
+                  "Average": 2.1,
+                  "Maximum": 8.3,
+                  "Period": "14 days"
+                }
+              },
+              "Recommendation": "Idle instance detected - CPU 2.1% and very low network over 14 days",
+              "EstimatedSavings": "$179.00/month",
+              "CheckCategory": "Idle Instances"
+            }
+          ]
+        },
+        "advanced_ec2_checks": {
+          "count": 0,
+          "recommendations": []
+        }
+      }
+    },
+    "ami": {
+      "service_name": "AMI",
+      "total_recommendations": 2,
+      "total_count": 2,
+      "total_monthly_savings": 10.00,
+      "sources": {
+        "old_amis": {
+          "count": 2,
+          "recommendations": [
+            {
+              "Resource": "ami-0abc123def4567890",
+              "Name": "old-ubuntu-20.04-base",
+              "State": "available",
+              "CreationDate": "2024-01-15T08:00:00.000Z",
+              "AgeDays": 470,
+              "Recommendation": "Old AMI (470 days) - consider deregistering if no longer in use",
+              "EstimatedSavings": "$5.00/month",
+              "EstimatedMonthlySavings": 5.00,
+              "CheckCategory": "Old AMIs"
+            },
+            {
+              "Resource": "ami-1def4567890abc123",
+              "Name": "legacy-app-server-v2",
+              "State": "available",
+              "CreationDate": "2023-11-20T10:30:00.000Z",
+              "AgeDays": 526,
+              "Recommendation": "Old AMI (526 days) - consider deregistering if no longer in use",
+              "EstimatedSavings": "$5.00/month",
+              "EstimatedMonthlySavings": 5.00,
+              "CheckCategory": "Old AMIs"
+            }
+          ]
+        }
+      }
+    },
+    "ebs": {
+      "service_name": "EBS",
+      "volume_counts": {
+        "total": 18,
+        "unattached": 3,
+        "gp2": 7
+      },
+      "total_recommendations": 4,
+      "total_monthly_savings": 94.20,
+      "optimization_descriptions": {
+        "unattached_volumes": {
+          "title": "Unattached EBS Volumes",
+          "description": "Found 3 unattached volumes incurring storage costs without serving any purpose."
+        },
+        "gp2_migration": {
+          "title": "Migrate gp2 to gp3 Volumes",
+          "description": "7 volumes using older gp2 type can be migrated to gp3 for up to 20% cost savings with better performance."
+        }
+      },
+      "sources": {
+        "compute_optimizer": {
+          "count": 0,
+          "recommendations": []
+        },
+        "unattached_volumes": {
+          "count": 2,
+          "recommendations": [
+            {
+              "Resource": "vol-0a1b2c3d4e5f67890",
+              "VolumeType": "gp3",
+              "Size": 100,
+              "State": "available",
+              "EstimatedMonthlyCost": 8.00,
+              "Recommendation": "Unattached volume - consider deleting or snapshotting",
+              "CheckCategory": "Unattached Volumes"
+            },
+            {
+              "Resource": "vol-0b2c3d4e5f678901",
+              "VolumeType": "gp2",
+              "Size": 500,
+              "State": "available",
+              "EstimatedMonthlyCost": 50.00,
+              "Recommendation": "Unattached volume - consider deleting or snapshotting",
+              "CheckCategory": "Unattached Volumes"
+            }
+          ]
+        },
+        "gp2_migration": {
+          "count": 2,
+          "recommendations": [
+            {
+              "Resource": "vol-0c3d4e5f67890123",
+              "VolumeType": "gp2",
+              "Size": 200,
+              "Recommendation": "Migrate gp2 to gp3 for up to 20% cost savings with better performance",
+              "EstimatedSavings": "$8.00/month",
+              "CheckCategory": "Volume Type Optimization"
+            },
+            {
+              "Resource": "vol-0d4e5f6789012345",
+              "VolumeType": "gp2",
+              "Size": 100,
+              "Recommendation": "Migrate gp2 to gp3 for up to 20% cost savings with better performance",
+              "EstimatedSavings": "$4.00/month",
+              "CheckCategory": "Volume Type Optimization"
+            }
+          ]
+        },
+        "enhanced_checks": {
+          "count": 0,
+          "recommendations": []
+        }
+      }
+    },
+    "rds": {
+      "service_name": "RDS",
+      "instance_counts": {
+        "total": 0,
+        "running": 0,
+        "mysql": 0
+      },
+      "total_recommendations": 0,
+      "total_monthly_savings": 0,
+      "sources": {
+        "compute_optimizer": {
+          "count": 0,
+          "recommendations": []
+        },
+        "enhanced_checks": {
+          "count": 0,
+          "recommendations": []
+        }
+      }
+    },
+    "file_systems": {
+      "service_name": "File Systems",
+      "efs_counts": {
+        "total": 0
+      },
+      "fsx_counts": {
+        "total": 0
+      },
+      "total_recommendations": 0,
+      "total_monthly_savings": 0,
+      "sources": {
+        "efs_lifecycle_analysis": {
+          "count": 0,
+          "recommendations": []
+        },
+        "fsx_optimization_analysis": {
+          "count": 0,
+          "recommendations": []
+        },
+        "enhanced_checks": {
+          "count": 0,
+          "recommendations": []
+        }
+      }
+    },
+    "s3": {
+      "service_name": "S3",
+      "fast_mode_warning": null,
+      "bucket_counts": {
+        "total": 15,
+        "without_lifecycle": 4,
+        "without_intelligent_tiering": 6
+      },
+      "total_recommendations": 3,
+      "total_monthly_savings": 245.00,
+      "optimization_descriptions": {
+        "lifecycle_policies": {
+          "title": "Missing Lifecycle Policies",
+          "description": "4 buckets without lifecycle policies could benefit from automated transition rules."
+        },
+        "intelligent_tiering": {
+          "title": "Intelligent-Tiering Adoption",
+          "description": "6 buckets could benefit from S3 Intelligent-Tiering for automatic cost optimization."
+        }
+      },
+      "sources": {
+        "s3_bucket_analysis": {
+          "count": 3,
+          "recommendations": [
+            {
+              "Resource": "my-company-logs-prod",
+              "BucketSize": "2.5 TB",
+              "BucketCost": 59.00,
+              "HasLifecycle": false,
+              "HasIntelligentTiering": false,
+              "Recommendation": "Add lifecycle policy to transition logs to IA after 30 days and Glacier after 90 days",
+              "EstimatedMonthlyCost": 59.00,
+              "CheckCategory": "Lifecycle Policies"
+            },
+            {
+              "Resource": "data-lake-raw-us-east-1",
+              "BucketSize": "8.2 TB",
+              "BucketCost": 184.50,
+              "HasLifecycle": false,
+              "HasIntelligentTiering": false,
+              "Recommendation": "Enable S3 Intelligent-Tiering for automatic cost optimization on access patterns",
+              "EstimatedMonthlyCost": 184.50,
+              "CheckCategory": "Storage Class Analysis"
+            },
+            {
+              "Resource": "backup-archive-2024",
+              "BucketSize": "1.1 TB",
+              "BucketCost": 24.80,
+              "HasLifecycle": false,
+              "HasIntelligentTiering": false,
+              "Recommendation": "Move archival data to S3 Glacier Deep Archive for up to 80% cost reduction",
+              "EstimatedMonthlyCost": 24.80,
+              "CheckCategory": "Storage Class Analysis"
+            }
+          ],
+          "top_cost_buckets": [
+            {"name": "data-lake-raw-us-east-1", "cost": 184.50},
+            {"name": "my-company-logs-prod", "cost": 59.00}
+          ],
+          "top_size_buckets": [
+            {"name": "data-lake-raw-us-east-1", "size": "8.2 TB"},
+            {"name": "my-company-logs-prod", "size": "2.5 TB"}
+          ]
+        },
+        "enhanced_checks": {
+          "count": 0,
+          "recommendations": []
+        }
+      }
+    },
+    "dynamodb": {
+      "service_name": "DynamoDB",
+      "table_counts": {
+        "total": 0,
+        "provisioned": 0,
+        "on_demand": 0
+      },
+      "total_recommendations": 0,
+      "total_monthly_savings": 0,
+      "sources": {
+        "dynamodb_table_analysis": {
+          "count": 0,
+          "recommendations": []
+        },
+        "enhanced_checks": {
+          "count": 0,
+          "recommendations": []
+        }
+      }
+    },
+    "containers": {
+      "service_name": "Containers",
+      "service_counts": {
+        "ecs_clusters": 0,
+        "eks_clusters": 0,
+        "ecr_repositories": 0,
+        "ecs_services": 0
+      },
+      "total_recommendations": 0,
+      "total_monthly_savings": 0,
+      "sources": {
+        "enhanced_checks": {
+          "count": 0,
+          "recommendations": []
+        }
+      }
+    },
+    "network": {
+      "service_name": "Network",
+      "total_recommendations": 0,
+      "total_monthly_savings": 0,
+      "sources": {
+        "enhanced_checks": {
+          "count": 0,
+          "recommendations": []
+        }
+      }
+    },
+    "monitoring": {
+      "service_name": "Monitoring",
+      "total_recommendations": 0,
+      "total_monthly_savings": 0,
+      "sources": {
+        "enhanced_checks": {
+          "count": 0,
+          "recommendations": []
+        }
+      }
+    },
+    "elasticache": {
+      "service_name": "ElastiCache",
+      "total_recommendations": 0,
+      "total_monthly_savings": 0,
+      "sources": {
+        "enhanced_checks": {
+          "count": 0,
+          "recommendations": []
+        }
+      }
+    },
+    "opensearch": {
+      "service_name": "OpenSearch",
+      "total_recommendations": 0,
+      "total_monthly_savings": 0,
+      "sources": {
+        "enhanced_checks": {
+          "count": 0,
+          "recommendations": []
+        }
+      }
+    },
+    "lambda": {
+      "service_name": "Lambda",
+      "total_recommendations": 0,
+      "total_monthly_savings": 0,
+      "sources": {
+        "enhanced_checks": {
+          "count": 0,
+          "recommendations": []
+        }
+      }
+    },
+    "cloudfront": {
+      "service_name": "CloudFront",
+      "total_recommendations": 0,
+      "total_monthly_savings": 0,
+      "sources": {
+        "enhanced_checks": {
+          "count": 0,
+          "recommendations": []
+        }
+      }
+    },
+    "api_gateway": {
+      "service_name": "API Gateway",
+      "total_recommendations": 0,
+      "total_monthly_savings": 0,
+      "sources": {
+        "enhanced_checks": {
+          "count": 0,
+          "recommendations": []
+        }
+      }
+    },
+    "step_functions": {
+      "service_name": "Step Functions",
+      "total_recommendations": 0,
+      "total_monthly_savings": 0,
+      "sources": {
+        "enhanced_checks": {
+          "count": 0,
+          "recommendations": []
+        }
+      }
+    },
+    "lightsail": {
+      "service_name": "Lightsail",
+      "total_recommendations": 0,
+      "total_monthly_savings": 0,
+      "sources": {
+        "enhanced_checks": {
+          "count": 0,
+          "recommendations": []
+        }
+      }
+    },
+    "redshift": {
+      "service_name": "Redshift",
+      "total_recommendations": 0,
+      "total_monthly_savings": 0,
+      "sources": {
+        "enhanced_checks": {
+          "count": 0,
+          "recommendations": []
+        }
+      }
+    },
+    "dms": {
+      "service_name": "DMS",
+      "total_recommendations": 0,
+      "total_monthly_savings": 0,
+      "sources": {
+        "enhanced_checks": {
+          "count": 0,
+          "recommendations": []
+        }
+      }
+    },
+    "quicksight": {
+      "service_name": "QuickSight",
+      "total_recommendations": 0,
+      "total_monthly_savings": 0,
+      "sources": {
+        "enhanced_checks": {
+          "count": 0,
+          "recommendations": []
+        }
+      }
+    },
+    "apprunner": {
+      "service_name": "App Runner",
+      "total_recommendations": 0,
+      "total_monthly_savings": 0,
+      "sources": {
+        "enhanced_checks": {
+          "count": 0,
+          "recommendations": []
+        }
+      }
+    },
+    "transfer": {
+      "service_name": "Transfer Family",
+      "total_recommendations": 0,
+      "total_monthly_savings": 0,
+      "sources": {
+        "enhanced_checks": {
+          "count": 0,
+          "recommendations": []
+        }
+      }
+    },
+    "msk": {
+      "service_name": "MSK",
+      "total_recommendations": 0,
+      "total_monthly_savings": 0,
+      "sources": {
+        "enhanced_checks": {
+          "count": 0,
+          "recommendations": []
+        }
+      }
+    },
+    "workspaces": {
+      "service_name": "WorkSpaces",
+      "total_recommendations": 0,
+      "total_monthly_savings": 0,
+      "sources": {
+        "enhanced_checks": {
+          "count": 0,
+          "recommendations": []
+        }
+      }
+    },
+    "mediastore": {
+      "service_name": "MediaStore",
+      "total_recommendations": 0,
+      "total_monthly_savings": 0,
+      "sources": {
+        "enhanced_checks": {
+          "count": 0,
+          "recommendations": []
+        }
+      }
+    },
+    "glue": {
+      "service_name": "Glue",
+      "total_recommendations": 0,
+      "total_monthly_savings": 0,
+      "sources": {
+        "enhanced_checks": {
+          "count": 0,
+          "recommendations": []
+        }
+      }
+    },
+    "athena": {
+      "service_name": "Athena",
+      "total_recommendations": 0,
+      "total_monthly_savings": 0,
+      "sources": {
+        "enhanced_checks": {
+          "count": 0,
+          "recommendations": []
+        }
+      }
+    },
+    "batch": {
+      "service_name": "Batch",
+      "total_recommendations": 0,
+      "total_monthly_savings": 0,
+      "sources": {
+        "enhanced_checks": {
+          "count": 0,
+          "recommendations": []
+        }
+      }
+    }
+  },
+  "summary": {
+    "total_services_scanned": 4,
+    "total_recommendations": 14,
+    "total_monthly_savings": 736.70
+  }
+}

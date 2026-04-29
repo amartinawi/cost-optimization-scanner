@@ -1,0 +1,2 @@
+67eace883eb18ca1ba8a6c3ab35d48be91949d855d625d79b409f9f6d1b8c442  golden_scan_results.json
+31d0ce50ab8a6e8ec0216c141e944cb3645afca277f99d89f1338bd2b82ca3c3  golden_report.html
