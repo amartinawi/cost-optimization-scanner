@@ -1,0 +1,107 @@
+"""API Gateway cost optimization checks.
+
+Extracted from CostOptimizer.get_enhanced_api_gateway_checks() as a free function.
+This module will later become ApiGatewayModule (T-321) implementing ServiceModule.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from core.scan_context import ScanContext
+
+print("🔍 [services/api_gateway.py] API Gateway module active")
+
+API_GATEWAY_OPTIMIZATION_DESCRIPTIONS: dict[str, dict[str, str]] = {
+    "rest_vs_http": {
+        "title": "Migrate Simple REST APIs to HTTP API",
+        "description": "REST APIs with ≤10 resources can migrate to cheaper HTTP APIs for 10-30% cost reduction.",
+        "action": "Review simple REST APIs and migrate to HTTP API where feature compatibility allows",
+    },
+    "unused_stages": {
+        "title": "Remove Unused API Gateway Stages",
+        "description": "Unused stages incur ongoing costs and should be cleaned up.",
+        "action": "Review and delete stages that are no longer in use",
+    },
+    "caching_opportunities": {
+        "title": "Enable API Gateway Caching",
+        "description": "Stages without cache clusters generate unnecessary backend calls that increase costs.",
+        "action": "Enable caching on stages with repetitive request patterns",
+    },
+    "throttling_optimization": {
+        "title": "Optimize API Gateway Throttling",
+        "description": "Proper throttling configuration prevents cost spikes from uncontrolled traffic.",
+        "action": "Review and configure appropriate throttling limits",
+    },
+    "request_validation": {
+        "title": "Review Request Validation Cost Impact",
+        "description": "Request validation can be tuned to reduce processing costs.",
+        "action": "Optimize request validation configurations for cost efficiency",
+    },
+}
+
+
+def get_enhanced_api_gateway_checks(ctx: ScanContext) -> dict[str, Any]:
+    """Get enhanced API Gateway cost optimization checks"""
+    checks: dict[str, list[dict[str, Any]]] = {
+        "rest_vs_http": [],
+        "unused_stages": [],
+        "caching_opportunities": [],
+        "throttling_optimization": [],
+        "request_validation": [],
+    }
+
+    try:
+        apigateway = ctx.client("apigateway")
+        paginator = apigateway.get_paginator("get_rest_apis")
+        for page in paginator.paginate():
+            for api in page.get("items", []):
+                api_id = api.get("id")
+                api_name = api.get("name", "Unknown")
+
+                try:
+                    resources = apigateway.get_resources(restApiId=api_id)
+                    resource_count = len(resources.get("items", []))
+
+                    if resource_count <= 10:
+                        checks["rest_vs_http"].append(
+                            {
+                                "ApiId": api_id,
+                                "ApiName": api_name,
+                                "ApiType": "REST",
+                                "ResourceCount": resource_count,
+                                "Recommendation": "Simple API - consider migrating to HTTP API for lower cost",
+                                "EstimatedSavings": "10-30% cost reduction for simple APIs",
+                                "CheckCategory": "API Gateway Type Optimization",
+                            }
+                        )
+                except Exception:
+                    pass
+
+                try:
+                    stages = apigateway.get_stages(restApiId=api_id)
+                    for stage in stages.get("item", []):
+                        stage_name = stage.get("stageName")
+                        if not stage.get("cacheClusterEnabled", False):
+                            checks["caching_opportunities"].append(
+                                {
+                                    "ApiId": api_id,
+                                    "ApiName": api_name,
+                                    "StageName": stage_name,
+                                    "Recommendation": "Enable caching to reduce backend calls",
+                                    "EstimatedSavings": "Reduced backend costs",
+                                    "CheckCategory": "API Gateway Caching",
+                                }
+                            )
+                except Exception as e:
+                    ctx.warn(f"Could not check stages for API {api_id}: {e}", "api_gateway")
+                    continue
+
+    except Exception as e:
+        ctx.warn(f"Could not perform API Gateway checks: {e}", "api_gateway")
+
+    all_recommendations: list[dict[str, Any]] = []
+    for _category, recs in checks.items():
+        all_recommendations.extend(recs)
+
+    return {"recommendations": all_recommendations, **checks}
