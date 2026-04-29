@@ -3190,45 +3190,45 @@ class CostOptimizer:
             ValueError: If both skip_services and scan_only are provided
             boto3.exceptions.ClientError: For AWS API permission or availability issues
         """
+        return self._scan_legacy_run(skip_services, scan_only)
+
+    def _scan_legacy_run(self, skip_services=None, scan_only=None) -> Dict[str, Any]:
+        """Extracted from scan_region()."""
         # Initialize service filtering
         skip_services = skip_services or []
         scan_only = scan_only or []
 
-        # Service mapping for filtering
-        # Service filtering configuration
-        # Maps user-friendly service names to internal service keys for intelligent filtering
-        # This enables users to specify services like 'containers' to include ECS, EKS, and ECR
         service_map = {
-            "ec2": ["ec2", "ami"],  # EC2 instances and AMI management
-            "ebs": ["ebs"],  # EBS volumes and snapshots
-            "rds": ["rds"],  # RDS databases and clusters
-            "s3": ["s3"],  # S3 buckets and storage optimization
-            "lambda": ["lambda"],  # Lambda functions and serverless
-            "dynamodb": ["dynamodb"],  # DynamoDB tables and capacity
-            "efs": ["efs", "file_systems"],  # EFS and file system optimization
-            "elasticache": ["elasticache"],  # ElastiCache clusters
-            "opensearch": ["opensearch"],  # OpenSearch domains
-            "containers": ["containers", "ecs", "eks", "ecr"],  # Container services
-            "network": ["network", "elastic_ip", "nat_gateway", "load_balancer"],  # Network resources
-            "monitoring": ["monitoring", "cloudwatch", "cloudtrail"],  # Monitoring and logging
-            "auto_scaling": ["auto_scaling"],  # Auto Scaling groups
-            "route53": ["route53"],  # Route 53 DNS and health checks
-            "backup": ["backup"],  # AWS Backup services
-            "cloudfront": ["cloudfront"],  # CloudFront CDN
-            "api_gateway": ["api_gateway"],  # API Gateway REST/HTTP APIs
-            "step_functions": ["step_functions"],  # Step Functions workflows
-            "lightsail": ["lightsail"],  # Lightsail instances and resources
-            "redshift": ["redshift"],  # Redshift clusters and serverless
-            "dms": ["dms"],  # Database Migration Service
-            "quicksight": ["quicksight"],  # QuickSight BI service
-            "apprunner": ["apprunner"],  # App Runner container service
-            "transfer": ["transfer"],  # Transfer Family (SFTP/FTPS)
-            "msk": ["msk"],  # Managed Streaming for Apache Kafka
-            "workspaces": ["workspaces"],  # WorkSpaces virtual desktops
-            "mediastore": ["mediastore"],  # Elemental MediaStore
-            "glue": ["glue"],  # AWS Glue ETL jobs
-            "athena": ["athena"],  # Athena query service
-            "batch": ["batch"],  # AWS Batch compute
+            "ec2": ["ec2", "ami"],
+            "ebs": ["ebs"],
+            "rds": ["rds"],
+            "s3": ["s3"],
+            "lambda": ["lambda"],
+            "dynamodb": ["dynamodb"],
+            "efs": ["efs", "file_systems"],
+            "elasticache": ["elasticache"],
+            "opensearch": ["opensearch"],
+            "containers": ["containers", "ecs", "eks", "ecr"],
+            "network": ["network", "elastic_ip", "nat_gateway", "load_balancer"],
+            "monitoring": ["monitoring", "cloudwatch", "cloudtrail"],
+            "auto_scaling": ["auto_scaling"],
+            "route53": ["route53"],
+            "backup": ["backup"],
+            "cloudfront": ["cloudfront"],
+            "api_gateway": ["api_gateway"],
+            "step_functions": ["step_functions"],
+            "lightsail": ["lightsail"],
+            "redshift": ["redshift"],
+            "dms": ["dms"],
+            "quicksight": ["quicksight"],
+            "apprunner": ["apprunner"],
+            "transfer": ["transfer"],
+            "msk": ["msk"],
+            "workspaces": ["workspaces"],
+            "mediastore": ["mediastore"],
+            "glue": ["glue"],
+            "athena": ["athena"],
+            "batch": ["batch"],
         }
 
         def should_scan_service(service_key):
