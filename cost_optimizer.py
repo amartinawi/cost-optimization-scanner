@@ -45,6 +45,12 @@ import argparse
 import re
 
 from core.scan_context import ScanContext
+from services.advisor import (
+    get_detailed_cost_hub_recommendations as _advisor_cost_hub_recs,
+    get_ec2_compute_optimizer_recommendations as _advisor_ec2_compute_optimizer_recs,
+    get_ebs_compute_optimizer_recommendations as _advisor_ebs_compute_optimizer_recs,
+    get_rds_compute_optimizer_recommendations as _advisor_rds_compute_optimizer_recs,
+)
 from services.ami import compute_ami_checks as _ami_compute
 from services.apprunner import (
     APPRUNNER_OPTIMIZATION_DESCRIPTIONS as _APPRUNNER_DESCRIPTIONS,
@@ -61,7 +67,6 @@ from services.quicksight import (
 from services.ebs import (
     EBS_OPTIMIZATION_DESCRIPTIONS as _EBS_DESCRIPTIONS,
     compute_ebs_checks as _ebs_compute,
-    get_ebs_compute_optimizer_recs as _ebs_compute_optimizer_recs,
     get_ebs_volume_count as _ebs_volume_count,
     get_unattached_volumes as _ebs_unattached_volumes,
 )
@@ -73,14 +78,12 @@ from services.s3 import (
 from services.ec2 import (
     get_advanced_ec2_checks as _ec2_advanced_checks,
     get_auto_scaling_checks as _ec2_auto_scaling_checks,
-    get_compute_optimizer_recommendations as _ec2_compute_optimizer_recs,
     get_ec2_instance_count as _ec2_instance_count,
     get_enhanced_ec2_checks as _ec2_enhanced_checks,
 )
 from services.rds import (
     RDS_OPTIMIZATION_DESCRIPTIONS as _RDS_DESCRIPTIONS,
     get_enhanced_rds_checks as _rds_enhanced_checks,
-    get_rds_compute_optimizer_recommendations as _rds_compute_optimizer_recs,
     get_rds_instance_count as _rds_instance_count,
 )
 from services.glue import (
@@ -109,6 +112,11 @@ from services.mediastore import (
     MEDIASTORE_OPTIMIZATION_DESCRIPTIONS as _MEDIASTORE_DESCRIPTIONS,
     get_enhanced_mediastore_checks as _mediastore_enhanced_checks,
 )
+from services.containers import (
+    CONTAINER_OPTIMIZATION_DESCRIPTIONS as _CONTAINER_DESCRIPTIONS,
+    get_container_services_analysis as _container_services_analysis,
+    get_enhanced_container_checks as _container_enhanced_checks,
+)
 from services.msk import (
     MSK_OPTIMIZATION_DESCRIPTIONS as _MSK_DESCRIPTIONS,
     get_enhanced_msk_checks as _msk_enhanced_checks,
@@ -136,6 +144,32 @@ from services.cloudfront import get_enhanced_cloudfront_checks as _cloudfront_en
 from services.step_functions import (
     STEP_FUNCTIONS_OPTIMIZATION_DESCRIPTIONS as _STEP_FUNCTIONS_DESCRIPTIONS,
     get_enhanced_step_functions_checks as _step_functions_enhanced_checks,
+)
+from services.monitoring import (
+    MONITORING_OPTIMIZATION_DESCRIPTIONS as _MONITORING_DESCRIPTIONS,
+    get_cloudwatch_checks as _cloudwatch_checks,
+    get_cloudtrail_checks as _cloudtrail_checks,
+)
+from services.backup import (
+    BACKUP_OPTIMIZATION_DESCRIPTIONS as _BACKUP_DESCRIPTIONS,
+    get_backup_checks as _backup_checks,
+)
+from services.elastic_ip import get_elastic_ip_checks as _elastic_ip_checks
+from services.nat_gateway import get_nat_gateway_checks as _nat_gateway_checks
+from services.vpc_endpoints import get_vpc_endpoints_checks as _vpc_endpoints_checks
+from services.load_balancer import get_load_balancer_checks as _load_balancer_checks
+from services.route53 import (
+    ROUTE53_OPTIMIZATION_DESCRIPTIONS as _ROUTE53_DESCRIPTIONS,
+    get_route53_checks as _route53_checks,
+)
+from services.efs_fsx import (
+    get_efs_file_system_count as _efs_file_system_count,
+    get_efs_lifecycle_analysis as _efs_lifecycle_analysis,
+    get_efs_optimization_descriptions as _efs_optimization_descriptions,
+    get_fsx_file_system_count as _fsx_file_system_count,
+    get_fsx_optimization_analysis as _fsx_optimization_analysis,
+    get_file_system_optimization_descriptions as _file_system_optimization_descriptions,
+    get_enhanced_efs_fsx_checks as _efs_fsx_enhanced_checks,
 )
 from core.client_registry import ClientRegistry
 from core.session import AwsSessionFactory
@@ -943,31 +977,7 @@ class CostOptimizer:
 
     def get_ebs_compute_optimizer_recommendations(self) -> List[Dict[str, Any]]:
         """Get EBS recommendations from Compute Optimizer"""
-        recommendations = []
-        try:
-            response = self.compute_optimizer.get_ebs_volume_recommendations()
-            recommendations.extend(response["volumeRecommendations"])
-
-            # Handle pagination manually
-            while response.get("nextToken"):
-                response = self.compute_optimizer.get_ebs_volume_recommendations(nextToken=response["nextToken"])
-                recommendations.extend(response["volumeRecommendations"])
-        except Exception as e:
-            print(f"Warning: EBS Compute Optimizer not available: {e}")
-            # Add recommendation to enable Compute Optimizer
-            if "OptInRequiredException" in str(e) or "not registered" in str(e):
-                opt_in_recommendation = {
-                    "ResourceId": "compute-optimizer-service",
-                    "ResourceType": "Service Configuration",
-                    "Issue": "AWS Compute Optimizer not enabled",
-                    "Recommendation": "Enable AWS Compute Optimizer for EBS recommendations",
-                    "EstimatedMonthlySavings": "Variable - up to 20% on EBS volumes",
-                    "Action": "Go to AWS Compute Optimizer console and opt-in to receive EBS rightsizing recommendations",
-                    "Priority": "Medium",
-                    "Service": "Compute Optimizer",
-                }
-                recommendations.append(opt_in_recommendation)
-        return recommendations
+        return _advisor_ebs_compute_optimizer_recs(self._ctx)
 
     def get_unattached_volumes(self) -> List[Dict[str, Any]]:
         """
@@ -1336,31 +1346,7 @@ class CostOptimizer:
 
     def get_rds_compute_optimizer_recommendations(self) -> List[Dict[str, Any]]:
         """Get RDS recommendations from Compute Optimizer"""
-        recommendations = []
-        try:
-            response = self.compute_optimizer.get_rds_database_recommendations()
-            recommendations.extend(response["rdsDBRecommendations"])
-
-            # Handle pagination manually
-            while response.get("nextToken"):
-                response = self.compute_optimizer.get_rds_database_recommendations(nextToken=response["nextToken"])
-                recommendations.extend(response["rdsDBRecommendations"])
-        except Exception as e:
-            print(f"Warning: RDS Compute Optimizer not available: {e}")
-            # Add recommendation to enable Compute Optimizer
-            if "OptInRequiredException" in str(e) or "not registered" in str(e):
-                opt_in_recommendation = {
-                    "ResourceId": "compute-optimizer-service",
-                    "ResourceType": "Service Configuration",
-                    "Issue": "AWS Compute Optimizer not enabled",
-                    "Recommendation": "Enable AWS Compute Optimizer for RDS recommendations",
-                    "EstimatedMonthlySavings": "Variable - up to 25% on RDS instances",
-                    "Action": "Go to AWS Compute Optimizer console and opt-in to receive RDS rightsizing recommendations",
-                    "Priority": "Medium",
-                    "Service": "Compute Optimizer",
-                }
-                recommendations.append(opt_in_recommendation)
-        return recommendations
+        return _advisor_rds_compute_optimizer_recs(self._ctx)
 
     def get_rds_optimization_descriptions(self) -> Dict[str, str]:
         """Get descriptions for RDS cost optimization opportunities"""
@@ -1424,120 +1410,10 @@ class CostOptimizer:
             return 0
 
     def get_efs_file_system_count(self) -> Dict[str, Any]:
-        """Get EFS file system counts and analysis"""
-        try:
-            paginator = self.efs.get_paginator("describe_file_systems")
-            counts = {
-                "total": 0,
-                "available": 0,
-                "creating": 0,
-                "deleting": 0,
-                "standard_storage": 0,
-                "one_zone_storage": 0,
-                "total_size_gb": 0,
-                "unused_systems": [],
-            }
-
-            for page in paginator.paginate():
-                for fs in page["FileSystems"]:
-                    counts["total"] += 1
-                    # Count by lifecycle state
-                    state = fs.get("LifeCycleState", "")
-                    if state == "available":
-                        counts["available"] += 1
-                    elif state == "creating":
-                        counts["creating"] += 1
-                    elif state == "deleting":
-                        counts["deleting"] += 1
-
-                    # Count by storage class
-                    if fs.get("AvailabilityZoneName"):
-                        counts["one_zone_storage"] += 1
-                    else:
-                        counts["standard_storage"] += 1
-
-                    # Calculate total size
-                    size_bytes = fs.get("SizeInBytes", {}).get("Value", 0)
-                    size_gb = size_bytes / (1024**3) if size_bytes else 0
-                    counts["total_size_gb"] += size_gb
-
-                    # Identify potentially unused systems (very small size)
-                    if size_gb < 0.1 and fs.get("NumberOfMountTargets", 0) == 0:
-                        counts["unused_systems"].append(
-                            {
-                                "FileSystemId": fs["FileSystemId"],
-                                "Name": fs.get("Name", "Unnamed"),
-                                "SizeGB": round(size_gb, 3),
-                                "CreationTime": fs["CreationTime"].isoformat(),
-                                "MountTargets": fs.get("NumberOfMountTargets", 0),
-                            }
-                        )
-
-            counts["total_size_gb"] = round(counts["total_size_gb"], 2)
-            return counts
-        except Exception as e:
-            print(f"Warning: Could not get EFS file system count: {e}")
-            return {
-                "total": 0,
-                "available": 0,
-                "creating": 0,
-                "deleting": 0,
-                "standard_storage": 0,
-                "one_zone_storage": 0,
-                "total_size_gb": 0,
-                "unused_systems": [],
-            }
+        return _efs_file_system_count(self._ctx)
 
     def get_efs_lifecycle_analysis(self) -> List[Dict[str, Any]]:
-        """Analyze EFS file systems for lifecycle policy optimization"""
-        recommendations = []
-        try:
-            paginator = self.efs.get_paginator("describe_file_systems")
-
-            for page in paginator.paginate():
-                for fs in page["FileSystems"]:
-                    fs_id = fs["FileSystemId"]
-
-                    try:
-                        # Get lifecycle configuration
-                        lifecycle_response = self.efs.describe_lifecycle_configuration(FileSystemId=fs_id)
-                        lifecycle_policies = lifecycle_response.get("LifecyclePolicies", [])
-
-                        # Check if One Zone file system (no Archive class available)
-                        availability_zone_name = fs.get("AvailabilityZoneName")
-                        is_one_zone = availability_zone_name is not None
-
-                        # Analyze lifecycle policies (Archive not available for One Zone)
-                        has_ia_policy = any(p.get("TransitionToIA") for p in lifecycle_policies)
-                        has_archive_policy = (
-                            any(p.get("TransitionToArchive") for p in lifecycle_policies) if not is_one_zone else False
-                        )
-
-                        size_bytes = fs.get("SizeInBytes", {}).get("Value", 0)
-                        size_gb = size_bytes / (1024**3) if size_bytes else 0
-
-                        recommendation = {
-                            "FileSystemId": fs_id,
-                            "Name": fs.get("Name", "Unnamed"),
-                            "SizeGB": round(size_gb, 2),
-                            "HasIAPolicy": has_ia_policy,
-                            "HasArchivePolicy": has_archive_policy,
-                            "MountTargets": fs.get("NumberOfMountTargets", 0),
-                            "StorageClass": "One Zone" if fs.get("AvailabilityZoneName") else "Standard",
-                            "EstimatedMonthlyCost": self._estimate_efs_cost(
-                                size_gb, fs.get("AvailabilityZoneName") is not None
-                            ),
-                        }
-
-                        recommendations.append(recommendation)
-
-                    except Exception as e:
-                        print(f"Warning: Could not get lifecycle config for {fs_id}: {e}")
-
-        except Exception as e:
-            print(f"Warning: Could not analyze EFS lifecycle policies: {e}")
-
-        return recommendations
+        return _efs_lifecycle_analysis(self._ctx, self.pricing_multiplier)
 
     def _estimate_efs_cost(self, size_gb: float, is_one_zone: bool = False) -> float:
         """Estimate monthly cost for EFS file system"""
@@ -1554,189 +1430,13 @@ class CostOptimizer:
         return base_cost * self.pricing_multiplier
 
     def get_efs_optimization_descriptions(self) -> Dict[str, str]:
-        """Get descriptions for EFS cost optimization opportunities"""
-        return {
-            "lifecycle_policies": {
-                "title": "Configure EFS Lifecycle Policies",
-                "description": "Automatically move infrequently accessed files to IA (up to 94% cost savings) and Archive storage classes.",
-                "action": "1. Enable Transition to IA after 30 days\n2. Enable Transition to Archive after 90 days\n3. Configure Transition back to Standard on access\n4. Estimated savings: 80-94% for infrequent data",
-            },
-            "unused_file_systems": {
-                "title": "Delete Unused EFS File Systems",
-                "description": "Remove EFS file systems with no mount targets and minimal data to eliminate unnecessary costs.",
-                "action": "1. Verify no applications are using the file system\n2. Create backup if data recovery needed\n3. Delete unused file systems via console or CLI\n4. Estimated savings: 100% of file system costs",
-            },
-            "one_zone_migration": {
-                "title": "Migrate to EFS One Zone Storage",
-                "description": "For workloads that don't require Multi-AZ resilience, One Zone storage offers 47% cost savings.",
-                "action": "1. Assess availability requirements\n2. Create new One Zone file system\n3. Migrate data using AWS DataSync\n4. Estimated savings: 47% vs Regional storage",
-            },
-            "storage_class_optimization": {
-                "title": "Optimize EFS Storage Classes",
-                "description": "Use appropriate storage classes based on access patterns: Standard, IA, or Archive.",
-                "action": "1. Analyze file access patterns\n2. Configure lifecycle policies for automatic transitions\n3. Use EFS Intelligent-Tiering for automatic optimization\n4. Estimated savings: Up to 94% for cold data",
-            },
-            "throughput_optimization": {
-                "title": "Optimize EFS Throughput Mode",
-                "description": "Switch from Provisioned to Elastic Throughput mode to pay only for actual usage.",
-                "action": "1. Monitor current throughput usage patterns\n2. Switch to Elastic Throughput mode\n3. Remove unnecessary provisioned throughput\n4. Estimated savings: 20-50% on throughput costs",
-            },
-        }
+        return _efs_optimization_descriptions()
 
     def get_fsx_file_system_count(self) -> Dict[str, Any]:
-        """Get FSx file system counts and analysis (includes File Cache)"""
-        try:
-            # Get FSx file systems
-            fs_response = self.fsx.describe_file_systems()
-
-            # Get File Cache instances
-            cache_response = self.fsx.describe_file_caches()
-
-            counts = {
-                "total": len(fs_response["FileSystems"]) + len(cache_response.get("FileCaches", [])),
-                "available": 0,
-                "creating": 0,
-                "deleting": 0,
-                "lustre": 0,
-                "windows": 0,
-                "ontap": 0,
-                "openzfs": 0,
-                "file_cache": len(cache_response.get("FileCaches", [])),
-                "total_capacity_gb": 0,
-                "underutilized_systems": [],
-            }
-
-            # Process FSx file systems
-            for fs in fs_response["FileSystems"]:
-                # Count by lifecycle state
-                state = fs.get("Lifecycle", "")
-                if state == "AVAILABLE":
-                    counts["available"] += 1
-                elif state == "CREATING":
-                    counts["creating"] += 1
-                elif state == "DELETING":
-                    counts["deleting"] += 1
-
-                # Count by file system type
-                fs_type = fs.get("FileSystemType", "").lower()
-                if fs_type == "lustre":
-                    counts["lustre"] += 1
-                elif fs_type == "windows":
-                    counts["windows"] += 1
-                elif fs_type == "ontap":
-                    counts["ontap"] += 1
-                elif fs_type == "openzfs":
-                    counts["openzfs"] += 1
-
-                # Calculate total capacity
-                capacity_gb = fs.get("StorageCapacity", 0)
-                counts["total_capacity_gb"] += capacity_gb
-
-                # Identify potentially underutilized systems (small capacity, older systems)
-                if capacity_gb > 0 and capacity_gb < 100:  # Less than 100GB might be underutilized
-                    counts["underutilized_systems"].append(
-                        {
-                            "FileSystemId": fs["FileSystemId"],
-                            "FileSystemType": fs.get("FileSystemType", "Unknown"),
-                            "StorageCapacity": capacity_gb,
-                            "CreationTime": fs["CreationTime"].isoformat(),
-                            "Lifecycle": fs.get("Lifecycle", "Unknown"),
-                        }
-                    )
-
-            # Process File Cache instances
-            for cache in cache_response.get("FileCaches", []):
-                state = cache.get("Lifecycle", "")
-                if state == "AVAILABLE":
-                    counts["available"] += 1
-                elif state == "CREATING":
-                    counts["creating"] += 1
-                elif state == "DELETING":
-                    counts["deleting"] += 1
-
-                # Add cache capacity
-                capacity_gb = cache.get("StorageCapacity", 0)
-                counts["total_capacity_gb"] += capacity_gb
-
-                # Check for underutilized caches
-                if capacity_gb > 0 and capacity_gb < 1200:  # File Cache minimum is 1.2 TiB
-                    counts["underutilized_systems"].append(
-                        {
-                            "FileCacheId": cache["FileCacheId"],
-                            "FileSystemType": "FILE_CACHE",
-                            "StorageCapacity": capacity_gb,
-                            "CreationTime": cache["CreationTime"].isoformat(),
-                            "Lifecycle": cache.get("Lifecycle", "Unknown"),
-                        }
-                    )
-
-            return counts
-        except Exception as e:
-            print(f"Warning: Could not get FSx file system count: {e}")
-            return {
-                "total": 0,
-                "available": 0,
-                "creating": 0,
-                "deleting": 0,
-                "lustre": 0,
-                "windows": 0,
-                "ontap": 0,
-                "openzfs": 0,
-                "file_cache": 0,
-                "total_capacity_gb": 0,
-                "underutilized_systems": [],
-            }
+        return _fsx_file_system_count(self._ctx)
 
     def get_fsx_optimization_analysis(self) -> List[Dict[str, Any]]:
-        """Analyze FSx file systems and File Cache for optimization opportunities"""
-        recommendations = []
-        try:
-            # Analyze FSx file systems
-            fs_response = self.fsx.describe_file_systems()
-
-            for fs in fs_response["FileSystems"]:
-                fs_id = fs["FileSystemId"]
-                fs_type = fs.get("FileSystemType", "Unknown")
-                capacity_gb = fs.get("StorageCapacity", 0)
-                storage_type = fs.get("StorageType", "Unknown")
-
-                recommendation = {
-                    "FileSystemId": fs_id,
-                    "FileSystemType": fs_type,
-                    "StorageCapacity": capacity_gb,
-                    "StorageType": storage_type,
-                    "Lifecycle": fs.get("Lifecycle", "Unknown"),
-                    "CreationTime": fs["CreationTime"].isoformat(),
-                    "EstimatedMonthlyCost": self._estimate_fsx_cost(fs_type, capacity_gb, storage_type),
-                    "OptimizationOpportunities": self._get_fsx_optimization_opportunities(fs),
-                }
-
-                recommendations.append(recommendation)
-
-            # Analyze File Cache instances
-            cache_response = self.fsx.describe_file_caches()
-
-            for cache in cache_response.get("FileCaches", []):
-                cache_id = cache["FileCacheId"]
-                capacity_gb = cache.get("StorageCapacity", 0)
-
-                recommendation = {
-                    "FileCacheId": cache_id,
-                    "FileSystemType": "FILE_CACHE",
-                    "StorageCapacity": capacity_gb,
-                    "StorageType": "SSD",  # File Cache uses SSD storage
-                    "Lifecycle": cache.get("Lifecycle", "Unknown"),
-                    "CreationTime": cache["CreationTime"].isoformat(),
-                    "EstimatedMonthlyCost": self._estimate_file_cache_cost(capacity_gb),
-                    "OptimizationOpportunities": self._get_file_cache_optimization_opportunities(cache),
-                }
-
-                recommendations.append(recommendation)
-
-        except Exception as e:
-            print(f"Warning: Could not analyze FSx file systems: {e}")
-
-        return recommendations
+        return _fsx_optimization_analysis(self._ctx, self.pricing_multiplier)
 
     def _estimate_fsx_cost(self, fs_type: str, capacity_gb: int, storage_type: str) -> float:
         """Estimate monthly cost for FSx file system"""
@@ -1807,49 +1507,7 @@ class CostOptimizer:
         return opportunities
 
     def get_file_system_optimization_descriptions(self) -> Dict[str, str]:
-        """Get descriptions for all file system cost optimization opportunities"""
-        return {
-            "efs_lifecycle_policies": {
-                "title": "Configure EFS Lifecycle Policies",
-                "description": "Automatically move infrequently accessed files to IA (up to 94% cost savings) and Archive storage classes.",
-                "action": "1. Enable Transition to IA after 30 days\n2. Enable Transition to Archive after 90 days\n3. Configure Transition back to Standard on access\n4. Estimated savings: 80-94% for infrequent data",
-            },
-            "efs_unused_systems": {
-                "title": "Delete Unused EFS File Systems",
-                "description": "Remove EFS file systems with no mount targets and minimal data to eliminate unnecessary costs.",
-                "action": "1. Verify no applications are using the file system\n2. Create backup if data recovery needed\n3. Delete unused file systems via console or CLI\n4. Estimated savings: 100% of file system costs",
-            },
-            "efs_one_zone_migration": {
-                "title": "Migrate to EFS One Zone Storage",
-                "description": "For workloads that don't require Multi-AZ resilience, One Zone storage offers 47% cost savings.",
-                "action": "1. Assess availability requirements\n2. Create new One Zone file system\n3. Migrate data using AWS DataSync\n4. Estimated savings: 47% vs Regional storage",
-            },
-            "fsx_storage_optimization": {
-                "title": "Optimize FSx Storage Types",
-                "description": "Choose appropriate storage types: SSD for performance, HDD for capacity, Intelligent-Tiering for automatic optimization.",
-                "action": "1. Analyze performance requirements\n2. Switch to HDD for large, less critical workloads\n3. Use Intelligent-Tiering for FSx OpenZFS\n4. Estimated savings: 60-75% with HDD storage",
-            },
-            "fsx_capacity_rightsizing": {
-                "title": "Rightsize FSx File System Capacity",
-                "description": "Optimize storage capacity based on actual usage patterns and consolidate small file systems.",
-                "action": "1. Monitor storage utilization metrics\n2. Consolidate small file systems\n3. Reduce over-provisioned capacity\n4. Estimated savings: 20-40% through rightsizing",
-            },
-            "fsx_ontap_features": {
-                "title": "Enable FSx ONTAP Data Efficiency",
-                "description": "Use deduplication, compression, and capacity pool tiers to reduce storage costs significantly.",
-                "action": "1. Enable data deduplication and compression\n2. Configure capacity pool for cold data\n3. Use SnapMirror for efficient replication\n4. Estimated savings: 30-70% through data efficiency",
-            },
-            "fsx_lustre_optimization": {
-                "title": "Optimize FSx Lustre Configuration",
-                "description": "Use scratch file systems for temporary workloads and enable data compression.",
-                "action": "1. Use scratch file systems for temporary data\n2. Enable LZ4 data compression\n3. Optimize metadata configuration\n4. Estimated savings: 40-60% for temporary workloads",
-            },
-            "file_cache_optimization": {
-                "title": "Optimize Amazon File Cache Usage",
-                "description": "Configure cache eviction policies, storage quotas, and monitor usage patterns to optimize costs.",
-                "action": "1. Enable automatic cache eviction\n2. Set user and group storage quotas\n3. Monitor cache hit rates via CloudWatch\n4. Adjust capacity based on usage patterns\n5. Estimated savings: 20-40% through better utilization",
-            },
-        }
+        return _file_system_optimization_descriptions()
 
     def get_s3_bucket_analysis(self) -> Dict[str, Any]:
         """Get S3 bucket analysis for cost optimization with performance optimizations"""
@@ -2678,38 +2336,7 @@ class CostOptimizer:
 
     def get_detailed_cost_hub_recommendations(self) -> List[Dict[str, Any]]:
         """Get detailed recommendations from Cost Optimization Hub (all resource types)"""
-        recommendations = []
-        if not self.cost_hub:
-            print("ℹ️ Cost Optimization Hub unavailable - continuing with other optimization sources")
-            return recommendations
-
-        try:
-            # Get all recommendations without filtering by resource type
-            response = self.cost_hub.list_recommendations(filter={"regions": [self.region]}, maxResults=100)
-
-            # Get detailed info for each recommendation
-            for rec in response.get("items", []):
-                try:
-                    detailed = self.cost_hub.get_recommendation(recommendationId=rec["recommendationId"])
-                    recommendations.append(detailed)
-                except Exception as e:
-                    recommendations.append(rec)  # Fallback to basic info
-
-            # Handle pagination
-            while response.get("nextToken"):
-                response = self.cost_hub.list_recommendations(
-                    filter={"regions": [self.region]}, nextToken=response["nextToken"], maxResults=100
-                )
-                for rec in response.get("items", []):
-                    try:
-                        detailed = self.cost_hub.get_recommendation(recommendationId=rec["recommendationId"])
-                        recommendations.append(detailed)
-                    except Exception as e:
-                        recommendations.append(rec)
-
-        except Exception as e:
-            print(f"Warning: Cost Optimization Hub error: {e}")
-        return recommendations
+        return _advisor_cost_hub_recs(self._ctx)
 
     def get_enhanced_ec2_checks(self) -> Dict[str, Any]:
         """Get enhanced EC2 cost optimization checks"""
@@ -2976,31 +2603,7 @@ class CostOptimizer:
 
     def get_compute_optimizer_recommendations(self) -> List[Dict[str, Any]]:
         """Get EC2 recommendations from Compute Optimizer"""
-        recommendations = []
-        try:
-            response = self.compute_optimizer.get_ec2_instance_recommendations()
-            recommendations.extend(response["instanceRecommendations"])
-
-            # Handle pagination manually
-            while response.get("nextToken"):
-                response = self.compute_optimizer.get_ec2_instance_recommendations(nextToken=response["nextToken"])
-                recommendations.extend(response["instanceRecommendations"])
-        except Exception as e:
-            print(f"Warning: Compute Optimizer not available: {e}")
-            # Add recommendation to enable Compute Optimizer
-            if "OptInRequiredException" in str(e) or "not registered" in str(e):
-                opt_in_recommendation = {
-                    "ResourceId": "compute-optimizer-service",
-                    "ResourceType": "Service Configuration",
-                    "Issue": "AWS Compute Optimizer not enabled",
-                    "Recommendation": "Enable AWS Compute Optimizer for EC2 recommendations",
-                    "EstimatedMonthlySavings": "Variable - up to 25% on EC2 instances",
-                    "Action": "Go to AWS Compute Optimizer console and opt-in to receive EC2 rightsizing recommendations",
-                    "Priority": "Medium",
-                    "Service": "Compute Optimizer",
-                }
-                recommendations.append(opt_in_recommendation)
-        return recommendations
+        return _advisor_ec2_compute_optimizer_recs(self._ctx)
 
     def get_ami_checks(self) -> Dict[str, Any]:
         """Get AMI optimization checks"""
@@ -3278,7 +2881,7 @@ class CostOptimizer:
             enhanced_ec2_checks = {"recommendations": []}
 
         # Get Cost Optimization Hub recommendations for all services (categorize by resource type)
-        all_cost_hub_recs = self.get_detailed_cost_hub_recommendations()
+        all_cost_hub_recs = _advisor_cost_hub_recs(self._ctx)
 
         # Categorize Cost Optimization Hub recommendations by resource type
         cost_hub_by_service = {"ec2": [], "lambda": [], "ebs": [], "rds": [], "other": []}
@@ -3298,7 +2901,7 @@ class CostOptimizer:
 
         # Get EC2-specific Cost Optimization Hub recommendations
         cost_hub_recs = cost_hub_by_service["ec2"]
-        compute_optimizer_recs = _ec2_compute_optimizer_recs(self._ctx) if should_scan_service("ec2") else []
+        compute_optimizer_recs = _advisor_ec2_compute_optimizer_recs(self._ctx) if should_scan_service("ec2") else []
 
         # AMI lifecycle management checks
         if should_scan_service("ami"):
@@ -3340,7 +2943,7 @@ class CostOptimizer:
             print("🗄️ Scanning RDS databases and optimization opportunities...")
             rds_counts = _rds_instance_count(self._ctx)
 
-            rds_compute_optimizer_recs = _rds_compute_optimizer_recs(self._ctx)
+            rds_compute_optimizer_recs = _advisor_rds_compute_optimizer_recs(self._ctx)
             rds_descriptions = _RDS_DESCRIPTIONS
         else:
             print("⏭️ Skipping RDS analysis...")
@@ -3379,9 +2982,9 @@ class CostOptimizer:
         # Container services scanning
         if should_scan_service("containers"):
             print("🐳 Scanning container services (ECS/EKS/ECR)...")
-            container_data = self.get_container_services_analysis()
-            enhanced_container_checks = self.get_enhanced_container_checks()
-            container_descriptions = self.get_container_optimization_descriptions()
+            container_data = _container_services_analysis(self._ctx)
+            enhanced_container_checks = _container_enhanced_checks(self._ctx)
+            container_descriptions = _CONTAINER_DESCRIPTIONS
         else:
             print("⏭️ Skipping container services analysis...")
             container_data = {}
@@ -3390,7 +2993,7 @@ class CostOptimizer:
 
         # EBS Compute Optimizer recommendations (only if EBS is being scanned)
         if should_scan_service("ebs"):
-            ebs_compute_optimizer_recs = _ebs_compute_optimizer_recs(self._ctx, self.pricing_multiplier)
+            ebs_compute_optimizer_recs = _advisor_ebs_compute_optimizer_recs(self._ctx)
             unattached_volumes = _ebs_unattached_volumes(self._ctx, self.pricing_multiplier)
             ebs_descriptions = _EBS_DESCRIPTIONS
         else:
@@ -3412,10 +3015,10 @@ class CostOptimizer:
         # Network & Infrastructure checks
         if should_scan_service("network"):
             print("🌐 Scanning network resources and infrastructure...")
-            elastic_ip_checks = self.get_elastic_ip_checks()
-            nat_gateway_checks = self.get_nat_gateway_checks()
-            vpc_endpoints_checks = self.get_vpc_endpoints_checks()
-            load_balancer_checks = self.get_load_balancer_checks()
+            elastic_ip_checks = _elastic_ip_checks(self._ctx)
+            nat_gateway_checks = _nat_gateway_checks(self._ctx)
+            vpc_endpoints_checks = _vpc_endpoints_checks(self._ctx)
+            load_balancer_checks = _load_balancer_checks(self._ctx)
             advanced_ec2_checks = _ec2_advanced_checks(self._ctx, self.pricing_multiplier, self.fast_mode)
         else:
             print("⏭️ Skipping network analysis...")
@@ -3435,9 +3038,9 @@ class CostOptimizer:
         # Monitoring & Logging checks
         if should_scan_service("monitoring"):
             print("📊 Scanning monitoring and logging services...")
-            cloudwatch_checks = self.get_cloudwatch_checks()
-            cloudtrail_checks = self.get_cloudtrail_checks()
-            backup_checks = self.get_backup_checks()
+            cloudwatch_checks = _cloudwatch_checks(self._ctx)
+            cloudtrail_checks = _cloudtrail_checks(self._ctx)
+            backup_checks = _backup_checks(self._ctx)
         else:
             print("⏭️ Skipping monitoring analysis...")
             cloudwatch_checks = {"recommendations": []}
@@ -3447,7 +3050,7 @@ class CostOptimizer:
         # Route 53 checks
         if should_scan_service("route53"):
             print("🌐 Scanning Route 53 DNS services...")
-            route53_checks = self.get_route53_checks()
+            route53_checks = _route53_checks(self._ctx)
         else:
             route53_checks = {"recommendations": []}
 
@@ -6698,251 +6301,11 @@ class CostOptimizer:
 
     def get_cloudwatch_checks(self) -> Dict[str, Any]:
         """Category 9: CloudWatch optimization checks"""
-        checks = {
-            "never_expiring_logs": [],
-            "excessive_logging": [],
-            "unused_custom_metrics": [],
-            "high_resolution_metrics": [],
-            "unused_alarms": [],
-            "duplicate_metrics": [],
-        }
-
-        try:
-            # Get all log groups
-            log_groups_response = self.logs.describe_log_groups()
-            log_groups = log_groups_response.get("logGroups", [])
-
-            for log_group in log_groups:
-                log_group_name = log_group.get("logGroupName")
-                retention_days = log_group.get("retentionInDays")
-                stored_bytes = log_group.get("storedBytes", 0)
-
-                # Check for never-expiring retention
-                if retention_days is None:
-                    checks["never_expiring_logs"].append(
-                        {
-                            "LogGroupName": log_group_name,
-                            "StoredBytes": stored_bytes,
-                            "StoredGB": round(stored_bytes / (1024**3), 2),
-                            "Recommendation": "Set retention policy to prevent unlimited log growth",
-                            "EstimatedSavings": f"${stored_bytes * 0.03 / (1024**3):.2f}/month with 30-day retention",
-                            "CheckCategory": "Never-Expiring Log Groups",
-                        }
-                    )
-
-                # Check for excessive log storage (>10GB)
-                if stored_bytes > 10 * 1024**3:  # 10GB
-                    checks["excessive_logging"].append(
-                        {
-                            "LogGroupName": log_group_name,
-                            "StoredGB": round(stored_bytes / (1024**3), 2),
-                            "RetentionDays": retention_days,
-                            "Recommendation": "Large log group - review log level and retention",
-                            "EstimatedSavings": "Reduce log level or retention period",
-                            "CheckCategory": "Excessive Log Storage",
-                        }
-                    )
-
-            # Get CloudWatch alarms with pagination
-            try:
-                paginator = self.cloudwatch.get_paginator("describe_alarms")
-                for page in paginator.paginate():
-                    alarms = page.get("MetricAlarms", [])
-
-                    for alarm in alarms:
-                        alarm_name = alarm.get("AlarmName")
-                        state_reason = alarm.get("StateReason", "")
-                        alarm_config_updated = alarm.get("AlarmConfigurationUpdatedTimestamp")
-
-                        # Check for alarms with insufficient data that are older than 7 days
-                        if "Insufficient Data" in state_reason and alarm_config_updated:
-                            from datetime import datetime, timezone, timedelta
-
-                            if isinstance(alarm_config_updated, str):
-                                # Parse string timestamp if needed
-                                continue
-
-                            age_days = (datetime.now(timezone.utc) - alarm_config_updated).days
-                            if age_days > 7:  # Only flag old alarms with insufficient data
-                                checks["unused_alarms"].append(
-                                    {
-                                        "AlarmName": alarm_name,
-                                        "StateReason": state_reason,
-                                        "AgeDays": age_days,
-                                        "Recommendation": f"Alarm has insufficient data for {age_days} days - review metric availability or delete",
-                                        "CheckCategory": "Unused CloudWatch Alarms",
-                                    }
-                                )
-
-            except Exception as e:
-                print(f"Warning: Could not analyze CloudWatch alarms: {e}")
-
-            # Get custom metrics with pagination
-            try:
-                paginator = self.cloudwatch.get_paginator("list_metrics")
-                metrics = []
-                for page in paginator.paginate():
-                    metrics.extend(page.get("Metrics", []))
-
-                # Group by namespace to identify custom metrics
-                namespace_counts = {}
-                for metric in metrics:
-                    namespace = metric.get("Namespace", "")
-                    if not namespace.startswith("AWS/"):  # Custom metrics
-                        namespace_counts[namespace] = namespace_counts.get(namespace, 0) + 1
-
-                for namespace, count in namespace_counts.items():
-                    if count > 100:  # High number of custom metrics
-                        checks["unused_custom_metrics"].append(
-                            {
-                                "Namespace": namespace,
-                                "MetricCount": count,
-                                "Recommendation": f"High number of custom metrics ({count}) - review necessity",
-                                "EstimatedSavings": f"${count * 0.30:.2f}/month if reduced by 50%",
-                                "CheckCategory": "Excessive Custom Metrics",
-                            }
-                        )
-
-            except Exception as e:
-                print(f"Warning: Could not analyze custom metrics: {e}")
-
-        except Exception as e:
-            print(f"Warning: Could not perform CloudWatch checks: {e}")
-
-        # Convert to recommendations format
-        recommendations = []
-        for category, items in checks.items():
-            for item in items:
-                recommendations.append(item)
-
-        return {"recommendations": recommendations, **checks}
+        return _cloudwatch_checks(self._ctx)
 
     def get_cloudtrail_checks(self) -> Dict[str, Any]:
         """Category 10: CloudTrail optimization checks"""
-        checks = {
-            "multi_region_trails": [],
-            "data_events_all_s3": [],
-            "data_events_all_lambda": [],
-            "duplicate_trails": [],
-            "expensive_storage_trails": [],
-            "unused_insights": [],
-        }
-
-        try:
-            # Get all CloudTrail trails
-            trails_response = self.cloudtrail.describe_trails()
-            trails = trails_response.get("trailList", [])
-
-            trail_names = set()
-
-            for trail in trails:
-                trail_name = trail.get("Name")
-                trail_arn = trail.get("TrailARN")
-                is_multi_region = trail.get("IsMultiRegionTrail", False)
-                s3_bucket = trail.get("S3BucketName")
-
-                # Track for duplicate detection
-                trail_names.add(trail_name)
-
-                # Check for multi-region trails where single-region might suffice
-                if is_multi_region:
-                    checks["multi_region_trails"].append(
-                        {
-                            "TrailName": trail_name,
-                            "TrailARN": trail_arn,
-                            "S3Bucket": s3_bucket,
-                            "Recommendation": "Multi-region trail - verify if all regions needed",
-                            "EstimatedSavings": "Single-region trail costs ~90% less",
-                            "CheckCategory": "Multi-Region CloudTrail",
-                        }
-                    )
-
-                # Get event selectors to check for data events
-                try:
-                    selectors_response = self.cloudtrail.get_event_selectors(TrailName=trail_name)
-                    event_selectors = selectors_response.get("EventSelectors", [])
-
-                    for selector in event_selectors:
-                        data_resources = selector.get("DataResources", [])
-
-                        for resource in data_resources:
-                            resource_type = resource.get("Type")
-                            values = resource.get("Values", [])
-
-                            # Check for data events on all S3 buckets
-                            if resource_type == "AWS::S3::Object" and "arn:aws:s3:::*/*" in values:
-                                checks["data_events_all_s3"].append(
-                                    {
-                                        "TrailName": trail_name,
-                                        "ResourceType": resource_type,
-                                        "Recommendation": "Data events enabled for all S3 buckets - very expensive",
-                                        "EstimatedSavings": "Limit to specific buckets for 80-95% savings",
-                                        "CheckCategory": "S3 Data Events All Buckets",
-                                    }
-                                )
-
-                            # Check for data events on all Lambda functions
-                            if resource_type == "AWS::Lambda::Function" and "arn:aws:lambda:*" in str(values):
-                                checks["data_events_all_lambda"].append(
-                                    {
-                                        "TrailName": trail_name,
-                                        "ResourceType": resource_type,
-                                        "Recommendation": "Data events enabled for all Lambda functions - expensive",
-                                        "EstimatedSavings": "Limit to specific functions for significant savings",
-                                        "CheckCategory": "Lambda Data Events All Functions",
-                                    }
-                                )
-
-                except ClientError as e:
-                    if e.response["Error"]["Code"] != "TrailNotFoundException":
-                        print(f"Warning: Could not analyze event selectors for {trail_name}: {e}")
-                except Exception as e:
-                    print(f"Warning: Could not analyze event selectors for {trail_name}: {e}")
-
-                # Check for CloudTrail Insights
-                try:
-                    insights_response = self.cloudtrail.get_insight_selectors(TrailName=trail_name)
-                    insight_selectors = insights_response.get("InsightSelectors", [])
-
-                    if insight_selectors:
-                        checks["unused_insights"].append(
-                            {
-                                "TrailName": trail_name,
-                                "InsightTypes": [s.get("InsightType") for s in insight_selectors],
-                                "Recommendation": "CloudTrail Insights enabled - verify usage and value",
-                                "EstimatedSavings": "$0.35 per 100,000 events if unused",
-                                "CheckCategory": "CloudTrail Insights",
-                            }
-                        )
-
-                except ClientError as e:
-                    if e.response["Error"]["Code"] != "TrailNotFoundException":
-                        print(f"Warning: Could not check insights for {trail_name}: {e}")
-                except Exception as e:
-                    print(f"Warning: Could not check insights for {trail_name}: {e}")
-
-            # Check for potentially duplicate trails (>2 trails with similar event selectors)
-            if len(trail_names) > 2:  # Only flag if >2 trails (not just >1)
-                checks["duplicate_trails"].append(
-                    {
-                        "TrailCount": len(trail_names),
-                        "TrailNames": list(trail_names),
-                        "Recommendation": f"{len(trail_names)} trails detected - review event selectors to avoid duplication",
-                        "EstimatedSavings": "Consolidate overlapping trails to reduce costs",
-                        "CheckCategory": "Multiple CloudTrail Trails",
-                    }
-                )
-
-        except Exception as e:
-            print(f"Warning: Could not perform CloudTrail checks: {e}")
-
-        # Convert to recommendations format
-        recommendations = []
-        for category, items in checks.items():
-            for item in items:
-                recommendations.append(item)
-
-        return {"recommendations": recommendations, **checks}
+        return _cloudtrail_checks(self._ctx)
 
     def get_backup_checks(self) -> Dict[str, Any]:
         """Category 11: AWS Backup optimization checks"""
@@ -7571,195 +6934,7 @@ class CostOptimizer:
         return {"recommendations": recommendations, **checks}
 
     def get_enhanced_efs_fsx_checks(self) -> Dict[str, Any]:
-        """Get enhanced EFS and FSx cost optimization checks"""
-        checks = {
-            "efs_archive_storage": [],
-            "efs_one_zone_migration": [],
-            "efs_idle_systems": [],
-            "efs_throughput_optimization": [],
-            "fsx_intelligent_tiering": [],
-            "fsx_storage_type_optimization": [],
-            "fsx_data_deduplication": [],
-            "fsx_single_az_migration": [],
-            "fsx_backup_retention": [],
-            "fsx_idle_systems": [],
-        }
-
-        recommendations = []
-
-        # EFS Archive Storage Check
-        try:
-            paginator = self.efs.get_paginator("describe_file_systems")
-            for page in paginator.paginate():
-                for fs in page["FileSystems"]:
-                    fs_id = fs["FileSystemId"]
-                    size_bytes = fs.get("SizeInBytes", {}).get("Value", 0)
-                    size_gb = size_bytes / (1024**3) if size_bytes else 0
-
-                    if size_gb < self.SMALL_EFS_SIZE_GB:  # Skip very small file systems
-                        continue
-
-                    try:
-                        lifecycle_response = self.efs.describe_lifecycle_configuration(FileSystemId=fs_id)
-                        lifecycle_policies = lifecycle_response.get("LifecyclePolicies", [])
-                        has_archive = any(p.get("TransitionToArchive") for p in lifecycle_policies)
-                        has_ia = any(p.get("TransitionToIA") for p in lifecycle_policies)
-
-                        # Check for Archive policy (only for Regional file systems - not One Zone)
-                        is_one_zone = fs.get("AvailabilityZoneName") is not None
-                        if not has_archive and size_gb > self.LARGE_EFS_SIZE_GB and not is_one_zone:
-                            checks["efs_archive_storage"].append(
-                                {
-                                    "FileSystemId": fs_id,
-                                    "Name": fs.get("Name", "Unnamed"),
-                                    "SizeGB": round(size_gb, 2),
-                                    "Recommendation": "Enable Archive storage class for rarely accessed data",
-                                    "EstimatedSavings": "Up to 94% for cold data",
-                                    "CheckCategory": "EFS Archive Storage Missing",
-                                }
-                            )
-
-                        # Check for One Zone migration opportunity
-                        is_regional = not fs.get("AvailabilityZoneName")
-                        if is_regional and size_gb > 1:
-                            checks["efs_one_zone_migration"].append(
-                                {
-                                    "FileSystemId": fs_id,
-                                    "Name": fs.get("Name", "Unnamed"),
-                                    "SizeGB": round(size_gb, 2),
-                                    "Recommendation": "Migrate to One Zone storage for non-critical workloads",
-                                    "EstimatedSavings": "47% cost reduction",
-                                    "CheckCategory": "EFS One Zone Migration",
-                                }
-                            )
-
-                        # Check for idle file systems
-                        mount_targets = fs.get("NumberOfMountTargets", 0)
-                        if mount_targets == 0 or size_gb < 0.01:
-                            checks["efs_idle_systems"].append(
-                                {
-                                    "FileSystemId": fs_id,
-                                    "Name": fs.get("Name", "Unnamed"),
-                                    "SizeGB": round(size_gb, 2),
-                                    "MountTargets": mount_targets,
-                                    "Recommendation": "Delete unused file system",
-                                    "EstimatedSavings": f"${size_gb * 0.30:.2f}/month",
-                                    "CheckCategory": "Idle EFS File System",
-                                }
-                            )
-
-                        # Check throughput mode
-                        throughput_mode = fs.get("ThroughputMode", "bursting")
-                        if throughput_mode == "provisioned":
-                            checks["efs_throughput_optimization"].append(
-                                {
-                                    "FileSystemId": fs_id,
-                                    "Name": fs.get("Name", "Unnamed"),
-                                    "ThroughputMode": throughput_mode,
-                                    "Recommendation": "Switch to Elastic Throughput mode",
-                                    "EstimatedSavings": "20-50% on throughput costs",
-                                    "CheckCategory": "EFS Throughput Optimization",
-                                }
-                            )
-                    except Exception as e:
-                        print(f"⚠️ Error analyzing EFS throughput: {str(e)}")
-        except Exception as e:
-            print(f"Warning: Could not analyze EFS systems: {e}")
-
-        # FSx Checks
-        try:
-            response = self.fsx.describe_file_systems()
-            for fs in response.get("FileSystems", []):
-                fs_id = fs.get("FileSystemId")
-                fs_type = fs.get("FileSystemType")
-                storage_capacity = fs.get("StorageCapacity", 0)
-                lifecycle = fs.get("Lifecycle", "")
-
-                if lifecycle != "AVAILABLE":
-                    continue
-
-                # FSx Intelligent-Tiering check (Lustre and OpenZFS)
-                if fs_type in ["LUSTRE", "OPENZFS"]:
-                    storage_type = fs.get("StorageType", "")
-                    if storage_type != "INTELLIGENT_TIERING":
-                        checks["fsx_intelligent_tiering"].append(
-                            {
-                                "FileSystemId": fs_id,
-                                "FileSystemType": fs_type,
-                                "StorageCapacity": storage_capacity,
-                                "Recommendation": "Enable Intelligent-Tiering for automatic cost optimization",
-                                "EstimatedSavings": "Significant for infrequently accessed data",
-                                "CheckCategory": "FSx Intelligent-Tiering",
-                            }
-                        )
-
-                # FSx Windows - Storage Type and Deduplication
-                if fs_type == "WINDOWS":
-                    windows_config = fs.get("WindowsConfiguration", {})
-                    storage_type = windows_config.get("DeploymentType", "")
-
-                    # Check for HDD vs SSD
-                    if storage_capacity > self.LARGE_FSX_CAPACITY_GB:
-                        checks["fsx_storage_type_optimization"].append(
-                            {
-                                "FileSystemId": fs_id,
-                                "FileSystemType": fs_type,
-                                "StorageCapacity": storage_capacity,
-                                "Recommendation": "Consider HDD storage for general-purpose workloads",
-                                "EstimatedSavings": "~85% storage cost reduction",
-                                "CheckCategory": "FSx Storage Type Optimization",
-                            }
-                        )
-
-                    # Data Deduplication check
-                    checks["fsx_data_deduplication"].append(
-                        {
-                            "FileSystemId": fs_id,
-                            "FileSystemType": fs_type,
-                            "StorageCapacity": storage_capacity,
-                            "Recommendation": "Enable Microsoft Data Deduplication",
-                            "EstimatedSavings": "30-80% storage capacity reduction",
-                            "CheckCategory": "FSx Data Deduplication",
-                        }
-                    )
-
-                    # Multi-AZ to Single-AZ check
-                    deployment_type = windows_config.get("DeploymentType", "")
-                    if deployment_type == "MULTI_AZ_1":
-                        checks["fsx_single_az_migration"].append(
-                            {
-                                "FileSystemId": fs_id,
-                                "FileSystemType": fs_type,
-                                "StorageCapacity": storage_capacity,
-                                "Recommendation": "Use Single-AZ for non-production workloads",
-                                "EstimatedSavings": "~50% cost reduction",
-                                "CheckCategory": "FSx Single-AZ Migration",
-                            }
-                        )
-
-                # Backup retention check
-                backup_config = fs.get("WindowsConfiguration", {}) if fs_type == "WINDOWS" else {}
-                automatic_backup_retention = backup_config.get("AutomaticBackupRetentionDays", 0)
-                if automatic_backup_retention > self.EXCESSIVE_BACKUP_RETENTION_DAYS:
-                    checks["fsx_backup_retention"].append(
-                        {
-                            "FileSystemId": fs_id,
-                            "FileSystemType": fs_type,
-                            "RetentionDays": automatic_backup_retention,
-                            "Recommendation": f"Reduce backup retention from {automatic_backup_retention} to 7-30 days",
-                            "EstimatedSavings": "Reduce backup storage costs",
-                            "CheckCategory": "FSx Backup Retention",
-                        }
-                    )
-        except Exception as e:
-            print(f"Warning: Could not analyze FSx systems: {e}")
-
-        # Compile all recommendations
-        for category, items in checks.items():
-            for item in items:
-                recommendations.append(item)
-
-        return {"recommendations": recommendations, **checks}
+        return _efs_fsx_enhanced_checks(self._ctx, self.pricing_multiplier)
 
     def get_enhanced_dynamodb_checks(self) -> Dict[str, Any]:
         """Get enhanced DynamoDB cost optimization checks"""
