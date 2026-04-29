@@ -91,6 +91,20 @@ from services.dms import (
     DMS_OPTIMIZATION_DESCRIPTIONS as _DMS_DESCRIPTIONS,
     get_enhanced_dms_checks as _dms_enhanced_checks,
 )
+from services.opensearch import (
+    OPENSEARCH_OPTIMIZATION_DESCRIPTIONS as _OPENSEARCH_DESCRIPTIONS,
+    get_enhanced_opensearch_checks as _opensearch_enhanced_checks,
+)
+from services.lambda_svc import (
+    LAMBDA_OPTIMIZATION_DESCRIPTIONS as _LAMBDA_DESCRIPTIONS,
+    get_enhanced_lambda_checks as _lambda_enhanced_checks,
+)
+from services.dynamodb import (
+    DYNAMODB_CHECK_DESCRIPTIONS as _DYNAMODB_DESCRIPTIONS,
+    get_dynamodb_table_analysis as _dynamodb_table_analysis,
+    get_dynamodb_optimization_descriptions as _dynamodb_optimization_descriptions,
+    get_enhanced_dynamodb_checks as _dynamodb_enhanced_checks,
+)
 from services.mediastore import (
     MEDIASTORE_OPTIMIZATION_DESCRIPTIONS as _MEDIASTORE_DESCRIPTIONS,
     get_enhanced_mediastore_checks as _mediastore_enhanced_checks,
@@ -113,6 +127,7 @@ from services.lightsail import (
     get_enhanced_lightsail_checks as _lightsail_enhanced_checks,
 )
 from services.athena import get_enhanced_athena_checks as _athena_enhanced_checks
+from services.elasticache import get_enhanced_elasticache_checks as _elasticache_enhanced_checks
 from services.batch_svc import (
     BATCH_OPTIMIZATION_DESCRIPTIONS as _BATCH_DESCRIPTIONS,
     get_enhanced_batch_checks as _batch_enhanced_checks,
@@ -2368,117 +2383,11 @@ class CostOptimizer:
 
     def get_dynamodb_table_analysis(self) -> Dict[str, Any]:
         """Get DynamoDB table analysis for cost optimization"""
-        try:
-            paginator = self.dynamodb.get_paginator("list_tables")
-            table_names = []
-            for page in paginator.paginate():
-                table_names.extend(page.get("TableNames", []))
-
-            analysis = {
-                "total_tables": len(table_names),
-                "provisioned_tables": [],
-                "on_demand_tables": [],
-                "optimization_opportunities": [],
-            }
-
-            for table_name in table_names:
-                try:
-                    table_response = self.dynamodb.describe_table(TableName=table_name)
-                    table = table_response["Table"]
-
-                    table_info = {
-                        "TableName": table_name,
-                        "BillingMode": table.get("BillingModeSummary", {}).get("BillingMode", "PROVISIONED"),
-                        "TableStatus": table.get("TableStatus", "UNKNOWN"),
-                        "ItemCount": table.get("ItemCount", 0),
-                        "TableSizeBytes": table.get("TableSizeBytes", 0),
-                        "ReadCapacityUnits": 0,
-                        "WriteCapacityUnits": 0,
-                        "EstimatedMonthlyCost": 0,
-                        "OptimizationOpportunities": [],
-                    }
-
-                    # Get provisioned throughput if applicable
-                    if table_info["BillingMode"] == "PROVISIONED":
-                        provisioned_throughput = table.get("ProvisionedThroughput", {})
-                        table_info["ReadCapacityUnits"] = provisioned_throughput.get("ReadCapacityUnits", 0)
-                        table_info["WriteCapacityUnits"] = provisioned_throughput.get("WriteCapacityUnits", 0)
-
-                        # Estimate cost for provisioned mode ($0.25 per RCU, $1.25 per WCU per month)
-                        monthly_cost = (table_info["ReadCapacityUnits"] * 0.25) + (
-                            table_info["WriteCapacityUnits"] * 1.25
-                        )
-                        table_info["EstimatedMonthlyCost"] = round(monthly_cost, 2)
-
-                        analysis["provisioned_tables"].append(table_name)
-
-                        # Check for optimization opportunities
-                        if table_info["ReadCapacityUnits"] > 100 or table_info["WriteCapacityUnits"] > 100:
-                            table_info["OptimizationOpportunities"].append(
-                                "Consider On-Demand billing for unpredictable workloads"
-                            )
-
-                        if table_info["ItemCount"] == 0:
-                            table_info["OptimizationOpportunities"].append("Empty table - consider deletion if unused")
-
-                    else:  # ON_DEMAND
-                        analysis["on_demand_tables"].append(table_name)
-                        # On-demand pricing is usage-based, harder to estimate without CloudWatch metrics
-                        table_info["OptimizationOpportunities"].append(
-                            "Monitor usage patterns to consider Provisioned mode for steady workloads"
-                        )
-
-                    # General optimizations
-                    if table_info["TableSizeBytes"] > 1024**3:  # > 1GB
-                        table_info["OptimizationOpportunities"].append(
-                            "Large table - consider data archiving or compression strategies"
-                        )
-
-                    analysis["optimization_opportunities"].append(table_info)
-
-                except Exception as e:
-                    print(f"Warning: Could not analyze table {table_name}: {e}")
-
-            return analysis
-
-        except Exception as e:
-            print(f"Warning: Could not analyze DynamoDB tables: {e}")
-            return {
-                "total_tables": 0,
-                "provisioned_tables": [],
-                "on_demand_tables": [],
-                "optimization_opportunities": [],
-            }
+        return _dynamodb_table_analysis(self._ctx)
 
     def get_dynamodb_optimization_descriptions(self) -> Dict[str, str]:
         """Get descriptions for DynamoDB cost optimization opportunities"""
-        return {
-            "billing_mode_optimization": {
-                "title": "Optimize DynamoDB Billing Mode",
-                "description": "Choose between Provisioned and On-Demand billing based on traffic patterns.",
-                "action": "1. Use Provisioned for predictable, steady workloads\n2. Use On-Demand for unpredictable, spiky traffic\n3. Monitor CloudWatch metrics for usage patterns\n4. Estimated savings: 20-60% with proper mode selection",
-            },
-            "capacity_rightsizing": {
-                "title": "Rightsize Provisioned Capacity",
-                "description": "Adjust read/write capacity units based on actual usage to avoid over-provisioning.",
-                "action": "1. Monitor consumed vs provisioned capacity\n2. Use Auto Scaling for dynamic adjustment\n3. Reduce unused capacity units\n4. Estimated savings: 30-70% through rightsizing",
-            },
-            "reserved_capacity": {
-                "title": "Purchase DynamoDB Reserved Capacity",
-                "description": "Save up to 76% on DynamoDB costs with reserved capacity for predictable workloads.",
-                "action": "1. Analyze baseline capacity requirements\n2. Purchase 1-year or 3-year reserved capacity\n3. Apply to tables with steady usage\n4. Estimated savings: 53-76% vs On-Demand",
-            },
-            "data_lifecycle": {
-                "title": "Implement Data Lifecycle Management",
-                "description": "Archive or delete old data to reduce storage costs and improve performance.",
-                "action": "1. Identify old or unused data\n2. Implement TTL for automatic expiration\n3. Archive historical data to S3\n4. Estimated savings: 40-80% on storage costs",
-            },
-            "global_tables_optimization": {
-                "title": "Optimize Global Tables Configuration",
-                "description": "Review Global Tables setup to ensure cost-effective multi-region replication.",
-                "action": "1. Evaluate necessity of each region\n2. Use consistent read where possible\n3. Optimize cross-region replication\n4. Estimated savings: 20-50% on replication costs",
-            },
-        }
+        return _dynamodb_optimization_descriptions()  # type: ignore[return-value]
 
     def get_container_services_analysis(self) -> Dict[str, Any]:
         """Get ECS, EKS, and ECR analysis for cost optimization"""
@@ -3456,12 +3365,11 @@ class CostOptimizer:
         # DynamoDB scanning
         if should_scan_service("dynamodb"):
             print("⚡ Scanning DynamoDB tables and capacity optimization...")
-            dynamodb_data = self.get_dynamodb_table_analysis()
+            dynamodb_data = _dynamodb_table_analysis(self._ctx)
 
-            # Get enhanced DynamoDB checks
-            enhanced_dynamodb_checks = self.get_enhanced_dynamodb_checks()
+            enhanced_dynamodb_checks = _dynamodb_enhanced_checks(self._ctx)
 
-            dynamodb_descriptions = self.get_dynamodb_optimization_descriptions()
+            dynamodb_descriptions = _dynamodb_optimization_descriptions()
         else:
             print("⏭️ Skipping DynamoDB analysis...")
             dynamodb_data = {"total_tables": 0}
@@ -3554,7 +3462,7 @@ class CostOptimizer:
         # ElastiCache/Redis scanning
         if should_scan_service("elasticache"):
             print("⚡ Scanning ElastiCache clusters...")
-            enhanced_elasticache_checks = self.get_enhanced_elasticache_checks()
+            enhanced_elasticache_checks = _elasticache_enhanced_checks(self._ctx)
         else:
             print("⏭️ Skipping ElastiCache analysis...")
             enhanced_elasticache_checks = {"recommendations": []}
@@ -3562,7 +3470,7 @@ class CostOptimizer:
         # OpenSearch scanning
         if should_scan_service("opensearch"):
             print("🔍 Scanning OpenSearch domains...")
-            enhanced_opensearch_checks = self.get_enhanced_opensearch_checks()
+            enhanced_opensearch_checks = _opensearch_enhanced_checks(self._ctx)
         else:
             print("⏭️ Skipping OpenSearch analysis...")
             enhanced_opensearch_checks = {"recommendations": []}
@@ -3587,7 +3495,7 @@ class CostOptimizer:
 
         # Lambda
         if should_scan_service("lambda"):
-            enhanced_lambda_checks = self.get_enhanced_lambda_checks()
+            enhanced_lambda_checks = _lambda_enhanced_checks(self._ctx)
         else:
             enhanced_lambda_checks = {"recommendations": []}
 
@@ -7855,265 +7763,7 @@ class CostOptimizer:
 
     def get_enhanced_dynamodb_checks(self) -> Dict[str, Any]:
         """Get enhanced DynamoDB cost optimization checks"""
-        checks = {
-            "billing_mode_optimization": [],
-            "capacity_rightsizing": [],
-            "reserved_capacity": [],
-            "data_lifecycle": [],
-            "global_tables_optimization": [],
-            "unused_tables": [],
-            "over_provisioned_capacity": [],
-        }
-
-        try:
-            # Get all DynamoDB tables
-            paginator = self.dynamodb.get_paginator("list_tables")
-            table_names = []
-            for page in paginator.paginate():
-                table_names.extend(page.get("TableNames", []))
-
-            for table_name in table_names:
-                try:
-                    table_response = self.dynamodb.describe_table(TableName=table_name)
-                    table = table_response["Table"]
-
-                    billing_mode = table.get("BillingModeSummary", {}).get("BillingMode", "PROVISIONED")
-                    table_status = table.get("TableStatus")
-                    item_count = table.get("ItemCount", 0)
-                    table_size_bytes = table.get("TableSizeBytes", 0)
-
-                    # Skip if not active
-                    if table_status != "ACTIVE":
-                        continue
-
-                    # Check for unused tables (empty tables)
-                    if item_count == 0:
-                        checks["unused_tables"].append(
-                            {
-                                "TableName": table_name,
-                                "ItemCount": item_count,
-                                "TableSizeBytes": table_size_bytes,
-                                "Recommendation": "Empty table - consider deletion if unused",
-                                "EstimatedSavings": "100% of table costs",
-                                "CheckCategory": "Unused DynamoDB Tables",
-                            }
-                        )
-
-                    # Check billing mode optimization (Note: Requires CloudWatch metrics for accurate recommendations)
-                    if billing_mode == "PROVISIONED":
-                        provisioned_throughput = table.get("ProvisionedThroughput", {})
-                        read_capacity = provisioned_throughput.get("ReadCapacityUnits", 0)
-                        write_capacity = provisioned_throughput.get("WriteCapacityUnits", 0)
-
-                        # Check for over-provisioned capacity (basic heuristic - CloudWatch recommended)
-                        if read_capacity > 100 or write_capacity > 100:
-                            # Try to get CloudWatch metrics for more accurate assessment
-                            try:
-                                cloudwatch = self.session.client("cloudwatch", region_name=self.region)
-                                # Get consumed capacity metrics for last 7 days
-                                end_time = datetime.now(timezone.utc)
-                                start_time = end_time - timedelta(days=7)
-
-                                read_response = cloudwatch.get_metric_statistics(
-                                    Namespace="AWS/DynamoDB",
-                                    MetricName="ConsumedReadCapacityUnits",
-                                    Dimensions=[{"Name": "TableName", "Value": table_name}],
-                                    StartTime=start_time,
-                                    EndTime=end_time,
-                                    Period=3600,  # 1 hour periods
-                                    Statistics=["Average", "Maximum"],
-                                )
-
-                                write_response = cloudwatch.get_metric_statistics(
-                                    Namespace="AWS/DynamoDB",
-                                    MetricName="ConsumedWriteCapacityUnits",
-                                    Dimensions=[{"Name": "TableName", "Value": table_name}],
-                                    StartTime=start_time,
-                                    EndTime=end_time,
-                                    Period=3600,
-                                    Statistics=["Average", "Maximum"],
-                                )
-
-                                # Calculate utilization if metrics available
-                                read_datapoints = read_response.get("Datapoints", [])
-                                write_datapoints = write_response.get("Datapoints", [])
-
-                                if read_datapoints and write_datapoints:
-                                    avg_read_consumed = sum(dp["Average"] for dp in read_datapoints) / len(
-                                        read_datapoints
-                                    )
-                                    avg_write_consumed = sum(dp["Average"] for dp in write_datapoints) / len(
-                                        write_datapoints
-                                    )
-
-                                    read_utilization = (
-                                        (avg_read_consumed / read_capacity) * 100 if read_capacity > 0 else 0
-                                    )
-                                    write_utilization = (
-                                        (avg_write_consumed / write_capacity) * 100 if write_capacity > 0 else 0
-                                    )
-
-                                    # Only recommend if utilization is low
-                                    if read_utilization < 20 or write_utilization < 20:
-                                        recommendation_text = f"Low utilization detected (Read: {read_utilization:.1f}%, Write: {write_utilization:.1f}%) - consider reducing capacity"
-                                    else:
-                                        recommendation_text = f"Utilization acceptable (Read: {read_utilization:.1f}%, Write: {write_utilization:.1f}%) - monitor usage patterns"
-                                else:
-                                    recommendation_text = "High provisioned capacity - validate with CloudWatch metrics"
-
-                            except Exception as e:
-                                recommendation_text = "High provisioned capacity - CloudWatch analysis recommended"
-
-                            checks["over_provisioned_capacity"].append(
-                                {
-                                    "TableName": table_name,
-                                    "ReadCapacityUnits": read_capacity,
-                                    "WriteCapacityUnits": write_capacity,
-                                    "Recommendation": recommendation_text,
-                                    "EstimatedSavings": "Variable based on actual usage",
-                                    "CheckCategory": "DynamoDB Over-Provisioned Capacity",
-                                }
-                            )
-
-                        # Suggest Reserved Capacity for steady workloads
-                        if read_capacity >= 100 and write_capacity >= 100:
-                            checks["reserved_capacity"].append(
-                                {
-                                    "TableName": table_name,
-                                    "ReadCapacityUnits": read_capacity,
-                                    "WriteCapacityUnits": write_capacity,
-                                    "Recommendation": "Consider Reserved Capacity for predictable workloads",
-                                    "EstimatedSavings": "53-76% vs On-Demand",
-                                    "CheckCategory": "DynamoDB Reserved Capacity",
-                                }
-                            )
-
-                    else:  # ON_DEMAND
-                        # Check CloudWatch consumed capacity for steady workload validation
-                        try:
-                            cloudwatch = self.session.client("cloudwatch", region_name=self.region)
-                            end_time = datetime.now(timezone.utc)
-                            start_time = end_time - timedelta(days=14)  # 14-day analysis
-
-                            # Get consumed read capacity
-                            read_response = cloudwatch.get_metric_statistics(
-                                Namespace="AWS/DynamoDB",
-                                MetricName="ConsumedReadCapacityUnits",
-                                Dimensions=[{"Name": "TableName", "Value": table_name}],
-                                StartTime=start_time,
-                                EndTime=end_time,
-                                Period=3600,
-                                Statistics=["Average", "Maximum"],
-                            )
-
-                            # Get consumed write capacity
-                            write_response = cloudwatch.get_metric_statistics(
-                                Namespace="AWS/DynamoDB",
-                                MetricName="ConsumedWriteCapacityUnits",
-                                Dimensions=[{"Name": "TableName", "Value": table_name}],
-                                StartTime=start_time,
-                                EndTime=end_time,
-                                Period=3600,
-                                Statistics=["Average", "Maximum"],
-                            )
-
-                            read_datapoints = read_response.get("Datapoints", [])
-                            write_datapoints = write_response.get("Datapoints", [])
-
-                            if read_datapoints and write_datapoints:
-                                # Calculate usage statistics
-                                avg_read = sum(dp["Average"] for dp in read_datapoints) / len(read_datapoints)
-                                max_read = max(dp["Maximum"] for dp in read_datapoints)
-                                avg_write = sum(dp["Average"] for dp in write_datapoints) / len(write_datapoints)
-                                max_write = max(dp["Maximum"] for dp in write_datapoints)
-
-                                # Calculate proposed provisioned baseline (avg + 20% buffer)
-                                proposed_read = avg_read * 1.2
-                                proposed_write = avg_write * 1.2
-
-                                # Check if usage is steady and high enough for Provisioned
-                                read_utilization = avg_read / proposed_read if proposed_read > 0 else 0
-                                write_utilization = avg_write / proposed_write if proposed_write > 0 else 0
-                                read_variability = max_read / avg_read if avg_read > 0 else float("inf")
-                                write_variability = max_write / avg_write if avg_write > 0 else float("inf")
-
-                                # Recommend Provisioned if:
-                                # 1. Average utilization > 70% of proposed baseline
-                                # 2. Traffic is predictable (max/avg ratio < 3)
-                                # 3. Minimum usage thresholds met
-                                if (
-                                    read_utilization > 0.7
-                                    and write_utilization > 0.7
-                                    and read_variability < 3
-                                    and write_variability < 3
-                                    and avg_read > 5
-                                    and avg_write > 1
-                                ):
-                                    checks["billing_mode_optimization"].append(
-                                        {
-                                            "TableName": table_name,
-                                            "CurrentBillingMode": billing_mode,
-                                            "AvgReadCapacity": f"{avg_read:.1f} RCU",
-                                            "AvgWriteCapacity": f"{avg_write:.1f} WCU",
-                                            "ReadUtilization": f"{read_utilization:.1%}",
-                                            "WriteUtilization": f"{write_utilization:.1%}",
-                                            "Recommendation": f"Steady high usage detected over 14 days (Read: {avg_read:.1f} RCU at {read_utilization:.0%} utilization, Write: {avg_write:.1f} WCU at {write_utilization:.0%} utilization) - switch to Provisioned mode",
-                                            "EstimatedSavings": "Up to 60% for predictable traffic patterns",
-                                            "CheckCategory": "DynamoDB Billing Mode - Metric-Backed",
-                                            "MetricsPeriod": "14 days",
-                                        }
-                                    )
-                            else:
-                                # No metrics available - suggest enabling CloudWatch
-                                checks["billing_mode_optimization"].append(
-                                    {
-                                        "TableName": table_name,
-                                        "CurrentBillingMode": billing_mode,
-                                        "TableSizeGB": round(table_size_bytes / (1024**3), 2),
-                                        "Recommendation": "Enable CloudWatch metrics to analyze usage patterns for billing mode optimization",
-                                        "EstimatedSavings": "Enable monitoring first - potential 60% savings with Provisioned mode for steady workloads",
-                                        "CheckCategory": "DynamoDB Monitoring Required",
-                                    }
-                                )
-
-                        except Exception:
-                            # Fallback - suggest enabling CloudWatch
-                            checks["billing_mode_optimization"].append(
-                                {
-                                    "TableName": table_name,
-                                    "CurrentBillingMode": billing_mode,
-                                    "TableSizeGB": round(table_size_bytes / (1024**3), 2),
-                                    "Recommendation": "Enable CloudWatch metrics to validate usage patterns before switching to Provisioned mode",
-                                    "EstimatedSavings": "CloudWatch analysis required - potential 60% savings for steady workloads",
-                                    "CheckCategory": "DynamoDB CloudWatch Required",
-                                }
-                            )
-
-                    # Check for data lifecycle opportunities
-                    if table_size_bytes > 10 * 1024**3:  # > 10GB
-                        checks["data_lifecycle"].append(
-                            {
-                                "TableName": table_name,
-                                "TableSizeGB": round(table_size_bytes / (1024**3), 2),
-                                "Recommendation": "Large table - implement TTL for old data or archive to S3",
-                                "EstimatedSavings": "40-80% on storage costs",
-                                "CheckCategory": "DynamoDB Data Lifecycle",
-                            }
-                        )
-
-                except Exception as e:
-                    print(f"Warning: Could not analyze DynamoDB table {table_name}: {e}")
-
-        except Exception as e:
-            print(f"Warning: Could not perform enhanced DynamoDB checks: {e}")
-
-        # Convert to recommendations format
-        recommendations = []
-        for category, items in checks.items():
-            for item in items:
-                recommendations.append(item)
-
-        return {"recommendations": recommendations, **checks}
+        return _dynamodb_enhanced_checks(self._ctx)
 
     def get_enhanced_elasticache_checks(self) -> Dict[str, Any]:
         """
