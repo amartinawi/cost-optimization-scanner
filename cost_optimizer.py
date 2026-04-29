@@ -46,6 +46,13 @@ import re
 
 from core.scan_context import ScanContext
 from services.ami import compute_ami_checks as _ami_compute
+from services.ebs import (
+    EBS_OPTIMIZATION_DESCRIPTIONS as _EBS_DESCRIPTIONS,
+    compute_ebs_checks as _ebs_compute,
+    get_ebs_compute_optimizer_recs as _ebs_compute_optimizer_recs,
+    get_ebs_volume_count as _ebs_volume_count,
+    get_unattached_volumes as _ebs_unattached_volumes,
+)
 from core.client_registry import ClientRegistry
 from core.session import AwsSessionFactory
 
@@ -3324,10 +3331,10 @@ class CostOptimizer:
         # EBS Storage Service Analysis
         if should_scan_service("ebs"):
             print("💾 Scanning EBS volumes and storage optimization...")
-            ebs_counts = self.get_ebs_volume_count()
+            ebs_counts = _ebs_volume_count(self._ctx)
 
             # Enhanced EBS checks for storage optimization
-            enhanced_ebs_checks = self.get_enhanced_ebs_checks()
+            enhanced_ebs_checks = _ebs_compute(self._ctx, self.pricing_multiplier, self.OLD_SNAPSHOT_DAYS)
         else:
             print("⏭️ Skipping EBS analysis...")
             ebs_counts = {"total_volumes": 0}
@@ -3407,9 +3414,9 @@ class CostOptimizer:
 
         # EBS Compute Optimizer recommendations (only if EBS is being scanned)
         if should_scan_service("ebs"):
-            ebs_compute_optimizer_recs = self.get_ebs_compute_optimizer_recommendations()
-            unattached_volumes = self.get_unattached_volumes()
-            ebs_descriptions = self.get_ebs_optimization_descriptions()
+            ebs_compute_optimizer_recs = _ebs_compute_optimizer_recs(self._ctx, self.pricing_multiplier)
+            unattached_volumes = _ebs_unattached_volumes(self._ctx, self.pricing_multiplier)
+            ebs_descriptions = _EBS_DESCRIPTIONS
         else:
             ebs_compute_optimizer_recs = []
             unattached_volumes = []
