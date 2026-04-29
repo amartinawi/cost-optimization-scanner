@@ -50,6 +50,10 @@ from services.apprunner import (
     APPRUNNER_OPTIMIZATION_DESCRIPTIONS as _APPRUNNER_DESCRIPTIONS,
     get_enhanced_apprunner_checks as _apprunner_enhanced_checks,
 )
+from services.api_gateway import (
+    API_GATEWAY_OPTIMIZATION_DESCRIPTIONS as _API_GATEWAY_DESCRIPTIONS,
+    get_enhanced_api_gateway_checks as _api_gateway_enhanced_checks,
+)
 from services.quicksight import (
     QUICKSIGHT_OPTIMIZATION_DESCRIPTIONS as _QUICKSIGHT_DESCRIPTIONS,
     get_enhanced_quicksight_checks as _quicksight_enhanced_checks,
@@ -83,6 +87,10 @@ from services.mediastore import (
     MEDIASTORE_OPTIMIZATION_DESCRIPTIONS as _MEDIASTORE_DESCRIPTIONS,
     get_enhanced_mediastore_checks as _mediastore_enhanced_checks,
 )
+from services.msk import (
+    MSK_OPTIMIZATION_DESCRIPTIONS as _MSK_DESCRIPTIONS,
+    get_enhanced_msk_checks as _msk_enhanced_checks,
+)
 from services.workspaces import (
     WORKSPACES_OPTIMIZATION_DESCRIPTIONS as _WORKSPACES_DESCRIPTIONS,
     get_enhanced_workspaces_checks as _workspaces_enhanced_checks,
@@ -96,6 +104,11 @@ from services.athena import get_enhanced_athena_checks as _athena_enhanced_check
 from services.batch_svc import (
     BATCH_OPTIMIZATION_DESCRIPTIONS as _BATCH_DESCRIPTIONS,
     get_enhanced_batch_checks as _batch_enhanced_checks,
+)
+from services.cloudfront import get_enhanced_cloudfront_checks as _cloudfront_enhanced_checks
+from services.step_functions import (
+    STEP_FUNCTIONS_OPTIMIZATION_DESCRIPTIONS as _STEP_FUNCTIONS_DESCRIPTIONS,
+    get_enhanced_step_functions_checks as _step_functions_enhanced_checks,
 )
 from core.client_registry import ClientRegistry
 from core.session import AwsSessionFactory
@@ -3544,19 +3557,19 @@ class CostOptimizer:
 
         # CloudFront CDN
         if should_scan_service("cloudfront"):
-            enhanced_cloudfront_checks = self.get_enhanced_cloudfront_checks()
+            enhanced_cloudfront_checks = _cloudfront_enhanced_checks(self._ctx)
         else:
             enhanced_cloudfront_checks = {"recommendations": []}
 
         # API Gateway
         if should_scan_service("api_gateway"):
-            enhanced_api_gateway_checks = self.get_enhanced_api_gateway_checks()
+            enhanced_api_gateway_checks = _api_gateway_enhanced_checks(self._ctx)
         else:
             enhanced_api_gateway_checks = {"recommendations": []}
 
         # Step Functions
         if should_scan_service("step_functions"):
-            enhanced_step_functions_checks = self.get_enhanced_step_functions_checks()
+            enhanced_step_functions_checks = _step_functions_enhanced_checks(self._ctx)
         else:
             enhanced_step_functions_checks = {"recommendations": []}
 
@@ -4197,8 +4210,8 @@ class CostOptimizer:
         # MSK scanning
         if should_scan_service("msk"):
             print("🔄 Scanning Managed Streaming for Apache Kafka optimization...")
-            enhanced_msk_checks = self.get_enhanced_msk_checks()
-            msk_descriptions = self.get_msk_optimization_descriptions()
+            enhanced_msk_checks = _msk_enhanced_checks(self._ctx)
+            msk_descriptions = _MSK_DESCRIPTIONS
         else:
             print("⏭️ Skipping MSK analysis...")
             enhanced_msk_checks = {"recommendations": []}
