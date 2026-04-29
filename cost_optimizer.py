@@ -83,7 +83,20 @@ from services.mediastore import (
     MEDIASTORE_OPTIMIZATION_DESCRIPTIONS as _MEDIASTORE_DESCRIPTIONS,
     get_enhanced_mediastore_checks as _mediastore_enhanced_checks,
 )
+from services.workspaces import (
+    WORKSPACES_OPTIMIZATION_DESCRIPTIONS as _WORKSPACES_DESCRIPTIONS,
+    get_enhanced_workspaces_checks as _workspaces_enhanced_checks,
+)
 from services.transfer_svc import get_enhanced_transfer_checks as _transfer_enhanced_checks
+from services.redshift import (
+    REDSHIFT_OPTIMIZATION_DESCRIPTIONS as _REDSHIFT_DESCRIPTIONS,
+    get_enhanced_redshift_checks as _redshift_enhanced_checks,
+)
+from services.athena import get_enhanced_athena_checks as _athena_enhanced_checks
+from services.batch_svc import (
+    BATCH_OPTIMIZATION_DESCRIPTIONS as _BATCH_DESCRIPTIONS,
+    get_enhanced_batch_checks as _batch_enhanced_checks,
+)
 from core.client_registry import ClientRegistry
 from core.session import AwsSessionFactory
 
@@ -4134,8 +4147,8 @@ class CostOptimizer:
         # Redshift scanning
         if should_scan_service("redshift"):
             print("🏢 Scanning Redshift clusters and serverless optimization...")
-            enhanced_redshift_checks = self.get_enhanced_redshift_checks()
-            redshift_descriptions = self.get_redshift_optimization_descriptions()
+            enhanced_redshift_checks = _redshift_enhanced_checks(self._ctx)
+            redshift_descriptions = _REDSHIFT_DESCRIPTIONS
         else:
             print("⏭️ Skipping Redshift analysis...")
             enhanced_redshift_checks = {"recommendations": []}
@@ -4194,8 +4207,8 @@ class CostOptimizer:
         # WorkSpaces scanning
         if should_scan_service("workspaces"):
             print("🖥️ Scanning WorkSpaces virtual desktops optimization...")
-            enhanced_workspaces_checks = self.get_enhanced_workspaces_checks()
-            workspaces_descriptions = self.get_workspaces_optimization_descriptions()
+            enhanced_workspaces_checks = _workspaces_enhanced_checks(self._ctx)
+            workspaces_descriptions = _WORKSPACES_DESCRIPTIONS
         else:
             print("⏭️ Skipping WorkSpaces analysis...")
             enhanced_workspaces_checks = {"recommendations": []}
@@ -4224,7 +4237,7 @@ class CostOptimizer:
         # Athena scanning
         if should_scan_service("athena"):
             print("📊 Scanning Athena query optimization...")
-            enhanced_athena_checks = self.get_enhanced_athena_checks()
+            enhanced_athena_checks = _athena_enhanced_checks(self._ctx)
             athena_descriptions = self.get_athena_optimization_descriptions()
         else:
             print("⏭️ Skipping Athena analysis...")
@@ -4234,8 +4247,8 @@ class CostOptimizer:
         # Batch scanning
         if should_scan_service("batch"):
             print("⚙️  Scanning AWS Batch compute optimization...")
-            enhanced_batch_checks = self.get_enhanced_batch_checks()
-            batch_descriptions = self.get_batch_optimization_descriptions()
+            enhanced_batch_checks = _batch_enhanced_checks(self._ctx)
+            batch_descriptions = _BATCH_DESCRIPTIONS
         else:
             print("⏭️ Skipping Batch analysis...")
             enhanced_batch_checks = {"recommendations": []}
