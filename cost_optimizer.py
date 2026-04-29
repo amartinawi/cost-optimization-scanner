@@ -46,6 +46,14 @@ import re
 
 from core.scan_context import ScanContext
 from services.ami import compute_ami_checks as _ami_compute
+from services.apprunner import (
+    APPRUNNER_OPTIMIZATION_DESCRIPTIONS as _APPRUNNER_DESCRIPTIONS,
+    get_enhanced_apprunner_checks as _apprunner_enhanced_checks,
+)
+from services.quicksight import (
+    QUICKSIGHT_OPTIMIZATION_DESCRIPTIONS as _QUICKSIGHT_DESCRIPTIONS,
+    get_enhanced_quicksight_checks as _quicksight_enhanced_checks,
+)
 from services.ebs import (
     EBS_OPTIMIZATION_DESCRIPTIONS as _EBS_DESCRIPTIONS,
     compute_ebs_checks as _ebs_compute,
@@ -71,6 +79,11 @@ from services.rds import (
     get_rds_compute_optimizer_recommendations as _rds_compute_optimizer_recs,
     get_rds_instance_count as _rds_instance_count,
 )
+from services.mediastore import (
+    MEDIASTORE_OPTIMIZATION_DESCRIPTIONS as _MEDIASTORE_DESCRIPTIONS,
+    get_enhanced_mediastore_checks as _mediastore_enhanced_checks,
+)
+from services.transfer_svc import get_enhanced_transfer_checks as _transfer_enhanced_checks
 from core.client_registry import ClientRegistry
 from core.session import AwsSessionFactory
 
@@ -4141,8 +4154,8 @@ class CostOptimizer:
         # QuickSight scanning
         if should_scan_service("quicksight"):
             print("📊 Scanning QuickSight BI service optimization...")
-            enhanced_quicksight_checks = self.get_enhanced_quicksight_checks()
-            quicksight_descriptions = self.get_quicksight_optimization_descriptions()
+            enhanced_quicksight_checks = _quicksight_enhanced_checks(self._ctx)
+            quicksight_descriptions = _QUICKSIGHT_DESCRIPTIONS
         else:
             print("⏭️ Skipping QuickSight analysis...")
             enhanced_quicksight_checks = {"recommendations": []}
@@ -4151,8 +4164,8 @@ class CostOptimizer:
         # App Runner scanning
         if should_scan_service("apprunner"):
             print("🏃 Scanning App Runner service optimization...")
-            enhanced_apprunner_checks = self.get_enhanced_apprunner_checks()
-            apprunner_descriptions = self.get_apprunner_optimization_descriptions()
+            enhanced_apprunner_checks = _apprunner_enhanced_checks(self._ctx)
+            apprunner_descriptions = _APPRUNNER_DESCRIPTIONS
         else:
             print("⏭️ Skipping App Runner analysis...")
             enhanced_apprunner_checks = {"recommendations": []}
@@ -4161,7 +4174,7 @@ class CostOptimizer:
         # Transfer Family scanning
         if should_scan_service("transfer"):
             print("📁 Scanning Transfer Family optimization...")
-            enhanced_transfer_checks = self.get_enhanced_transfer_checks()
+            enhanced_transfer_checks = _transfer_enhanced_checks(self._ctx)
             transfer_descriptions = self.get_transfer_optimization_descriptions()
         else:
             print("⏭️ Skipping Transfer Family analysis...")
@@ -4191,8 +4204,8 @@ class CostOptimizer:
         # MediaStore scanning
         if should_scan_service("mediastore"):
             print("🎬 Scanning Elemental MediaStore optimization...")
-            enhanced_mediastore_checks = self.get_enhanced_mediastore_checks()
-            mediastore_descriptions = self.get_mediastore_optimization_descriptions()
+            enhanced_mediastore_checks = _mediastore_enhanced_checks(self._ctx)
+            mediastore_descriptions = _MEDIASTORE_DESCRIPTIONS
         else:
             print("⏭️ Skipping MediaStore analysis...")
             enhanced_mediastore_checks = {"recommendations": []}
