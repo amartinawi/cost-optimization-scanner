@@ -53,6 +53,24 @@ from services.ebs import (
     get_ebs_volume_count as _ebs_volume_count,
     get_unattached_volumes as _ebs_unattached_volumes,
 )
+from services.s3 import (
+    S3_OPTIMIZATION_DESCRIPTIONS as _S3_DESCRIPTIONS,
+    get_enhanced_s3_checks as _s3_enhanced_checks,
+    get_s3_bucket_analysis as _s3_bucket_analysis,
+)
+from services.ec2 import (
+    get_advanced_ec2_checks as _ec2_advanced_checks,
+    get_auto_scaling_checks as _ec2_auto_scaling_checks,
+    get_compute_optimizer_recommendations as _ec2_compute_optimizer_recs,
+    get_ec2_instance_count as _ec2_instance_count,
+    get_enhanced_ec2_checks as _ec2_enhanced_checks,
+)
+from services.rds import (
+    RDS_OPTIMIZATION_DESCRIPTIONS as _RDS_DESCRIPTIONS,
+    get_enhanced_rds_checks as _rds_enhanced_checks,
+    get_rds_compute_optimizer_recommendations as _rds_compute_optimizer_recs,
+    get_rds_instance_count as _rds_instance_count,
+)
 from core.client_registry import ClientRegistry
 from core.session import AwsSessionFactory
 
@@ -3290,10 +3308,10 @@ class CostOptimizer:
         # Includes EC2 instances, AMIs, and compute optimization recommendations
         if should_scan_service("ec2"):
             print("📊 Scanning EC2 instances and compute resources...")
-            instance_count = self.get_ec2_instance_count()
+            instance_count = _ec2_instance_count(self._ctx)
 
             # Enhanced EC2 checks for advanced optimization opportunities
-            enhanced_ec2_checks = self.get_enhanced_ec2_checks()
+            enhanced_ec2_checks = _ec2_enhanced_checks(self._ctx, self.pricing_multiplier)
         else:
             print("⏭️ Skipping EC2 analysis...")
             instance_count = {"total_instances": 0}
@@ -3320,7 +3338,7 @@ class CostOptimizer:
 
         # Get EC2-specific Cost Optimization Hub recommendations
         cost_hub_recs = cost_hub_by_service["ec2"]
-        compute_optimizer_recs = self.get_compute_optimizer_recommendations() if should_scan_service("ec2") else []
+        compute_optimizer_recs = _ec2_compute_optimizer_recs(self._ctx) if should_scan_service("ec2") else []
 
         # AMI lifecycle management checks
         if should_scan_service("ami"):
@@ -3360,10 +3378,10 @@ class CostOptimizer:
         # RDS scanning
         if should_scan_service("rds"):
             print("🗄️ Scanning RDS databases and optimization opportunities...")
-            rds_counts = self.get_rds_instance_count()
+            rds_counts = _rds_instance_count(self._ctx)
 
-            rds_compute_optimizer_recs = self.get_rds_compute_optimizer_recommendations()
-            rds_descriptions = self.get_rds_optimization_descriptions()
+            rds_compute_optimizer_recs = _rds_compute_optimizer_recs(self._ctx)
+            rds_descriptions = _RDS_DESCRIPTIONS
         else:
             print("⏭️ Skipping RDS analysis...")
             rds_counts = {"total_instances": 0}
@@ -3373,12 +3391,11 @@ class CostOptimizer:
         # S3 scanning
         if should_scan_service("s3"):
             print("🪣 Scanning S3 buckets and storage optimization...")
-            s3_data = self.get_s3_bucket_analysis()
+            s3_data = _s3_bucket_analysis(self._ctx, self.fast_mode, self.pricing_multiplier)
 
-            # Get enhanced S3 checks
-            enhanced_s3_checks = self.get_enhanced_s3_checks()
+            enhanced_s3_checks = _s3_enhanced_checks(self._ctx, self.pricing_multiplier)
 
-            s3_descriptions = self.get_s3_optimization_descriptions()
+            s3_descriptions = _S3_DESCRIPTIONS
         else:
             print("⏭️ Skipping S3 analysis...")
             s3_data = {"total_buckets": 0, "optimization_opportunities": []}
@@ -3424,7 +3441,7 @@ class CostOptimizer:
 
         # Enhanced RDS checks (only if RDS is being scanned)
         if should_scan_service("rds"):
-            enhanced_rds_checks = self.get_enhanced_rds_checks()
+            enhanced_rds_checks = _rds_enhanced_checks(self._ctx, self.pricing_multiplier, self.OLD_SNAPSHOT_DAYS)
         else:
             enhanced_rds_checks = {"recommendations": []}
 
@@ -3440,7 +3457,7 @@ class CostOptimizer:
             nat_gateway_checks = self.get_nat_gateway_checks()
             vpc_endpoints_checks = self.get_vpc_endpoints_checks()
             load_balancer_checks = self.get_load_balancer_checks()
-            advanced_ec2_checks = self.get_advanced_ec2_checks()
+            advanced_ec2_checks = _ec2_advanced_checks(self._ctx, self.pricing_multiplier, self.fast_mode)
         else:
             print("⏭️ Skipping network analysis...")
             elastic_ip_checks = {"recommendations": []}
@@ -3452,7 +3469,7 @@ class CostOptimizer:
         # Auto Scaling checks
         if should_scan_service("auto_scaling"):
             print("📈 Scanning Auto Scaling groups...")
-            auto_scaling_checks = self.get_auto_scaling_checks()
+            auto_scaling_checks = _ec2_auto_scaling_checks(self._ctx)
         else:
             auto_scaling_checks = {"recommendations": []}
 

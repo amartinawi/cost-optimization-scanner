@@ -19,6 +19,7 @@ def compute_ami_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> dic
 
     Returns dict with 'recommendations' (list) and 'total_count' (int).
     """
+    print("🔍 [services/ami.py] AMI module active")
     ec2 = ctx.client("ec2")
     autoscaling = ctx.client("autoscaling")
     checks: dict[str, list[dict[str, Any]]] = {"unused_amis": [], "old_amis": []}

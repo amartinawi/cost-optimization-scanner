@@ -76,6 +76,7 @@ def get_ebs_volume_count(ctx: ScanContext) -> dict[str, int]:
     Returns:
         Dict with volume counts by state (attached/unattached) and type (gp2/gp3/io1/io2)
     """
+    print("🔍 [services/ebs.py] EBS module active")
     ec2 = ctx.client("ec2")
     try:
         paginator = ec2.get_paginator("describe_volumes")
