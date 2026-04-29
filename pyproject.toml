@@ -1,0 +1,26 @@
+[project]
+name = "aws-cost-optimization"
+version = "2.5.9"
+description = "AWS Cost Optimization Scanner — 30 services, 220+ checks"
+requires-python = ">=3.11"
+license = "MIT"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "A", "SIM"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["core", "services", "report", "cli.py"]
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_any_generics = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
