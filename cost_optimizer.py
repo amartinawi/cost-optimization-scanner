@@ -91,6 +91,7 @@ class CostOptimizer:
             profile=self.profile,
             fast_mode=self.fast_mode,
             clients=registry,
+            pricing_multiplier=self.pricing_multiplier,
         )
         print("✅ All AWS service clients initialized successfully!")
         print(f"🎯 Ready to scan {region} with comprehensive cost optimization analysis")
