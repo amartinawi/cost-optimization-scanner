@@ -5,6 +5,40 @@ All notable changes to the AWS Cost Optimization Scanner project will be documen
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.0.0] - 2026-04-30
+
+### Changed (BREAKING)
+- **Modular Architecture**: Replaced 8,500-line `cost_optimizer.py` monolith with clean modular architecture
+  - `cost_optimizer.py` is now a 130-line thin shell delegating to `ScanOrchestrator`
+  - 28 service scans extracted into independent `ServiceModule` adapter classes in `services/adapters/`
+  - Core orchestration extracted into `core/` package (ScanContext, ScanOrchestrator, ScanResultBuilder, ClientRegistry, ServiceModule Protocol)
+
+### Added
+- **ServiceModule Protocol** (`core/contracts.py`): Formal interface for service adapters with key, cli_aliases, display_name, stat_cards, grouping, scan(), custom_grouping()
+- **ScanOrchestrator** (`core/scan_orchestrator.py`): Iterates registered modules with safe_scan error handling, pre-fetches Cost Hub data
+- **ScanResultBuilder** (`core/result_builder.py`): Serializes ServiceFindings to JSON matching legacy format
+- **ClientRegistry** (`core/client_registry.py`): Caching boto3 client factory with global-service routing (us-east-1 for Route53, CloudFront, IAM, etc.)
+- **AwsSessionFactory** (`core/session.py`): Session management with adaptive retry config
+- **28 ServiceModule Adapters** (`services/adapters/`): One file per AWS service
+  - 12 flat-rate: lightsail, redshift, dms, quicksight, apprunner, transfer, msk, workspaces, mediastore, glue, athena, batch
+  - 6 parse-rate: cloudfront, api_gateway, step_functions, elasticache, opensearch, ami
+  - 6 complex: ec2, ebs, rds, s3, lambda, dynamodb
+  - 4 composite: file_systems (efs+fsx), containers (ecs+eks+ecr), network (eip+nat+vpc+lb+asg), monitoring (cloudwatch+cloudtrail+backup+route53)
+- **BaseServiceModule** (`services/_base.py`): Base class with default implementations
+- **Service Descriptor Dict pattern** in reporter: Reduced `if service_key ==` branches from 62 to 7
+- **131 tests** including 112 new snapshot tests for reporter refactoring
+- **resolve_cli_keys** (`core/filtering.py`): Alias-based CLI service filtering
+
+### Removed
+- ~8,400 lines of inline service scan logic from `cost_optimizer.py` (preserved as `.bak` locally)
+
+### Reporter Refactoring (Phase 1)
+- **html_report_generator.py**: 4,380 -> 2,432 lines (-44%)
+- **reporter_phase_a.py** (424 lines): Descriptor-driven grouped services
+- **reporter_phase_b.py** (1,502 lines): Function registry for source handlers
+- Smart grouping: 62 -> 7 `if service_key ==` branches
+- EC2 pre-filter + S3 extra stats registries for clean data flow
+
 ## [2.6.0] - 2026-01-25
 
 ### Added

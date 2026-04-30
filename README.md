@@ -1,7 +1,7 @@
 # AWS Cost Optimization Scanner 💰
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Version](https://img.shields.io/badge/Version-2.6.0-blue)](https://github.com/aws-cost-optimizer/aws-cost-optimizer)
+[![Version](https://img.shields.io/badge/Version-3.0.0-blue)](https://github.com/aws-cost-optimizer/aws-cost-optimizer)
 [![AWS Services](https://img.shields.io/badge/AWS%20Services-30-orange)](https://aws.amazon.com/)
 [![Cost Checks](https://img.shields.io/badge/Cost%20Checks-220+-red)](https://github.com/aws-cost-optimizer/aws-cost-optimizer)
 [![Global Regions](https://img.shields.io/badge/AWS%20Regions-Global-green)](https://aws.amazon.com/about-aws/global-infrastructure/)
@@ -149,7 +149,7 @@ python3 cost_optimizer.py us-east-1 --fast --scan-only s3
 ## 📈 Sample Output
 
 ```
-🚀 AWS Cost Optimization Scanner v2.5.9 - Production Ready
+🚀 AWS Cost Optimization Scanner v3.0.0 - Modular Architecture
 📍 Scanning region: us-east-1
 👤 AWS profile: production
 🎯 Scanning only: s3, lambda
@@ -305,14 +305,56 @@ Regional pricing is applied with per‑region multipliers where defined. Regions
 
 ## 🏗️ Architecture
 
-The scanner is built as a modular Python application with enterprise-scale capabilities:
+The scanner uses a modular architecture with a thin orchestrator shell and 28 independent ServiceModule adapters:
 
-- **40+ AWS Service Clients**: Comprehensive coverage with adaptive retry configuration
-- **Pagination Support**: Handles unlimited resources (tested with 1000+ per service)
-- **CloudWatch Integration**: Real metrics for accurate utilization analysis
-- **Regional Pricing Engine**: Accurate cost calculations across 30+ AWS regions
-- **Professional Reports**: Interactive HTML with multi-tab interface and smart grouping
-- **Error Resilience**: Exponential backoff with comprehensive error tracking
+```
+CLI (cli.py)
+  └─ CostOptimizer (cost_optimizer.py) — thin shell
+       ├─ AwsSessionFactory (core/session.py)
+       ├─ ClientRegistry (core/client_registry.py)
+       └─ ScanOrchestrator (core/scan_orchestrator.py)
+            └─ 28 ServiceModule adapters (services/adapters/*.py)
+                 └─ ScanResultBuilder (core/result_builder.py) → JSON/HTML
+```
+
+### Key Design Principles
+- **ServiceModule Protocol**: Each service implements a standard interface (`scan(context) → ServiceFindings`)
+- **Thin shell**: `cost_optimizer.py` is ~130 lines — AWS session init + delegates to orchestrator
+- **Adapter pattern**: 28 self-contained adapters, one file per service
+- **Caching client registry**: boto3 clients are shared and reused across adapters
+- **Safe scan wrapper**: Each adapter runs in error-isolated context
+
+### Project Structure
+
+| File | Lines | Purpose |
+|------|-------|---------|
+| `cost_optimizer.py` | 130 | Thin CostOptimizer shell |
+| `cli.py` | 91 | Unified CLI entry point |
+| `core/contracts.py` | ~100 | ServiceModule Protocol, ServiceFindings, SourceBlock |
+| `core/scan_orchestrator.py` | 67 | ScanOrchestrator + safe_scan |
+| `core/scan_context.py` | 50 | ScanContext (region, clients, warnings) |
+| `core/result_builder.py` | 59 | ScanResultBuilder (JSON serialization) |
+| `core/client_registry.py` | 54 | Caching boto3 client registry |
+| `core/session.py` | 42 | AWS session factory |
+| `core/filtering.py` | 58 | CLI service-key resolver |
+| `services/__init__.py` | ~60 | ALL_MODULES registry (28 adapters) |
+| `services/_base.py` | ~80 | BaseServiceModule base class |
+| `services/_savings.py` | ~40 | parse_dollar_savings helper |
+| `services/advisor.py` | ~200 | Cost Hub + Compute Optimizer utilities |
+| `services/adapters/*.py` | 28 files | ServiceModule adapters |
+| `html_report_generator.py` | 2,432 | HTML report generation |
+| `reporter_phase_a.py` | 424 | Phase A descriptor-driven grouped services |
+| `reporter_phase_b.py` | 1,502 | Phase B function registry for source handlers |
+
+### Adapter Categories (28 adapters)
+
+**Flat-rate** (12): lightsail, redshift, dms, quicksight, apprunner, transfer, msk, workspaces, mediastore, glue, athena, batch
+
+**Parse-rate** (6): cloudfront, api_gateway, step_functions, elasticache, opensearch, ami
+
+**Complex** (6): ec2, ebs, rds, s3, lambda, dynamodb
+
+**Composite** (4): file_systems, containers, network, monitoring
 
 ## 📚 Documentation
 
@@ -344,6 +386,13 @@ pip install -r requirements.txt
 # Run with your AWS credentials
 python3 cost_optimizer.py us-east-1 --profile your-profile
 ```
+
+### Adding a New Service Adapter
+
+1. Create `services/adapters/your_service.py` implementing the `ServiceModule` protocol
+2. Register it in `services/__init__.py` via `ALL_MODULES`
+3. The adapter receives a `ScanContext` and returns `ServiceFindings`
+4. See `services/_base.py` for the base class and existing adapters for patterns
 
 ## 📄 License
 
