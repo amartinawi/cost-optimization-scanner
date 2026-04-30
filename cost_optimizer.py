@@ -2779,7 +2779,42 @@ class CostOptimizer:
             ValueError: If both skip_services and scan_only are provided
             boto3.exceptions.ClientError: For AWS API permission or availability issues
         """
-        return self._scan_legacy_run(skip_services, scan_only)
+        return self._scan_modular_run(skip_services, scan_only)
+
+    def _scan_modular_run(self, skip_services=None, scan_only=None) -> Dict[str, Any]:
+        from core.scan_orchestrator import ScanOrchestrator
+        from core.result_builder import ScanResultBuilder
+        from services import ALL_MODULES
+
+        print(f"Starting comprehensive cost optimization scan for region: {self.region}")
+        print(f"Using AWS profile: {self.profile}")
+
+        skip_set: set[str] | None = set(skip_services) if skip_services else None
+        scan_only_set: set[str] | None = set(scan_only) if scan_only else None
+
+        if scan_only_set:
+            print(f"Analyzing {len(scan_only_set)} AWS services with 220+ cost optimization checks...")
+            print(f"🎯 Scanning only: {', '.join(sorted(scan_only_set))}")
+        elif skip_set:
+            all_keys = {m.key for m in ALL_MODULES}
+            remaining = len(all_keys - skip_set)
+            print(f"Analyzing {remaining} AWS services with 220+ cost optimization checks...")
+            print(f"⏭️ Skipping: {', '.join(sorted(skip_set))}")
+        else:
+            print(f"Analyzing {len(ALL_MODULES)} AWS services with 220+ cost optimization checks...")
+
+        orchestrator = ScanOrchestrator(self._ctx, ALL_MODULES)
+        findings = orchestrator.run(scan_only=scan_only_set, skip=skip_set)
+        builder = ScanResultBuilder(self._ctx)
+        result = builder.build(findings)
+
+        print("✅ Cost optimization scan completed successfully!")
+
+        total_recs = result["summary"]["total_recommendations"]
+        svc_count = len(result["services"])
+        print(f"📊 Found {total_recs} optimization opportunities across {svc_count} services")
+
+        return result
 
     def _scan_legacy_run(self, skip_services=None, scan_only=None) -> Dict[str, Any]:
         """Extracted from scan_region()."""
