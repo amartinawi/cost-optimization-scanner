@@ -54,10 +54,6 @@ class NetworkModule(BaseServiceModule):
             total_recommendations=total_recs,
             total_monthly_savings=savings,
             sources={
-                "elastic_ip_checks": SourceBlock(count=len(eip_recs), recommendations=tuple(eip_recs)),
-                "nat_gateway_checks": SourceBlock(count=len(nat_recs), recommendations=tuple(nat_recs)),
-                "vpc_endpoints_checks": SourceBlock(count=len(vpc_recs), recommendations=tuple(vpc_recs)),
-                "load_balancer_checks": SourceBlock(count=len(lb_recs), recommendations=tuple(lb_recs)),
-                "auto_scaling_checks": SourceBlock(count=len(asg_recs), recommendations=tuple(asg_recs)),
+                "enhanced_checks": SourceBlock(count=total_recs, recommendations=tuple(all_recs)),
             },
         )
