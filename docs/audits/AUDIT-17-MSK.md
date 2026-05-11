@@ -2,8 +2,8 @@
 
 **Date:** 2026-05-01  
 **Auditor:** Automated Audit  
-**Adapter File:** `/Users/amartinawi/Desktop/Cost_OptV1_dev/services/adapters/msk.py`  
-**Legacy Logic File:** `/Users/amartinawi/Desktop/Cost_OptV1_dev/services/msk.py`
+**Adapter File:** `services/adapters/msk.py`  
+**Legacy Logic File:** `services/msk.py`
 
 ---
 

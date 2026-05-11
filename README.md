@@ -1,7 +1,7 @@
 # AWS Cost Optimization Scanner
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Version](https://img.shields.io/badge/Version-3.0.0-blue)](https://github.com/aws-cost-optimizer/aws-cost-optimizer)
+[![Version](https://img.shields.io/badge/Version-3.0.0-blue)](https://github.com/amartinawi/cost-optimization-scanner)
 
 A production-ready, read-only AWS cost optimization scanner that analyzes **37 AWS service categories** across **all AWS regions** with **260+ automated checks**. Outputs JSON scan results and interactive HTML reports with per-service tabs, executive summary charts, and dark mode support.
 
@@ -21,7 +21,7 @@ Built for FinOps teams, DevOps engineers, and cloud architects who need actionab
 ## Architecture Overview
 
 ```
-Cost_OptV1_dev/
+cost-optimization-scanner/
   cli.py                          CLI entry point (argparse)
   cost_optimizer.py               Thin orchestration shell (134 lines)
   core/
@@ -58,8 +58,8 @@ The `ServiceModule` Protocol in `core/contracts.py` defines the adapter interfac
 ## Installation
 
 ```bash
-git clone https://github.com/aws-cost-optimizer/aws-cost-optimizer.git
-cd aws-cost-optimizer
+git clone https://github.com/amartinawi/cost-optimization-scanner.git
+cd cost-optimization-scanner
 pip install -r requirements.txt
 ```
 

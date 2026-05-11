@@ -3,7 +3,7 @@
 ## System Overview
 
 The AWS Cost Optimization Scanner is a modular Python application that performs
-220+ cost optimization checks across 28 adapter modules covering 30 AWS service
+260+ cost optimization checks across 37 adapter modules covering 37 AWS service
 categories. The system uses a clean layered architecture with typed contracts,
 a service registry, and isolated adapter modules.
 
@@ -21,8 +21,8 @@ a service registry, and isolated adapter modules.
                         |
          +----------------+----------------+
          |                |                |
-   ALL_MODULES[0]   ALL_MODULES[1]  ... ALL_MODULES[27]
-   (28 adapters in services/adapters/*.py)
+   ALL_MODULES[0]   ALL_MODULES[1]  ... ALL_MODULES[36]
+   (37 adapters in services/adapters/*.py)
          |                |                |
          +----------------+----------------+
                         |
@@ -188,7 +188,7 @@ Adapters subclass this and override only what they need.
 
 ### Adapter Files (`services/adapters/*.py`)
 
-29 files (28 adapters + `__pycache__`). Each adapter is a thin class that:
+37 adapter files (excluding `__pycache__`). Each adapter is a thin class that:
 
 1. Declares `key`, `cli_aliases`, `display_name`, `required_clients()`
 2. In `scan()`, calls one or more analysis functions from the legacy service
@@ -616,7 +616,7 @@ Based on [AWS Well-Architected Framework COST07-BP01](https://docs.aws.amazon.co
 ## File Map
 
 ```
-Cost_OptV1_dev/
+cost-optimization-scanner/
   cli.py                          (91)   CLI entry point
   cost_optimizer.py               (134)  Thin orchestration shell
   html_report_generator.py        (2454) HTML report generation
@@ -634,7 +634,7 @@ Cost_OptV1_dev/
     session.py                    (50)   AwsSessionFactory
     filtering.py                  (60)   resolve_cli_keys
   services/
-    __init__.py                   (63)   ALL_MODULES registry (28 adapters)
+    __init__.py                   (63)   ALL_MODULES registry (37 adapters)
     _base.py                      (32)   BaseServiceModule
     _savings.py                   (16)   parse_dollar_savings
     advisor.py                    (153)  Cost Hub + Compute Optimizer

@@ -1,6 +1,6 @@
 # Contributing to AWS Cost Optimization Scanner
 
-We welcome contributions. This guide covers the v3.0 modular architecture with 28 ServiceModule adapters.
+We welcome contributions. This guide covers the v3.0 modular architecture with 37 ServiceModule adapters.
 
 ## Getting Started
 
@@ -13,8 +13,8 @@ We welcome contributions. This guide covers the v3.0 modular architecture with 2
 ### Development Setup
 
 ```bash
-git clone https://github.com/aws-cost-optimizer/aws-cost-optimizer.git
-cd aws-cost-optimizer
+git clone https://github.com/amartinawi/cost-optimization-scanner.git
+cd cost-optimization-scanner
 pip install -r requirements.txt
 
 # Run tests (offline — no AWS credentials needed)
@@ -52,11 +52,11 @@ core/
   pricing_engine.py             AWS Pricing API with in-memory cache
   filtering.py                  --scan-only / --skip-service resolver
 services/
-  __init__.py                   ALL_MODULES registry (28 instances)
+  __init__.py                   ALL_MODULES registry (37 instances)
   _base.py                      BaseServiceModule default implementations
   _savings.py                   parse_dollar_savings helper
   advisor.py                    Cost Hub + Compute Optimizer utilities
-  adapters/                     28 ServiceModule adapter files
+  adapters/                     37 ServiceModule adapter files
 html_report_generator.py        HTML report generation
 reporter_phase_a.py             Descriptor-driven grouped rendering
 reporter_phase_b.py             Function registry for source handlers

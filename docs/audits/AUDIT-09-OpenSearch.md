@@ -1,7 +1,7 @@
 # Audit Report: OpenSearch Service Adapter
 
-**Adapter File:** `/Users/amartinawi/Desktop/Cost_OptV1_dev/services/adapters/opensearch.py`  
-**Legacy Module:** `/Users/amartinawi/Desktop/Cost_OptV1_dev/services/opensearch.py`  
+**Adapter File:** `services/adapters/opensearch.py`  
+**Legacy Module:** `services/opensearch.py`  
 **Audit Date:** 2026-05-01  
 **Auditor:** Automated Audit  
 

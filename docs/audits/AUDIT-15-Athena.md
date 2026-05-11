@@ -2,8 +2,8 @@
 
 **Auditor:** OpenCode AI Agent  
 **Date:** 2026-05-01  
-**Adapter:** `/Users/amartinawi/Desktop/Cost_OptV1_dev/services/adapters/athena.py`  
-**Related:** `/Users/amartinawi/Desktop/Cost_OptV1_dev/services/athena.py` (legacy shim)  
+**Adapter:** `services/adapters/athena.py`  
+**Related:** `services/athena.py` (legacy shim)  
 
 ---
 

@@ -23,7 +23,7 @@ You are a senior code auditor. Strict, evidence-based, zero-fabrication.
 
 ## Codebase
 
-`/Users/amartinawi/Desktop/Cost_OptV1_dev/`
+Repository root (relative paths used throughout).
 
 ---
 

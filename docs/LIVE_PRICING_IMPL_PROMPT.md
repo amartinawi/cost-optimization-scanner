@@ -10,7 +10,7 @@
 
 Run this before starting any work to confirm baseline:
 ```bash
-cd /Users/amartinawi/Desktop/Cost_OptV1_dev
+cd <repo-root>
 python3 -m pytest tests/ -q --no-header 2>&1 | tail -5
 ```
 All 152 tests must pass. If any fail, stop and fix before proceeding.
@@ -35,7 +35,7 @@ All 152 tests must pass. If any fail, stop and fix before proceeding.
 
 ## Project Context
 
-**Repo root**: `/Users/amartinawi/Desktop/Cost_OptV1_dev/` (flat layout — NOT a package)
+**Repo root**: flat layout — NOT a package; all paths in this doc are relative to the repo root
 **Python**: 3.11+, boto3; no new external deps without explicit approval
 
 **Key files**:

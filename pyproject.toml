@@ -1,7 +1,7 @@
 [project]
-name = "aws-cost-optimization"
+name = "cost-optimization-scanner"
 version = "3.0.0"
-description = "AWS Cost Optimization Scanner — 30 services, 220+ checks"
+description = "AWS Cost Optimization Scanner — 37 services, 260+ checks"
 requires-python = ">=3.11"
 license = "MIT"
 

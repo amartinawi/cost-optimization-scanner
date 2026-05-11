@@ -1,7 +1,7 @@
 # AUDIT-20: Step Functions Service Adapter
 
-**Adapter File:** `/Users/amartinawi/Desktop/Cost_OptV1_dev/services/adapters/step_functions.py`  
-**Legacy Module:** `/Users/amartinawi/Desktop/Cost_OptV1_dev/services/step_functions.py`  
+**Adapter File:** `services/adapters/step_functions.py`  
+**Legacy Module:** `services/step_functions.py`  
 **Audit Date:** 2026-05-01  
 **Auditor:** AI Agent  
 **Verdict:** ⚠️ WARN — Multiple Issues Detected
