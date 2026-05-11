@@ -53,7 +53,7 @@ def get_detailed_cost_hub_recommendations(
 
     cost_hub = ctx.client("cost-optimization-hub", region="us-east-1")
     if not cost_hub:
-        print("ℹ️ Cost Optimization Hub unavailable - continuing with other optimization sources")
+        logger.info("Cost Optimization Hub unavailable - continuing with other optimization sources")
         return recommendations
 
     try:
@@ -83,7 +83,7 @@ def get_detailed_cost_hub_recommendations(
                     recommendations.append(rec)
 
     except Exception as e:
-        print(f"Warning: Cost Optimization Hub error: {e}")
+        ctx.warn(f"Cost Optimization Hub error: {e}", service="cost_optimization_hub")
     return recommendations
 
 
