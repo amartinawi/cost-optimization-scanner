@@ -28,8 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **Future Roadmap** (`docs/ROADMAP.md`): 28-capability research-backed roadmap across 4 phases, covering Compute Optimizer integration, Cost Optimization Hub, Aurora checks, Savings Plans analysis, AI/ML cost visibility, EKS/Kubernetes, FOCUS 1.2 export, multi-account support, and more
-- **Service Audit Reports** (`docs/audits/`): Cross-service audit results for all 28 adapters (3 PASS, 22 WARN, 1 FAIL)
-- **Live Pricing Implementation Tracker** (`docs/LIVE_PRICING_IMPL_PROMPT.md`): Phase-by-phase status of PricingEngine migration
+- **Service Audit Reports** (`docs/audits/REPORT.md`): Consolidated cross-service audit results for all 28 adapters (3 PASS, 22 WARN, 1 FAIL)
 
 ### Changed
 - **CLAUDE.md (root)**: Rewritten as lean project quick-reference; agent policy moved to `AGENTS.md` as canonical source

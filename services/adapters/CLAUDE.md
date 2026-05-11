@@ -54,4 +54,3 @@ Extract dollar amounts from recommendation text or use keyword-based estimates:
 3. Multiply by `ctx.pricing_multiplier` for regional adjustment
 4. Wrap in try/except — fall back to `flat_rate × ctx.pricing_multiplier` on failure
 5. If using CloudWatch metrics, check `ctx.fast_mode` first
-

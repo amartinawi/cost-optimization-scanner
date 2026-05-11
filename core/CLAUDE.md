@@ -47,4 +47,3 @@ Centralized AWS Pricing API access. Key design:
 price = ctx.pricing_engine.get_ec2_instance_monthly_price("m5.xlarge")
 monthly = price * ctx.pricing_multiplier
 ```
-

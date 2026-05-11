@@ -170,6 +170,9 @@ Audit/
 backup_*/
 backup_[0-9]*/
 
+# Customer data (never commit real scans)
+tests/fixtures/real_reports/
+
 # Temporary files
 *.tmp
 *.temp
