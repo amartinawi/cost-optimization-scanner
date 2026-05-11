@@ -720,12 +720,20 @@ def get_advanced_ec2_checks(
                                     size_gb = volume.get("Size", 0)
 
                                     if size_gb > 100:
+                                        volume_type = volume.get("VolumeType", "gp2")
+                                        gb_rate = (
+                                            ctx.pricing_engine.get_ebs_monthly_price_per_gb(volume_type)
+                                            if ctx.pricing_engine
+                                            else 0.10 * ctx.pricing_multiplier
+                                        )
+                                        root_savings = max(size_gb - 20, 0) * gb_rate
                                         checks["oversized_root_volumes"].append(
                                             {
                                                 "InstanceId": instance_id,
                                                 "InstanceType": instance_type,
                                                 "RootVolumeSize": f"{size_gb}GB",
                                                 "VolumeId": volume_id,
+                                                "VolumeType": volume_type,
                                                 "Recommendation": (
                                                     f"Root volume ({size_gb}GB)"
                                                     " may be oversized -"
@@ -733,7 +741,7 @@ def get_advanced_ec2_checks(
                                                     " separate data volumes"
                                                 ),
                                                 "EstimatedSavings": (
-                                                    f"${(size_gb - 20) * 0.10:.2f}"
+                                                    f"${root_savings:.2f}"
                                                     "/month if reduced to 20GB"
                                                     " + separate data volume"
                                                 ),

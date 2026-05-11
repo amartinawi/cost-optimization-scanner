@@ -18,6 +18,7 @@ class EC2Module(BaseServiceModule):
     cli_aliases: tuple[str, ...] = ("ec2",)
     display_name: str = "EC2"
     reads_fast_mode: bool = True
+    requires_cloudwatch: bool = True
 
     def required_clients(self) -> tuple[str, ...]:
         """Returns boto3 client names required for EC2 scanning."""

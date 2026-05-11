@@ -43,10 +43,9 @@ def _render_ec2_enhanced_checks(recommendations: List[Rec], source_name: str, se
         ):
             continue
 
-        if "CheckCategory" in rec and "Spot" in rec.get("CheckCategory", ""):
-            continue
-        if "Recommendation" in rec and "spot instance" in rec.get("Recommendation", "").lower():
-            continue
+        # Spot-related recommendations are intentionally rendered: they count
+        # toward total_recommendations and total_monthly_savings at the adapter
+        # layer, so dropping them here would desync the headline from the table.
         finding = rec.get("finding", rec.get("instanceFinding", rec.get("InstanceFinding", ""))).lower()
         if finding == "optimized":
             continue
@@ -94,8 +93,7 @@ def _render_ec2_cost_hub(recommendations: List[Rec], source_name: str, service_d
             or "ecs" in all_text
         ):
             continue
-        if "Recommendation" in rec and "spot instance" in rec.get("Recommendation", "").lower():
-            continue
+        # Spot recs are kept (adapter already counted them); see _render_ec2_enhanced_checks.
         finding = rec.get("finding", "").lower()
         if finding == "optimized":
             continue
@@ -985,11 +983,7 @@ def render_generic_per_rec(service_key: str, recommendations: List[Rec], source_
     """
     content = ""
     for rec in recommendations:
-        if "CheckCategory" in rec and "Spot" in rec.get("CheckCategory", ""):
-            continue
-        if "Recommendation" in rec and "spot instance" in rec.get("Recommendation", "").lower():
-            continue
-
+        # Spot recs are kept (adapter already counted them); see _render_ec2_enhanced_checks.
         finding = rec.get("finding", rec.get("instanceFinding", rec.get("InstanceFinding", ""))).lower()
         if finding == "optimized":
             continue

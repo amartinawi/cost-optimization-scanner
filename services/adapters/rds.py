@@ -6,7 +6,7 @@ from typing import Any
 
 from core.contracts import ServiceFindings, SourceBlock
 from services._base import BaseServiceModule
-from services._savings import parse_dollar_savings
+from services._savings import compute_optimizer_savings, parse_dollar_savings
 from services.rds import (
     RDS_OPTIMIZATION_DESCRIPTIONS,
     get_enhanced_rds_checks,
@@ -60,7 +60,7 @@ class RdsModule(BaseServiceModule):
             print(f"Warning: [rds] instance count failed: {e}")
 
         savings = 0.0
-        savings += sum(r.get("estimatedMonthlySavings", 0) for r in co_recs)
+        savings += sum(compute_optimizer_savings(r) for r in co_recs)
         for rec in enhanced_recs:
             est = rec.get("EstimatedSavings", "")
             if "$" in est and "/month" in est:
