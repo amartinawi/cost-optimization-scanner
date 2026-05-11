@@ -14,11 +14,35 @@ Extracted from:
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from core.scan_context import ScanContext
 
-print("🔍 [services/advisor.py] Advisor module active")
+logger = logging.getLogger(__name__)
+
+
+def _compute_optimizer_opt_in_rec(service_label: str, action_summary: str) -> dict[str, Any]:
+    """Build a synthetic Compute-Optimizer-disabled placeholder rec.
+
+    The placeholder carries zero quantified savings (estimatedMonthlySavings = 0.0)
+    so downstream aggregators read the same flat-float schema as real AWS responses
+    rather than parsing a prose string.
+    """
+    return {
+        "ResourceId": "compute-optimizer-service",
+        "ResourceType": "Service Configuration",
+        "Issue": "AWS Compute Optimizer not enabled",
+        "Recommendation": f"Enable AWS Compute Optimizer for {service_label} {action_summary} recommendations",
+        "estimatedMonthlySavings": 0.0,
+        "currencyCode": "USD",
+        "Action": (
+            "Go to AWS Compute Optimizer console and opt-in to receive"
+            f" {service_label} {action_summary} recommendations"
+        ),
+        "Priority": "Medium",
+        "Service": "Compute Optimizer",
+    }
 
 
 def get_detailed_cost_hub_recommendations(
@@ -77,19 +101,9 @@ def get_ec2_compute_optimizer_recommendations(
             response = compute_optimizer.get_ec2_instance_recommendations(nextToken=response["nextToken"])
             recommendations.extend(response["instanceRecommendations"])
     except Exception as e:
-        print(f"Warning: Compute Optimizer not available: {e}")
+        logger.warning("Compute Optimizer not available: %s", e)
         if "OptInRequiredException" in str(e) or "not registered" in str(e):
-            opt_in_recommendation = {
-                "ResourceId": "compute-optimizer-service",
-                "ResourceType": "Service Configuration",
-                "Issue": "AWS Compute Optimizer not enabled",
-                "Recommendation": ("Enable AWS Compute Optimizer for EC2 recommendations"),
-                "EstimatedMonthlySavings": ("Variable - up to 25% on EC2 instances"),
-                "Action": ("Go to AWS Compute Optimizer console and opt-in to receive EC2 rightsizing recommendations"),
-                "Priority": "Medium",
-                "Service": "Compute Optimizer",
-            }
-            recommendations.append(opt_in_recommendation)
+            recommendations.append(_compute_optimizer_opt_in_rec("EC2", "rightsizing"))
     return recommendations
 
 
@@ -107,19 +121,9 @@ def get_ebs_compute_optimizer_recommendations(
             response = compute_optimizer.get_ebs_volume_recommendations(nextToken=response["nextToken"])
             recommendations.extend(response["volumeRecommendations"])
     except Exception as e:
-        print(f"Warning: EBS Compute Optimizer not available: {e}")
+        logger.warning("EBS Compute Optimizer not available: %s", e)
         if "OptInRequiredException" in str(e) or "not registered" in str(e):
-            opt_in_recommendation = {
-                "ResourceId": "compute-optimizer-service",
-                "ResourceType": "Service Configuration",
-                "Issue": "AWS Compute Optimizer not enabled",
-                "Recommendation": "Enable AWS Compute Optimizer for EBS recommendations",
-                "EstimatedMonthlySavings": "Variable - up to 20% on EBS volumes",
-                "Action": ("Go to AWS Compute Optimizer console and opt-in to receive EBS rightsizing recommendations"),
-                "Priority": "Medium",
-                "Service": "Compute Optimizer",
-            }
-            recommendations.append(opt_in_recommendation)
+            recommendations.append(_compute_optimizer_opt_in_rec("EBS", "rightsizing"))
     return recommendations
 
 
@@ -137,17 +141,7 @@ def get_rds_compute_optimizer_recommendations(
             response = compute_optimizer.get_rds_database_recommendations(nextToken=response["nextToken"])
             recommendations.extend(response["rdsDBRecommendations"])
     except Exception as e:
-        print(f"Warning: RDS Compute Optimizer not available: {e}")
+        logger.warning("RDS Compute Optimizer not available: %s", e)
         if "OptInRequiredException" in str(e) or "not registered" in str(e):
-            opt_in_recommendation = {
-                "ResourceId": "compute-optimizer-service",
-                "ResourceType": "Service Configuration",
-                "Issue": "AWS Compute Optimizer not enabled",
-                "Recommendation": ("Enable AWS Compute Optimizer for RDS recommendations"),
-                "EstimatedMonthlySavings": "Variable - up to 25% on RDS instances",
-                "Action": ("Go to AWS Compute Optimizer console and opt-in to receive RDS rightsizing recommendations"),
-                "Priority": "Medium",
-                "Service": "Compute Optimizer",
-            }
-            recommendations.append(opt_in_recommendation)
+            recommendations.append(_compute_optimizer_opt_in_rec("RDS", "rightsizing"))
     return recommendations

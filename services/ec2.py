@@ -6,12 +6,15 @@ This module will later become Ec2Module (T-316) implementing ServiceModule.
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from botocore.exceptions import ClientError  # type: ignore[import-untyped]
 
 from core.scan_context import ScanContext
+
+logger = logging.getLogger(__name__)
 
 # Per-check reduction factors used to convert an instance's on-demand monthly
 # cost into an estimated saving. Calibrated against typical AWS rightsizing
@@ -58,7 +61,7 @@ def get_ec2_instance_count(ctx: ScanContext) -> int:
         Total number of EC2 instances in the region.
         Returns 0 on errors (with warning messages).
     """
-    print("🔍 [services/ec2.py] EC2 module active")
+    logger.debug("EC2 module active")
     ec2 = ctx.client("ec2")
     try:
         paginator = ec2.get_paginator("describe_instances")
@@ -69,15 +72,19 @@ def get_ec2_instance_count(ctx: ScanContext) -> int:
         return count
     except ClientError as e:
         error_code = e.response["Error"]["Code"]
-        if error_code == "UnauthorizedOperation":
-            print("Warning: Missing IAM permission for describe_instances")
+        if error_code in ("UnauthorizedOperation", "AccessDenied"):
+            ctx.permission_issue(
+                f"Missing IAM permission for describe_instances: {error_code}",
+                service="ec2",
+                action="ec2:DescribeInstances",
+            )
         elif error_code == "RequestLimitExceeded":
-            print("Warning: Rate limit exceeded for describe_instances (retries exhausted)")
+            ctx.warn("Rate limit exceeded for describe_instances (retries exhausted)", service="ec2")
         else:
-            print(f"Warning: Could not get EC2 instance count: {e}")
+            ctx.warn(f"Could not get EC2 instance count: {e}", service="ec2")
         return 0
     except Exception as e:
-        print(f"Warning: Unexpected error getting EC2 instance count: {e}")
+        ctx.warn(f"Unexpected error getting EC2 instance count: {e}", service="ec2")
         return 0
 
 
@@ -110,7 +117,7 @@ def _is_eks_nodegroup_asg(asg_name: str, tags: dict[str, str]) -> bool:
         return False
 
     except Exception as e:
-        print(f"⚠️ Error checking EKS nodegroup for {asg_name}: {str(e)}")
+        logger.debug("Error checking EKS nodegroup for %s: %s", asg_name, e)
         return False
 
 
@@ -136,11 +143,18 @@ def _is_eks_managed_instance(tags: dict[str, str]) -> bool:
 def get_enhanced_ec2_checks(
     ctx: ScanContext,
     pricing_multiplier: float,
+    fast_mode: bool = False,
 ) -> dict[str, Any]:
-    """Get enhanced EC2 cost optimization checks."""
+    """Get enhanced EC2 cost optimization checks.
+
+    When ``fast_mode`` is True, skips all CloudWatch metric queries and the
+    Auto Scaling membership probe — emitting only the cheap structural checks
+    (previous-generation t2 family, dedicated tenancy, stopped instances).
+    This matches the public ``--fast`` contract documented in README.
+    """
     ec2 = ctx.client("ec2")
-    cloudwatch = ctx.client("cloudwatch", ctx.region)
-    autoscaling = ctx.client("autoscaling", ctx.region)
+    cloudwatch = ctx.client("cloudwatch", ctx.region) if not fast_mode else None
+    autoscaling = ctx.client("autoscaling", ctx.region) if not fast_mode else None
     checks: dict[str, list[dict[str, Any]]] = {
         "idle_instances": [],
         "rightsizing_opportunities": [],
@@ -169,6 +183,9 @@ def get_enhanced_ec2_checks(
                         try:
                             end_time = datetime.now(UTC)
                             start_time = end_time - timedelta(days=7)
+
+                            if cloudwatch is None:
+                                raise RuntimeError("fast_mode: CloudWatch skipped")
 
                             cpu_response = cloudwatch.get_metric_statistics(
                                 Namespace="AWS/EC2",
@@ -228,21 +245,28 @@ def get_enhanced_ec2_checks(
                                     )
 
                         except Exception:
-                            checks["rightsizing_opportunities"].append(
-                                {
-                                    "InstanceId": instance_id,
-                                    "InstanceType": instance_type,
-                                    "Recommendation": (
-                                        "Enable detailed CloudWatch monitoring"
-                                        " to analyze utilization for"
-                                        " rightsizing opportunities"
-                                    ),
-                                    "EstimatedSavings": "$0.00/month - enable CloudWatch monitoring to quantify",
-                                    "CheckCategory": "Monitoring Required",
-                                }
-                            )
+                            if cloudwatch is None:
+                                # fast_mode intentionally skips CloudWatch — don't emit a noisy
+                                # "enable monitoring" rec for every running instance.
+                                pass
+                            else:
+                                checks["rightsizing_opportunities"].append(
+                                    {
+                                        "InstanceId": instance_id,
+                                        "InstanceType": instance_type,
+                                        "Recommendation": (
+                                            "Enable detailed CloudWatch monitoring"
+                                            " to analyze utilization for"
+                                            " rightsizing opportunities"
+                                        ),
+                                        "EstimatedSavings": "$0.00/month - enable CloudWatch monitoring to quantify",
+                                        "CheckCategory": "Monitoring Required",
+                                    }
+                                )
 
                         try:
+                            if autoscaling is None:
+                                raise RuntimeError("fast_mode: AutoScaling probe skipped")
                             asg_response = autoscaling.describe_auto_scaling_instances(InstanceIds=[instance_id])
                             if not asg_response.get("AutoScalingInstances"):
                                 instance_name = ""
@@ -278,8 +302,22 @@ def get_enhanced_ec2_checks(
                                             "CheckCategory": ("Auto Scaling Missing"),
                                         }
                                     )
-                        except Exception:
-                            pass
+                        except ClientError as ec:
+                            code = ec.response.get("Error", {}).get("Code", "")
+                            if code in ("UnauthorizedOperation", "AccessDenied"):
+                                ctx.permission_issue(
+                                    f"describe_auto_scaling_instances denied: {code}",
+                                    service="ec2",
+                                    action="autoscaling:DescribeAutoScalingInstances",
+                                )
+                            elif code:
+                                logger.debug(
+                                    "ASG probe failed for %s: %s",
+                                    instance_id,
+                                    code,
+                                )
+                        except Exception as e:
+                            logger.debug("ASG probe failed for %s: %s", instance_id, e)
 
                         if instance_type.startswith("t2."):
                             prevgen_savings = _compute_ec2_savings(
@@ -312,11 +350,14 @@ def get_enhanced_ec2_checks(
                                 }
                             )
 
-                        if instance_type.startswith(("t2.", "t3.", "t4g.")):
+                        if instance_type.startswith(("t2.", "t3.", "t4g.")) and cloudwatch is not None:
                             try:
                                 end_time = datetime.now(UTC)
                                 start_time = end_time - timedelta(days=7)
 
+                                # CPUCreditBalance publishes at 5-min frequency only — use Period=300
+                                # with Minimum statistic to surface short credit droughts that hourly
+                                # averaging would smooth over.
                                 credit_response = cloudwatch.get_metric_statistics(
                                     Namespace="AWS/EC2",
                                     MetricName="CPUCreditBalance",
@@ -328,7 +369,7 @@ def get_enhanced_ec2_checks(
                                     ],
                                     StartTime=start_time,
                                     EndTime=end_time,
-                                    Period=3600,
+                                    Period=300,
                                     Statistics=["Average", "Minimum"],
                                 )
 
@@ -449,7 +490,7 @@ def get_enhanced_ec2_checks(
                         )
 
     except Exception as e:
-        print(f"Warning: Could not perform enhanced EC2 checks: {e}")
+        ctx.warn(f"Could not perform enhanced EC2 checks: {e}", service="ec2")
 
     recommendations: list[dict[str, Any]] = []
     for _category, items in checks.items():
@@ -517,7 +558,8 @@ def get_auto_scaling_checks(ctx: ScanContext) -> dict[str, Any]:
                                 " dynamic scaling"
                             ),
                             "EstimatedSavings": (
-                                "Potential 20-40% savings through dynamic scaling based on workload demand"
+                                "$0.00/month - quantify via per-node price ×"
+                                " expected scale-down hours"
                             ),
                             "Action": (
                                 "1. Install Cluster Autoscaler or Karpenter\n"
@@ -541,7 +583,8 @@ def get_auto_scaling_checks(ctx: ScanContext) -> dict[str, Any]:
                                 "ASG not configured for scaling - consider fixed EC2 instances or enable scaling"
                             ),
                             "EstimatedSavings": (
-                                "Remove ASG overhead, use Reserved Instances, or enable dynamic scaling"
+                                "$0.00/month - quantify after switch to Reserved"
+                                " Instances or dynamic scaling"
                             ),
                             "Action": (
                                 "1. Evaluate if scaling is needed\n"
@@ -561,7 +604,10 @@ def get_auto_scaling_checks(ctx: ScanContext) -> dict[str, Any]:
                         "Environment": environment,
                         "MinSize": min_size,
                         "Recommendation": ("Non-prod ASG running 24/7 - implement shutdown schedule"),
-                        "EstimatedSavings": ("65-75% savings with 12-hour daily shutdown"),
+                        "EstimatedSavings": (
+                            "$0.00/month - quantify via per-instance price ×"
+                            " (730 - shutdown_hours_per_month)"
+                        ),
                         "CheckCategory": "Non-Prod 24/7 ASGs",
                     }
                 )
@@ -584,13 +630,16 @@ def get_auto_scaling_checks(ctx: ScanContext) -> dict[str, Any]:
                                 "AutoScalingGroupName": asg_name,
                                 "InstanceType": instance_type,
                                 "Recommendation": ("Large instance type in ASG - verify rightsizing"),
-                                "EstimatedSavings": ("Potential 20-50% savings with rightsizing"),
+                                "EstimatedSavings": (
+                                    f"${_compute_ec2_savings(ctx, instance_type, 'Rightsizing Opportunities'):.2f}"
+                                    "/month per node if rightsized"
+                                ),
                                 "CheckCategory": "Oversized ASG Instances",
                             }
                         )
 
                 except Exception as e:
-                    print(f"Warning: Could not analyze launch template for {asg_name}: {e}")
+                    ctx.warn(f"Could not analyze launch template for {asg_name}: {e}", service="ec2")
 
             try:
                 policies_response = autoscaling.describe_policies(AutoScalingGroupName=asg_name)
@@ -606,16 +655,16 @@ def get_auto_scaling_checks(ctx: ScanContext) -> dict[str, Any]:
                             "ScaleOutPolicies": len(scale_out_policies),
                             "ScaleInPolicies": len(scale_in_policies),
                             "Recommendation": ("ASG has scale-out but no scale-in policies"),
-                            "EstimatedSavings": ("Prevent cost accumulation from scaling events"),
+                            "EstimatedSavings": "$0.00/month - prevents future cost spikes",
                             "CheckCategory": "Missing Scale-In Policies",
                         }
                     )
 
             except Exception as e:
-                print(f"Warning: Could not get Auto Scaling policies: {e}")
+                ctx.warn(f"Could not get Auto Scaling policies for {asg_name}: {e}", service="ec2")
 
     except Exception as e:
-        print(f"Warning: Could not perform Auto Scaling checks: {e}")
+        ctx.warn(f"Could not perform Auto Scaling checks: {e}", service="ec2")
 
     recommendations: list[dict[str, Any]] = []
     for _category, items in checks.items():
@@ -630,9 +679,14 @@ def get_advanced_ec2_checks(
     pricing_multiplier: float,
     fast_mode: bool,
 ) -> dict[str, Any]:
-    """Category 6: EC2 Advanced optimization checks."""
+    """Category 6: EC2 Advanced optimization checks.
+
+    When ``fast_mode`` is True, the per-instance ``describe_volumes`` enrichment
+    used by the Oversized Root Volumes check is skipped. Name-pattern checks
+    (cron/batch/monitoring/instance-store) still run because they read only the
+    fields already returned by ``describe_instances``.
+    """
     ec2 = ctx.client("ec2")
-    ctx.client("cloudwatch", ctx.region)
     checks: dict[str, list[dict[str, Any]]] = {
         "no_network_traffic": [],
         "cron_job_instances": [],
@@ -705,6 +759,11 @@ def get_advanced_ec2_checks(
                             }
                         )
 
+                    if fast_mode:
+                        # Skip the per-instance describe_volumes enrichment;
+                        # name-pattern checks above still run.
+                        continue
+
                     for bdm in instance.get("BlockDeviceMappings", []):
                         if bdm.get("DeviceName") in [
                             "/dev/sda1",
@@ -750,7 +809,7 @@ def get_advanced_ec2_checks(
                                         )
 
                                 except Exception as e:
-                                    print(f"Warning: Could not get volume details for {volume_id}: {e}")
+                                    ctx.warn(f"Could not get volume details for {volume_id}: {e}", service="ec2")
 
                     if any(
                         family in instance_type
@@ -815,7 +874,7 @@ def get_advanced_ec2_checks(
                         )
 
     except Exception as e:
-        print(f"Warning: Could not perform Advanced EC2 checks: {e}")
+        ctx.warn(f"Could not perform Advanced EC2 checks: {e}", service="ec2")
 
     recommendations: list[dict[str, Any]] = []
     for _category, items in checks.items():

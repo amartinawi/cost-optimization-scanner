@@ -60,15 +60,22 @@ def _render_ec2_enhanced_checks(recommendations: List[Rec], source_name: str, se
         content += f'<div class="rec-item{_priority_class(recs[0])}">'
         content += f"<h5>{category} ({len(recs)} resources)</h5>"
         content += f"<p><strong>Recommendation:</strong> {recs[0].get('Recommendation', 'Optimize resource')}</p>"
-        content += f'<p class="savings"><strong>Estimated Savings:</strong> {recs[0].get("EstimatedSavings", "Cost optimization")}</p>'
         content += "<p><strong>Affected Resources:</strong></p><ul>"
         for rec in recs:
             resource_id = rec.get("InstanceId", rec.get("ImageId", rec.get("AllocationId", "Resource")))
             instance_type = rec.get("InstanceType", "")
+            savings = rec.get("EstimatedSavings", "")
+            # Per-instance utilization details when available (idle/rightsizing/burstable).
+            details: List[str] = []
             if instance_type:
-                content += f"<li>{resource_id} ({instance_type})</li>"
-            else:
-                content += f"<li>{resource_id}</li>"
+                details.append(instance_type)
+            if rec.get("AvgCPU"):
+                details.append(f"avg CPU {rec['AvgCPU']}")
+            if rec.get("MaxCPU"):
+                details.append(f"max CPU {rec['MaxCPU']}")
+            detail_str = f" ({', '.join(details)})" if details else ""
+            savings_str = f" — <span class=\"savings\">{savings}</span>" if savings else ""
+            content += f"<li>{resource_id}{detail_str}{savings_str}</li>"
         content += "</ul></div>"
     return content
 

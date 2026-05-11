@@ -5,10 +5,8 @@
       "recommendationType": "ComputeSavingsPlans",
       "currentResourceType": "SavingsPlans",
       "recommendedResourceType": "SavingsPlans",
-      "estimatedMonthlySavings": {
-        "currency": "USD",
-        "value": 150.00
-      },
+      "estimatedMonthlySavings": 150.00,
+      "currencyCode": "USD",
       "region": "us-east-1"
     },
     {
@@ -16,10 +14,8 @@
       "recommendationType": "RdsComputeSavingsPlans",
       "currentResourceType": "SavingsPlans",
       "recommendedResourceType": "SavingsPlans",
-      "estimatedMonthlySavings": {
-        "currency": "USD",
-        "value": 75.00
-      },
+      "estimatedMonthlySavings": 75.00,
+      "currencyCode": "USD",
       "region": "us-east-1"
     },
     {
@@ -27,10 +23,8 @@
       "recommendationType": "Ec2InstanceSavingsPlans",
       "currentResourceType": "SavingsPlans",
       "recommendedResourceType": "SavingsPlans",
-      "estimatedMonthlySavings": {
-        "currency": "USD",
-        "value": 200.00
-      },
+      "estimatedMonthlySavings": 200.00,
+      "currencyCode": "USD",
       "region": "us-east-1"
     },
     {
@@ -38,10 +32,8 @@
       "recommendationType": "UnknownResourceType",
       "currentResourceType": "Unknown",
       "recommendedResourceType": "Unknown",
-      "estimatedMonthlySavings": {
-        "currency": "USD",
-        "value": 30.00
-      },
+      "estimatedMonthlySavings": 30.00,
+      "currencyCode": "USD",
       "region": "us-east-1"
     }
   ],

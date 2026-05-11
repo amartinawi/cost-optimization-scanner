@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from core.contracts import ServiceFindings, SourceBlock
@@ -9,6 +10,8 @@ from services._base import BaseServiceModule
 from services._savings import compute_optimizer_savings, parse_dollar_savings
 from services.advisor import get_ec2_compute_optimizer_recommendations
 from services.ec2 import get_advanced_ec2_checks, get_ec2_instance_count, get_enhanced_ec2_checks
+
+logger = logging.getLogger(__name__)
 
 
 class EC2Module(BaseServiceModule):
@@ -38,11 +41,11 @@ class EC2Module(BaseServiceModule):
             ServiceFindings with "cost_optimization_hub", "compute_optimizer",
             "enhanced_checks", and "advanced_ec2_checks" SourceBlock entries.
         """
-        print("\U0001f50d [services/adapters/ec2.py] EC2 module active")
+        logger.debug("EC2 adapter scan starting")
 
         cost_hub_recs = ctx.cost_hub_splits.get("ec2", [])
         co_recs = get_ec2_compute_optimizer_recommendations(ctx)
-        enhanced_result = get_enhanced_ec2_checks(ctx, ctx.pricing_multiplier)
+        enhanced_result = get_enhanced_ec2_checks(ctx, ctx.pricing_multiplier, ctx.fast_mode)
         enhanced_recs = enhanced_result.get("recommendations", [])
         advanced_result = get_advanced_ec2_checks(ctx, ctx.pricing_multiplier, ctx.fast_mode)
         advanced_recs = advanced_result.get("recommendations", [])

@@ -41,7 +41,8 @@ STUB_RESPONSES: Dict[str, Dict[str, Dict[str, Any]]] = {
             "recommendationId": "stub-id",
             "currentResourceType": "Ec2Instance",
             "recommendedResourceType": "Ec2Instance",
-            "estimatedMonthlySavings": {"currency": "USD", "value": 0.0},
+            "estimatedMonthlySavings": 0.0,
+            "currencyCode": "USD",
         },
     },
     "compute-optimizer": {
