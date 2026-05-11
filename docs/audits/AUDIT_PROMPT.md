@@ -18,10 +18,45 @@
 **Evidence rule**: every finding must cite `file:line` (e.g. `services/adapters/ec2.py:55`) — no exceptions.
 **Severity rule**: use exactly one of `CRITICAL | HIGH | MEDIUM | LOW | INFO`.
 **Verdict rule**: per layer, one of `PASS | CONDITIONAL-PASS | WARN | FAIL`. Overall = worst of three.
+**External-validation rule**: every CRITICAL or HIGH finding in L2 (Calculation) MUST be corroborated by at least one external source (AWS Pricing MCP, AWS docs via WebFetch, or boto3 reference via Context7). Cite the URL/MCP tool call so the finding is reproducible. See Section 0.1.
 
 ---
 
 ## 0. Pre-flight: Anchor the audit (always run first)
+
+### 0.1 — External validation toolchain
+
+Before writing any finding, the auditor MUST be ready to invoke these external sources. They turn "the code says X" into "the code says X **and** AWS/boto3 says Y, so the gap is real":
+
+| Tool | When to use | Example call |
+|------|------------|--------------|
+| `mcp__aws-pricing-mcp-server__get_pricing_service_codes` | Discover the canonical AWS service code for a service (verify adapter uses the right one) | one-shot at audit start |
+| `mcp__aws-pricing-mcp-server__get_pricing_service_attributes` | List filterable attributes for a service to verify adapter filter logic | `get_pricing_service_attributes('AmazonEC2')` |
+| `mcp__aws-pricing-mcp-server__get_pricing_attribute_values` | Confirm an attribute value used in the adapter is legal | `get_pricing_attribute_values('AmazonEC2', 'instanceType')` |
+| `mcp__aws-pricing-mcp-server__get_pricing` | Fetch a live price to compare against the adapter's hardcoded / parsed value | `get_pricing('AmazonEC2', 'us-east-1', [...])` |
+| `mcp__aws-pricing-mcp-server__get_price_list_urls` | Bulk pricing snapshots when L2-005-style hardcoded constants need point-in-time validation | rare |
+| `mcp__aws-pricing-mcp-server__get_bedrock_patterns` | Bedrock service only — required by the MCP server's own instructions | bedrock audit only |
+| `mcp__aws-cloudwatch-mcp-server__get_metric_metadata` | Verify a CloudWatch namespace + metric name the adapter queries actually exists | EC2 audit: `AWS/EC2 / CPUUtilization` |
+| `mcp__aws-cloudwatch-mcp-server__get_metric_data` | Sanity-check a metric query pattern (e.g. periodicity, statistic) | sparingly |
+| `WebFetch` | Fetch a specific AWS docs page (boto3 reference, pricing page, API schema) — prefer over WebSearch when you already know the URL | `WebFetch("https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/compute-optimizer/client/get_ec2_instance_recommendations.html")` |
+| `WebSearch` | Find a doc page when you don't know the URL, or sanity-check that a behavior is documented | `"AWS Compute Optimizer estimatedMonthlySavings response schema"` |
+| `mcp__Context7__resolve-library-id` + `query-docs` | boto3 / botocore API references for fields, defaults, pagination | `resolve-library-id('boto3')` → `query-docs(<id>, 'EC2 describe_instances pagination')` |
+| `mcp__github__search_code` | Search GitHub for canonical reference implementations or AWS samples to compare against | optional |
+
+**Disconnected MCPs to avoid** (do not call, they will fail):
+- `mcp__aws-knowledge-mcp-server__*` — disconnected in this environment; use `WebFetch` on `docs.aws.amazon.com` URLs instead.
+
+**Validation cadence**:
+- **L1 Technical**: no external validation required — pure code inspection. May use `Context7` for boto3 method signatures.
+- **L2 Calculation**: external validation **mandatory** for every CRITICAL/HIGH finding (pricing constants, schema fields, units, regional behavior).
+- **L3 Reporting**: external validation **optional** — focus on internal field-name parity with renderers.
+
+**Recording external evidence**: each cited external source must appear in the report as:
+```
+External: <tool name> → <URL or key argument> → <one-sentence summary of what it confirmed>
+```
+
+### 0.2 — Codebase anchor files
 
 Read these to ground the audit:
 
@@ -174,7 +209,24 @@ Recommendation type → Source classification → Evidence (file:line)
 | L2.6.1 | Two consecutive scans of the same account/region produce the same `total_monthly_savings` (within ±$0.01 from API jitter) | run twice with same fixtures, diff |
 | L2.6.2 | Golden snapshot `tests/fixtures/reporter_snapshots/savings/<SERVICE>.txt` matches a fresh offline scan | `pytest tests/test_reporter_snapshots.py -k <SERVICE>` passes |
 
-**L2 verdict**: `PASS` only if every L2.* checks pass. Any `arbitrary`-classified value → `FAIL`. Any L2.2 unit error → `FAIL`. Any L2.3.1 double-multiplier → `HIGH` and `WARN` minimum. Any L2.5.2 double-count → `HIGH` and `WARN` minimum.
+### L2.7 — External validation (MANDATORY for CRITICAL/HIGH)
+
+For every CRITICAL or HIGH finding raised in L2.1–L2.6, run **at least one** of these and record the result:
+
+| Finding type | Required validation | Tool |
+|---|---|---|
+| Hardcoded price constant differs from AWS | Fetch live price for the SKU + region the adapter targets, compare | `mcp__aws-pricing-mcp-server__get_pricing` |
+| Wrong AWS Pricing service code (e.g. `AmazonDMS` vs `AWSDatabaseMigrationSvc`) | Confirm canonical code | `mcp__aws-pricing-mcp-server__get_pricing_service_codes` |
+| Wrong filter attribute or value | Confirm attribute exists & value is legal | `get_pricing_service_attributes` + `get_pricing_attribute_values` |
+| Wrong field name on AWS API response (e.g. top-level vs nested) | Confirm canonical schema | `WebFetch` boto3 ref page OR `Context7` query |
+| CloudWatch metric name / namespace wrong | Confirm namespace + metric | `mcp__aws-cloudwatch-mcp-server__get_metric_metadata` |
+| Unit error (hourly vs monthly, $/GB vs $/TB) | Confirm AWS docs definition | `WebFetch` AWS docs URL |
+| 730-hours-per-month assumption | AWS publishes hours/month assumption in EC2 on-demand pricing docs | `WebFetch` pricing page |
+| Free-tier deduction missing/wrong | Confirm free-tier rules | `WebFetch` service free-tier page |
+
+When a validation **disproves** a draft finding, demote or remove the finding. Do not keep findings that the external source contradicts.
+
+**L2 verdict**: `PASS` only if every L2.* checks pass. Any `arbitrary`-classified value → `FAIL`. Any L2.2 unit error → `FAIL`. Any L2.3.1 double-multiplier → `HIGH` and `WARN` minimum. Any L2.5.2 double-count → `HIGH` and `WARN` minimum. **Any CRITICAL/HIGH L2 finding without an external-validation citation → demote to MEDIUM (or remove) until validation is performed.**
 
 ---
 
@@ -325,9 +377,17 @@ For each finding:
 ## L2 — Calculation findings
 Same structure. Plus the source-classification table:
 
-| Recommendation type | Source | Evidence | Acceptable? |
-|---|---|---|---|
-| <rec type> | live/aws-api/parsed/… | `file:line` | YES/CONDITIONAL/WARN/NO |
+| Recommendation type | Source | Evidence | Acceptable? | External validation |
+|---|---|---|---|---|
+| <rec type> | live/aws-api/parsed/… | `file:line` | YES/CONDITIONAL/WARN/NO | `<tool → URL/args → result>` or `n/a` |
+
+### External validation log
+
+For every CRITICAL/HIGH L2 finding, append a row:
+
+| Finding ID | Tool | Call | Result | Confirms / Refutes |
+|---|---|---|---|---|
+| L2-NNN | <tool name> | <key args or URL> | <one-line result> | confirms / refutes |
 
 ## L3 — Reporting findings
 Same structure. Plus the field-presence table:
