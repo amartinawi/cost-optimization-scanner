@@ -13,6 +13,40 @@ from botocore.exceptions import ClientError  # type: ignore[import-untyped]
 
 from core.scan_context import ScanContext
 
+# Per-check reduction factors used to convert an instance's on-demand monthly
+# cost into an estimated saving. Calibrated against typical AWS rightsizing
+# guidance — kept as a single table so the audit trail is one diff away.
+EC2_SAVINGS_FACTORS: dict[str, float] = {
+    "Idle Instances": 1.0,
+    "Rightsizing Opportunities": 0.40,
+    "Burstable Instance Optimization": 0.30,
+    "Previous Generation Migration": 0.10,
+    "Cron Job Instances": 0.85,
+    "Batch Job Instances": 0.75,
+    "Underutilized Instance Store": 0.15,
+    "Dedicated Hosts": 0.30,
+}
+
+_HOURS_PER_MONTH: int = 730
+
+
+def _compute_ec2_savings(ctx: ScanContext, instance_type: str, category: str) -> float:
+    """Return estimated monthly $ savings for an instance under a named check.
+
+    Looks up the on-demand Linux hourly price via PricingEngine, converts to
+    monthly (730 hours), and multiplies by the category's reduction factor.
+    Returns 0.0 when the category is unknown, pricing is unavailable, or any
+    lookup fails — never crashes the scan.
+    """
+    factor = EC2_SAVINGS_FACTORS.get(category, 0.0)
+    if factor <= 0.0 or not ctx.pricing_engine or not instance_type:
+        return 0.0
+    try:
+        hourly = ctx.pricing_engine.get_ec2_hourly_price(instance_type, "Linux")
+    except Exception:
+        return 0.0
+    return hourly * _HOURS_PER_MONTH * factor
+
 
 def get_ec2_instance_count(ctx: ScanContext) -> int:
     """Get total EC2 instance count in region.
@@ -153,6 +187,7 @@ def get_enhanced_ec2_checks(
                                 max_cpu = max(dp["Maximum"] for dp in cpu_response["Datapoints"])
 
                                 if avg_cpu < 5 and max_cpu < 10:
+                                    idle_savings = _compute_ec2_savings(ctx, instance_type, "Idle Instances")
                                     checks["idle_instances"].append(
                                         {
                                             "InstanceId": instance_id,
@@ -166,11 +201,14 @@ def get_enhanced_ec2_checks(
                                                 " - consider terminating or"
                                                 " downsizing"
                                             ),
-                                            "EstimatedSavings": ("Up to 100% if terminated, 50-70% if downsized"),
+                                            "EstimatedSavings": f"${idle_savings:.2f}/month if terminated",
                                             "CheckCategory": "Idle Instances",
                                         }
                                     )
                                 elif avg_cpu < 20 and max_cpu < 40:
+                                    rs_savings = _compute_ec2_savings(
+                                        ctx, instance_type, "Rightsizing Opportunities"
+                                    )
                                     checks["rightsizing_opportunities"].append(
                                         {
                                             "InstanceId": instance_id,
@@ -184,7 +222,7 @@ def get_enhanced_ec2_checks(
                                                 " - consider smaller instance"
                                                 " type"
                                             ),
-                                            "EstimatedSavings": ("30-50% cost reduction with proper rightsizing"),
+                                            "EstimatedSavings": f"${rs_savings:.2f}/month if rightsized",
                                             "CheckCategory": ("Rightsizing Opportunities"),
                                         }
                                     )
@@ -199,9 +237,7 @@ def get_enhanced_ec2_checks(
                                         " to analyze utilization for"
                                         " rightsizing opportunities"
                                     ),
-                                    "EstimatedSavings": (
-                                        "Enable monitoring first - potential 30-70% savings with proper rightsizing"
-                                    ),
+                                    "EstimatedSavings": "$0.00/month - enable CloudWatch monitoring to quantify",
                                     "CheckCategory": "Monitoring Required",
                                 }
                             )
@@ -236,7 +272,8 @@ def get_enhanced_ec2_checks(
                                                 " cost optimization"
                                             ),
                                             "EstimatedSavings": (
-                                                "Improved availability and potential Spot instance usage"
+                                                "$0.00/month - improves availability;"
+                                                " quantify after ASG sizing"
                                             ),
                                             "CheckCategory": ("Auto Scaling Missing"),
                                         }
@@ -245,6 +282,9 @@ def get_enhanced_ec2_checks(
                             pass
 
                         if instance_type.startswith("t2."):
+                            prevgen_savings = _compute_ec2_savings(
+                                ctx, instance_type, "Previous Generation Migration"
+                            )
                             checks["previous_generation"].append(
                                 {
                                     "InstanceId": instance_id,
@@ -254,18 +294,21 @@ def get_enhanced_ec2_checks(
                                         f" {instance_type.replace('t2.', 't3.')}"
                                         " for better cost efficiency"
                                     ),
-                                    "EstimatedSavings": ("Potential cost reduction with better performance per dollar"),
+                                    "EstimatedSavings": f"${prevgen_savings:.2f}/month after t2→t3 migration",
                                     "CheckCategory": ("Previous Generation Migration"),
                                 }
                             )
 
                         if instance.get("Placement", {}).get("Tenancy") == "dedicated":
+                            dedicated_savings = _compute_ec2_savings(ctx, instance_type, "Dedicated Hosts")
                             checks["dedicated_hosts"].append(
                                 {
                                     "InstanceId": instance_id,
+                                    "InstanceType": instance_type,
                                     "Tenancy": "dedicated",
                                     "Recommendation": ("Review dedicated tenancy necessity"),
-                                    "EstimatedSavings": ("Significant cost reduction if shared tenancy acceptable"),
+                                    "EstimatedSavings": f"${dedicated_savings:.2f}/month with shared tenancy",
+                                    "CheckCategory": "Dedicated Hosts",
                                 }
                             )
 
@@ -326,7 +369,9 @@ def get_enhanced_ec2_checks(
                                             " - consider smaller fixed"
                                             " instance"
                                         )
-                                        savings = "Potential 20-40% cost reduction with smaller fixed instances"
+                                        burst_savings = _compute_ec2_savings(
+                                            ctx, instance_type, "Burstable Instance Optimization"
+                                        )
 
                                         checks["burstable_credits"].append(
                                             {
@@ -334,7 +379,10 @@ def get_enhanced_ec2_checks(
                                                 "InstanceType": instance_type,
                                                 "Recommendation": recommendation,
                                                 "CheckCategory": ("Burstable Instance Optimization"),
-                                                "EstimatedSavings": savings,
+                                                "EstimatedSavings": (
+                                                    f"${burst_savings:.2f}/month"
+                                                    " with smaller fixed instance"
+                                                ),
                                                 "ActionRequired": (
                                                     "Enable detailed CloudWatch monitoring if not already enabled"
                                                 ),
@@ -347,7 +395,6 @@ def get_enhanced_ec2_checks(
                                     recommendation = (
                                         "Enable detailed CloudWatch monitoring for accurate burstable instance analysis"
                                     )
-                                    savings = "CloudWatch detailed monitoring required for assessment"
 
                                     checks["burstable_credits"].append(
                                         {
@@ -355,7 +402,10 @@ def get_enhanced_ec2_checks(
                                             "InstanceType": instance_type,
                                             "Recommendation": recommendation,
                                             "CheckCategory": ("Burstable Instance Optimization"),
-                                            "EstimatedSavings": savings,
+                                            "EstimatedSavings": (
+                                                "$0.00/month - enable"
+                                                " CloudWatch monitoring to quantify"
+                                            ),
                                             "ActionRequired": (
                                                 "Enable detailed CloudWatch monitoring if not already enabled"
                                             ),
@@ -368,7 +418,6 @@ def get_enhanced_ec2_checks(
                                     " analyze CPU credit usage and determine"
                                     " optimal instance type"
                                 )
-                                savings = "CloudWatch detailed monitoring required for accurate rightsizing"
 
                                 checks["burstable_credits"].append(
                                     {
@@ -376,7 +425,7 @@ def get_enhanced_ec2_checks(
                                         "InstanceType": instance_type,
                                         "Recommendation": recommendation,
                                         "CheckCategory": ("Burstable Instance Optimization"),
-                                        "EstimatedSavings": savings,
+                                        "EstimatedSavings": "$0.00/month - enable CloudWatch monitoring to quantify",
                                         "ActionRequired": (
                                             "Enable detailed CloudWatch monitoring if not already enabled"
                                         ),
@@ -395,7 +444,7 @@ def get_enhanced_ec2_checks(
                                     " storage costs"
                                 ),
                                 "CheckCategory": "Stopped Instances",
-                                "EstimatedSavings": ("EBS storage costs only (compute already saved)"),
+                                "EstimatedSavings": "$0.00/month - EBS storage saving depends on attached volumes",
                             }
                         )
 
@@ -622,13 +671,14 @@ def get_advanced_ec2_checks(
                             "scheduler",
                         ]
                     ):
+                        cron_savings = _compute_ec2_savings(ctx, instance_type, "Cron Job Instances")
                         checks["cron_job_instances"].append(
                             {
                                 "InstanceId": instance_id,
                                 "InstanceType": instance_type,
                                 "Name": name,
                                 "Recommendation": ("Consider Lambda, EventBridge, or Batch for cron jobs"),
-                                "EstimatedSavings": ("80-95% cost reduction vs always-on EC2"),
+                                "EstimatedSavings": f"${cron_savings:.2f}/month with serverless equivalent",
                                 "CheckCategory": "Cron Job Instances",
                             }
                         )
@@ -650,7 +700,7 @@ def get_advanced_ec2_checks(
                                 "Recommendation": (
                                     "Consider CloudWatch, managed monitoring, or containerized solution"
                                 ),
-                                "EstimatedSavings": ("Reduce infrastructure overhead"),
+                                "EstimatedSavings": "$0.00/month - quantify after replacement design",
                                 "CheckCategory": ("Monitoring-Only Instances"),
                             }
                         )
@@ -713,6 +763,9 @@ def get_advanced_ec2_checks(
                             "analytics",
                         ]
                     ):
+                        store_savings = _compute_ec2_savings(
+                            ctx, instance_type, "Underutilized Instance Store"
+                        )
                         checks["underutilized_instance_store"].append(
                             {
                                 "InstanceId": instance_id,
@@ -724,7 +777,7 @@ def get_advanced_ec2_checks(
                                     " consider non-storage optimized"
                                     " type"
                                 ),
-                                "EstimatedSavings": ("10-20% cost reduction with equivalent non-storage instance type"),
+                                "EstimatedSavings": f"${store_savings:.2f}/month with non-storage equivalent",
                                 "CheckCategory": ("Underutilized Instance Store"),
                             }
                         )
@@ -741,24 +794,15 @@ def get_advanced_ec2_checks(
                         )
                         and "web" not in name.lower()
                     ):
+                        batch_savings = _compute_ec2_savings(ctx, instance_type, "Batch Job Instances")
                         checks["batch_job_instances"].append(
                             {
                                 "InstanceId": instance_id,
                                 "InstanceType": instance_type,
                                 "Name": name,
                                 "Recommendation": ("Consider AWS Batch with Spot instances for batch workloads"),
-                                "EstimatedSavings": ("60-90% cost reduction with Spot instances in Batch"),
+                                "EstimatedSavings": f"${batch_savings:.2f}/month with Spot in Batch",
                                 "CheckCategory": "Batch Job Instances",
-                            }
-                        )
-                        checks["underutilized_instance_store"].append(
-                            {
-                                "InstanceId": instance_id,
-                                "InstanceType": instance_type,
-                                "Name": name,
-                                "Recommendation": ("Instance type includes instance store - verify utilization"),
-                                "EstimatedSavings": ("Switch to non-storage optimized if unused"),
-                                "CheckCategory": ("Underutilized Instance Store"),
                             }
                         )
 

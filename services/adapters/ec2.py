@@ -6,7 +6,7 @@ from typing import Any
 
 from core.contracts import ServiceFindings, SourceBlock
 from services._base import BaseServiceModule
-from services._savings import parse_dollar_savings
+from services._savings import compute_optimizer_savings, parse_dollar_savings
 from services.advisor import get_ec2_compute_optimizer_recommendations
 from services.ec2 import get_advanced_ec2_checks, get_ec2_instance_count, get_enhanced_ec2_checks
 
@@ -48,9 +48,7 @@ class EC2Module(BaseServiceModule):
 
         savings = 0.0
         savings += sum(rec.get("estimatedMonthlySavings", 0) for rec in cost_hub_recs)
-        co_total = sum(rec.get("estimatedMonthlySavings", 0) for rec in co_recs)
-        if co_total > 0:
-            savings += co_total
+        savings += sum(compute_optimizer_savings(rec) for rec in co_recs)
         for rec in enhanced_recs:
             savings += parse_dollar_savings(rec.get("EstimatedSavings", ""))
         for rec in advanced_recs:
