@@ -15,6 +15,8 @@ from core.pricing_engine import (
     FALLBACK_EIP_MONTH,
     FALLBACK_NAT_MONTH,
     FALLBACK_RDS_BACKUP_GB_MONTH,
+    FALLBACK_RDS_INSTANCE_MONTHLY,
+    FALLBACK_RDS_MULTI_AZ_FACTOR,
     FALLBACK_RDS_STORAGE_GB_MONTH,
     FALLBACK_S3_GB_MONTH,
     FALLBACK_VPC_ENDPOINT_MONTH,
@@ -136,6 +138,37 @@ class TestPricingEngine:
         engine = _make_engine(api_return=0.20)
         price = engine.get_instance_monthly_price("AmazonElastiCache", "cache.m5.large")
         assert price == pytest.approx(0.20 * 730)
+
+    def test_rds_instance_monthly_fallback_single_az(self):
+        engine = _make_engine(api_return=None)
+        price = engine.get_rds_instance_monthly_price("mysql", "db.t3.medium", multi_az=False)
+        assert price == FALLBACK_RDS_INSTANCE_MONTHLY
+
+    def test_rds_instance_monthly_fallback_multi_az(self):
+        engine = _make_engine(api_return=None)
+        price = engine.get_rds_instance_monthly_price("postgres", "db.t3.medium", multi_az=True)
+        assert price == pytest.approx(FALLBACK_RDS_INSTANCE_MONTHLY * FALLBACK_RDS_MULTI_AZ_FACTOR)
+
+    def test_rds_instance_monthly_engine_normalization(self):
+        """SQL Server engine maps to License included; helper should not crash."""
+        engine = _make_engine(api_return=None)
+        price = engine.get_rds_instance_monthly_price("SQLSERVER-EX", "db.m5.large", multi_az=False)
+        # SQLServer uses License Included path but fallback is engine-agnostic.
+        assert price == FALLBACK_RDS_INSTANCE_MONTHLY
+
+    def test_rds_instance_monthly_cache(self):
+        engine = _make_engine(api_return=0.072)
+        engine.get_rds_instance_monthly_price("postgres", "db.t3.medium", multi_az=False)
+        engine.get_rds_instance_monthly_price("postgres", "db.t3.medium", multi_az=False)
+        # Cache hit on the second call: only one API roundtrip.
+        assert engine._pricing.get_products.call_count == 1
+
+    def test_rds_instance_monthly_separate_cache_for_multi_az(self):
+        """Multi-AZ vs Single-AZ are separate cache keys for the same instance class."""
+        engine = _make_engine(api_return=0.072)
+        engine.get_rds_instance_monthly_price("postgres", "db.t3.medium", multi_az=False)
+        engine.get_rds_instance_monthly_price("postgres", "db.t3.medium", multi_az=True)
+        assert engine._pricing.get_products.call_count == 2
 
 
 class TestPricingEngineLiveOption:

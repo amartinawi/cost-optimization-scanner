@@ -6,10 +6,39 @@ This module will later become RdsModule (T-329) implementing ServiceModule.
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from typing import Any
 
+from botocore.exceptions import ClientError  # type: ignore[import-untyped]
+
 from core.scan_context import ScanContext
+
+logger = logging.getLogger(__name__)
+
+# Per-check reduction factors applied to live instance pricing.
+# Values reflect typical AWS guidance:
+#   - Multi-AZ disable: Multi-AZ is ≈ 2× Single-AZ, so dropping it on a Multi-AZ
+#     instance saves ≈ 50% of the Multi-AZ price (= Single-AZ price).
+#   - Non-prod schedule: nights + weekends shutdown ≈ 12h/day weekdays only,
+#     yielding ≈ 65% reduction relative to 24/7.
+#   - Reserved Instance: 1-yr no-upfront on AWS is ≈ 40% off on-demand.
+RDS_MULTI_AZ_REDUCTION: float = 0.50
+RDS_NON_PROD_SCHEDULE_REDUCTION: float = 0.65
+RDS_RESERVED_INSTANCE_REDUCTION: float = 0.40
+
+
+def _rds_monthly_price(ctx: ScanContext, engine: str, instance_class: str, *, multi_az: bool) -> float:
+    """Return RDS instance monthly $ price via PricingEngine, or 0.0 on failure."""
+    if not ctx.pricing_engine or not engine or not instance_class:
+        return 0.0
+    try:
+        return ctx.pricing_engine.get_rds_instance_monthly_price(
+            engine, instance_class, multi_az=multi_az
+        )
+    except Exception as exc:
+        logger.debug("RDS pricing lookup failed for %s %s: %s", engine, instance_class, exc)
+        return 0.0
 
 RDS_OPTIMIZATION_DESCRIPTIONS: dict[str, dict[str, str]] = {
     "idle_databases": {
@@ -84,7 +113,7 @@ RDS_OPTIMIZATION_DESCRIPTIONS: dict[str, dict[str, str]] = {
 
 def get_rds_instance_count(ctx: ScanContext) -> dict[str, int]:
     """Get RDS instance counts by engine and state."""
-    print("🔍 [services/rds.py] RDS module active")
+    logger.debug("RDS module active")
     rds = ctx.client("rds")
     _empty: dict[str, int] = {
         "total": 0,
@@ -132,8 +161,19 @@ def get_rds_instance_count(ctx: ScanContext) -> dict[str, int]:
                 counts["sqlserver"] += 1
 
         return counts
+    except ClientError as ec:
+        code = ec.response.get("Error", {}).get("Code", "")
+        if code in ("UnauthorizedOperation", "AccessDenied"):
+            ctx.permission_issue(
+                f"describe_db_instances denied: {code}",
+                service="rds",
+                action="rds:DescribeDBInstances",
+            )
+        else:
+            ctx.warn(f"Could not get RDS instance count: {ec}", service="rds")
+        return _empty
     except Exception as e:
-        print(f"Warning: Could not get RDS instance count: {e}")
+        ctx.warn(f"Unexpected error getting RDS instance count: {e}", service="rds")
         return _empty
 
 
@@ -220,7 +260,12 @@ def get_enhanced_rds_checks(
                         else:
                             env_name = env_tag or "non-prod"
 
-                    except Exception:
+                    except Exception as tag_exc:
+                        logger.debug(
+                            "RDS tag lookup failed for %s; falling back to name-substring heuristic: %s",
+                            db_instance_id,
+                            tag_exc,
+                        )
                         is_non_prod = any(env in db_instance_id.lower() for env in ["dev", "test", "staging", "qa"])
                         env_name = next(
                             (env for env in ["dev", "test", "staging", "qa"] if env in db_instance_id.lower()),
@@ -228,16 +273,27 @@ def get_enhanced_rds_checks(
                         )
 
                     if is_non_prod:
+                        multi_az_price = _rds_monthly_price(
+                            ctx, engine or "", db_instance_class or "", multi_az=True
+                        )
+                        single_az_price = _rds_monthly_price(
+                            ctx, engine or "", db_instance_class or "", multi_az=False
+                        )
+                        # Saving = Multi-AZ cost − Single-AZ cost (≈ 50% of Multi-AZ).
+                        multi_az_savings = max(multi_az_price - single_az_price, 0.0)
                         checks["multi_az_unnecessary"].append(
                             {
                                 "DBInstanceIdentifier": db_instance_id,
+                                "DBInstanceClass": db_instance_class,
                                 "resourceArn": (f"arn:aws:rds:{region}:{account_id}:db:{db_instance_id}"),
                                 "engine": engine,
                                 "engineVersion": instance.get("EngineVersion", ""),
                                 "MultiAZ": multi_az,
                                 "Environment": env_name,
                                 "Recommendation": (f"Disable Multi-AZ for {env_name} environment to reduce costs"),
-                                "EstimatedSavings": "~50% of instance cost",
+                                "EstimatedSavings": (
+                                    f"${multi_az_savings:.2f}/month with single-AZ deployment"
+                                ),
                                 "CheckCategory": "Multi-AZ Optimization",
                                 "instanceFinding": (f"Multi-AZ enabled in {env_name} environment"),
                             }
@@ -250,6 +306,10 @@ def get_enhanced_rds_checks(
                         if ctx.pricing_engine
                         else 0.095 * pricing_multiplier
                     )
+                    # AWS provides free backup storage = 100% of total provisioned
+                    # DB storage in the region. This estimate assumes that pool is
+                    # already exhausted and additional retention is fully billable;
+                    # accounts under the free tier may see lower realized savings.
                     backup_savings = allocated_storage * backup_price * extra_backup_days / 30
                     checks["backup_retention_excessive"].append(
                         {
@@ -260,7 +320,8 @@ def get_enhanced_rds_checks(
                             "BackupRetentionPeriod": backup_retention,
                             "Recommendation": (f"Reduce backup retention from {backup_retention} to 7 days"),
                             "EstimatedSavings": (
-                                f"${backup_savings:.2f}/month in backup storage (estimate - beyond free tier)"
+                                f"${backup_savings:.2f}/month (estimate assumes regional"
+                                " free tier — 100% of provisioned storage — is exhausted)"
                             ),
                             "CheckCategory": "Backup Retention Optimization",
                             "instanceFinding": (
@@ -317,9 +378,14 @@ def get_enhanced_rds_checks(
                         "non-prod",
                     )
                     if engine in ["mysql", "postgres", "mariadb"]:
+                        sched_base_price = _rds_monthly_price(
+                            ctx, engine, db_instance_class or "", multi_az=multi_az
+                        )
+                        sched_savings = sched_base_price * RDS_NON_PROD_SCHEDULE_REDUCTION
                         checks["non_prod_scheduling"].append(
                             {
                                 "DBInstanceIdentifier": db_instance_id,
+                                "DBInstanceClass": db_instance_class,
                                 "resourceArn": (f"arn:aws:rds:{region}:{account_id}:db:{db_instance_id}"),
                                 "engine": engine,
                                 "engineVersion": instance.get("EngineVersion", ""),
@@ -327,7 +393,9 @@ def get_enhanced_rds_checks(
                                 "Recommendation": (
                                     f"Implement start/stop schedule for {env_name} database (stop nights/weekends)"
                                 ),
-                                "EstimatedSavings": "65-75% of compute costs",
+                                "EstimatedSavings": (
+                                    f"${sched_savings:.2f}/month with nights/weekends shutdown"
+                                ),
                                 "CheckCategory": "Non-Production Scheduling",
                                 "instanceFinding": (f"{env_name} database - eligible for automated scheduling"),
                             }
@@ -368,6 +436,10 @@ def get_enhanced_rds_checks(
                 if db_instance_status == "available":
                     is_likely_prod = not any(env in db_instance_id.lower() for env in ["dev", "test", "staging", "qa"])
                     ri_text = "production databases" if is_likely_prod else "long-running databases"
+                    ri_base_price = _rds_monthly_price(
+                        ctx, engine or "", db_instance_class or "", multi_az=multi_az
+                    )
+                    ri_savings = ri_base_price * RDS_RESERVED_INSTANCE_REDUCTION
                     checks["reserved_instances"].append(
                         {
                             "DBInstanceIdentifier": db_instance_id,
@@ -375,7 +447,9 @@ def get_enhanced_rds_checks(
                             "engine": engine,
                             "DBInstanceClass": db_instance_class,
                             "Recommendation": (f"Consider Reserved Instances for {ri_text}"),
-                            "EstimatedSavings": ("Up to 60% savings for 1-3 year commitments"),
+                            "EstimatedSavings": (
+                                f"${ri_savings:.2f}/month with 1-yr no-upfront RI"
+                            ),
                             "CheckCategory": ("Reserved Instance Opportunities"),
                             "instanceFinding": (f"Instance ({db_instance_class}) - RI candidate"),
                         }
@@ -395,7 +469,10 @@ def get_enhanced_rds_checks(
                             "engineVersion": instance.get("EngineVersion", ""),
                             "DBInstanceClass": db_instance_class,
                             "Recommendation": ("Consider migrating to Aurora Serverless v2 for variable workloads"),
-                            "EstimatedSavings": ("Pay only for capacity used (up to 90% for idle periods)"),
+                            "EstimatedSavings": (
+                                "$0.00/month - quantify after measuring idle hours"
+                                " (Aurora Serverless v2 charges per ACU-hour)"
+                            ),
                             "CheckCategory": ("Aurora Serverless v2 Migration"),
                             "instanceFinding": (
                                 f"Small Aurora instance ({db_instance_class}) - good candidate for Serverless v2"
@@ -434,7 +511,7 @@ def get_enhanced_rds_checks(
                                 }
                             )
         except Exception as e:
-            print(f"Warning: Could not check RDS snapshots: {e}")
+            ctx.warn(f"Could not check RDS snapshots: {e}", service="rds")
 
         try:
             paginator = rds.get_paginator("describe_db_clusters")
@@ -451,7 +528,11 @@ def get_enhanced_rds_checks(
                                     "resourceArn": (f"arn:aws:rds:{region}:{account_id}:cluster:{cluster_id}"),
                                     "Engine": engine,
                                     "Recommendation": ("Consider Aurora Serverless v2 for variable workloads"),
-                                    "EstimatedSavings": ("20-90% cost reduction for variable workloads"),
+                                    "EstimatedSavings": (
+                                        "$0.00/month - quantify after measuring"
+                                        " idle hours (Aurora Serverless v2 is"
+                                        " ACU-hour billed)"
+                                    ),
                                     "CheckCategory": ("Aurora Serverless v2 Migration"),
                                 }
                             )
@@ -469,7 +550,11 @@ def get_enhanced_rds_checks(
                                         " consider Aurora I/O-Optimized"
                                         " if high I/O costs"
                                     ),
-                                    "EstimatedSavings": ("Potential I/O cost reduction for high-throughput workloads"),
+                                    "EstimatedSavings": (
+                                        "$0.00/month - quantify after reviewing"
+                                        " I/O usage; Aurora I/O-Optimized has"
+                                        " higher storage but zero I/O charges"
+                                    ),
                                     "CheckCategory": ("Aurora Storage Optimization"),
                                     "instanceFinding": ("Aurora cluster - review I/O patterns"),
                                 }
@@ -513,12 +598,12 @@ def get_enhanced_rds_checks(
                                     }
                                 )
             except Exception as e:
-                print(f"Warning: Could not check Aurora cluster snapshots: {e}")
+                ctx.warn(f"Could not check Aurora cluster snapshots: {e}", service="rds")
         except Exception as e:
-            print(f"Warning: Could not check Aurora clusters: {e}")
+            ctx.warn(f"Could not check Aurora clusters: {e}", service="rds")
 
     except Exception as e:
-        print(f"Warning: Could not perform enhanced RDS checks: {e}")
+        ctx.warn(f"Could not perform enhanced RDS checks: {e}", service="rds")
 
     recommendations: list[dict[str, Any]] = []
     for _category, items in checks.items():

@@ -66,6 +66,47 @@ FALLBACK_RDS_STORAGE_GB_MONTH: dict[str, float] = {
     "io1": 0.200,
 }
 FALLBACK_RDS_BACKUP_GB_MONTH: float = 0.095
+# Single-AZ db.t3.medium MySQL us-east-1 on-demand monthly cost (730h × $0.068/h).
+# Used only when AWS Pricing API is unavailable; multiplied by the regional fallback multiplier.
+FALLBACK_RDS_INSTANCE_MONTHLY: float = 49.64
+# Multiplier applied to FALLBACK_RDS_INSTANCE_MONTHLY for Multi-AZ deployments
+# (Multi-AZ is roughly 2× Single-AZ for all engines per AWS Pricing API).
+FALLBACK_RDS_MULTI_AZ_FACTOR: float = 2.0
+
+# RDS engine name → AWS Pricing API 'databaseEngine' filter value.
+# RDS describe_db_instances returns engine strings like "mysql", "postgres",
+# "aurora-postgresql", "oracle-se2", "sqlserver-ex". Map to the human-friendly
+# label the Price List service uses on its 'databaseEngine' attribute.
+_RDS_ENGINE_LABELS: dict[str, str] = {
+    "mysql": "MySQL",
+    "postgres": "PostgreSQL",
+    "postgresql": "PostgreSQL",
+    "mariadb": "MariaDB",
+    "aurora": "Aurora MySQL",
+    "aurora-mysql": "Aurora MySQL",
+    "aurora-postgresql": "Aurora PostgreSQL",
+    "oracle-ee": "Oracle",
+    "oracle-ee-cdb": "Oracle",
+    "oracle-se": "Oracle",
+    "oracle-se1": "Oracle",
+    "oracle-se2": "Oracle",
+    "oracle-se2-cdb": "Oracle",
+    "sqlserver-ee": "SQL Server",
+    "sqlserver-se": "SQL Server",
+    "sqlserver-ex": "SQL Server",
+    "sqlserver-web": "SQL Server",
+    "db2-ae": "Db2",
+    "db2-se": "Db2",
+}
+
+# RDS engines whose Pricing API rows live under licenseModel="License included"
+# rather than the default "No license required". Oracle and SQL Server BYOL paths
+# (which RDS does not bill for license) would need different handling, but RDS
+# only offers LI for SQL Server today and an LI/BYOL split for Oracle.
+_RDS_LICENSE_INCLUDED_ENGINES: frozenset[str] = frozenset({
+    "sqlserver-ee", "sqlserver-se", "sqlserver-ex", "sqlserver-web",
+    "oracle-se2",
+})
 FALLBACK_S3_GB_MONTH: dict[str, float] = {
     "STANDARD": 0.023,
     "STANDARD_IA": 0.0125,
@@ -213,6 +254,47 @@ class PricingEngine:
             price = self._use_fallback(
                 FALLBACK_RDS_STORAGE_GB_MONTH.get(storage_type, 0.115) * self._fallback_multiplier,
                 f"Pricing API unavailable for RDS {storage_type} ({'Multi-AZ' if multi_az else 'Single-AZ'}) in {self._region}; using fallback",
+            )
+        self._cache.set(key, price)
+        return price
+
+    def get_rds_instance_monthly_price(
+        self,
+        engine: str,
+        instance_class: str,
+        *,
+        multi_az: bool = False,
+    ) -> float:
+        """$/month for an RDS DB instance, engine- and deployment-aware.
+
+        Args:
+            engine: RDS engine name as returned by ``describe_db_instances`` (e.g.
+                ``"mysql"``, ``"postgres"``, ``"sqlserver-ex"``, ``"aurora-postgresql"``).
+                Case-insensitive.
+            instance_class: RDS instance class string (e.g. ``"db.t3.medium"``).
+            multi_az: When True, fetches the Multi-AZ deployment price (~2× Single-AZ).
+
+        Returns:
+            Monthly on-demand price in USD (730 hours). Returns 0.0 when both the
+            Pricing API and the fallback constant are unavailable for the given key.
+
+        Notes:
+            RDS pricing requires ``databaseEngine``, ``deploymentOption``, and
+            ``licenseModel`` filters in addition to ``instanceType`` + ``location``
+            to disambiguate. The generic ``get_instance_monthly_price`` is not
+            sufficient for RDS — use this method instead.
+        """
+        normalized = engine.lower().strip()
+        key = ("rds_instance", normalized, instance_class, "Multi-AZ" if multi_az else "Single-AZ")
+        if (cached := self._get_cached(key)) is not None:
+            return cached
+        price = self._fetch_rds_instance_price(normalized, instance_class, multi_az=multi_az)
+        if price is None:
+            fallback = FALLBACK_RDS_INSTANCE_MONTHLY * (FALLBACK_RDS_MULTI_AZ_FACTOR if multi_az else 1.0)
+            price = self._use_fallback(
+                fallback * self._fallback_multiplier,
+                f"Pricing API unavailable for RDS {instance_class} {normalized} "
+                f"({'Multi-AZ' if multi_az else 'Single-AZ'}) in {self._region}; using fallback",
             )
         self._cache.set(key, price)
         return price
@@ -433,6 +515,27 @@ class PricingEngine:
             {"Type": "TERM_MATCH", "Field": "productFamily", "Value": "System Operation"},
         ]
         return self._call_pricing_api("AmazonEC2", filters)
+
+    def _fetch_rds_instance_price(
+        self,
+        engine: str,
+        instance_class: str,
+        *,
+        multi_az: bool = False,
+    ) -> float | None:
+        """Fetch on-demand monthly RDS instance price; None on miss."""
+        engine_label = _RDS_ENGINE_LABELS.get(engine, "MySQL")
+        license_model = "License included" if engine in _RDS_LICENSE_INCLUDED_ENGINES else "No license required"
+        filters = [
+            {"Type": "TERM_MATCH", "Field": "instanceType", "Value": instance_class},
+            {"Type": "TERM_MATCH", "Field": "databaseEngine", "Value": engine_label},
+            {"Type": "TERM_MATCH", "Field": "deploymentOption", "Value": "Multi-AZ" if multi_az else "Single-AZ"},
+            {"Type": "TERM_MATCH", "Field": "licenseModel", "Value": license_model},
+            {"Type": "TERM_MATCH", "Field": "location", "Value": self._display_name},
+            {"Type": "TERM_MATCH", "Field": "productFamily", "Value": "Database Instance"},
+        ]
+        hourly = self._call_pricing_api_hourly("AmazonRDS", filters)
+        return hourly * 730 if hourly is not None else None
 
     def _fetch_rds_storage_price(self, storage_type: str, *, multi_az: bool = False) -> float | None:
         deployment_option = "Multi-AZ" if multi_az else "Single-AZ"

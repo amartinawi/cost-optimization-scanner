@@ -4,7 +4,10 @@ Provides specialised renderers for complex services (EC2, EBS, RDS, S3, etc.)
 and generic fallback renderers used by ``HTMLReportGenerator``.
 """
 
+import logging
 from typing import Any, Callable, Dict, List, Tuple
+
+logger = logging.getLogger(__name__)
 
 Rec = Dict[str, Any]
 
@@ -436,7 +439,7 @@ def _render_rds_enhanced_checks(recommendations: List[Rec], source_name: str, se
                     total_savings += savings_val
                     has_numeric_savings = True
                 except (ValueError, AttributeError) as e:
-                    print(f"⚠️ Could not parse grouped savings '{savings_str}': {str(e)}")
+                    logger.debug("Could not parse grouped savings %r: %s", savings_str, e)
 
         if has_numeric_savings:
             content += f'<p class="savings"><strong>Estimated Savings:</strong> ${total_savings:.2f}/month</p>'
