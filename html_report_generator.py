@@ -30,9 +30,14 @@ Version: 2.5.9
 Last Updated: 2026-01-24
 """
 
+import copy
+import html
 import json
+import logging
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Tuple
+
+logger = logging.getLogger(__name__)
 
 _SAVINGS_KEYWORDS: Dict[str, List[Tuple[str, float]]] = {
     "ec2": [
@@ -114,10 +119,78 @@ _SERVICE_STATS_CONFIG: Dict[str, Dict[str, Any]] = {
             ("ECS Services", "ecs_services"),
         ],
     },
+    "cost_anomaly": {
+        "multi_source_cards": [
+            ("Active Anomalies", "extras", "active_anomaly_count"),
+            ("30-Day Impact", "extras", "total_anomaly_impact_30d"),
+            ("Anomaly Monitors", "extras", "monitor_count"),
+            ("Billing Alarms", "extras", "billing_alarm_count"),
+        ],
+    },
+    "eks_cost": {
+        "multi_source_cards": [
+            ("EKS Clusters", "extras", "cluster_count"),
+            ("Node Groups", "extras", "node_group_count"),
+            ("Fargate Profiles", "extras", "fargate_profile_count"),
+            ("Add-ons", "extras", "addon_count"),
+            ("Monthly Control Plane", "extras", "monthly_control_plane_cost"),
+        ],
+    },
+    "aurora": {
+        "multi_source_cards": [
+            ("Aurora Clusters", "extras", "cluster_count"),
+            ("Serverless v2", "extras", "serverless_cluster_count"),
+            ("Global Clusters", "extras", "global_cluster_count"),
+        ],
+    },
+    "bedrock": {
+        "multi_source_cards": [
+            ("Provisioned Throughputs", "extras", "pt_count"),
+            ("Knowledge Bases", "extras", "kb_count"),
+            ("Agents", "extras", "agent_count"),
+        ],
+    },
+    "sagemaker": {
+        "multi_source_cards": [
+            ("Active Endpoints", "extras", "active_endpoint_count"),
+            ("Idle Endpoints", "extras", "idle_endpoint_count"),
+            ("Running Notebooks", "extras", "running_notebook_count"),
+        ],
+    },
+    "network_cost": {
+        "multi_source_cards": [
+            ("30-Day Transfer Spend", "extras", "total_data_transfer_spend_30d"),
+            ("Cross-Region Spend", "extras", "cross_region_spend_30d"),
+            ("VPC Peerings", "extras", "peering_count"),
+            ("TGW Attachments", "extras", "tgw_count"),
+        ],
+    },
+    "commitment_analysis": {
+        "multi_source_cards": [
+            ("SP Utilization", "extras", "sp_utilization_rate"),
+            ("SP Coverage", "extras", "sp_coverage_rate"),
+            ("RI Utilization", "extras", "ri_utilization_rate"),
+            ("RI Coverage", "extras", "ri_coverage_rate"),
+        ],
+    },
+    "compute_optimizer": {
+        "multi_source_cards": [
+            ("EBS Findings", "extras", "ebs_count"),
+            ("Lambda Findings", "extras", "lambda_count"),
+            ("ECS Findings", "extras", "ecs_count"),
+            ("ASG Findings", "extras", "asg_count"),
+        ],
+    },
+    "cost_optimization_hub": {
+        "multi_source_cards": [
+            ("Total Recommendations", "extras", "total_recommendations_in_hub"),
+        ],
+    },
 }
 
 
 def _extract_ec2_resources(rec: Dict[str, Any], resource_groups: Dict[str, list]) -> None:
+    """Extract EC2 instance resource IDs into grouped lists. Called by: _get_affected_resources_list."""
     if "actionType" in rec:
         if "ebsVolume" in rec.get("currentResourceDetails", {}):
             return
@@ -177,6 +250,7 @@ def _extract_ec2_resources(rec: Dict[str, Any], resource_groups: Dict[str, list]
 
 
 def _extract_ebs_resources(rec: Dict[str, Any], source_name: str, resource_groups: Dict[str, list]) -> None:
+    """Extract EBS volume resource IDs into grouped lists. Called by: _get_affected_resources_list."""
     if "actionType" in rec and "ebsVolume" in rec.get("currentResourceDetails", {}):
         action_type = rec.get("actionType", "Unknown")
         resource_id = rec.get("resourceId", "N/A")
@@ -222,9 +296,35 @@ def _extract_ebs_resources(rec: Dict[str, Any], source_name: str, resource_group
         )
     elif rec.get("finding", "").lower() == "optimized":
         pass
+    else:
+        # Catch-all for enhanced_checks recs (Underutilized Volumes, Over-Provisioned IOPS,
+        # Old/Orphaned Snapshots, Unused Encrypted Volumes, Snapshot Lifecycle, etc.)
+        # These have VolumeId or SnapshotId but no actionType/ebsVolume structure.
+        resource_id = rec.get("VolumeId") or rec.get("SnapshotId", "N/A")
+        if resource_id == "N/A" and rec.get("volumeArn"):
+            resource_id = rec["volumeArn"].split("/")[-1]
+        if resource_id != "N/A" or rec.get("CheckCategory"):
+            check_cat = rec.get("CheckCategory", "Enhanced Checks")
+            if check_cat not in resource_groups:
+                resource_groups[check_cat] = []
+            size = rec.get("Size") or rec.get("VolumeSize", 0)
+            vol_type = rec.get("VolumeType", "N/A")
+            if size:
+                type_label = f"{vol_type} ({size} GB)"
+            else:
+                type_label = rec.get("Recommendation", rec.get("Description", "N/A"))
+            raw_savings = rec.get("EstimatedSavings", 0)
+            savings_val = 0
+            if isinstance(raw_savings, (int, float)):
+                savings_val = raw_savings
+            elif isinstance(raw_savings, str):
+                digits = "".join(c for c in raw_savings if c.isdigit() or c == ".")
+                savings_val = float(digits) if digits else 0
+            resource_groups[check_cat].append({"id": resource_id, "type": type_label, "savings": savings_val})
 
 
 def _extract_rds_resources(rec: Dict[str, Any], resource_groups: Dict[str, list]) -> None:
+    """Extract RDS database resource IDs into grouped lists. Called by: _get_affected_resources_list."""
     finding = (
         rec.get("instanceFinding")
         or rec.get("InstanceFinding")
@@ -256,6 +356,7 @@ def _extract_rds_resources(rec: Dict[str, Any], resource_groups: Dict[str, list]
 
 
 def _extract_file_systems_resources(rec: Dict[str, Any], resource_groups: Dict[str, list]) -> None:
+    """Extract EFS/FSx file-system resource IDs into grouped lists. Called by: _get_affected_resources_list."""
     if "FileSystemType" in rec:
         fs_type = rec.get("FileSystemType", "Unknown")
         if f"FSx {fs_type}" not in resource_groups:
@@ -356,7 +457,7 @@ class HTMLReportGenerator:
         """
         self.scan_results = scan_results
 
-    def generate_html_report(self, output_file: str = None) -> str:
+    def generate_html_report(self, output_file: str | None = None) -> str:
         """
         Generate complete interactive HTML report from scan results.
 
@@ -403,9 +504,24 @@ class HTMLReportGenerator:
     {self._get_css()}
 </head>
 <body>
-    <button class="theme-toggle" onclick="toggleTheme()" title="Toggle Dark Mode">
-        <span id="theme-icon">🌙</span>
+    <svg xmlns="http://www.w3.org/2000/svg" style="display:none">
+<symbol id="icon-chart" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="18" y="3" width="4" height="18"/><rect x="10" y="8" width="4" height="13"/><rect x="2" y="13" width="4" height="8"/></symbol>
+<symbol id="icon-lightbulb" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18h6M10 22h4M15.09 14.41c.38-.38.67-.84.85-1.35A4.5 4.5 0 0 0 12 6.5a4.5 4.5 0 0 0-3.94 6.56c.18.51.47.97.85 1.35V17h6v-2.59z"/></symbol>
+<symbol id="icon-clipboard" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="8" y="2" width="8" height="4" rx="1" ry="1"/><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/></symbol>
+<symbol id="icon-dollar" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="1" x2="12" y2="23"/><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></symbol>
+<symbol id="icon-trending" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></symbol>
+<symbol id="icon-alert" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></symbol>
+<symbol id="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></symbol>
+<symbol id="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></symbol>
+<symbol id="icon-arrow-up" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="18 15 12 9 6 15"/></symbol>
+<symbol id="icon-download" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></symbol>
+</svg>
+    <button class="theme-toggle" onclick="toggleTheme()" title="Toggle Dark Mode" aria-pressed="false">
+        <svg class="icon" id="theme-icon-svg"><use href="#icon-moon"/></svg>
         <span id="theme-text">Dark</span>
+    </button>
+    <button class="export-btn" onclick="window.print()" aria-label="Export report as PDF" title="Export as PDF">
+        <svg class="icon" width="16" height="16"><use href="#icon-download"/></svg>
     </button>
     <div class="container">
         {self._get_header()}
@@ -414,6 +530,7 @@ class HTMLReportGenerator:
         {self._get_footer()}
     </div>
     {self._get_javascript()}
+    <button class="back-to-top" aria-label="Back to top" title="Back to top"><svg width="20" height="20"><use href="#icon-arrow-up"/></svg></button>
 </body>
 </html>"""
 
@@ -447,6 +564,7 @@ class HTMLReportGenerator:
             --shadow-3: 0 10px 20px rgba(0,0,0,0.19), 0 6px 6px rgba(0,0,0,0.23);
             --shadow-4: 0 14px 28px rgba(0,0,0,0.25), 0 10px 10px rgba(0,0,0,0.22);
             --shadow-5: 0 19px 38px rgba(0,0,0,0.30), 0 15px 12px rgba(0,0,0,0.22);
+            --hover-bg: rgba(25, 118, 210, 0.06);
         }
         
         [data-theme="dark"] {
@@ -469,6 +587,14 @@ class HTMLReportGenerator:
             --shadow-3: 0 10px 20px rgba(0,0,0,0.5), 0 6px 6px rgba(0,0,0,0.6);
             --shadow-4: 0 14px 28px rgba(0,0,0,0.6), 0 10px 10px rgba(0,0,0,0.7);
             --shadow-5: 0 19px 38px rgba(0,0,0,0.7), 0 15px 12px rgba(0,0,0,0.8);
+            --hover-bg: rgba(66, 165, 245, 0.12);
+        }
+        
+        [data-theme="dark"] .success {
+            background: rgba(76, 175, 80, 0.15);
+        }
+        [data-theme="dark"] .rec-item .savings {
+            background: rgba(76, 175, 80, 0.15);
         }
         
         body { 
@@ -504,8 +630,8 @@ class HTMLReportGenerator:
             position: absolute;
             top: -50%;
             right: -10%;
-            width: 500px;
-            height: 500px;
+            width: clamp(300px, 50vw, 500px);
+            height: clamp(300px, 50vw, 500px);
             background: radial-gradient(circle, rgba(255,255,255,0.1) 0%, transparent 70%);
             border-radius: 50%;
         }
@@ -573,6 +699,13 @@ class HTMLReportGenerator:
             transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
             position: relative;
             overflow: hidden;
+            will-change: transform;
+        }
+        
+        .summary-card:hover {
+            box-shadow: var(--shadow-4);
+            transform: translateY(-4px);
+            z-index: 1;
         }
         
         .summary-card::before {
@@ -587,11 +720,8 @@ class HTMLReportGenerator:
             transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
         }
         
-        .summary-card:hover {
-            box-shadow: var(--shadow-4);
-            transform: translateY(-4px);
-        }
-        
+        .summary-card:hover { box-shadow: var(--shadow-4); transform: translateY(-4px); z-index: 1; }
+
         .summary-card:hover::before {
             transform: scaleY(1);
         }
@@ -648,6 +778,29 @@ class HTMLReportGenerator:
             border-radius: 4px;
         }
         
+        .tab-buttons {
+            -webkit-overflow-scrolling: touch;
+            scroll-snap-type: x proximity;
+            position: relative;
+        }
+
+        .tabs {
+            position: relative;
+        }
+        .tabs::after {
+            content: '';
+            position: absolute;
+            top: 49px;
+            right: 0;
+            width: 48px;
+            height: calc(100% - 49px - 2px);
+            background: linear-gradient(to right, transparent, var(--surface));
+            pointer-events: none;
+            z-index: 1;
+            opacity: 1;
+            transition: opacity 0.3s;
+        }
+        
         .tab-button {
             flex: 0 0 auto;
             min-width: 160px;
@@ -679,7 +832,7 @@ class HTMLReportGenerator:
         }
         
         .tab-button:hover {
-            background: rgba(0,0,0,0.04);
+            background: rgba(128,128,128,0.08);
             color: var(--text-primary);
         }
         
@@ -695,6 +848,7 @@ class HTMLReportGenerator:
         .tab-content {
             display: none;
             padding: 32px;
+            min-height: 300px;
             animation: fadeIn 0.3s cubic-bezier(0.4, 0, 0.2, 1);
         }
         
@@ -744,7 +898,7 @@ class HTMLReportGenerator:
         }
         
         .stat-card h4 {
-            font-size: 0.75rem;
+            font-size: 0.8125rem;
             color: var(--text-secondary);
             margin-bottom: 8px;
             text-transform: uppercase;
@@ -867,13 +1021,49 @@ class HTMLReportGenerator:
         
         .rec-item .savings { 
             color: var(--success);
-            font-weight: 500;
+            font-weight: 700;
             background: rgba(76, 175, 80, 0.1);
             padding: 8px 16px;
             border-radius: 4px;
             display: inline-block;
             margin: 8px 0;
-            font-size: 0.875rem;
+            font-size: 1.125rem;
+            letter-spacing: -0.01em;
+        }
+        
+        /* Recommendation Detail Tables (Cost Hub, Anomaly, etc.) */
+        .rec-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 8px 0 12px 0;
+            font-size: 0.85rem;
+        }
+        .rec-table th {
+            background: var(--bg-secondary);
+            color: var(--text-secondary);
+            font-weight: 600;
+            text-align: left;
+            padding: 8px 10px;
+            border-bottom: 2px solid var(--border);
+            white-space: nowrap;
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        .rec-table td {
+            padding: 7px 10px;
+            border-bottom: 1px solid var(--border);
+            color: var(--text-primary);
+            vertical-align: top;
+        }
+        .rec-table tr:last-child td {
+            border-bottom: none;
+        }
+        .rec-table tr:hover td {
+            background: var(--hover-bg, rgba(0, 0, 0, 0.04));
+        }
+        [data-theme="dark"] .rec-table tr:hover td {
+            background: rgba(255, 255, 255, 0.06);
         }
         
         /* Material Chips/Badges */
@@ -900,6 +1090,11 @@ class HTMLReportGenerator:
             background-color: #e1f5fe;
         }
         
+        .source-badge {
+            display: inline-block;
+            margin: 8px 0;
+        }
+        
         .badge-success {
             color: #1b5e20;
             background-color: #e8f5e9;
@@ -908,6 +1103,23 @@ class HTMLReportGenerator:
         .badge-danger {
             color: #b71c1c;
             background-color: #ffebee;
+        }
+        
+        [data-theme="dark"] .badge-warning {
+            color: #ffcc80;
+            background-color: rgba(255, 152, 0, 0.2);
+        }
+        [data-theme="dark"] .badge-info {
+            color: #64b5f6;
+            background-color: rgba(33, 150, 243, 0.2);
+        }
+        [data-theme="dark"] .badge-success {
+            color: #81c784;
+            background-color: rgba(76, 175, 80, 0.2);
+        }
+        [data-theme="dark"] .badge-danger {
+            color: #ef9a9a;
+            background-color: rgba(244, 67, 54, 0.2);
         }
         
         /* Material Tables */
@@ -945,7 +1157,8 @@ class HTMLReportGenerator:
         
         .recommendations-table tr:hover,
         .top-buckets-table tr:hover {
-            background-color: rgba(0,0,0,0.02);
+            background-color: var(--hover-bg);
+            transition: background-color 0.15s ease;
         }
         
         .recommendations-table tr:last-child td,
@@ -980,6 +1193,19 @@ class HTMLReportGenerator:
             border-left: 4px solid var(--info);
             margin: 16px 0;
             color: var(--text-primary);
+        }
+        
+        .info-note, .pricing-note {
+            background: rgba(33, 150, 243, 0.1);
+            border-left: 4px solid var(--info);
+            padding: 10px 15px;
+            margin: 10px 0;
+            border-radius: 4px;
+            font-size: 0.9em;
+            color: var(--text-primary);
+        }
+        .info-note p, .pricing-note p {
+            margin: 4px 0;
         }
         
         .warning-box {
@@ -1042,6 +1268,8 @@ class HTMLReportGenerator:
         .resource-list {
             margin-left: 20px;
             color: var(--text-secondary);
+            max-height: 300px;
+            overflow-y: auto;
         }
         
         .resource-list li {
@@ -1060,6 +1288,20 @@ class HTMLReportGenerator:
         .show-more-link:hover {
             color: var(--primary-dark);
             text-decoration: underline;
+        }
+        
+        .show-more-link:focus-visible {
+            outline: 2px solid var(--primary);
+            outline-offset: 2px;
+            border-radius: 2px;
+        }
+        
+        .tab-btn:focus-visible,
+        .theme-toggle:focus-visible,
+        button:focus-visible,
+        a:focus-visible {
+            outline: 2px solid var(--primary);
+            outline-offset: 2px;
         }
         
         .show-more-container {
@@ -1121,16 +1363,23 @@ class HTMLReportGenerator:
             .service-stats { grid-template-columns: repeat(2, 1fr); }
         }
         
+        @media (max-width: 768px) {
+            .summary-grid { grid-template-columns: repeat(2, 1fr); }
+            .charts-container { grid-template-columns: 1fr; }
+        }
+        
         @media (max-width: 600px) {
             .header h1 { font-size: 1.75rem; }
             .header .subtitle { font-size: 1rem; }
-            .tab-button { min-width: 120px; font-size: 0.75rem; padding: 12px 16px; }
+            .header-info { grid-template-columns: 1fr; }
+            .tab-button { min-width: 100px; font-size: 0.7rem; padding: 10px 14px; }
             .service-title { font-size: 1.5rem; }
             .service-stats { grid-template-columns: 1fr; }
             .summary-card .value { font-size: 2rem; }
             .stat-card .value { font-size: 1.5rem; }
             .rec-item { padding: 16px; }
             .top-buckets-table { overflow-x: auto; }
+            .chart-wrapper { height: 250px; }
         }
         
         /* Charts Container */
@@ -1163,12 +1412,10 @@ class HTMLReportGenerator:
             align-items: center;
         }
         
-        @media (max-width: 768px) {
-            .charts-container {
-                grid-template-columns: 1fr;
-            }
+        .chart-wrapper canvas {
+            cursor: pointer;
         }
-        
+
         /* Dark Mode Toggle */
         .theme-toggle {
             position: fixed;
@@ -1194,65 +1441,195 @@ class HTMLReportGenerator:
             transform: translateY(-1px);
         }
         
+        .icon {
+            width: 20px;
+            height: 20px;
+            display: inline-block;
+            vertical-align: middle;
+            margin-right: 4px;
+        }
+        .icon-sm {
+            width: 18px;
+            height: 18px;
+        }
+        .chart-fallback {
+            text-align: center;
+            color: var(--text-secondary);
+            font-style: italic;
+            padding: 24px;
+            border: 1px dashed var(--divider);
+            border-radius: 8px;
+            margin: 8px 0;
+        }
+
+        /* Back to Top Button */
+        .back-to-top {
+            position: fixed;
+            bottom: 2rem;
+            right: 2rem;
+            width: 44px;
+            height: 44px;
+            border-radius: 50%;
+            background: var(--primary);
+            color: white;
+            border: none;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            opacity: 0;
+            visibility: hidden;
+            transition: opacity 0.3s, visibility 0.3s, transform 0.2s;
+            box-shadow: var(--shadow-3);
+            z-index: 100;
+        }
+        .back-to-top.visible {
+            opacity: 1;
+            visibility: visible;
+        }
+        .back-to-top:hover {
+            transform: translateY(-2px);
+            box-shadow: var(--shadow-4);
+        }
+
+        /* Export Button */
+        .export-btn {
+            position: fixed;
+            top: 20px;
+            right: 140px;
+            z-index: 1000;
+            background: var(--surface);
+            border: 1px solid var(--divider);
+            border-radius: 50px;
+            padding: 8px 16px;
+            cursor: pointer;
+            box-shadow: var(--shadow-2);
+            transition: all 0.3s ease;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 14px;
+            color: var(--text-primary);
+        }
+        .export-btn:hover {
+            box-shadow: var(--shadow-3);
+            transform: translateY(-1px);
+        }
+        .export-btn:focus-visible {
+            outline: 2px solid var(--primary);
+            outline-offset: 2px;
+        }
+
+        /* Tab Count Badges */
+        .tab-count {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            min-width: 18px;
+            height: 18px;
+            padding: 0 5px;
+            margin-left: 6px;
+            font-size: 0.65rem;
+            font-weight: 600;
+            border-radius: 9px;
+            background: var(--bg-secondary, #f5f5f5);
+            color: var(--text-secondary);
+            line-height: 1;
+            vertical-align: middle;
+        }
+        [data-theme="dark"] .tab-count {
+            background: rgba(255,255,255,0.12);
+            color: rgba(255,255,255,0.7);
+        }
+
         /* Print Styles */
         @media print {
-            body { background: white; }
+            body { background: white; color: black; font-family: Georgia, 'Times New Roman', serif; }
             .container { box-shadow: none; }
             .tab-buttons { display: none; }
+            .theme-toggle { display: none; }
+            .export-btn { display: none; }
+            .back-to-top { display: none; }
+            .header::before { display: none; }
             .tab-content { display: block !important; page-break-inside: avoid; }
             .rec-item { page-break-inside: avoid; }
+            canvas { max-width: 100%; page-break-inside: avoid; }
+            .service-section { page-break-after: auto; }
+            .service-section:not(:last-child) { page-break-after: always; }
+            .rec-item { page-break-inside: avoid; }
+            .recommendations-table { page-break-inside: avoid; }
+        }
+        @media (prefers-reduced-motion: reduce) {
+            *, *::before, *::after {
+                animation-duration: 0.01ms !important;
+                animation-iteration-count: 1 !important;
+                transition-duration: 0.01ms !important;
+                scroll-behavior: auto !important;
+            }
         }
         </style>"""
 
     def _get_header(self) -> str:
         """Get header section"""
-        return f"""<div class="header">
+        region = self.scan_results["region"]
+        header = f"""<div class="header">
             <h1>AWS Cost Optimization Report</h1>
             <div class="header-info">
-                <div><strong>Account ID:</strong> {self.scan_results["account_id"]}</div>
-                <div><strong>Region:</strong> {self.scan_results["region"]}</div>
-                <div><strong>Scan Time:</strong> {self.scan_results["scan_time"][:19]}</div>
+                <div><strong>Account ID:</strong> {html.escape(str(self.scan_results["account_id"]))}</div>
+                <div><strong>Region:</strong> {html.escape(str(region))}</div>
+                <div><strong>Scan Time:</strong> {html.escape(str(self.scan_results["scan_time"][:19]))}</div>
                 <div><strong>Services:</strong> {self.scan_results["summary"]["total_services_scanned"]}</div>
             </div>
         </div>"""
 
+        pricing_note = f'<div class="pricing-note"><p><svg class="icon icon-sm"><use href="#icon-dollar"/></svg> Savings estimates based on AWS Pricing API data for <strong>{region}</strong>. Some services use regional pricing estimates. Pricing may vary based on actual usage patterns and reserved capacity.</p>'
+        multiplier = self.scan_results.get("pricing_multiplier")
+        if multiplier is not None and multiplier > 1.0:
+            pricing_note += f'<p><svg class="icon icon-sm"><use href="#icon-alert"/></svg> Regional pricing multiplier of {multiplier}x applied for this region.</p>'
+        pricing_note += "</div>"
+
+        return header + pricing_note
+
     def _get_summary(self) -> str:
         """Get summary section"""
-        # Filter out Graviton recommendations from summary
-        filtered_services = {}
-        total_recommendations = 0
-        total_savings = 0
-        services_with_recommendations = 0
+        # Use canonical totals from ScanResultBuilder — same source as the executive summary tab.
+        summary = self.scan_results.get("summary", {})
+        total_recommendations = summary.get("total_recommendations", 0)
+        total_savings = summary.get("total_monthly_savings", 0)
+        services_with_recommendations = sum(
+            1
+            for service_data in self.scan_results["services"].values()
+            if service_data.get("total_recommendations", 0) > 0
+        )
+        total_services_scanned = len(self.scan_results.get("services", {}))
 
-        for service_key, service_data in self.scan_results["services"].items():
-            filtered_data = self._filter_recommendations(service_data)
-            if filtered_data["total_recommendations"] > 0:
-                services_with_recommendations += 1
-            filtered_services[service_key] = filtered_data
-            total_recommendations += filtered_data["total_recommendations"]
-            total_savings += filtered_data["total_monthly_savings"]
-
-        return f"""<div class="summary">
+        html = f"""<div class="summary">
             <h2>Executive Summary</h2>
             <div class="summary-grid">
-                <div class="summary-card">
+                <div class="summary-card" role="status" aria-label="Total Recommendations: {total_recommendations}">
                     <h3>Total Recommendations</h3>
                     <div class="value">{total_recommendations}</div>
                 </div>
-                <div class="summary-card">
+                <div class="summary-card" role="status" aria-label="Estimated Monthly Savings: ${total_savings:.2f}">
                     <h3>Estimated Monthly Savings</h3>
                     <div class="value">${total_savings:.2f}</div>
                 </div>
-                <div class="summary-card">
+                <div class="summary-card" role="status" aria-label="Services Scanned: {total_services_scanned}">
                     <h3>Services Scanned</h3>
-                    <div class="value">{services_with_recommendations}</div>
+                    <div class="value">{total_services_scanned}</div>
                 </div>
-                <div class="summary-card">
+                <div class="summary-card" role="status" aria-label="Potential Annual Savings: ${total_savings * 12:.2f}">
                     <h3>Potential Annual Savings</h3>
                     <div class="value">${total_savings * 12:.2f}</div>
                 </div>
-            </div>
-        </div>"""
+            </div>"""
+
+        graviton_count = self._count_graviton_exclusions()
+        if graviton_count > 0:
+            html += f'<div class="info-note"><p><svg class="icon icon-sm"><use href="#icon-clipboard"/></svg> Note: {graviton_count} Graviton migration recommendations excluded from per-service detail. These require architecture-level review and are available via AWS Compute Optimizer.</p></div>'
+
+        html += "</div>"
+        return html
 
     def _get_tabs(self) -> str:
         """Get tabs section"""
@@ -1263,37 +1640,38 @@ class HTMLReportGenerator:
         amis_data = self._extract_amis_data(services)
 
         # Tab buttons
-        tab_buttons = '<div class="tab-buttons">'
+        tab_buttons = '<div class="tab-buttons" role="tablist">'
 
-        # Add Executive Summary tab first (always active)
-        tab_buttons += (
-            '<button class="tab-button active" onclick="showTab(\'executive-summary\')">📊 Executive Summary</button>'
-        )
+        tab_buttons += '<button class="tab-button active" role="tab" aria-selected="true" aria-controls="panel-executive-summary" id="tab-executive-summary" onclick="showTab(\'executive-summary\', event)"><svg class="icon icon-sm"><use href="#icon-chart"/></svg> Executive Summary</button>'
 
         # Add main service tabs with Snapshots and AMIs
         for i, (service_key, service_data) in enumerate(services.items()):
-            # Skip tabs with no recommendations
-            if service_data.get("total_recommendations", 0) == 0:
+            # Use filtered data for accurate counts (removes MigrateToGraviton etc.)
+            filtered = self._filter_recommendations(service_data)
+            rec_count = filtered.get("total_recommendations", 0)
+            if rec_count == 0:
                 continue
 
-            # No longer first tab since Executive Summary is first
-            tab_buttons += f'<button class="tab-button" onclick="showTab(\'{service_key}\')">{service_data["service_name"]}</button>'
+            tab_buttons += f'<button class="tab-button" role="tab" aria-selected="false" aria-controls="panel-{html.escape(service_key)}" id="tab-{html.escape(service_key)}" onclick="showTab(\'{html.escape(service_key)}\', event)">{html.escape(str(service_data["service_name"]))}<span class="tab-count">{rec_count}</span></button>'
 
             # Add Snapshots tab right after EBS (if snapshots exist)
             if service_key == "ebs" and snapshots_data["count"] > 0:
-                tab_buttons += f'<button class="tab-button" onclick="showTab(\'snapshots\')">Snapshots</button>'
+                snap_count = snapshots_data["count"]
+                tab_buttons += f'<button class="tab-button" role="tab" aria-selected="false" aria-controls="panel-snapshots" id="tab-snapshots" onclick="showTab(\'snapshots\', event)">Snapshots<span class="tab-count">{snap_count}</span></button>'
 
         # Add standalone Snapshots tab if no EBS tab but snapshots exist
         if snapshots_data["count"] > 0 and not any(
             s.get("total_recommendations", 0) > 0 for k, s in services.items() if k == "ebs"
         ):
-            tab_buttons += f'<button class="tab-button" onclick="showTab(\'snapshots\')">Snapshots</button>'
+            snap_count = snapshots_data["count"]
+            tab_buttons += f'<button class="tab-button" role="tab" aria-selected="false" aria-controls="panel-snapshots" id="tab-snapshots" onclick="showTab(\'snapshots\', event)">Snapshots<span class="tab-count">{snap_count}</span></button>'
 
         # Add standalone AMIs tab if no AMI service but AMIs exist
         if amis_data["count"] > 0 and not any(
             s.get("total_recommendations", 0) > 0 for k, s in services.items() if k == "ami"
         ):
-            tab_buttons += f'<button class="tab-button" onclick="showTab(\'amis\')">AMIs</button>'
+            ami_count = amis_data["count"]
+            tab_buttons += f'<button class="tab-button" role="tab" aria-selected="false" aria-controls="panel-amis" id="tab-amis" onclick="showTab(\'amis\', event)">AMIs<span class="tab-count">{ami_count}</span></button>'
 
         tab_buttons += "</div>"
 
@@ -1301,7 +1679,7 @@ class HTMLReportGenerator:
         tab_contents = ""
 
         # Add Executive Summary tab content first (always active)
-        tab_contents += '<div id="executive-summary" class="tab-content active">'
+        tab_contents += '<div id="executive-summary" class="tab-content active" role="tabpanel" id="panel-executive-summary" aria-labelledby="tab-executive-summary">'
         tab_contents += self._get_executive_summary_content()
         tab_contents += "</div>"
 
@@ -1312,9 +1690,9 @@ class HTMLReportGenerator:
                 continue
 
             # No longer active since Executive Summary is active
-            tab_contents += f'<div id="{service_key}" class="tab-content">'
-
-            # Use custom AMI content if AMI service
+            tab_contents += (
+                f'<div id="{service_key}" class="tab-content" role="tabpanel" aria-labelledby="tab-{service_key}">'
+            )
             if service_key == "ami" and amis_data["count"] > 0:
                 tab_contents += self._get_amis_content(amis_data)
             else:
@@ -1324,7 +1702,9 @@ class HTMLReportGenerator:
 
             # Add Snapshots tab content right after EBS
             if service_key == "ebs" and snapshots_data["count"] > 0:
-                tab_contents += f'<div id="snapshots" class="tab-content">'
+                tab_contents += (
+                    '<div id="snapshots" class="tab-content" role="tabpanel" aria-labelledby="tab-snapshots">'
+                )
                 tab_contents += self._get_snapshots_content(snapshots_data)
                 tab_contents += "</div>"
 
@@ -1332,7 +1712,7 @@ class HTMLReportGenerator:
         if snapshots_data["count"] > 0 and not any(
             s.get("total_recommendations", 0) > 0 for k, s in services.items() if k == "ebs"
         ):
-            tab_contents += f'<div id="snapshots" class="tab-content">'
+            tab_contents += '<div id="snapshots" class="tab-content" role="tabpanel" aria-labelledby="tab-snapshots">'
             tab_contents += self._get_snapshots_content(snapshots_data)
             tab_contents += "</div>"
 
@@ -1340,7 +1720,7 @@ class HTMLReportGenerator:
         if amis_data["count"] > 0 and not any(
             s.get("total_recommendations", 0) > 0 for k, s in services.items() if k == "ami"
         ):
-            tab_contents += f'<div id="amis" class="tab-content">'
+            tab_contents += '<div id="amis" class="tab-content" role="tabpanel" aria-labelledby="tab-amis">'
             tab_contents += self._get_amis_content(amis_data)
             tab_contents += "</div>"
 
@@ -1369,11 +1749,19 @@ class HTMLReportGenerator:
             "count": len(snapshots),
             "recommendations": snapshots,
             "total_savings": sum(
-                float(rec.get("EstimatedSavings", "0").replace("$", "").replace("/month", "").split("(")[0].strip())
+                float(
+                    rec.get("EstimatedSavings", "0")
+                    .replace(",", "")
+                    .replace("$", "")
+                    .replace("/month", "")
+                    .split("(")[0]
+                    .strip()
+                )
                 for rec in snapshots
                 if "EstimatedSavings" in rec
                 and rec.get("EstimatedSavings", "0") != "0"
                 and rec.get("EstimatedSavings", "")
+                .replace(",", "")
                 .replace("$", "")
                 .replace("/month", "")
                 .split("(")[0]
@@ -1438,11 +1826,13 @@ class HTMLReportGenerator:
             if "$" in savings_str and "/month" in savings_str:
                 try:
                     # Remove currency, time unit, and any additional text like "(max estimate)"
-                    clean_str = savings_str.replace("$", "").replace("/month", "").split("(")[0].strip()
+                    clean_str = (
+                        savings_str.replace(",", "").replace("$", "").replace("/month", "").split("(")[0].strip()
+                    )
                     savings_val = float(clean_str)
                     total_savings += savings_val
                 except (ValueError, AttributeError) as e:
-                    print(f"⚠️ Could not parse snapshot savings '{savings_str}': {str(e)}")
+                    logger.warning("Could not parse snapshot savings '%s': %s", savings_str, e)
                     # Continue without this savings amount
 
         # Use standard service header format
@@ -1457,7 +1847,7 @@ class HTMLReportGenerator:
 
         # Use standard recommendations section format
         content += '<div class="recommendation-section">'
-        content += '<h3 class="section-title">💡 Optimization Recommendations</h3>'
+        content += '<h3 class="section-title"><svg class="icon icon-sm"><use href="#icon-lightbulb"/></svg> Optimization Recommendations</h3>'
         content += f'<div class="rec-summary"><strong>Total Recommendations:</strong> {snapshots_data["count"]} | '
         content += (
             f'<strong>Estimated Monthly Savings:</strong> <span class="savings">${total_savings:.2f}</span></div>'
@@ -1476,11 +1866,12 @@ class HTMLReportGenerator:
                 if "$" in savings_str and "/month" in savings_str:
                     try:
                         # Remove currency, time unit, and any additional text like "(max estimate)"
-                        clean_str = savings_str.replace("$", "").replace("/month", "").split("(")[0].strip()
+                        clean_str = (
+                            savings_str.replace(",", "").replace("$", "").replace("/month", "").split("(")[0].strip()
+                        )
                         group_savings += float(clean_str)
                     except (ValueError, AttributeError) as e:
-                        print(f"⚠️ Could not parse snapshot savings '{savings_str}': {str(e)}")
-                        # Continue without this savings amount
+                        logger.warning("Could not parse snapshot savings '%s': %s", savings_str, e)
                 total_size += snap.get("VolumeSize", 0)
 
             content += f'<div class="rec-item">'
@@ -1528,7 +1919,7 @@ class HTMLReportGenerator:
 
         # Use standard recommendations section format
         content += '<div class="recommendation-section">'
-        content += '<h3 class="section-title">💡 Optimization Recommendations</h3>'
+        content += '<h3 class="section-title"><svg class="icon icon-sm"><use href="#icon-lightbulb"/></svg> Optimization Recommendations</h3>'
 
         # Calculate total savings
         total_savings = sum(ami.get("EstimatedMonthlySavings", 0) for amis in age_groups.values() for ami in amis)
@@ -1575,7 +1966,7 @@ class HTMLReportGenerator:
         if total_recommendations == 0:
             return """
             <div class="service-header">
-                <h2 class="service-title">📊 Executive Summary</h2>
+                <h2 class="service-title"><svg class="icon icon-sm"><use href="#icon-chart"/></svg> Executive Summary</h2>
             </div>
             <div class="empty-state">
                 <h3>No Cost Optimization Recommendations Found</h3>
@@ -1590,7 +1981,7 @@ class HTMLReportGenerator:
         content = (
             """
         <div class="service-header">
-            <h2 class="service-title">📊 Executive Summary</h2>
+            <h2 class="service-title"><svg class="icon icon-sm"><use href="#icon-chart"/></svg> Executive Summary</h2>
             <div class="service-stats">
                 <div class="stat-card">
                     <h4>Total Monthly Savings</h4>
@@ -1612,29 +2003,125 @@ class HTMLReportGenerator:
                 </div>
             </div>
         </div>
-        
+        """
+        )
+
+        graviton_count = self._count_graviton_exclusions()
+        if graviton_count > 0:
+            content += f'<div class="info-note"><p><svg class="icon icon-sm"><use href="#icon-clipboard"/></svg> Note: {graviton_count} Graviton migration recommendations excluded from per-service detail. These require architecture-level review and are available via AWS Compute Optimizer.</p></div>'
+
+        content += """
         <div class="charts-container">
             <div class="chart-section">
                 <h3>Cost Savings Distribution by Service</h3>
                 <div class="chart-wrapper">
-                    <canvas id="savingsPieChart" width="400" height="400"></canvas>
+                    <canvas id="savingsPieChart" width="400" height="400" role="img" aria-label="Cost breakdown pie chart showing savings by service"></canvas>
+                    <noscript><p class="chart-fallback">Enable JavaScript to view the cost savings pie chart.</p></noscript>
                 </div>
             </div>
             <div class="chart-section">
                 <h3>Top Services by Savings Potential</h3>
                 <div class="chart-wrapper">
-                    <canvas id="savingsBarChart" width="400" height="400"></canvas>
+                    <canvas id="savingsBarChart" width="400" height="400" role="img" aria-label="Monthly savings bar chart by service"></canvas>
+                    <noscript><p class="chart-fallback">Enable JavaScript to view the savings bar chart.</p></noscript>
                 </div>
             </div>
         </div>
         """
-        )
+
+        content += self._get_trends_section()
 
         return content
 
+    def _get_trends_section(self) -> str:
+        trend = self.scan_results.get("trend_analysis")
+        if not trend:
+            return ""
+
+        total_spend = trend.get("total_spend", 0)
+        spend_change_pct = trend.get("spend_change_pct", 0)
+        forecast = trend.get("forecast")
+        fastest_growing = trend.get("fastest_growing", [])
+        daily_spend_series = trend.get("daily_spend_series", [])
+        days_back = trend.get("days_back", 90)
+
+        stat_cards = (
+            '<div class="stat-card"><h4>90-Day Total Spend</h4>'
+            f'<div class="value">${total_spend:,.2f}</div></div>'
+            '<div class="stat-card"><h4>Spend Change</h4>'
+            f'<div class="value">{spend_change_pct:+.1f}%</div></div>'
+        )
+        if forecast and isinstance(forecast, (int, float)):
+            stat_cards += (
+                f'<div class="stat-card"><h4>30-Day Forecast</h4><div class="value">${forecast:,.2f}</div></div>'
+            )
+
+        chart_html = ""
+        if daily_spend_series:
+            dates = [d["date"] for d in daily_spend_series]
+            amounts = [d["amount"] for d in daily_spend_series]
+            dates_js = json.dumps(dates)
+            amounts_js = json.dumps(amounts)
+            chart_html = (
+                '<div class="charts-container"><div class="chart-section">'
+                f'<div class="chart-wrapper"><canvas id="spendTrendChart" width="800" height="300" role="img" aria-label="Spend trend line chart"></canvas><noscript><p class="chart-fallback">Enable JavaScript to view the spend trend chart.</p></noscript></div>'
+                "</div></div>"
+                "<script>(function(){"
+                'var canvas=document.getElementById("spendTrendChart");'
+                "if(!canvas)return;"
+                'var ctx=canvas.getContext("2d");'
+                'var isDark=document.documentElement.getAttribute("data-theme")==="dark";'
+                'var textColor=isDark?"#e0e0e0":"#333333";'
+                'var gridColor=isDark?"rgba(255,255,255,0.1)":"rgba(0,0,0,0.1)";'
+                f"var dates={dates_js};"
+                f"var amounts={amounts_js};"
+                "new Chart(ctx,{"
+                'type:"line",'
+                "data:{labels:dates,datasets:[{"
+                'label:"Daily Spend ($)",'
+                "data:amounts,"
+                'borderColor:"#42a5f5",'
+                'backgroundColor:"rgba(66,165,245,0.1)",'
+                "fill:true,"
+                "tension:0.3,"
+                "pointRadius:1,"
+                "pointHoverRadius:4"
+                "}]},"
+                "options:{responsive:true,maintainAspectRatio:false,"
+                "plugins:{legend:{labels:{color:textColor}},"
+                'tooltip:{callbacks:{label:function(c){return "$"+c.parsed.y.toFixed(2);}}}}},'
+                "scales:{"
+                'y:{beginAtZero:false,ticks:{color:textColor,callback:function(v){return "$"+v.toFixed(0);}},grid:{color:gridColor}},'
+                "x:{ticks:{color:textColor,maxTicksLimit:12,maxRotation:45},grid:{color:gridColor}}"
+                "}"
+                "}});})();</script>"
+            )
+
+        table_html = ""
+        if fastest_growing:
+            table_rows = ""
+            for svc in fastest_growing[:5]:
+                name = html.escape(svc.get("service", "Unknown"))
+                change = svc.get("change_pct", 0)
+                table_rows += f"<tr><td>{name}</td><td>{change:+.1f}%</td></tr>"
+            table_html = (
+                '<div class="table-responsive"><table class="data-table">'
+                "<thead><tr><th>Service</th><th>Growth</th></tr></thead>"
+                f"<tbody>{table_rows}</tbody></table></div>"
+            )
+
+        return (
+            '<div class="chart-section">'
+            f'<h3><svg class="icon icon-sm"><use href="#icon-trending"/></svg> {days_back}-Day Spend Trends</h3>'
+            f'<div class="service-stats">{stat_cards}</div>'
+            f"{chart_html}"
+            f"{table_html}"
+            "</div>"
+        )
+
     def _filter_recommendations(self, service_data: Dict[str, Any]) -> Dict[str, Any]:
         """Filter out non-relevant recommendations like MigrateToGraviton"""
-        filtered_data = service_data.copy()
+        filtered_data = copy.deepcopy(service_data)
 
         if "sources" in filtered_data:
             for source_name, source_data in filtered_data["sources"].items():
@@ -1645,6 +2132,9 @@ class HTMLReportGenerator:
                         rec
                         for rec in original_recs
                         if isinstance(rec, dict) and rec.get("actionType") != "MigrateToGraviton"
+                    ]
+                    filtered_recs = [
+                        rec for rec in filtered_recs if isinstance(rec, dict) and rec.get("finding") != "OPTIMIZED"
                     ]
 
                     # Update counts and savings
@@ -1662,12 +2152,17 @@ class HTMLReportGenerator:
                             0, filtered_data.get("total_monthly_savings", 0) - graviton_savings
                         )
 
-        # Recalculate total recommendations and savings
+        # Recalculate total recommendations - only count sources with actual recommendations
         total_recs = 0
         for source in filtered_data.get("sources", {}).values():
             if isinstance(source, dict):
-                # Old format: {'count': X, 'recommendations': [...]}
-                total_recs += source.get("count", 0)
+                # Only count if there are actual recommendations (not just a count placeholder)
+                recs = source.get("recommendations", [])
+                if recs and len(recs) > 0:
+                    total_recs += len(recs)
+                elif source.get("count", 0) > 0:
+                    # Fallback to count if recommendations list is empty but count exists
+                    total_recs += source.get("count", 0)
             elif isinstance(source, list):
                 # New format: direct list of recommendations
                 total_recs += len(source)
@@ -1684,6 +2179,16 @@ class HTMLReportGenerator:
                 filtered_data["total_monthly_savings"] = 0
 
         return filtered_data
+
+    def _count_graviton_exclusions(self) -> int:
+        count = 0
+        for service_data in self.scan_results.get("services", {}).values():
+            for source_data in service_data.get("sources", {}).values():
+                if isinstance(source_data, dict):
+                    for rec in source_data.get("recommendations", []):
+                        if isinstance(rec, dict) and rec.get("actionType") == "MigrateToGraviton":
+                            count += 1
+        return count
 
     def _get_affected_resources_list(self, service_key: str, service_data: Dict[str, Any]) -> str:
         """Get list of affected resources for each recommendation type"""
@@ -1770,10 +2275,10 @@ class HTMLReportGenerator:
 
     def _get_service_content(self, service_key: str, service_data: Dict[str, Any]) -> str:
         """Get content for a specific service tab"""
-        # Calculate realistic savings if JSON shows $0
+        canonical_savings = service_data.get("total_monthly_savings", 0)
         calculated_savings = self._calculate_service_savings(service_key, service_data)
+        is_estimated = calculated_savings > 0 and (canonical_savings == 0 or calculated_savings != canonical_savings)
 
-        # Update service data with calculated savings
         if calculated_savings > 0:
             service_data = service_data.copy()
             service_data["total_monthly_savings"] = calculated_savings
@@ -1795,7 +2300,7 @@ class HTMLReportGenerator:
         filtered_service_data = self._filter_recommendations(service_data)
 
         content = f'<div class="service-header">'
-        content += f'<h2 class="service-title">{filtered_service_data["service_name"]} Cost Optimization</h2>'
+        content += f'<h2 class="service-title">{html.escape(str(filtered_service_data["service_name"]))} Cost Optimization</h2>'
         content += self._get_service_stats(service_key, filtered_service_data)
         content += "</div>"
 
@@ -1830,18 +2335,46 @@ class HTMLReportGenerator:
 
         # Recommendations section
         content += '<div class="recommendation-section">'
-        content += '<h3 class="section-title">💡 Optimization Recommendations</h3>'
+        content += '<h3 class="section-title"><svg class="icon icon-sm"><use href="#icon-lightbulb"/></svg> Optimization Recommendations</h3>'
+        savings_value = filtered_service_data.get("total_monthly_savings", 0.0)
+        savings_label = "Estimated Monthly Savings" if is_estimated else "Monthly Savings"
         content += f'<div class="rec-summary"><strong>Total Recommendations:</strong> {filtered_service_data["total_recommendations"]} | '
-        content += f'<strong>Estimated Monthly Savings:</strong> <span class="savings">${filtered_service_data["total_monthly_savings"]:.2f}</span></div>'
+        if savings_value > 0:
+            content += f'<strong>{savings_label}:</strong> <span class="savings">${savings_value:.2f}</span></div>'
+        else:
+            content += f'<strong>{savings_label}:</strong> <span class="savings">$0.00</span></div>'
+            content += '<div class="info-box"><p><svg class="icon icon-sm"><use href="#icon-lightbulb"/></svg> These recommendations focus on best practices and cost avoidance — no direct monetary savings were calculated. Review each recommendation for potential operational improvements.</p></div>'
 
-        # Optimization opportunities
+        # Optimization opportunities - only include if corresponding source has actual recommendations
         descs = filtered_service_data.get("optimization_descriptions")
+        sources = filtered_service_data.get("sources", {})
         if descs:
             content += '<div class="opportunities">'
             for desc_key, desc in list(descs.items())[:5]:
+                title = desc.get("title", "")
+                description = desc.get("description", "")
+                # Only show opportunity if there's corresponding source with actual recommendations
+                # Map optimization desc keys to source keys
+                source_key_map = {
+                    "compute_optimizer": "compute_optimizer",
+                    "compute_optimizer_ebs": "compute_optimizer",
+                    "unattached_volumes": "unattached_volumes",
+                    "gp2_migration": "gp2_migration",
+                    "gp3_migration": "gp2_migration",
+                    "old_snapshots": "old_snapshots",
+                    "enhanced_ebs": "enhanced_ebs",
+                }
+                source_key = source_key_map.get(desc_key, desc_key)
+                source_data = sources.get(source_key, {})
+                recs = source_data.get("recommendations", []) if isinstance(source_data, dict) else []
+                # Only render if source has actual recommendations
+                if not recs or len(recs) == 0:
+                    continue
+                if not title or not description:
+                    continue
                 content += f"""<div class="opportunity">
-                    <h4>{desc.get("title", "")}</h4>
-                    <p>{desc.get("description", "")}</p>
+                    <h4>{title}</h4>
+                    <p>{description}</p>
                 </div>"""
             content += "</div>"
 
@@ -1925,6 +2458,7 @@ class HTMLReportGenerator:
             should_skip_source_loop,
             should_use_handler,
             should_fallback_to_per_rec,
+            source_type_badge,
         )
 
         if service_key == "file_systems":
@@ -1955,12 +2489,18 @@ class HTMLReportGenerator:
                 if total_count == 0:
                     continue
 
-                if not should_skip_section_header(service_key):
-                    content += f"<h4>{source_name.replace('_', ' ').title()}: {total_count} items</h4>"
-
                 if should_use_handler(service_key, source_name):
                     handler = PHASE_B_HANDLERS[(service_key, source_name)]
-                    content += handler(recommendations, source_name, service_data)
+                    handler_output = handler(recommendations, source_name, service_data)
+                    if not handler_output:
+                        # Handler filtered out all recs (e.g., all findings are "Optimized")
+                        continue
+                    badge = source_type_badge(service_key, source_name)
+                    if not should_skip_section_header(service_key):
+                        content += f"<h4>{source_name.replace('_', ' ').title()}: {total_count} items{badge}</h4>"
+                    else:
+                        content += f'<div class="source-badge">{badge}</div>'
+                    content += handler_output
                     continue
 
                 if should_fallback_to_per_rec(service_key):
@@ -2015,7 +2555,7 @@ class HTMLReportGenerator:
         # Active Plans Section
         if active_plans:
             content += '<div class="recommendation-section">'
-            content += '<h3 class="section-title">💡 Active Savings Plans</h3>'
+            content += '<h3 class="section-title"><svg class="icon icon-sm"><use href="#icon-lightbulb"/></svg> Active Savings Plans</h3>'
             for plan in active_plans:
                 plan_type = plan.get("savingsPlanType", "Unknown")
                 commitment = plan.get("commitment", 0)
@@ -2036,7 +2576,7 @@ class HTMLReportGenerator:
         # Utilization Analysis
         if utilization:
             content += '<div class="recommendation-section">'
-            content += '<h3 class="section-title">💡 Utilization Analysis</h3>'
+            content += '<h3 class="section-title"><svg class="icon icon-sm"><use href="#icon-lightbulb"/></svg> Utilization Analysis</h3>'
             content += '<div class="rec-item">'
             content += f"<h5>Overall Utilization: {utilization.get('utilization_percentage', 0):.1f}% ({utilization.get('status', 'Unknown')})</h5>"
             content += f"<p><strong>Total Commitment:</strong> ${utilization.get('total_commitment', '0')}</p>"
@@ -2047,7 +2587,7 @@ class HTMLReportGenerator:
         # Coverage Analysis
         if coverage:
             content += '<div class="recommendation-section">'
-            content += '<h3 class="section-title">💡 Coverage Analysis</h3>'
+            content += '<h3 class="section-title"><svg class="icon icon-sm"><use href="#icon-lightbulb"/></svg> Coverage Analysis</h3>'
             content += '<div class="rec-item">'
             content += f"<h5>Coverage: {coverage.get('coverage_percentage', 0):.1f}% ({coverage.get('status', 'Unknown')})</h5>"
             content += f"<p><strong>On-Demand Cost:</strong> ${coverage.get('on_demand_cost', 0):.2f}</p>"
@@ -2058,7 +2598,7 @@ class HTMLReportGenerator:
         # Recommendations
         if recommendations:
             content += '<div class="recommendation-section">'
-            content += '<h3 class="section-title">💡 Optimization Recommendations</h3>'
+            content += '<h3 class="section-title"><svg class="icon icon-sm"><use href="#icon-lightbulb"/></svg> Optimization Recommendations</h3>'
             for rec in recommendations:
                 severity = rec.get("severity", "Medium")
                 badge_class = "danger" if severity == "High" else "warning" if severity == "Medium" else "success"
@@ -2079,7 +2619,7 @@ class HTMLReportGenerator:
         # Uncovered Instance Families
         if uncovered_families:
             content += '<div class="recommendation-section">'
-            content += '<h3 class="section-title">💡 Uncovered Instance Families</h3>'
+            content += '<h3 class="section-title"><svg class="icon icon-sm"><use href="#icon-lightbulb"/></svg> Uncovered Instance Families</h3>'
             content += "<p>The following instance families are not covered by EC2 Instance Savings Plans:</p>"
             for family_info in uncovered_families:
                 content += '<div class="rec-item">'
@@ -2095,7 +2635,7 @@ class HTMLReportGenerator:
         cost_hub_recs = sp_data.get("cost_hub_purchase_recommendations", [])
         if cost_hub_recs:
             content += '<div class="recommendation-section">'
-            content += '<h3 class="section-title">💡 Cost Optimization Hub - Purchase Recommendations</h3>'
+            content += '<h3 class="section-title"><svg class="icon icon-sm"><use href="#icon-lightbulb"/></svg> Cost Optimization Hub - Purchase Recommendations</h3>'
             content += "<p>AWS Cost Optimization Hub has identified opportunities to purchase Savings Plans:</p>"
             for rec in cost_hub_recs:
                 severity = rec.get("severity", "Medium")
@@ -2113,7 +2653,7 @@ class HTMLReportGenerator:
         # No Savings Plans message
         if not summary.get("has_savings_plans"):
             content += '<div class="info-box">'
-            content += '<h3 class="section-title">ℹ️ No Active Savings Plans Found</h3>'
+            content += '<h3 class="section-title">No Active Savings Plans Found</h3>'
             content += "<p>Consider purchasing Savings Plans to save up to 72% on your compute usage:</p>"
             content += "<ul>"
             content += "<li><strong>Compute Savings Plans:</strong> Most flexible, up to 66% savings on EC2, Fargate, and Lambda</li>"
@@ -2122,7 +2662,7 @@ class HTMLReportGenerator:
 
             # Show Cost Hub recommendations even without active plans
             if cost_hub_recs:
-                content += '<p class="callout-margin"><strong>💡 Cost Optimization Hub has identified purchase opportunities above.</strong></p>'
+                content += '<p class="callout-margin"><strong><svg class="icon icon-sm"><use href="#icon-lightbulb"/></svg> Cost Optimization Hub has identified purchase opportunities above.</strong></p>'
 
             content += "</div>"
 
@@ -2140,7 +2680,7 @@ class HTMLReportGenerator:
                     {
                         "service": service_data.get("service_name", service_key.title()),
                         "service_key": service_key,
-                        "savings": service_data.get("total_monthly_savings", 0),
+                        "savings": self._calculate_service_savings(service_key, service_data),
                         "recommendations": service_data.get("total_recommendations", 0),
                     }
                 )
@@ -2150,7 +2690,11 @@ class HTMLReportGenerator:
 
         return f"""<script>
         let currentFilter = null;
-        const chartData = {chart_data};
+        const chartData = {json.dumps(chart_data)};
+        
+        function formatCurrency(amount) {{
+            return '$' + amount.toFixed(2).replace(/\\B(?=(\\d{{3}})+(?!\\d))/g, ',');
+        }}
         
         // Dark Mode Functions
         function toggleTheme() {{
@@ -2160,6 +2704,7 @@ class HTMLReportGenerator:
             
             html.setAttribute('data-theme', newTheme);
             localStorage.setItem('theme', newTheme);
+            document.querySelector('.theme-toggle').setAttribute('aria-pressed', newTheme === 'dark' ? 'true' : 'false');
             updateThemeToggle(newTheme);
             
             // Reinitialize charts with new colors
@@ -2169,14 +2714,14 @@ class HTMLReportGenerator:
         }}
 
         function updateThemeToggle(theme) {{
-            const icon = document.getElementById('theme-icon');
+            const icon = document.getElementById('theme-icon-svg');
             const text = document.getElementById('theme-text');
             
             if (theme === 'dark') {{
-                icon.textContent = '☀️';
+                icon.setAttributeNS('http://www.w3.org/1999/xlink', 'href', '#icon-sun');
                 text.textContent = 'Light';
             }} else {{
-                icon.textContent = '🌙';
+                icon.setAttributeNS('http://www.w3.org/1999/xlink', 'href', '#icon-moon');
                 text.textContent = 'Dark';
             }}
         }}
@@ -2187,20 +2732,18 @@ class HTMLReportGenerator:
             updateThemeToggle(savedTheme);
         }}
         
-        function showTab(tabId) {{
-            // Hide all tab contents
+        function showTab(tabId, evt) {{
             const contents = document.querySelectorAll('.tab-content');
             contents.forEach(content => content.classList.remove('active'));
             
-            // Remove active class from all buttons
             const buttons = document.querySelectorAll('.tab-button');
             buttons.forEach(button => button.classList.remove('active'));
             
-            // Show selected tab content
             document.getElementById(tabId).classList.add('active');
             
-            // Add active class to clicked button
-            event.target.classList.add('active');
+            if (evt && evt.target) {{
+                evt.target.classList.add('active');
+            }}
             
             // Clear filter when switching to executive summary
             if (tabId === 'executive-summary') {{
@@ -2213,8 +2756,14 @@ class HTMLReportGenerator:
             currentFilter = serviceKey;
             updateFilterIndicators();
             
-            // Show the specific service tab
             showTab(serviceKey);
+            
+            const btns = document.querySelectorAll('.tab-button');
+            btns.forEach(b => {{
+                if (b.getAttribute('onclick') && b.getAttribute('onclick').includes(serviceKey)) {{
+                    b.classList.add('active');
+                }}
+            }});
         }}
         
         function updateFilterIndicators() {{
@@ -2233,17 +2782,18 @@ class HTMLReportGenerator:
         
         function initializeCharts() {{
             if (chartData.length === 0) return;
-            
+            try {{
             const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
             const borderColor = isDark ? '#1e1e1e' : '#fff';
             const textColor = isDark ? '#ffffff' : '#212121';
             const gridColor = isDark ? '#333333' : '#e0e0e0';
             
+            Chart.defaults.font.family = "'Roboto', -apple-system, BlinkMacSystemFont, sans-serif";
+            
             // AWS Theme Colors
-            const awsColors = [
-                '#42a5f5', '#64b5f6', '#ffb74d', '#66bb6a', '#ef5350',
-                '#ab47bc', '#26c6da', '#9ccc65', '#ffca28', '#8d6e63'
-            ];
+            const awsColors = Array.from({{length: Math.max(chartData.length, 10)}}, (_, i) => 
+                `hsl(${{(i * 360 / Math.max(chartData.length, 10)) % 360}}, 65%, 55%)`
+            );
             
             // Destroy existing charts
             if (pieChart) {{
@@ -2282,6 +2832,8 @@ class HTMLReportGenerator:
                                 }}
                             }},
                             tooltip: {{
+                                titleFont: {{ family: "'Roboto', sans-serif" }},
+                                bodyFont: {{ family: "'Roboto', sans-serif" }},
                                 titleColor: textColor,
                                 bodyColor: textColor,
                                 backgroundColor: isDark ? '#333333' : '#ffffff',
@@ -2318,8 +2870,7 @@ class HTMLReportGenerator:
                         datasets: [{{
                             label: 'Monthly Savings ($)',
                             data: chartData.map(d => d.savings),
-                            backgroundColor: '#42a5f5',
-                            borderColor: '#1976d2',
+                            backgroundColor: awsColors.slice(0, chartData.length),
                             borderWidth: 1
                         }}]
                     }},
@@ -2331,6 +2882,8 @@ class HTMLReportGenerator:
                                 display: false
                             }},
                             tooltip: {{
+                                titleFont: {{ family: "'Roboto', sans-serif" }},
+                                bodyFont: {{ family: "'Roboto', sans-serif" }},
                                 titleColor: textColor,
                                 bodyColor: textColor,
                                 backgroundColor: isDark ? '#333333' : '#ffffff',
@@ -2356,7 +2909,9 @@ class HTMLReportGenerator:
                                     color: gridColor
                                 }},
                                 title: {{
-                                    display: false
+                                    display: true,
+                                    text: 'Monthly Savings ($)',
+                                    color: textColor
                                 }}
                             }},
                             x: {{
@@ -2382,8 +2937,29 @@ class HTMLReportGenerator:
                     }}
                 }});
             }}
+            }} catch (e) {{
+                console.error('Chart initialization failed:', e);
+                document.querySelectorAll('.chart-fallback').forEach(function(el) {{
+                    el.style.display = 'block';
+                }});
+            }}
         }}
         
+        // Back to top button
+        const backToTopBtn = document.querySelector('.back-to-top');
+        if (backToTopBtn) {{
+            window.addEventListener('scroll', function() {{
+                if (window.scrollY > 400) {{
+                    backToTopBtn.classList.add('visible');
+                }} else {{
+                    backToTopBtn.classList.remove('visible');
+                }}
+            }});
+            backToTopBtn.addEventListener('click', function() {{
+                window.scrollTo({{ top: 0, behavior: 'smooth' }});
+            }});
+        }}
+
         // Initialize theme and charts when page loads
         document.addEventListener('DOMContentLoaded', function() {{
             initializeTheme();
@@ -2392,7 +2968,7 @@ class HTMLReportGenerator:
         </script>"""
 
 
-def generate_html_report_from_json(json_file: str, output_file: str = None) -> str:
+def generate_html_report_from_json(json_file: str, output_file: str | None = None) -> str:
     """Generate HTML report from JSON scan results file"""
     with open(json_file, "r") as f:
         scan_results = json.load(f)

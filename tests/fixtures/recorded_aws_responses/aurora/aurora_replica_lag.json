@@ -1,0 +1,10 @@
+{
+  "Datapoints": [
+    {
+      "Timestamp": "2026-04-29T10:30:00+00:00",
+      "Average": 15.0,
+      "Unit": "Milliseconds"
+    }
+  ],
+  "Label": "AuroraReplicaLag"
+}

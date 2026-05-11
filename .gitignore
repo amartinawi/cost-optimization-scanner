@@ -157,7 +157,18 @@ Thumbs.db
 .claude*
 .auto-claude*
 .kiro*
+.sisyphus/
+.opencode/
 almashhad_*
+
+# Generated audit and screenshot outputs
+AUDIT_REPORT.md
+audit_screenshots/
+Audit/
+
+# Local backups
+backup_*/
+backup_[0-9]*/
 
 # Temporary files
 *.tmp

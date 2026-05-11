@@ -1,0 +1,24 @@
+{
+  "lambdaFunctionRecommendations": [
+    {
+      "functionArn": "arn:aws:lambda:us-east-1:123456789012:function:my-function-1",
+      "currentMemorySize": 1024,
+      "currentExecutionType": "x86_64",
+      "finding": "Overprovisioned",
+      "memorySizeRecommendationOptions": [
+        {
+          "memorySize": 256,
+          "savingsOpportunity": {
+            "estimatedMonthlySavings": {
+              "currency": "USD",
+              "value": 12.50
+            }
+          }
+        }
+      ],
+      "lookBackPeriodInDays": 14,
+      "utilizationImprovementMetrics": []
+    }
+  ],
+  "nextToken": null
+}

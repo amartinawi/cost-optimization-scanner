@@ -14,6 +14,7 @@ print("🔍 [services/vpc_endpoints.py] VPC Endpoints module active")
 
 
 def get_vpc_endpoints_checks(ctx: ScanContext) -> dict[str, Any]:
+    vpc_ep_monthly = ctx.pricing_engine.get_vpc_endpoint_monthly_price() if ctx.pricing_engine is not None else 7.30
     """Category 3: VPC Endpoints optimization checks"""
     checks: dict[str, list[dict[str, Any]]] = {
         "missing_gateway_endpoints": [],
@@ -92,7 +93,7 @@ def get_vpc_endpoints_checks(ctx: ScanContext) -> dict[str, Any]:
                         "VpcId": vpc_id,
                         "Environment": environment,
                         "Recommendation": "Interface endpoints in non-prod may be unnecessary",
-                        "EstimatedSavings": "$7.30/month per endpoint",
+                        "EstimatedSavings": f"${vpc_ep_monthly:.2f}/month per endpoint",
                         "CheckCategory": "Interface Endpoints in Non-Prod",
                     }
                 )
@@ -114,7 +115,7 @@ def get_vpc_endpoints_checks(ctx: ScanContext) -> dict[str, Any]:
                         "EndpointCount": len(service_endpoints),
                         "EndpointIds": [ep["endpoint_id"] for ep in service_endpoints],
                         "Recommendation": f"{len(service_endpoints)} endpoints for same service - review if all needed (multiple can be valid for different route tables/policies)",
-                        "EstimatedSavings": f"${(len(service_endpoints) - 2) * 7.30:.2f}/month if some consolidated",
+                        "EstimatedSavings": f"${(len(service_endpoints) - 2) * vpc_ep_monthly:.2f}/month if some consolidated",
                         "CheckCategory": "Multiple VPC Endpoints",
                     }
                 )

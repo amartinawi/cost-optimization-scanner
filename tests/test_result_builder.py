@@ -1,3 +1,5 @@
+"""Unit tests for ScanResultBuilder summary and serialisation logic."""
+
 from __future__ import annotations
 
 from types import MappingProxyType
@@ -9,7 +11,10 @@ from core.result_builder import ScanResultBuilder
 
 
 class TestSummary:
+    """Tests for ScanResultBuilder._summary aggregation logic."""
+
     def test_total_services_scanned_quirk(self) -> None:
+        """Verify total_services_scanned counts services with recommendations or total_count > 0."""
         findings: dict[str, ServiceFindings] = {
             "ec2": ServiceFindings(
                 service_name="EC2",
@@ -45,7 +50,10 @@ class TestSummary:
 
 
 class TestSerialize:
+    """Tests for ScanResultBuilder._serialize field filtering."""
+
     def test_drops_zero_total_count(self) -> None:
+        """Verify total_count is omitted when zero."""
         f = ServiceFindings(
             service_name="S3",
             total_recommendations=0,
@@ -57,6 +65,7 @@ class TestSerialize:
         assert "schema_version" not in result
 
     def test_preserves_ami_total_count(self) -> None:
+        """Verify total_count is preserved when non-zero."""
         f = ServiceFindings(
             service_name="AMI",
             total_recommendations=2,
@@ -68,6 +77,7 @@ class TestSerialize:
         assert result["total_count"] == 5
 
     def test_handles_mapping_proxy_extras(self) -> None:
+        """Verify MappingProxyType extras are flattened into the serialised output."""
         f = ServiceFindings(
             service_name="EC2",
             total_recommendations=1,

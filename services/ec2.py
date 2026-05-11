@@ -80,6 +80,25 @@ def _is_eks_nodegroup_asg(asg_name: str, tags: dict[str, str]) -> bool:
         return False
 
 
+def _is_eks_managed_instance(tags: dict[str, str]) -> bool:
+    """Determine if an EC2 instance is managed by EKS.
+
+    EKS-managed instances have tags:
+    - kubernetes.io/cluster/<cluster-name>
+    - eks:cluster-name
+    - eks:nodegroup-name
+    """
+    for key in tags:
+        key_lower = key.lower()
+        if key_lower.startswith("kubernetes.io/cluster/"):
+            return True
+        if key_lower == "eks:cluster-name":
+            return True
+        if key_lower == "eks:nodegroup-name":
+            return True
+    return False
+
+
 def get_enhanced_ec2_checks(
     ctx: ScanContext,
     pricing_multiplier: float,
@@ -107,6 +126,10 @@ def get_enhanced_ec2_checks(
                     instance_id = instance["InstanceId"]
                     instance_type = instance["InstanceType"]
                     state = instance["State"]["Name"]
+                    tags = {tag["Key"]: tag["Value"] for tag in instance.get("Tags", [])}
+
+                    if _is_eks_managed_instance(tags):
+                        continue
 
                     if state == "running":
                         try:
@@ -394,31 +417,14 @@ def get_enhanced_ec2_checks(
 def get_compute_optimizer_recommendations(
     ctx: ScanContext,
 ) -> list[dict[str, Any]]:
-    """Get EC2 recommendations from Compute Optimizer."""
-    compute_optimizer = ctx.client("compute-optimizer")
-    recommendations: list[dict[str, Any]] = []
-    try:
-        response = compute_optimizer.get_ec2_instance_recommendations()
-        recommendations.extend(response["instanceRecommendations"])
+    """Get EC2 recommendations from Compute Optimizer.
 
-        while response.get("nextToken"):
-            response = compute_optimizer.get_ec2_instance_recommendations(nextToken=response["nextToken"])
-            recommendations.extend(response["instanceRecommendations"])
-    except Exception as e:
-        print(f"Warning: Compute Optimizer not available: {e}")
-        if "OptInRequiredException" in str(e) or "not registered" in str(e):
-            opt_in_recommendation = {
-                "ResourceId": "compute-optimizer-service",
-                "ResourceType": "Service Configuration",
-                "Issue": "AWS Compute Optimizer not enabled",
-                "Recommendation": ("Enable AWS Compute Optimizer for EC2 recommendations"),
-                "EstimatedMonthlySavings": ("Variable - up to 25% on EC2 instances"),
-                "Action": ("Go to AWS Compute Optimizer console and opt-in to receive EC2 rightsizing recommendations"),
-                "Priority": "Medium",
-                "Service": "Compute Optimizer",
-            }
-            recommendations.append(opt_in_recommendation)
-    return recommendations
+    Delegates to services.advisor — the canonical location for all
+    advisory-service (Cost Hub / Compute Optimizer) functions.
+    """
+    from services.advisor import get_ec2_compute_optimizer_recommendations
+
+    return get_ec2_compute_optimizer_recommendations(ctx)
 
 
 def get_auto_scaling_checks(ctx: ScanContext) -> dict[str, Any]:
@@ -601,6 +607,10 @@ def get_advanced_ec2_checks(
                         continue
 
                     tags = {tag["Key"]: tag["Value"] for tag in instance.get("Tags", [])}
+
+                    if _is_eks_managed_instance(tags):
+                        continue
+
                     name = tags.get("Name", instance_id)
 
                     if any(

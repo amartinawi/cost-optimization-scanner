@@ -16,20 +16,48 @@ from services.rds import (
 
 
 class RdsModule(BaseServiceModule):
+    """ServiceModule adapter for RDS. Multi-source savings strategy."""
+
     key: str = "rds"
     cli_aliases: tuple[str, ...] = ("rds",)
     display_name: str = "RDS"
 
     def required_clients(self) -> tuple[str, ...]:
+        """Returns boto3 client names required for RDS scanning."""
         return ("rds", "compute-optimizer")
 
     def scan(self, ctx: Any) -> ServiceFindings:
+        """Scan RDS instances for cost optimization opportunities.
+
+        Consults Compute Optimizer and enhanced RDS checks. Savings
+        aggregated from Hub estimates and parsed dollar-amount strings.
+
+        Args:
+            ctx: ScanContext with region, clients, and pricing data.
+
+        Returns:
+            ServiceFindings with compute_optimizer and enhanced_checks sources.
+        """
         print("\U0001f50d [services/adapters/rds.py] RDS module active")
 
-        co_recs = get_rds_compute_optimizer_recommendations(ctx)
-        enhanced_result = get_enhanced_rds_checks(ctx, ctx.pricing_multiplier, ctx.old_snapshot_days)
-        enhanced_recs = enhanced_result.get("recommendations", [])
-        rds_counts = get_rds_instance_count(ctx)
+        co_recs = []
+        try:
+            co_recs = get_rds_compute_optimizer_recommendations(ctx)
+        except Exception as e:
+            print(f"Warning: [rds] Compute Optimizer check failed: {e}")
+
+        enhanced_recs = []
+        try:
+            enhanced_result = get_enhanced_rds_checks(ctx, ctx.pricing_multiplier, ctx.old_snapshot_days)
+            enhanced_recs = enhanced_result.get("recommendations", [])
+        except Exception as e:
+            print(f"Warning: [rds] enhanced checks failed: {e}")
+
+        rds_counts = {}
+        try:
+            rds_counts = get_rds_instance_count(ctx)
+        except Exception as e:
+            print(f"Warning: [rds] instance count failed: {e}")
 
         savings = 0.0
         savings += sum(r.get("estimatedMonthlySavings", 0) for r in co_recs)

@@ -1,0 +1,10 @@
+{
+  "Datapoints": [
+    {
+      "Timestamp": "2026-04-29T10:30:00+00:00",
+      "Average": 25.5,
+      "Unit": "Percent"
+    }
+  ],
+  "Label": "ServerlessV2CapacityUtilization"
+}

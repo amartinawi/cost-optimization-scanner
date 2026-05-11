@@ -6,9 +6,14 @@ This module will later become ApiGatewayModule (T-321) implementing ServiceModul
 
 from __future__ import annotations
 
+from datetime import timedelta, timezone
 from typing import Any
 
 from core.scan_context import ScanContext
+
+REST_PER_M = 3.50
+HTTP_PER_M = 1.00
+SAVINGS_PER_M = REST_PER_M - HTTP_PER_M
 
 print("🔍 [services/api_gateway.py] API Gateway module active")
 
@@ -64,6 +69,31 @@ def get_enhanced_api_gateway_checks(ctx: ScanContext) -> dict[str, Any]:
                     resource_count = len(resources.get("items", []))
 
                     if resource_count <= 10:
+                        monthly_requests = 0.0
+                        if not ctx.fast_mode:
+                            try:
+                                from datetime import datetime
+
+                                cw = ctx.client("cloudwatch")
+                                end = datetime.now(timezone.utc)
+                                start = end - timedelta(days=30)
+                                resp = cw.get_metric_statistics(
+                                    Namespace="AWS/ApiGateway",
+                                    MetricName="Count",
+                                    Dimensions=[{"Name": "ApiName", "Value": api_name}],
+                                    StartTime=start,
+                                    EndTime=end,
+                                    Period=2592000,
+                                    Statistics=["Sum"],
+                                )
+                                monthly_requests = sum(dp["Sum"] for dp in resp.get("Datapoints", []))
+                            except Exception:
+                                monthly_requests = 0.0
+
+                        estimated_savings = (
+                            (monthly_requests / 1_000_000) * SAVINGS_PER_M if monthly_requests > 0 else 0.0
+                        )
+
                         checks["rest_vs_http"].append(
                             {
                                 "ApiId": api_id,
@@ -72,6 +102,8 @@ def get_enhanced_api_gateway_checks(ctx: ScanContext) -> dict[str, Any]:
                                 "ResourceCount": resource_count,
                                 "Recommendation": "Simple API - consider migrating to HTTP API for lower cost",
                                 "EstimatedSavings": "10-30% cost reduction for simple APIs",
+                                "EstimatedMonthlySavings": estimated_savings,
+                                "MonthlyRequests": monthly_requests,
                                 "CheckCategory": "API Gateway Type Optimization",
                             }
                         )

@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import re
 from typing import Any
 
 from core.contracts import ServiceFindings, SourceBlock
 from services._base import BaseServiceModule
+from services._savings import parse_dollar_savings
 from services.ec2 import get_auto_scaling_checks
 from services.elastic_ip import get_elastic_ip_checks
 from services.load_balancer import get_load_balancer_checks
@@ -15,14 +15,28 @@ from services.vpc_endpoints import get_vpc_endpoints_checks
 
 
 class NetworkModule(BaseServiceModule):
+    """ServiceModule adapter for EIP, NAT, VPC, ELB, and ASG. Composite savings strategy."""
+
     key: str = "network"
     cli_aliases: tuple[str, ...] = ("network",)
     display_name: str = "Network & Infrastructure"
 
     def required_clients(self) -> tuple[str, ...]:
-        return ("ec2", "elasticloadbalancingv2", "autoscaling")
+        """Returns boto3 client names required for network infrastructure scanning."""
+        return ("ec2", "elasticloadbalancingv2", "autoscaling", "elb")
 
     def scan(self, ctx: Any) -> ServiceFindings:
+        """Scan Elastic IPs, NAT Gateways, VPC Endpoints, Load Balancers, and ASGs.
+
+        Consults Elastic IP, NAT Gateway, VPC Endpoints, Load Balancer, and
+        Auto Scaling checks. Savings parsed from dollar-amount strings.
+
+        Args:
+            ctx: ScanContext with region, clients, and pricing data.
+
+        Returns:
+            ServiceFindings with consolidated enhanced_checks SourceBlock.
+        """
         print("\U0001f50d [services/adapters/network.py] Network module active")
 
         eip_result = get_elastic_ip_checks(ctx)
@@ -39,13 +53,7 @@ class NetworkModule(BaseServiceModule):
 
         all_recs = eip_recs + nat_recs + vpc_recs + lb_recs + asg_recs
 
-        savings = 0.0
-        for rec in all_recs:
-            savings_str = rec.get("EstimatedSavings", "")
-            if "$" in savings_str and "/month" in savings_str:
-                match = re.search(r"\$(\d+\.?\d*)", savings_str)
-                if match:
-                    savings += float(match.group(1))
+        savings = sum(parse_dollar_savings(rec.get("EstimatedSavings", "")) for rec in all_recs)
 
         total_recs = len(all_recs)
 

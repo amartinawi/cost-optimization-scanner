@@ -1,0 +1,19 @@
+{
+  "UtilizationsByTime": [
+    {
+      "Groups": [
+        {
+          "Attributes": {"service": "Amazon EC2"},
+          "Utilization": {
+            "UtilizationPercentage": "85.0",
+            "TotalAmortizedCost": "200.00",
+            "AmortizedUpfrontCost": "50.00"
+          }
+        }
+      ]
+    }
+  ],
+  "Total": {
+    "UtilizationPercentage": "85.0"
+  }
+}

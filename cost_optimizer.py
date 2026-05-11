@@ -1,3 +1,9 @@
+"""AWS Cost Optimization Scanner — thin orchestration shell.
+
+Initialises the AWS session, resolves account metadata, and delegates
+all scanning work to ``ScanOrchestrator`` + ``ScanResultBuilder``.
+"""
+
 from __future__ import annotations
 
 import boto3
@@ -8,9 +14,12 @@ from typing import Any, Dict
 from core.client_registry import ClientRegistry
 from core.scan_context import ScanContext
 from core.session import AwsSessionFactory
+from core.pricing_engine import PricingEngine
 
 
 class CostOptimizer:
+    """Main entry-point for running cost-optimization scans against an AWS account."""
+
     REGIONAL_PRICING = {
         "us-east-1": 1.00,
         "us-east-2": 1.00,
@@ -53,6 +62,7 @@ class CostOptimizer:
 
     @classmethod
     def get_regional_pricing_multiplier(cls, region: str) -> float:
+        """Return the cost multiplier for *region* relative to us-east-1."""
         if region not in cls.REGIONAL_PRICING:
             print(f"⚠️ WARNING: Regional pricing not defined for {region}")
             print(f"   Using conservative 15% premium over us-east-1 pricing")
@@ -61,12 +71,21 @@ class CostOptimizer:
         return cls.REGIONAL_PRICING[region]
 
     def add_warning(self, message: str, service: str | None = None) -> None:
+        """Append a scan warning to the context. Called by: scan adapters."""
         self._ctx.warn(message, service or "")
 
     def add_permission_issue(self, message: str, service: str, action: str | None = None) -> None:
+        """Record an IAM permission issue encountered during scanning. Called by: scan adapters."""
         self._ctx.permission_issue(message, service, action)
 
     def __init__(self, region: str, profile: str | None = None, fast_mode: bool = False) -> None:
+        """Initialise AWS session, resolve account ID, and build ScanContext.
+
+        Args:
+            region: Target AWS region for the scan.
+            profile: Optional named AWS CLI profile.
+            fast_mode: Skip CloudWatch metric lookups when True.
+        """
         print(f"🚀 Initializing AWS Cost Optimization Scanner...")
         print(f"📍 Target region: {region}")
         print(f"👤 AWS profile: {profile or 'default'}")
@@ -87,6 +106,12 @@ class CostOptimizer:
         print(f"✅ Connected to AWS account: {self.account_id}")
 
         registry = ClientRegistry(factory)
+        pricing_client = factory.session().client("pricing", region_name="us-east-1")
+        pricing_engine = PricingEngine(
+            region_code=self.region,
+            pricing_client=pricing_client,
+            fallback_multiplier=self.pricing_multiplier,
+        )
         self._ctx = ScanContext(
             region=self.region,
             account_id=self.account_id,
@@ -94,6 +119,7 @@ class CostOptimizer:
             fast_mode=self.fast_mode,
             clients=registry,
             pricing_multiplier=self.pricing_multiplier,
+            pricing_engine=pricing_engine,
         )
         print("✅ All AWS service clients initialized successfully!")
         print(f"🎯 Ready to scan {region} with comprehensive cost optimization analysis")
@@ -103,6 +129,15 @@ class CostOptimizer:
         skip_services: list[str] | None = None,
         scan_only: list[str] | None = None,
     ) -> Dict[str, Any]:
+        """Run a full cost-optimization scan and return structured results.
+
+        Args:
+            skip_services: Service keys to exclude from the scan.
+            scan_only: Service keys to include (everything else excluded).
+
+        Returns:
+            Dict with ``services``, ``summary``, and metadata keys.
+        """
         from core.scan_orchestrator import ScanOrchestrator
         from core.result_builder import ScanResultBuilder
         from services import ALL_MODULES
@@ -129,6 +164,20 @@ class CostOptimizer:
         builder = ScanResultBuilder(self._ctx)
         result = builder.build(findings)
 
+        try:
+            from core.trend_analysis import analyze_spend_trends
+
+            trend = analyze_spend_trends(self._ctx)
+            result["trend_analysis"] = asdict(trend)
+        except Exception as exc:
+            import traceback as _tb
+
+            self._ctx.warn(f"Trend analysis unavailable: {type(exc).__name__}: {exc}")
+            print(f"🔍 [cost_optimizer.py] Trend analysis exception traceback:\n{_tb.format_exc()}")
+            result["trend_analysis"] = None
+
+        if self._ctx.pricing_engine is not None:
+            self._ctx.pricing_engine.log_summary()
         print("✅ Cost optimization scan completed successfully!")
         total_recs = result["summary"]["total_recommendations"]
         svc_count = len(result["services"])

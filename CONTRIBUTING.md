@@ -1,347 +1,254 @@
 # Contributing to AWS Cost Optimization Scanner
 
-We welcome contributions to the AWS Cost Optimization Scanner! This guide will help you get started with contributing to this production-ready tool that analyzes 30 AWS services with 220+ cost optimization checks.
+We welcome contributions. This guide covers the v3.0 modular architecture with 28 ServiceModule adapters.
 
-## 🚀 Getting Started
+## Getting Started
 
 ### Prerequisites
+
 - Python 3.8+
-- AWS CLI configured with appropriate permissions
-- boto3 library
-- Basic understanding of AWS services and cost optimization
+- boto3
+- pytest, moto, freezegun (for testing)
 
 ### Development Setup
 
 ```bash
-# Clone the repository
 git clone https://github.com/aws-cost-optimizer/aws-cost-optimizer.git
 cd aws-cost-optimizer
-
-# Install dependencies
 pip install -r requirements.txt
 
-# Test with your AWS credentials
-python3 cost_optimizer.py us-east-1 --profile your-profile
+# Run tests (offline — no AWS credentials needed)
+pytest tests/ -v
 ```
 
-## 📋 How to Contribute
+## How to Contribute
 
-### 1. Reporting Issues
-- Use GitHub Issues to report bugs or request features
-- Include AWS region, Python version, and error messages
-- Provide sample output or logs when possible
-- Check existing issues before creating new ones
+### Reporting Issues
 
-### 2. Feature Requests
-- Describe the AWS service or optimization opportunity
-- Explain the potential cost savings impact
-- Provide AWS documentation references
-- Consider implementation complexity
+- Use GitHub Issues
+- Include AWS region, Python version, and error output
+- Check existing issues first
 
-### 3. Code Contributions
+### Code Contributions
+
 - Fork the repository
 - Create a feature branch (`git checkout -b feature/new-service`)
-- Make your changes following our coding standards
-- Test thoroughly with multiple AWS accounts/regions
-- Submit a pull request with detailed description
+- Follow coding standards below
+- Run the regression gate before pushing
+- Submit a pull request
 
-## 🔧 Development Guidelines
-
-### Code Structure
-
-The project follows a modular architecture:
+## Project Structure
 
 ```
-cost_optimizer.py           # Main engine (8,677 lines)
-├── CostOptimizer class     # Core optimization logic
-├── Service analysis methods # One per AWS service
-├── Enhanced check methods  # Advanced optimization checks
-└── Utility methods        # Helper functions
-
-html_report_generator.py    # Report generation (3,699 lines)
-├── HTMLReportGenerator    # Professional report creation with executive summary
-├── Executive Summary Tab  # Interactive charts and key metrics dashboard
-├── Chart.js Integration   # Cost distribution visualizations
-├── Smart grouping logic   # Recommendation categorization
-└── UI components         # Interactive elements
+cli.py                          CLI entry point (argparse)
+cost_optimizer.py               Thin orchestration shell (134 lines)
+core/
+  contracts.py                  ServiceModule Protocol + dataclasses
+  scan_orchestrator.py          Iterates ALL_MODULES via safe_scan
+  scan_context.py               Region, clients, pricing, warnings
+  result_builder.py             ServiceFindings -> JSON dict
+  client_registry.py            Caching boto3 client factory
+  session.py                    AWS session with adaptive retry
+  pricing_engine.py             AWS Pricing API with in-memory cache
+  filtering.py                  --scan-only / --skip-service resolver
+services/
+  __init__.py                   ALL_MODULES registry (28 instances)
+  _base.py                      BaseServiceModule default implementations
+  _savings.py                   parse_dollar_savings helper
+  advisor.py                    Cost Hub + Compute Optimizer utilities
+  adapters/                     28 ServiceModule adapter files
+html_report_generator.py        HTML report generation
+reporter_phase_a.py             Descriptor-driven grouped rendering
+reporter_phase_b.py             Function registry for source handlers
+tests/                          pytest suite (moto + stubs)
 ```
 
-### Adding New AWS Services
+### Key Files
 
-To add support for a new AWS service:
+| File | Purpose |
+|------|---------|
+| `core/contracts.py` | `ServiceModule` Protocol, `ServiceFindings`, `SourceBlock` dataclasses |
+| `services/_base.py` | `BaseServiceModule` — default Protocol implementation |
+| `services/__init__.py` | `ALL_MODULES` — append-only registry of adapter instances |
+| `services/_savings.py` | `parse_dollar_savings()` — shared utility for dollar parsing |
+| `core/pricing_engine.py` | `PricingEngine` — live AWS Pricing API with 12 methods |
+| `core/scan_orchestrator.py` | `ScanOrchestrator` — iterates modules, calls `safe_scan` |
 
-1. **Add Service Client** (in `__init__` method):
+## Adding a New Service Adapter
+
+No changes to `core/` are required. The adapter is automatically available via `--scan-only` and included in full scans.
+
+### Step 1: Create the adapter
+
+Create `services/adapters/<service>.py`:
+
 ```python
-self.new_service = self.session.client('new-service', region_name=region, config=retry_config)
+from core.contracts import ServiceFindings, SourceBlock
+from services._base import BaseServiceModule
+
+
+class NewServiceModule(BaseServiceModule):
+    key: str = "newservice"
+    cli_aliases: tuple[str, ...] = ("newservice",)
+    display_name: str = "NewService"
+
+    def required_clients(self) -> tuple[str, ...]:
+        return ("newservice",)
+
+    def scan(self, ctx) -> ServiceFindings:
+        client = ctx.clients["newservice"]
+        recommendations = []
+
+        try:
+            paginator = client.get_paginator("list_resources")
+            for page in paginator.paginate():
+                for resource in page.get("Resources", []):
+                    # Analyze resource, build recommendation dicts
+                    pass
+        except Exception as exc:
+            ctx.warnings.append(str(exc))
+
+        return ServiceFindings(
+            service_name=self.display_name,
+            total_recommendations=len(recommendations),
+            total_monthly_savings=0.0,
+            sources={
+                "resource_checks": SourceBlock(
+                    count=len(recommendations),
+                    recommendations=tuple(recommendations),
+                ),
+            },
+        )
 ```
 
-2. **Implement Analysis Method**:
+### Step 2: Register in ALL_MODULES
+
+Edit `services/__init__.py` — add the import and append the instance:
+
 ```python
-def get_enhanced_newservice_checks(self) -> Dict[str, Any]:
-    """Get enhanced NewService cost optimization checks"""
-    checks = {
-        'optimization_category_1': [],
-        'optimization_category_2': []
-    }
-    
-    try:
-        # Use pagination for scalability
-        paginator = self.new_service.get_paginator('list_resources')
-        for page in paginator.paginate():
-            for resource in page.get('Resources', []):
-                # Analyze resource for optimization opportunities
-                pass
-    except Exception as e:
-        self.add_warning(f"Could not analyze NewService: {e}", "newservice")
-    
-    return {'recommendations': recommendations, 'checks': checks}
+from services.adapters.newservice import NewServiceModule
+
+ALL_MODULES: list[Any] = [
+    # ... existing modules ...
+    NewServiceModule(),  # append at end
+]
 ```
 
-3. **Add to Service Filtering**:
-```python
-# In service_map dictionary
-'newservice': ['newservice'],  # New service category
+### Step 3: Test
+
+```bash
+pytest tests/ -v
+pytest tests/test_regression_snapshot.py -v
+pytest tests/test_reporter_snapshots.py -v
 ```
 
-4. **Add to Main Scan Method**:
-```python
-# In scan_region method
-if should_scan_service('newservice'):
-    print("🔧 Scanning NewService optimization...")
-    enhanced_newservice_checks = self.get_enhanced_newservice_checks()
-else:
-    enhanced_newservice_checks = {'recommendations': []}
-```
+## Coding Standards
 
-5. **Add IAM Permissions**:
-```json
-"newservice:ListResources",
-"newservice:DescribeResource"
-```
+### Style
 
-### Coding Standards
+- PEP 8 with type annotations on all function signatures
+- Google-style docstrings
+- ATX headers (`#`) in Markdown — no emoji in headers or code
+- `black` for formatting, `isort` for imports, `ruff` for linting
 
-#### Python Style
-- Follow PEP 8 style guidelines
-- Use type hints for method signatures
-- Include comprehensive docstrings
-- Handle exceptions gracefully with warnings
+### AWS Integration
 
-#### AWS Integration
 - Always use pagination for list operations
-- Implement proper retry logic with exponential backoff
-- Handle IAM permission errors gracefully
-- Use region-specific clients when needed
+- Handle `ClientError` gracefully — use `ctx.warnings.append()` or `ctx.permission_issues.append()`
+- Use `ctx.clients[<name>]` from `ClientRegistry` (never create boto3 clients directly)
+- Access pricing via `ctx.pricing_engine` — never hardcode rates
 
-#### Cost Calculations
-- Use regional pricing multipliers
-- Include estimation disclaimers
-- Base calculations on current AWS pricing
-- Provide savings ranges rather than exact amounts
+### Cost Calculations
 
-#### Error Handling
+- Use `ctx.pricing_engine` methods for live pricing
+- Apply `ctx.pricing_multiplier` for regional adjustments
+- Fall back to `0.0` on pricing API failure — scans never crash due to pricing
+
+### Error Handling
+
 ```python
+from botocore.exceptions import ClientError
+
 try:
-    # AWS API call
-    response = self.service.describe_resources()
-except ClientError as e:
-    error_code = e.response['Error']['Code']
-    if error_code == 'UnauthorizedOperation':
-        self.add_permission_issue(f"Missing permission for describe_resources", "service")
+    response = client.describe_resources()
+except ClientError as exc:
+    error_code = exc.response["Error"]["Code"]
+    if error_code in ("UnauthorizedOperation", "AccessDenied"):
+        ctx.permission_issues.append(f"Missing permission: {error_code}")
     else:
-        self.add_warning(f"Could not analyze service: {e}", "service")
-except Exception as e:
-    self.add_warning(f"Unexpected error: {e}", "service")
+        ctx.warnings.append(f"Could not analyze service: {exc}")
+except Exception as exc:
+    ctx.warnings.append(f"Unexpected error: {exc}")
 ```
 
-### Testing Guidelines
+## Testing
 
-#### Manual Testing
-- Test with multiple AWS accounts (small and large)
-- Verify across different regions
-- Test service filtering combinations
-- Validate HTML report generation
+All tests run offline using `moto` mock AWS and pre-built stub responses in `tests/aws_stubs/`. No AWS credentials are needed.
 
-#### Edge Cases
-- Empty AWS accounts
-- Accounts with 1000+ resources per service
-- Cross-region resource dependencies
-- API throttling scenarios
-- Permission-restricted environments
+### Running Tests
 
-## 📊 Adding New Optimization Checks
+```bash
+# Full test suite
+pytest tests/ -v
 
-### Check Categories
-1. **Idle Resources** - 100% cost elimination
-2. **Rightsizing** - 20-50% cost reduction
-3. **Reserved Instances** - 30-72% savings
-4. **Storage Optimization** - 20-95% savings
-5. **Architecture Optimization** - Variable savings
-
-### Implementation Pattern
-```python
-def get_service_optimization_checks(self) -> Dict[str, Any]:
-    checks = {
-        'idle_resources': [],
-        'rightsizing_opportunities': [],
-        'reserved_instance_opportunities': [],
-        'storage_optimization': [],
-        'architecture_optimization': []
-    }
-    
-    # Implement checks with CloudWatch integration where possible
-    # Use intelligent gating to prevent false positives
-    # Calculate regional pricing adjustments
-    
-    return {'recommendations': recommendations, 'checks': checks}
+# Golden-file regression gate (required before merge)
+pytest tests/test_regression_snapshot.py tests/test_reporter_snapshots.py -v
 ```
 
-### CloudWatch Integration
-For accurate recommendations, integrate CloudWatch metrics:
+### Test Files
 
-```python
-# Example: CPU utilization analysis
-cpu_response = self.cloudwatch.get_metric_statistics(
-    Namespace='AWS/ServiceName',
-    MetricName='CPUUtilization',
-    Dimensions=[{'Name': 'ResourceId', 'Value': resource_id}],
-    StartTime=start_time,
-    EndTime=end_time,
-    Period=3600,
-    Statistics=['Average', 'Maximum']
-)
+| File | Purpose |
+|------|---------|
+| `tests/test_offline_scan.py` | End-to-end scan with moto mocks |
+| `tests/test_orchestrator.py` | ScanOrchestrator unit tests |
+| `tests/test_pricing_engine.py` | PricingEngine unit tests |
+| `tests/test_result_builder.py` | ResultBuilder serialization tests |
+| `tests/test_regression_snapshot.py` | Golden-file regression gate |
+| `tests/test_reporter_snapshots.py` | HTML reporter regression gate |
+| `tests/conftest.py` | Shared fixtures |
+| `tests/aws_stubs/` | Pre-built AWS API responses |
 
-if cpu_response['Datapoints']:
-    avg_cpu = sum(dp['Average'] for dp in cpu_response['Datapoints']) / len(cpu_response['Datapoints'])
-    # Only recommend if utilization is actually low
-    if avg_cpu < 20:
-        # Add rightsizing recommendation
-```
+### Writing Tests
 
-## 🎨 HTML Report Contributions
+- Use `moto` mocks for AWS API calls
+- Use stubs from `tests/aws_stubs/` for consistent responses
+- Follow existing test patterns in the suite
 
-### Adding New Service Tabs
-1. Add service data extraction in `_get_detailed_recommendations`
-2. Implement service-specific formatting
-3. Add to tab generation logic
-4. Include statistics calculation
-5. Test responsive design
+## Pull Request Checklist
 
-### UI Improvements
-- Follow Material Design principles
-- Ensure mobile compatibility
-- Maintain consistent styling
-- Test across different browsers
+Before submitting:
 
-## 📝 Documentation Standards
-
-### Code Documentation
-- Include comprehensive docstrings for all methods
-- Document parameters and return values
-- Explain complex algorithms and business logic
-- Include usage examples
-
-### README Updates
-- Keep service counts accurate
-- Update feature lists with new capabilities
-- Include relevant usage examples
-- Maintain accurate IAM permissions
-
-### Architecture Documentation
-- Update component diagrams for new services
-- Document new optimization categories
-- Include performance characteristics
-- Explain integration patterns
-
-## 🧪 Testing Contributions
-
-### Test Coverage Areas
-- Service filtering logic
-- Cost calculation accuracy
-- Regional pricing multipliers
-- Error handling scenarios
-- HTML report generation
-
-### Performance Testing
-- Large account scenarios (1000+ resources)
-- Cross-region analysis
-- Memory usage optimization
-- Scan duration benchmarks
-
-## 📋 Pull Request Guidelines
-
-### Before Submitting
-- [ ] Code follows Python style guidelines
-- [ ] All new services include proper error handling
-- [ ] IAM permissions documented
-- [ ] Regional pricing considerations included
-- [ ] HTML report integration completed
-- [ ] Documentation updated
+- [ ] Code follows PEP 8 with type annotations
+- [ ] Google-style docstrings on all public methods
+- [ ] Error handling uses `ctx.warnings` / `ctx.permission_issues`
+- [ ] No hardcoded pricing rates — uses `ctx.pricing_engine`
+- [ ] New adapters registered in `services/__init__.py` `ALL_MODULES`
+- [ ] `pytest tests/ -v` passes
+- [ ] `pytest tests/test_regression_snapshot.py tests/test_reporter_snapshots.py -v` passes
+- [ ] No emoji in code or Markdown headers
 
 ### PR Description Template
+
 ```markdown
 ## Description
 Brief description of changes
 
 ## Type of Change
 - [ ] Bug fix
-- [ ] New AWS service support
+- [ ] New service adapter
 - [ ] New optimization check
 - [ ] Documentation update
 - [ ] Performance improvement
 
 ## Testing
-- [ ] Tested with multiple AWS accounts
-- [ ] Verified across different regions
-- [ ] HTML report generation works
-- [ ] Service filtering functions correctly
-
-## Checklist
-- [ ] Code follows style guidelines
-- [ ] Self-review completed
-- [ ] Documentation updated
-- [ ] IAM permissions documented
+- [ ] pytest tests/ -v passes
+- [ ] Regression gate passes
+- [ ] New tests added (if applicable)
 ```
 
-## 🏷️ Release Process
+## Resources
 
-### Version Numbering
-- **Major** (X.0.0): Breaking changes or major new features
-- **Minor** (X.Y.0): New services or significant enhancements
-- **Patch** (X.Y.Z): Bug fixes and minor improvements
-
-### Release Checklist
-- [ ] Update version in all files
-- [ ] Update CHANGELOG.md
-- [ ] Test with multiple accounts
-- [ ] Verify documentation accuracy
-- [ ] Create GitHub release
-- [ ] Update badges and links
-
-## 🤝 Community Guidelines
-
-### Code of Conduct
-- Be respectful and inclusive
-- Focus on constructive feedback
-- Help newcomers get started
-- Share knowledge and best practices
-
-### Communication
-- Use GitHub Issues for bug reports
-- Use GitHub Discussions for questions
-- Be clear and specific in communications
-- Provide context and examples
-
-## 📚 Resources
-
-### AWS Documentation
-- [AWS Cost Optimization](https://aws.amazon.com/aws-cost-management/)
-- [AWS Well-Architected Cost Optimization](https://docs.aws.amazon.com/wellarchitected/latest/cost-optimization-pillar/)
+- [ARCHITECTURE.md](ARCHITECTURE.md) — Technical architecture and design decisions
+- [CHANGELOG.md](CHANGELOG.md) — Version history
 - [AWS Pricing](https://aws.amazon.com/pricing/)
-
-### Development Resources
 - [boto3 Documentation](https://boto3.amazonaws.com/v1/documentation/api/latest/index.html)
-- [AWS CLI Reference](https://docs.aws.amazon.com/cli/latest/reference/)
-- [Python Style Guide](https://pep8.org/)
-
-Thank you for contributing to the AWS Cost Optimization Scanner! Your contributions help the entire AWS community optimize their cloud costs effectively.

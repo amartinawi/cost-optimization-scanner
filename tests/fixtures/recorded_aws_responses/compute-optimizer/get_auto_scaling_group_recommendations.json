@@ -1,0 +1,28 @@
+{
+  "autoScalingGroupRecommendations": [
+    {
+      "autoScalingGroupArn": "arn:aws:autoscaling:us-east-1:123456789012:autoScalingGroupName:my-asg",
+      "autoScalingGroupName": "my-asg",
+      "currentConfiguration": {
+        "instanceType": "m5.xlarge",
+        "desiredCapacity": 2
+      },
+      "finding": "Overprovisioned",
+      "instanceRecommendationOptions": [
+        {
+          "configuration": {
+            "instanceType": "m5.large"
+          },
+          "savingsOpportunity": {
+            "estimatedMonthlySavings": {
+              "currency": "USD",
+              "value": 45.00
+            }
+          }
+        }
+      ],
+      "lookBackPeriodInDays": 14
+    }
+  ],
+  "nextToken": null
+}

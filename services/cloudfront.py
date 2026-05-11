@@ -90,8 +90,11 @@ def get_enhanced_cloudfront_checks(ctx: ScanContext) -> dict[str, Any]:
                             "Status": status,
                             "PriceClass": price_class,
                             "Enabled": enabled,
-                            "Recommendation": "Disabled distribution - consider deletion to eliminate costs",
-                            "EstimatedSavings": "100% of distribution costs",
+                            "Recommendation": (
+                                "Disabled distribution - consider deletion to"
+                                " eliminate allocation overhead and configuration drift"
+                            ),
+                            "EstimatedSavings": "$0/month (no data transfer cost when disabled)",
                             "CheckCategory": "CloudFront Unused Distribution",
                         }
                     )
@@ -100,23 +103,64 @@ def get_enhanced_cloudfront_checks(ctx: ScanContext) -> dict[str, Any]:
                     dist_config = cloudfront.get_distribution_config(Id=dist_id)
                     origins = dist_config.get("DistributionConfig", {}).get("Origins", {}).get("Items", [])
 
-                    for origin in origins:
-                        origin_shield = origin.get("OriginShield", {})
-                        if origin_shield.get("Enabled", False):
-                            checks["origin_shield_unnecessary"].append(
-                                {
-                                    "DistributionId": dist_id,
-                                    "DomainName": domain_name,
-                                    "Status": status,
-                                    "PriceClass": price_class,
-                                    "OriginShieldRegion": origin_shield.get("OriginShieldRegion", "Unknown"),
-                                    "Recommendation": (
-                                        "Origin Shield adds costs - review necessity for traffic patterns"
-                                    ),
-                                    "EstimatedSavings": "Variable based on cache hit improvement vs additional costs",
-                                    "CheckCategory": "CloudFront Origin Shield Review",
-                                }
+                    should_check_origin_shield = False
+                    try:
+                        cw_end = datetime.now(UTC)
+                        cw_start = cw_end - timedelta(days=7)
+                        cloudwatch = ctx.client("cloudwatch")
+
+                        hit_metrics = cloudwatch.get_metric_statistics(
+                            Namespace="AWS/CloudFront",
+                            MetricName="CacheHitRate",
+                            Dimensions=[{"Name": "DistributionId", "Value": dist_id}],
+                            StartTime=cw_start,
+                            EndTime=cw_end,
+                            Period=86400,
+                            Statistics=["Average"],
+                        )
+                        avg_hit_rate = None
+                        dps = hit_metrics.get("Datapoints", [])
+                        if dps:
+                            avg_hit_rate = sum(dp["Average"] for dp in dps) / len(dps)
+                            if avg_hit_rate < 90:
+                                should_check_origin_shield = True
+
+                        if not should_check_origin_shield:
+                            req_metrics = cloudwatch.get_metric_statistics(
+                                Namespace="AWS/CloudFront",
+                                MetricName="Requests",
+                                Dimensions=[{"Name": "DistributionId", "Value": dist_id}],
+                                StartTime=cw_start,
+                                EndTime=cw_end,
+                                Period=60,
+                                Statistics=["Sum"],
                             )
+                            req_dps = req_metrics.get("Datapoints", [])
+                            if req_dps:
+                                max_per_min = max(dp["Sum"] for dp in req_dps)
+                                if max_per_min > 1000:
+                                    should_check_origin_shield = True
+                    except Exception:
+                        pass
+
+                    if should_check_origin_shield:
+                        for origin in origins:
+                            origin_shield = origin.get("OriginShield", {})
+                            if origin_shield.get("Enabled", False):
+                                checks["origin_shield_unnecessary"].append(
+                                    {
+                                        "DistributionId": dist_id,
+                                        "DomainName": domain_name,
+                                        "Status": status,
+                                        "PriceClass": price_class,
+                                        "OriginShieldRegion": origin_shield.get("OriginShieldRegion", "Unknown"),
+                                        "Recommendation": (
+                                            "Origin Shield adds costs - review necessity for traffic patterns"
+                                        ),
+                                        "EstimatedSavings": "Variable based on cache hit improvement vs additional costs",
+                                        "CheckCategory": "CloudFront Origin Shield Review",
+                                    }
+                                )
                 except Exception as e:
                     ctx.warn(f"Error analyzing CloudFront distribution {dist_id}: {e}", "cloudfront")
 

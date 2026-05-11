@@ -1,0 +1,71 @@
+{
+  "service_name": "Network Transfer Costs",
+  "total_recommendations": 4,
+  "total_monthly_savings": 509.20,
+  "sources": {
+    "cross_region_transfer": {
+      "count": 1,
+      "recommendations": [
+        {
+          "resource_id": "cross-region-transfer",
+          "check_type": "cross_region_transfer",
+          "check_category": "Cross-Region Transfer",
+          "current_value": "$850.00/mo cross-region transfer spend",
+          "recommended_value": "Consolidate workloads to fewer regions or use VPC endpoints",
+          "monthly_savings": 255.00,
+          "severity": "HIGH",
+          "reason": "Cross-region data transfer costs $850.00/mo; architectural changes (regional consolidation, caching, endpoint placement) could reduce by up to 30%"
+        }
+      ]
+    },
+    "cross_az_transfer": {
+      "count": 1,
+      "recommendations": [
+        {
+          "resource_id": "cross-az-transfer",
+          "check_type": "cross_az_transfer",
+          "check_category": "Cross-AZ Transfer",
+          "current_value": "$360.00/mo cross-AZ transfer spend",
+          "recommended_value": "Co-locate communicating services in the same AZ",
+          "monthly_savings": 180.00,
+          "severity": "MEDIUM",
+          "reason": "Cross-AZ transfer costs $360.00/mo; co-locating services in the same AZ could save ~50%"
+        }
+      ]
+    },
+    "internet_egress": {
+      "count": 1,
+      "recommendations": [
+        {
+          "resource_id": "internet-egress",
+          "check_type": "internet_egress",
+          "check_category": "Internet Egress",
+          "current_value": "$125.00/mo direct internet egress",
+          "recommended_value": "Route traffic through CloudFront for egress optimization",
+          "monthly_savings": 50.00,
+          "severity": "MEDIUM",
+          "reason": "Direct internet egress costs $125.00/mo; CloudFront could reduce costs by ~40% with better performance"
+        }
+      ]
+    },
+    "tgw_vs_peering": {
+      "count": 1,
+      "recommendations": [
+        {
+          "resource_id": "tgw-route-optimization",
+          "check_type": "tgw_vs_peering",
+          "check_category": "TGW vs Peering",
+          "current_value": "TGW + 3 peering connections, $1210.00/mo transfer",
+          "recommended_value": "Optimize TGW route tables to minimize cross-hub traffic",
+          "monthly_savings": 24.20,
+          "severity": "MEDIUM",
+          "reason": "Mixed TGW/peering topology with $1210.00/mo transfer. Optimizing TGW routes could save ~20% on processing costs."
+        }
+      ]
+    }
+  },
+  "total_data_transfer_spend_30d": 1210.00,
+  "cross_region_spend_30d": 850.00,
+  "peering_count": 3,
+  "tgw_count": 1
+}

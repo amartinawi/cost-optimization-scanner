@@ -14,11 +14,21 @@ from core.scan_context import ScanContext
 print("🔍 [services/dms.py] DMS module active")
 
 DMS_OPTIMIZATION_DESCRIPTIONS: dict[str, dict[str, str]] = {
+    "serverless_migration": {
+        "title": "DMS Serverless Migration Review",
+        "description": "Monitor DMS Serverless usage patterns for cost optimization opportunities.",
+        "action": "Review serverless replication configs and assess cost vs provisioned instances",
+    },
     "instance_rightsizing": {
         "title": "Optimize DMS Instance Sizing",
         "description": "Right-size DMS instances or migrate to serverless for variable workloads.",
         "action": "Consider DMS Serverless or smaller instance types",
-    }
+    },
+    "unused_instances": {
+        "title": "Unused DMS Instances",
+        "description": "DMS instances with very low CPU utilization that may be candidates for termination.",
+        "action": "Verify instance is truly unused, then stop or delete to save full instance cost",
+    },
 }
 
 
@@ -43,7 +53,7 @@ def get_enhanced_dms_checks(ctx: ScanContext) -> dict[str, Any]:
                 instance_class = instance.get("ReplicationInstanceClass")
                 status = instance.get("ReplicationInstanceStatus")
 
-                if status == "available" and instance_class and "large" in instance_class:
+                if status == "available" and instance_class:
                     try:
                         end_time = datetime.now(UTC)
                         start_time = end_time - timedelta(days=7)
@@ -73,7 +83,7 @@ def get_enhanced_dms_checks(ctx: ScanContext) -> dict[str, Any]:
                                         f"Low CPU utilization ({avg_cpu:.1f}%) "
                                         "- consider DMS Serverless or smaller instance"
                                     ),
-                                    "EstimatedSavings": "$100/month potential",
+                                    "EstimatedSavings": "Rightsize for ~35% savings on instance cost",
                                     "CheckCategory": "Instance Optimization",
                                 }
                             )
@@ -98,7 +108,7 @@ def get_enhanced_dms_checks(ctx: ScanContext) -> dict[str, Any]:
                                     "Review replication instance utilization "
                                     "- consider DMS Serverless for variable workloads"
                                 ),
-                                "EstimatedSavings": "$100/month potential",
+                                "EstimatedSavings": "Rightsize for ~35% savings on instance cost",
                                 "CheckCategory": "Instance Optimization",
                                 "Note": "Verify actual CPU and network utilization before downsizing",
                             }

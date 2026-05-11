@@ -10,18 +10,49 @@ from services.msk import MSK_OPTIMIZATION_DESCRIPTIONS, get_enhanced_msk_checks
 
 
 class MskModule(BaseServiceModule):
+    """ServiceModule adapter for MSK. Flat-rate savings strategy."""
+
     key: str = "msk"
     cli_aliases: tuple[str, ...] = ("msk",)
     display_name: str = "MSK"
 
     def required_clients(self) -> tuple[str, ...]:
+        """Returns boto3 client names required for MSK scanning."""
         return ("kafka",)
 
     def scan(self, ctx: Any) -> ServiceFindings:
+        """Scan MSK clusters for cost optimization opportunities.
+
+        Consults enhanced MSK checks. Savings calculated via flat-rate
+        heuristic per recommendation.
+
+        Args:
+            ctx: ScanContext with region, clients, and pricing data.
+
+        Returns:
+            ServiceFindings with enhanced_checks SourceBlock.
+        """
+        # TODO: Serverless migration comparison needs DCU-hour pricing ($0.06/DCU-hour).
+        # Current recommendation is directional only, not cost-quantified.
         print("\U0001f50d [services/adapters/msk.py] MSK module active")
         result = get_enhanced_msk_checks(ctx)
         recs = result.get("recommendations", [])
-        savings = 150 * len(recs)
+        savings = 0.0
+        if ctx.pricing_engine is not None:
+            for rec in recs:
+                instance_type = rec.get("InstanceType")
+                num_brokers = rec.get("NumberOfBrokerNodes", 3)
+                if instance_type:
+                    hourly = ctx.pricing_engine.get_msk_broker_hourly_price(instance_type)
+                    monthly_cluster = hourly * 730 * num_brokers
+                    volume_size = rec.get("BrokerStorageGB", 100)
+                    storage_monthly = volume_size * 0.10 * num_brokers
+                    monthly_cluster += storage_monthly
+                    savings += monthly_cluster * 0.30 * ctx.pricing_multiplier
+                else:
+                    savings += 150.0 * ctx.pricing_multiplier
+        else:
+            savings = 150.0 * len(recs) * ctx.pricing_multiplier
 
         sources = {"enhanced_checks": SourceBlock(count=len(recs), recommendations=tuple(recs))}
 

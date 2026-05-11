@@ -10,7 +10,7 @@
       "service_name": "EC2",
       "instance_count": 12,
       "total_recommendations": 5,
-      "total_monthly_savings": 387.50,
+      "total_monthly_savings": 387.5,
       "sources": {
         "cost_optimization_hub": {
           "count": 0,
@@ -87,7 +87,7 @@
       "service_name": "AMI",
       "total_recommendations": 2,
       "total_count": 2,
-      "total_monthly_savings": 10.00,
+      "total_monthly_savings": 10.0,
       "sources": {
         "old_amis": {
           "count": 2,
@@ -100,7 +100,7 @@
               "AgeDays": 470,
               "Recommendation": "Old AMI (470 days) - consider deregistering if no longer in use",
               "EstimatedSavings": "$5.00/month",
-              "EstimatedMonthlySavings": 5.00,
+              "EstimatedMonthlySavings": 5.0,
               "CheckCategory": "Old AMIs"
             },
             {
@@ -111,7 +111,7 @@
               "AgeDays": 526,
               "Recommendation": "Old AMI (526 days) - consider deregistering if no longer in use",
               "EstimatedSavings": "$5.00/month",
-              "EstimatedMonthlySavings": 5.00,
+              "EstimatedMonthlySavings": 5.0,
               "CheckCategory": "Old AMIs"
             }
           ]
@@ -126,7 +126,7 @@
         "gp2": 7
       },
       "total_recommendations": 4,
-      "total_monthly_savings": 94.20,
+      "total_monthly_savings": 94.2,
       "optimization_descriptions": {
         "unattached_volumes": {
           "title": "Unattached EBS Volumes",
@@ -150,7 +150,7 @@
               "VolumeType": "gp3",
               "Size": 100,
               "State": "available",
-              "EstimatedMonthlyCost": 8.00,
+              "EstimatedMonthlyCost": 8.0,
               "Recommendation": "Unattached volume - consider deleting or snapshotting",
               "CheckCategory": "Unattached Volumes"
             },
@@ -159,7 +159,7 @@
               "VolumeType": "gp2",
               "Size": 500,
               "State": "available",
-              "EstimatedMonthlyCost": 50.00,
+              "EstimatedMonthlyCost": 50.0,
               "Recommendation": "Unattached volume - consider deleting or snapshotting",
               "CheckCategory": "Unattached Volumes"
             }
@@ -246,7 +246,7 @@
         "without_intelligent_tiering": 6
       },
       "total_recommendations": 3,
-      "total_monthly_savings": 245.00,
+      "total_monthly_savings": 245.0,
       "optimization_descriptions": {
         "lifecycle_policies": {
           "title": "Missing Lifecycle Policies",
@@ -264,41 +264,53 @@
             {
               "Resource": "my-company-logs-prod",
               "BucketSize": "2.5 TB",
-              "BucketCost": 59.00,
+              "BucketCost": 59.0,
               "HasLifecycle": false,
               "HasIntelligentTiering": false,
               "Recommendation": "Add lifecycle policy to transition logs to IA after 30 days and Glacier after 90 days",
-              "EstimatedMonthlyCost": 59.00,
+              "EstimatedMonthlyCost": 59.0,
               "CheckCategory": "Lifecycle Policies"
             },
             {
               "Resource": "data-lake-raw-us-east-1",
               "BucketSize": "8.2 TB",
-              "BucketCost": 184.50,
+              "BucketCost": 184.5,
               "HasLifecycle": false,
               "HasIntelligentTiering": false,
               "Recommendation": "Enable S3 Intelligent-Tiering for automatic cost optimization on access patterns",
-              "EstimatedMonthlyCost": 184.50,
+              "EstimatedMonthlyCost": 184.5,
               "CheckCategory": "Storage Class Analysis"
             },
             {
               "Resource": "backup-archive-2024",
               "BucketSize": "1.1 TB",
-              "BucketCost": 24.80,
+              "BucketCost": 24.8,
               "HasLifecycle": false,
               "HasIntelligentTiering": false,
               "Recommendation": "Move archival data to S3 Glacier Deep Archive for up to 80% cost reduction",
-              "EstimatedMonthlyCost": 24.80,
+              "EstimatedMonthlyCost": 24.8,
               "CheckCategory": "Storage Class Analysis"
             }
           ],
           "top_cost_buckets": [
-            {"name": "data-lake-raw-us-east-1", "cost": 184.50},
-            {"name": "my-company-logs-prod", "cost": 59.00}
+            {
+              "name": "data-lake-raw-us-east-1",
+              "cost": 184.5
+            },
+            {
+              "name": "my-company-logs-prod",
+              "cost": 59.0
+            }
           ],
           "top_size_buckets": [
-            {"name": "data-lake-raw-us-east-1", "size": "8.2 TB"},
-            {"name": "my-company-logs-prod", "size": "2.5 TB"}
+            {
+              "name": "data-lake-raw-us-east-1",
+              "size": "8.2 TB"
+            },
+            {
+              "name": "my-company-logs-prod",
+              "size": "2.5 TB"
+            }
           ]
         },
         "enhanced_checks": {
@@ -563,11 +575,340 @@
           "recommendations": []
         }
       }
+    },
+    "compute_optimizer": {
+      "service_name": "Compute Optimizer",
+      "total_recommendations": 0,
+      "total_monthly_savings": 0.0,
+      "sources": {},
+      "extras": {
+        "opt_in_required": false,
+        "resource_counts": {}
+      }
+    },
+    "cost_optimization_hub": {
+      "service_name": "Cost Optimization Hub",
+      "total_recommendations": 0,
+      "total_monthly_savings": 0.0,
+      "sources": {},
+      "extras": {
+        "recommendation_type_counts": {},
+        "total_recommendations_in_hub": 0
+      }
+    },
+    "aurora": {
+      "service_name": "Aurora",
+      "total_recommendations": 0,
+      "total_monthly_savings": 0.0,
+      "sources": {},
+      "extras": {
+        "cluster_count": 0,
+        "serverless_cluster_count": 0,
+        "global_cluster_count": 0
+      }
+    },
+    "commitment_analysis": {
+      "service_name": "Commitment Analysis",
+      "total_recommendations": 0,
+      "total_monthly_savings": 0.0,
+      "sources": {},
+      "extras": {
+        "sp_utilization_rate": 0.0,
+        "sp_coverage_rate": 0.0,
+        "ri_utilization_rate": 0.0,
+        "ri_coverage_rate": 0.0
+      }
+    },
+    "bedrock": {
+      "service_name": "Bedrock",
+      "total_recommendations": 5,
+      "total_monthly_savings": 1674.00,
+      "sources": {
+        "idle_provisioned_throughput": {
+          "count": 2,
+          "recommendations": [
+            {
+              "provisioned_model_id": "my-haiku-pt",
+              "model_id": "anthropic.claude-3-haiku",
+              "model_units": 1,
+              "check_category": "PT Analysis",
+              "current_value": "PT 'my-haiku-pt' with 1 unit(s), 0 invocations in 30 days",
+              "recommended_value": "Delete idle Provisioned Throughput",
+              "monthly_savings": 584.00,
+              "reason": "Provisioned Throughput 'my-haiku-pt' has zero invocations in 30 days — wasting $584.00/mo"
+            },
+            {
+              "provisioned_model_id": "my-titan-pt",
+              "model_id": "amazon.titan-text-lite",
+              "model_units": 1,
+              "check_category": "PT Analysis",
+              "current_value": "PT 'my-titan-pt' with 1 unit(s), 0 invocations in 30 days",
+              "recommended_value": "Delete idle Provisioned Throughput",
+              "monthly_savings": 219.00,
+              "reason": "Provisioned Throughput 'my-titan-pt' has zero invocations in 30 days — wasting $219.00/mo"
+            }
+          ]
+        },
+        "pt_breakeven_analysis": {
+          "count": 1,
+          "recommendations": [
+            {
+              "provisioned_model_id": "my-sonnet-pt",
+              "model_id": "anthropic.claude-3-sonnet",
+              "model_units": 1,
+              "check_category": "PT Analysis",
+              "current_value": "PT commitment $2920.00/mo, estimated on-demand $2200.00/mo",
+              "recommended_value": "Switch to on-demand pricing",
+              "monthly_savings": 720.00,
+              "reason": "On-demand estimated at $2200.00/mo vs PT cost $2920.00/mo — save $720.00/mo by switching"
+            }
+          ]
+        },
+        "idle_knowledge_bases": {
+          "count": 1,
+          "recommendations": [
+            {
+              "knowledge_base_id": "KB1A2B3C4D5",
+              "knowledge_base_name": "product-docs-kb",
+              "status": "ACTIVE",
+              "check_category": "Knowledge Base",
+              "current_value": "KB 'product-docs-kb' active, ~$146.00/mo OCU cost",
+              "recommended_value": "Review Knowledge Base usage and delete if unused",
+              "monthly_savings": 146.00,
+              "reason": "Knowledge Base 'product-docs-kb' may have idle OCU hours — estimated $146.00/mo if fully idle"
+            }
+          ]
+        },
+        "idle_agents": {
+          "count": 1,
+          "recommendations": [
+            {
+              "agent_id": "AG9X8Y7Z6W",
+              "agent_name": "customer-support-agent",
+              "status": "PREPARED",
+              "check_category": "Agent",
+              "current_value": "Agent 'customer-support-agent' (PREPARED)",
+              "recommended_value": "Review Agent invocation volume and delete if unused",
+              "monthly_savings": 5.00,
+              "reason": "Agent 'customer-support-agent' has no invocations detected — estimated $5.00/mo in underlying model costs"
+            }
+          ]
+        }
+      },
+      "optimization_descriptions": {
+        "idle_provisioned_throughput": {
+          "title": "Idle Provisioned Throughput",
+          "description": "Provisioned Throughputs with zero invocations over 30 days"
+        },
+        "pt_breakeven_analysis": {
+          "title": "PT Breakeven Analysis",
+          "description": "Provisioned Throughputs that cost more than on-demand pricing"
+        },
+        "idle_knowledge_bases": {
+          "title": "Idle Knowledge Bases",
+          "description": "Knowledge Bases with potentially unused OCU hours"
+        },
+        "idle_agents": {
+          "title": "Idle Agents",
+          "description": "Bedrock Agents with no invocation activity detected"
+        }
+      },
+      "pt_count": 3,
+      "kb_count": 1,
+      "agent_count": 1
+    },
+    "sagemaker": {
+      "service_name": "SageMaker",
+      "total_recommendations": 6,
+      "total_monthly_savings": 4231.20,
+      "sources": {
+        "idle_endpoints": {
+          "count": 2,
+          "recommendations": [
+            {
+              "endpoint_name": "fraud-detection-prod",
+              "instance_type": "ml.m5.xlarge",
+              "check_category": "Idle Endpoints",
+              "current_value": "Endpoint 'fraud-detection-prod' (ml.m5.xlarge) has 0 invocations in 7 days",
+              "recommended_value": "Delete endpoint or reduce instance count",
+              "monthly_savings": 576.40,
+              "reason": "SageMaker endpoint 'fraud-detection-prod' is active but received zero invocations in the last 7 days"
+            },
+            {
+              "endpoint_name": "image-classifier-v2",
+              "instance_type": "ml.c5.2xlarge",
+              "check_category": "Idle Endpoints",
+              "current_value": "Endpoint 'image-classifier-v2' (ml.c5.2xlarge) has 0 invocations in 7 days",
+              "recommended_value": "Delete endpoint or reduce instance count",
+              "monthly_savings": 1452.80,
+              "reason": "SageMaker endpoint 'image-classifier-v2' is active but received zero invocations in the last 7 days"
+            }
+          ]
+        },
+        "idle_notebooks": {
+          "count": 2,
+          "recommendations": [
+            {
+              "notebook_name": "eda-notebook-dev",
+              "instance_type": "ml.t3.medium",
+              "check_category": "Idle Notebooks",
+              "current_value": "Notebook 'eda-notebook-dev' (ml.t3.medium) is running",
+              "recommended_value": "Stop or delete idle notebook instance",
+              "monthly_savings": 76.50,
+              "reason": "SageMaker notebook 'eda-notebook-dev' (ml.t3.medium) is running; consider stopping if not actively in use"
+            },
+            {
+              "notebook_name": "training-analysis",
+              "instance_type": "ml.m5.large",
+              "check_category": "Idle Notebooks",
+              "current_value": "Notebook 'training-analysis' (ml.m5.large) is running",
+              "recommended_value": "Stop or delete idle notebook instance",
+              "monthly_savings": 153.00,
+              "reason": "SageMaker notebook 'training-analysis' (ml.m5.large) is running; consider stopping if not actively in use"
+            }
+          ]
+        },
+        "spot_training": {
+          "count": 1,
+          "recommendations": [
+            {
+              "job_name": "bert-finetune-2026-04-15",
+              "instance_type": "ml.p3.2xlarge",
+              "training_hours": 48.5,
+              "check_category": "Spot Training",
+              "current_value": "Training job 'bert-finetune-2026-04-15' ran 48.5h on-demand (ml.p3.2xlarge)",
+              "recommended_value": "Enable Managed Spot Training for similar future jobs",
+              "monthly_savings": 856.50,
+              "reason": "Training job 'bert-finetune-2026-04-15' ran 48.5h on-demand; Spot Training could save ~70% ($856.50 per equivalent run)"
+            }
+          ]
+        },
+        "multi_model_consolidation": {
+          "count": 1,
+          "recommendations": [
+            {
+              "instance_type": "ml.m5.xlarge",
+              "endpoint_count": 3,
+              "endpoints": "sentiment-prod, ner-prod, summarizer-prod",
+              "check_category": "Consolidation",
+              "current_value": "3 endpoints using ml.m5.xlarge",
+              "recommended_value": "Consolidate into fewer multi-model endpoints",
+              "monthly_savings": 1116.00,
+              "reason": "3 SageMaker endpoints use ml.m5.xlarge; consolidating onto multi-model endpoints could save ~30%"
+            }
+          ]
+        }
+      },
+      "optimization_descriptions": {
+        "idle_endpoints": {
+          "title": "Idle Endpoints",
+          "description": "Active endpoints with zero invocations over 7 days"
+        },
+        "idle_notebooks": {
+          "title": "Idle Notebooks",
+          "description": "Running notebook instances that may not be in use"
+        },
+        "spot_training": {
+          "title": "Spot Training Opportunities",
+          "description": "On-demand training jobs that could use Managed Spot Training"
+        },
+        "multi_model_consolidation": {
+          "title": "Multi-Model Endpoint Consolidation",
+          "description": "Endpoints with the same instance type that could be consolidated"
+        }
+      },
+      "active_endpoint_count": 5,
+      "idle_endpoint_count": 2,
+      "running_notebook_count": 2
+    },
+    "network_cost": {
+      "service_name": "Network Transfer Costs",
+      "total_recommendations": 4,
+      "total_monthly_savings": 509.20,
+      "sources": {
+        "cross_region_transfer": {
+          "count": 1,
+          "recommendations": [
+            {
+              "resource_id": "cross-region-transfer",
+              "check_type": "cross_region_transfer",
+              "check_category": "Cross-Region Transfer",
+              "current_value": "$850.00/mo cross-region transfer spend",
+              "recommended_value": "Consolidate workloads to fewer regions or use VPC endpoints",
+              "monthly_savings": 255.00,
+              "severity": "HIGH",
+              "reason": "Cross-region data transfer costs $850.00/mo; architectural changes (regional consolidation, caching, endpoint placement) could reduce by up to 30%"
+            }
+          ]
+        },
+        "cross_az_transfer": {
+          "count": 1,
+          "recommendations": [
+            {
+              "resource_id": "cross-az-transfer",
+              "check_type": "cross_az_transfer",
+              "check_category": "Cross-AZ Transfer",
+              "current_value": "$360.00/mo cross-AZ transfer spend",
+              "recommended_value": "Co-locate communicating services in the same AZ",
+              "monthly_savings": 180.00,
+              "severity": "MEDIUM",
+              "reason": "Cross-AZ transfer costs $360.00/mo; co-locating services in the same AZ could save ~50%"
+            }
+          ]
+        },
+        "internet_egress": {
+          "count": 1,
+          "recommendations": [
+            {
+              "resource_id": "internet-egress",
+              "check_type": "internet_egress",
+              "check_category": "Internet Egress",
+              "current_value": "$125.00/mo direct internet egress",
+              "recommended_value": "Route traffic through CloudFront for egress optimization",
+              "monthly_savings": 50.00,
+              "severity": "MEDIUM",
+              "reason": "Direct internet egress costs $125.00/mo; CloudFront could reduce costs by ~40% with better performance"
+            }
+          ]
+        },
+        "tgw_vs_peering": {
+          "count": 1,
+          "recommendations": [
+            {
+              "resource_id": "tgw-route-optimization",
+              "check_type": "tgw_vs_peering",
+              "check_category": "TGW vs Peering",
+              "current_value": "TGW + 3 peering connections, $1210.00/mo transfer",
+              "recommended_value": "Optimize TGW route tables to minimize cross-hub traffic",
+              "monthly_savings": 24.20,
+              "severity": "MEDIUM",
+              "reason": "Mixed TGW/peering topology with $1210.00/mo transfer. Optimizing TGW routes could save ~20% on processing costs."
+            }
+          ]
+        }
+      },
+      "total_data_transfer_spend_30d": 1210.00,
+      "cross_region_spend_30d": 850.00,
+      "peering_count": 3,
+      "tgw_count": 1
+    },
+    "cost_anomaly": {
+      "service_name": "Cost Anomaly Detection",
+      "total_recommendations": 0,
+      "total_monthly_savings": 0.0,
+      "sources": {}
+    },
+    "eks_cost": {
+      "service_name": "EKS Cost Visibility",
+      "total_recommendations": 0,
+      "total_monthly_savings": 0.0,
+      "sources": {}
     }
   },
   "summary": {
-    "total_services_scanned": 4,
-    "total_recommendations": 14,
-    "total_monthly_savings": 736.70
-  }
+    "total_services_scanned": 7,
+    "total_recommendations": 29,
+    "total_monthly_savings": 7151.10
+  },
+  "trend_analysis": null
 }

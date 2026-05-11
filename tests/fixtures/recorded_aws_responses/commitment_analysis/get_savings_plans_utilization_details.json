@@ -1,0 +1,20 @@
+{
+  "SavingsPlansUtilizationsDetails": [
+    {
+      "SavingsPlanArn": "arn:aws:savingsplans::123456789012:savingsplan/sp-abc123",
+      "UtilizationPercentage": "88.0",
+      "AmortizedCommitment": {
+        "TotalHourlyCommitment": "0.50"
+      },
+      "EndDateTime": "2027-04-01T00:00:00Z"
+    },
+    {
+      "SavingsPlanArn": "arn:aws:savingsplans::123456789012:savingsplan/sp-def456",
+      "UtilizationPercentage": "97.0",
+      "AmortizedCommitment": {
+        "TotalHourlyCommitment": "1.00"
+      },
+      "EndDateTime": "2026-06-01T00:00:00Z"
+    }
+  ]
+}

@@ -5,6 +5,73 @@ All notable changes to the AWS Cost Optimization Scanner project will be documen
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.2.1] - 2026-05-03
+
+### Fixed
+- **46 audit remediations** across 8 waves from `AUDIT_REPORT.md` code audit:
+  - W1 (7): Critical crash in `html_report_generator.py` (KeyError), wrong dollar values in `cost_anomaly.py`, `opensearch.py`, `ebs.py`, `file_systems.py`, `lambda_svc.py`, `network_cost.py`
+  - W2 (8): Contract key mismatches in `optimization_descriptions` across 7 adapters (`ebs`, `ami`, `dynamodb`, `eks`, `dms`, `s3`, `cloudfront`) and summary count in `compute_optimizer.py`
+  - W3 (3): Missing client declarations in `elasticache`, `mediastore`, `network` adapters
+  - W4 (10): Missing `reads_fast_mode` class attributes in 10 adapters
+  - W5 (5): Pagination gaps in `commitment_analysis` (4 CE APIs), `cost_anomaly` (2 APIs), `monitoring`, `aurora`, `sagemaker` (2 APIs)
+  - W6 (3): Silent `except: pass` blocks replaced with warning logs; legacy calls wrapped; `rds.py` narrowed exception scope
+  - W7 (6): XSS fix via `html.escape()` in report generator, `deepcopy` for source mutation, comma-safe savings parsing, `logging.warning()` replacing `print()`, service count card fix, `json.dumps` for chartData
+  - W8 (4): `datetime.utcnow()` → `datetime.now(timezone.utc)`, magic numbers → named constants, `parse_dollar_savings` percentage fallback
+- **4 post-fix corrections**: `opensearch.py` (live pricing path ×2), `ebs.py` (live pricing path ×1), `compute_optimizer.py` (summary count) — all now apply `ctx.pricing_multiplier` consistently on both live and fallback pricing paths
+- **Cost Optimization Hub double-counting**: Replaced fabricated `_ROUTED_TYPES` strings (`Ec2InstanceRightsizing` etc.) with correct `_ROUTED_RESOURCE_TYPES` using real AWS API `currentResourceType` values (`Ec2Instance`, `EbsVolume`, `LambdaFunction`, `RdsDbInstance`)
+- **EKS/EC2 triple-counting**: Added `_is_eks_managed_instance()` helper in `services/ec2.py` to skip EKS-managed nodes in `get_enhanced_ec2_checks()` and `get_advanced_ec2_checks()`, eliminating overlap with `eks.py` and `containers.py` adapters
+
+### Removed
+- Aurora/RDS investigation closed as false positive (complementary sub-populations, no dollar overlap)
+
+## [3.2.0] - 2026-05-02
+
+### Added
+- **Future Roadmap** (`docs/ROADMAP.md`): 28-capability research-backed roadmap across 4 phases, covering Compute Optimizer integration, Cost Optimization Hub, Aurora checks, Savings Plans analysis, AI/ML cost visibility, EKS/Kubernetes, FOCUS 1.2 export, multi-account support, and more
+- **Service Audit Reports** (`docs/audits/`): Cross-service audit results for all 28 adapters (3 PASS, 22 WARN, 1 FAIL)
+- **Live Pricing Implementation Tracker** (`docs/LIVE_PRICING_IMPL_PROMPT.md`): Phase-by-phase status of PricingEngine migration
+
+### Changed
+- **CLAUDE.md (root)**: Rewritten as lean project quick-reference; agent policy moved to `AGENTS.md` as canonical source
+- **CONTRIBUTING.md**: Rewritten for v3.0 ServiceModule adapter architecture (was referencing 8,677-line monolith)
+- **ROADMAP.md**: Corrected baseline from 10 to 28 adapters; removed 4 items already implemented (NAT Gateway, EFS, Redshift, CloudFront); fixed competitive benchmarking and success metrics tables
+- **.gitignore**: Added `.sisyphus/` to AI assistant exclusions
+
+### Removed
+- Deleted `report_audit.md` and `service_audit.md` (completed one-shot audit prompts)
+- Moved `Audit/` directory to `docs/audits/` for cleaner root structure
+- Moved pricing plan files from root to `docs/`
+
+## [3.1.0] - 2026-05-01
+
+### Added
+- **Live Pricing Engine** (`core/pricing_engine.py`, 517 lines): Centralized AWS Pricing API client with in-memory `PricingCache` (6-hour TTL). 12 public methods covering EC2 instances, EBS volumes, RDS instances and storage (including Multi-AZ), S3 storage classes, and generic instance/storage lookups
+- **PricingEngine integration** into `ScanContext`: All adapters access live pricing via `ctx.pricing_engine` with automatic fallback to `pricing_multiplier` on API failures
+- **22 unit tests** for PricingEngine (`tests/test_pricing_engine.py`): cache behavior, API query construction, Multi-AZ storage pricing, error fallbacks
+
+### Changed
+- **11 adapters migrated** from flat-rate/heuristic pricing to live AWS Pricing API or resource-size-aware calculations:
+  - `workspaces.py` — live WorkSpaces bundle pricing via `get_instance_monthly_price()`
+  - `glue.py` — DPU-based pricing ($0.44/DPU/hour × 160 hrs/month × 0.30 rightsizing)
+  - `lightsail.py` — live Lightsail bundle pricing via `get_instance_monthly_price()`
+  - `apprunner.py` — vCPU ($0.064/hr) + memory ($0.007/GB/hr) hourly rates × 730
+  - `transfer.py` — per-protocol hourly pricing ($0.30/protocol/hour × 730)
+  - `mediastore.py` — S3-equivalent storage pricing via `get_s3_monthly_price_per_gb()`
+  - `quicksight.py` — SPICE tier pricing ($0.25–$0.38/GB × unused capacity)
+  - `containers.py` — Fargate rates ($0.04048/vCPU + $0.004445/GB/hr) × 730 with spot/rightsizing/lifecycle discounts
+  - `dynamodb.py` — RCU ($0.00013/hr) + WCU ($0.00065/hr) × 730 × 0.23 reserved discount
+  - `athena.py` — CloudWatch ProcessedBytes → $5/TB × 0.75 scan reduction (fast_mode fallback)
+  - `step_functions.py` — CloudWatch ExecutionsStarted → $0.025/1K transitions × 0.60 (fast_mode fallback)
+- **19 adapters now use live pricing** total (8 original complex adapters + 11 newly migrated)
+- **RDS Multi-AZ storage pricing**: `get_rds_monthly_storage_price_per_gb()` accepts `multi_az` parameter with independent cache keys
+- **Network adapter**: replaced regex parsing with `parse_dollar_savings()` from `services/_savings.py`
+- **S3 volume type filter**: Fixed `GetProducts` query to include correct `volumeType` values
+- **VPC Endpoint pricing**: Fixed dict collision bug for multiple endpoint types
+- **MSK NumberOfBrokerNodes**: Fixed missing field extraction
+
+### Removed
+- No breaking changes. Flat-rate fallbacks preserved via `pricing_multiplier` for `--fast` mode and API failures
+
 ## [3.0.0] - 2026-04-30
 
 ### Changed (BREAKING)

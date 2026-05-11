@@ -51,6 +51,8 @@ def _is_kubernetes_managed_alb(elbv2: Any, lb_name: str, lb_arn: str) -> bool:
 
 
 def get_load_balancer_checks(ctx: ScanContext) -> dict[str, Any]:
+    alb_monthly = ctx.pricing_engine.get_alb_monthly_price() if ctx.pricing_engine is not None else 16.20
+    nlb_monthly = alb_monthly * 1.4
     """Category 4: Load Balancers optimization checks"""
     checks: dict[str, list[dict[str, Any]]] = {
         "zero_traffic_albs": [],
@@ -122,7 +124,7 @@ def get_load_balancer_checks(ctx: ScanContext) -> dict[str, Any]:
                         "LoadBalancerName": lb_name,
                         "Type": lb_type,
                         "Recommendation": "Review if ALB can handle your traffic patterns (HTTP/HTTPS only) - ALB is typically cheaper",
-                        "EstimatedSavings": "Estimated $6.30/month savings (NLB: $22.50 vs ALB: $16.20)",
+                        "EstimatedSavings": f"Estimated ${nlb_monthly - alb_monthly:.2f}/month savings (NLB: ${nlb_monthly:.2f} vs ALB: ${alb_monthly:.2f})",
                         "Action": "1. Verify if you need Layer 4 load balancing\n2. Check if traffic is HTTP/HTTPS only\n3. Consider ALB if Layer 7 features sufficient\n4. Keep NLB if you need TCP/UDP or extreme performance",
                         "CheckCategory": "NLB vs ALB Cost Optimization",
                     }
@@ -138,7 +140,7 @@ def get_load_balancer_checks(ctx: ScanContext) -> dict[str, Any]:
                             "LoadBalancerName": lb_name,
                             "Type": lb_type,
                             "Recommendation": "Load balancer has no listeners configured - verify configuration or delete if unused",
-                            "EstimatedSavings": f"${16 if lb_type == 'application' else 22}/month if deleted",
+                            "EstimatedSavings": f"${alb_monthly if lb_type == 'application' else nlb_monthly:.0f}/month if deleted",
                             "Action": "1. Check if listeners were accidentally deleted\n2. Verify if LB is still needed\n3. Configure listeners or delete LB",
                             "CheckCategory": "Load Balancer Configuration Issue",
                         }
@@ -150,7 +152,7 @@ def get_load_balancer_checks(ctx: ScanContext) -> dict[str, Any]:
                             "LoadBalancerName": lb_name,
                             "ListenerCount": len(listeners),
                             "Recommendation": "ALB serving single service - consider consolidating multiple services on one ALB to reduce costs",
-                            "EstimatedSavings": "Up to $16.20/month per ALB eliminated through consolidation",
+                            "EstimatedSavings": f"Up to ${alb_monthly:.2f}/month per ALB eliminated through consolidation",
                             "Action": "1. Identify other single-service ALBs\n2. Plan consolidation using host-based or path-based routing\n3. Test routing rules before migration\n4. Delete unused ALBs after consolidation",
                             "CheckCategory": "ALB Consolidation Opportunity",
                         }
@@ -162,7 +164,7 @@ def get_load_balancer_checks(ctx: ScanContext) -> dict[str, Any]:
                             "LoadBalancerName": lb_name,
                             "ListenerCount": len(listeners),
                             "Recommendation": "K8s ALB serving single service - consider using Ingress Groups to share ALBs across multiple services",
-                            "EstimatedSavings": "Up to $16.20/month per ALB eliminated through Ingress Groups",
+                            "EstimatedSavings": f"Up to ${alb_monthly:.2f}/month per ALB eliminated through Ingress Groups",
                             "Action": "1. Review Kubernetes Ingress resources\n2. Add alb.ingress.kubernetes.io/group.name annotation\n3. Use same group name across multiple Ingress resources\n4. Test routing before removing individual ALBs",
                             "CheckCategory": "K8s ALB Consolidation Opportunity",
                         }
@@ -214,8 +216,8 @@ def get_load_balancer_checks(ctx: ScanContext) -> dict[str, Any]:
                         "ALBCount": standalone_count,
                         "K8sALBCount": k8s_managed_albs,
                         "Recommendation": f"{standalone_count} standalone ALBs detected - consolidate using host-based or path-based routing to reduce costs",
-                        "EstimatedSavings": f"Save ${(standalone_count - 2) * 16}/month by consolidating to 2 ALBs",
-                        "Action": "1. Identify ALBs serving similar applications or environments\n2. Plan consolidation using host-based routing (different domains) or path-based routing (same domain, different paths)\n3. Test routing rules in staging environment\n4. Migrate traffic gradually and monitor performance\n5. Delete unused ALBs after successful consolidation\n6. Each ALB costs $16.20/month base + data processing fees",
+                        "EstimatedSavings": f"Save ${(standalone_count - 2) * alb_monthly:.0f}/month by consolidating to 2 ALBs",
+                        "Action": f"1. Identify ALBs serving similar applications or environments\n2. Plan consolidation using host-based routing (different domains) or path-based routing (same domain, different paths)\n3. Test routing rules in staging environment\n4. Migrate traffic gradually and monitor performance\n5. Delete unused ALBs after successful consolidation\n6. Each ALB costs ${alb_monthly:.2f}/month base + data processing fees",
                         "CheckCategory": "Shared ALB Opportunity",
                     }
                 )
@@ -226,7 +228,7 @@ def get_load_balancer_checks(ctx: ScanContext) -> dict[str, Any]:
                         "ALBCount": k8s_managed_albs,
                         "StandaloneALBCount": standalone_count,
                         "Recommendation": f"{k8s_managed_albs} K8s ALBs detected - consider using Ingress Groups for consolidation",
-                        "EstimatedSavings": f"Save ${(k8s_managed_albs - 2) * 16}/month through Ingress Groups",
+                        "EstimatedSavings": f"Save ${(k8s_managed_albs - 2) * alb_monthly:.0f}/month through Ingress Groups",
                         "Action": "1. Review Kubernetes Ingress resources\n2. Add alb.ingress.kubernetes.io/group.name annotation\n3. Use same group name across multiple Ingress resources\n4. Set alb.ingress.kubernetes.io/group.order for rule priority\n5. Test routing before removing individual ALBs",
                         "CheckCategory": "K8s Ingress Groups Opportunity",
                     }

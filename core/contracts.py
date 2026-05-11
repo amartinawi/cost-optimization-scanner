@@ -20,6 +20,14 @@ CONTRACT_SCHEMA_VERSION: int = 1
 
 @dataclass(frozen=True)
 class WarningRecord:
+    """Non-fatal warning emitted during a scan.
+
+    Attributes:
+        message: Human-readable warning text.
+        service: Service key that produced the warning.
+        timestamp: ISO-8601 UTC timestamp.
+    """
+
     message: str
     service: str
     timestamp: str
@@ -27,6 +35,15 @@ class WarningRecord:
 
 @dataclass(frozen=True)
 class PermissionIssueRecord:
+    """IAM permission gap encountered during a scan.
+
+    Attributes:
+        message: Human-readable description of the missing permission.
+        service: Service key that encountered the issue.
+        action: The denied AWS API action, or None if unknown.
+        timestamp: ISO-8601 UTC timestamp.
+    """
+
     message: str
     service: str
     action: str | None
@@ -38,12 +55,29 @@ class PermissionIssueRecord:
 
 @dataclass(frozen=True)
 class SourceBlock:
+    """A named bucket of recommendations from a single check source.
+
+    Attributes:
+        count: Number of recommendations in this source.
+        recommendations: Immutable tuple of recommendation dicts.
+        extras: Optional additional key-value metadata.
+    """
+
     count: int
     recommendations: tuple[dict[str, Any], ...]
+    extras: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
 class StatCardSpec:
+    """Declaration for a summary stat card in the HTML report.
+
+    Attributes:
+        label: Display label for the card.
+        source_path: Dot-separated path into the findings dict.
+        formatter: Display format for the card value.
+    """
+
     label: str
     source_path: str
     formatter: Literal["int", "currency", "percent", "size_gb"] = "int"
@@ -51,12 +85,24 @@ class StatCardSpec:
 
 @dataclass(frozen=True)
 class GroupingSpec:
+    """Forward-looking: defines how recommendations should be grouped in the report.
+
+    Not yet consumed by the rendering pipeline. Will be integrated when the
+    reporter supports configurable grouping modes (by check_category, resource_type,
+    or source) instead of the current hardcoded per-service dispatch.
+    """
+
     by: Literal["check_category", "resource_type", "source"]
     label_path: str | None = None
 
 
 @dataclass(frozen=True)
 class Group:
+    """Forward-looking: a named group of recommendations with aggregated savings.
+
+    Companion to GroupingSpec — not yet consumed by the rendering pipeline.
+    """
+
     label: str
     recommendations: tuple[dict[str, Any], ...]
     aggregated_savings: float = 0.0
@@ -64,6 +110,19 @@ class Group:
 
 @dataclass(frozen=True)
 class ServiceFindings:
+    """Typed result container returned by every ServiceModule.scan() call.
+
+    Attributes:
+        service_name: Human-readable display name of the service.
+        total_recommendations: Number of optimization recommendations found.
+        total_monthly_savings: Estimated monthly savings in USD.
+        sources: Named check-source buckets keyed by source name.
+        optimization_descriptions: Optional per-check description metadata.
+        extras: Additional service-specific metadata.
+        total_count: Total resource count (omitted from output when zero).
+        schema_version: Contract schema version for forward compatibility.
+    """
+
     service_name: str
     total_recommendations: int
     total_monthly_savings: float
@@ -94,6 +153,19 @@ class ServiceFindings:
 
 @runtime_checkable
 class ServiceModule(Protocol):
+    """Interface every service adapter must implement.
+
+    Attributes:
+        key: Unique machine-readable identifier for the service.
+        cli_aliases: CLI tokens accepted by --scan-only / --skip-service.
+        display_name: Human-readable name for reports.
+        stat_cards: Stat card declarations for the HTML report.
+        grouping: Default grouping specification, or None.
+        requires_cloudwatch: Whether the adapter needs CloudWatch metrics.
+        reads_fast_mode: Whether the adapter respects the --fast flag.
+        custom_grouping: Optional callable for custom recommendation grouping.
+    """
+
     key: str
     cli_aliases: tuple[str, ...]
     display_name: str
@@ -102,7 +174,12 @@ class ServiceModule(Protocol):
     requires_cloudwatch: bool
     reads_fast_mode: bool
 
-    def required_clients(self) -> tuple[str, ...]: ...
-    def scan(self, ctx: Any) -> ServiceFindings: ...
+    def required_clients(self) -> tuple[str, ...]:
+        """Return boto3 client names this adapter needs."""
+        ...
+
+    def scan(self, ctx: Any) -> ServiceFindings:
+        """Execute the scan and return typed findings."""
+        ...
 
     custom_grouping: Callable[[ServiceFindings], list[Group]] | None

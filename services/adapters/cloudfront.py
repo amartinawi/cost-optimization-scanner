@@ -10,22 +10,74 @@ from services.cloudfront import get_enhanced_cloudfront_checks
 
 
 class CloudfrontModule(BaseServiceModule):
+    """ServiceModule adapter for CloudFront. Flat-rate savings strategy."""
+
     key: str = "cloudfront"
     cli_aliases: tuple[str, ...] = ("cloudfront",)
     display_name: str = "CloudFront"
 
     def required_clients(self) -> tuple[str, ...]:
+        """Returns boto3 client names required for CloudFront scanning."""
         return ("cloudfront",)
 
     def scan(self, ctx: Any) -> ServiceFindings:
+        """Scan CloudFront distributions for cost optimization opportunities.
+
+        Consults the cloudfront service module for price class optimization,
+        disabled distributions, and origin shield review. Traffic-based savings.
+
+        Args:
+            ctx: ScanContext with region, clients, and pricing data.
+
+        Returns:
+            ServiceFindings with an "enhanced_checks" SourceBlock entry.
+        """
         print("\U0001f50d [services/adapters/cloudfront.py] CloudFront module active")
-        result = get_enhanced_cloudfront_checks(ctx)
+        try:
+            result = get_enhanced_cloudfront_checks(ctx)
+        except Exception as e:
+            print(f"Warning: [cloudfront] enhanced checks failed: {e}")
+            result = {}
         recs = result.get("recommendations", [])
-        savings = 25 * len(recs)
+
+        savings = 0.0
+        price_per_gb = 0.10
+        for rec in recs:
+            weekly_requests_str = rec.get("WeeklyRequests", "")
+            try:
+                weekly_requests = float(weekly_requests_str)
+            except (ValueError, TypeError):
+                weekly_requests = 0.0
+
+            if weekly_requests > 0:
+                est_gb = weekly_requests * 0.0005 / 4.33
+                savings += est_gb * price_per_gb
+            elif rec.get("CheckCategory") == "CloudFront Unused Distribution":
+                savings += 0.0
+            else:
+                savings += 10.0
+
+        multiplier = getattr(ctx, "pricing_multiplier", 1.0)
+        savings = round(savings * multiplier, 2)
 
         return ServiceFindings(
             service_name="CloudFront",
             total_recommendations=len(recs),
             total_monthly_savings=savings,
             sources={"enhanced_checks": SourceBlock(count=len(recs), recommendations=tuple(recs))},
+            optimization_descriptions={
+                "enhanced_checks": {
+                    "title": "CloudFront Distribution Optimization",
+                    "description": (
+                        "Price class optimization for traffic patterns, disabled distribution"
+                        " detection, and origin shield configuration review."
+                    ),
+                    "action": (
+                        "1. Review price class settings for each distribution\n"
+                        "2. Delete or disable unused distributions\n"
+                        "3. Enable Origin Shield where applicable\n"
+                        "4. Estimated savings: varies by traffic volume"
+                    ),
+                },
+            },
         )

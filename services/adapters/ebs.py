@@ -17,14 +17,30 @@ from services.ebs import (
 
 
 class EbsModule(BaseServiceModule):
+    """ServiceModule adapter for EBS. Multi-source savings strategy."""
+
     key: str = "ebs"
     cli_aliases: tuple[str, ...] = ("ebs",)
     display_name: str = "EBS"
 
     def required_clients(self) -> tuple[str, ...]:
+        """Returns boto3 client names required for EBS scanning."""
         return ("ec2", "compute-optimizer")
 
     def scan(self, ctx: Any) -> ServiceFindings:
+        """Scan EBS volumes for cost optimization opportunities.
+
+        Consults Compute Optimizer, unattached volume detection, GP2-to-GP3
+        migration checks, and enhanced EBS service module. Savings aggregated
+        from all sources using parse_dollar_savings and per-GB GP2 estimates.
+
+        Args:
+            ctx: ScanContext with region, clients, and pricing data.
+
+        Returns:
+            ServiceFindings with "compute_optimizer", "unattached_volumes",
+            "gp2_migration", and "enhanced_checks" SourceBlock entries.
+        """
         print("\U0001f50d [services/adapters/ebs.py] EBS module active")
 
         enhanced_result = compute_ebs_checks(ctx, ctx.pricing_multiplier, ctx.old_snapshot_days)
@@ -41,7 +57,12 @@ class EbsModule(BaseServiceModule):
             savings += parse_dollar_savings(rec.get("EstimatedSavings", ""))
         for rec in gp2_recs:
             size = rec.get("Size", 0)
-            savings += size * 0.10 * 0.20
+            if ctx.pricing_engine:
+                gp2_price = ctx.pricing_engine.get_ebs_monthly_price_per_gb("gp2")
+                gp3_price = ctx.pricing_engine.get_ebs_monthly_price_per_gb("gp3")
+                savings += size * max(gp2_price - gp3_price, 0) * ctx.pricing_multiplier
+            else:
+                savings += size * 0.10 * 0.20 * ctx.pricing_multiplier
         savings += sum(r.get("estimatedMonthlySavings", 0) for r in co_recs)
 
         total_recs = len(co_recs) + len(unattached_volumes) + len(gp2_recs) + len(other_recs)

@@ -67,8 +67,8 @@ DYNAMODB_CHECK_DESCRIPTIONS: dict[str, dict[str, str]] = {
     },
 }
 
-_PROVISIONED_RCU_COST: float = 0.25
-_PROVISIONED_WCU_COST: float = 1.25
+_PROVISIONED_RCU_COST: float = 0.107
+_PROVISIONED_WCU_COST: float = 0.537
 _HIGH_CAPACITY_THRESHOLD: int = 100
 _LARGE_TABLE_BYTES: int = 1024**3
 _VERY_LARGE_TABLE_BYTES: int = 10 * 1024**3
@@ -140,6 +140,42 @@ def get_dynamodb_table_analysis(ctx: ScanContext) -> dict[str, Any]:
 
                 else:
                     analysis["on_demand_tables"].append(table_name)
+                    try:
+                        cloudwatch = ctx.client("cloudwatch")
+                        cw_end = datetime.now(UTC)
+                        cw_start = cw_end - timedelta(days=_ON_DEMAND_ANALYSIS_DAYS)
+                        r_resp = cloudwatch.get_metric_statistics(
+                            Namespace="AWS/DynamoDB",
+                            MetricName="ConsumedReadCapacityUnits",
+                            Dimensions=[{"Name": "TableName", "Value": table_name}],
+                            StartTime=cw_start,
+                            EndTime=cw_end,
+                            Period=3600,
+                            Statistics=["Average"],
+                        )
+                        w_resp = cloudwatch.get_metric_statistics(
+                            Namespace="AWS/DynamoDB",
+                            MetricName="ConsumedWriteCapacityUnits",
+                            Dimensions=[{"Name": "TableName", "Value": table_name}],
+                            StartTime=cw_start,
+                            EndTime=cw_end,
+                            Period=3600,
+                            Statistics=["Average"],
+                        )
+                        r_dps = r_resp.get("Datapoints", [])
+                        w_dps = w_resp.get("Datapoints", [])
+                        if r_dps and w_dps:
+                            avg_r = sum(d["Average"] for d in r_dps) / len(r_dps)
+                            avg_w = sum(d["Average"] for d in w_dps) / len(w_dps)
+                            on_demand_rcu = 0.00000125
+                            on_demand_wcu = 0.00000625
+                            table_info["EstimatedMonthlyCost"] = round(
+                                (avg_r * on_demand_rcu + avg_w * on_demand_wcu) * 730, 2
+                            )
+                        else:
+                            table_info["EstimatedMonthlyCost"] = 25.0
+                    except Exception:
+                        table_info["EstimatedMonthlyCost"] = 25.0
                     table_info["OptimizationOpportunities"].append(
                         "Monitor usage patterns to consider Provisioned mode for steady workloads"
                     )
@@ -168,7 +204,34 @@ def get_dynamodb_table_analysis(ctx: ScanContext) -> dict[str, Any]:
 
 def get_dynamodb_optimization_descriptions() -> dict[str, dict[str, str]]:
     """Get descriptions for DynamoDB cost optimization opportunities"""
-    return DYNAMODB_CHECK_DESCRIPTIONS
+    return {
+        "dynamodb_table_analysis": {
+            "title": "DynamoDB Table Analysis",
+            "description": (
+                "Analysis of DynamoDB table configurations including billing mode,"
+                " provisioned capacity, and reserved capacity opportunities."
+            ),
+            "action": (
+                "1. Review table billing mode (Provisioned vs On-Demand)\n"
+                "2. Rightsize provisioned RCU/WCU based on usage\n"
+                "3. Consider reserved capacity for steady workloads\n"
+                "4. Estimated savings: 20-76% depending on optimization type"
+            ),
+        },
+        "enhanced_checks": {
+            "title": "Enhanced DynamoDB Checks",
+            "description": (
+                "Additional DynamoDB checks including data lifecycle management,"
+                " global tables optimization, and unused table detection."
+            ),
+            "action": (
+                "1. Implement TTL for automatic data expiration\n"
+                "2. Archive old data to S3\n"
+                "3. Review global tables replication configuration\n"
+                "4. Estimated savings: 20-80% on storage costs"
+            ),
+        },
+    }
 
 
 def get_enhanced_dynamodb_checks(ctx: ScanContext) -> dict[str, Any]:

@@ -17,14 +17,29 @@ from services.efs_fsx import (
 
 
 class FileSystemsModule(BaseServiceModule):
+    """ServiceModule adapter for file systems (EFS, FSx). Composite savings strategy."""
+
     key: str = "file_systems"
     cli_aliases: tuple[str, ...] = ("efs", "file_systems")
     display_name: str = "File Systems"
 
     def required_clients(self) -> tuple[str, ...]:
+        """Returns boto3 client names required for file system scanning."""
         return ("efs", "fsx")
 
     def scan(self, ctx: Any) -> ServiceFindings:
+        """Scan EFS and FSx file systems for cost optimization opportunities.
+
+        Consults EFS lifecycle analysis, FSx optimization analysis, and enhanced
+        checks. Savings derived from 30% of estimated monthly cost per rec.
+
+        Args:
+            ctx: ScanContext with region, clients, and pricing data.
+
+        Returns:
+            ServiceFindings with "efs_lifecycle_analysis",
+            "fsx_optimization_analysis", and "enhanced_checks" SourceBlock entries.
+        """
         print("\U0001f50d [services/adapters/file_systems.py] File Systems module active")
 
         efs_counts = get_efs_file_system_count(ctx)
@@ -46,7 +61,22 @@ class FileSystemsModule(BaseServiceModule):
         )
         enhanced_recs = enhanced_result.get("recommendations", [])
 
-        savings = sum(rec.get("EstimatedMonthlyCost", 0) * 0.3 for rec in efs_recs + fsx_recs)
+        savings = 0.0
+        for rec in efs_recs:
+            cost = rec.get("EstimatedMonthlyCost", 0)
+            if ctx.pricing_engine is not None and cost == 0:
+                size_gb = rec.get("SizeGB", rec.get("StorageCapacity", 0))
+                if size_gb > 0:
+                    price = ctx.pricing_engine.get_efs_monthly_price_per_gb()
+                    cost = size_gb * price
+            savings += cost * 0.40
+        for rec in fsx_recs:
+            cost = rec.get("EstimatedMonthlyCost", 0)
+            if ctx.pricing_multiplier:
+                cost *= ctx.pricing_multiplier
+            savings += cost * 0.40
+        for rec in enhanced_recs:
+            savings += rec.get("EstimatedMonthlySavings", rec.get("monthly_savings", 0))
 
         total_recs = len(efs_recs) + len(fsx_recs) + len(enhanced_recs)
 

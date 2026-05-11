@@ -81,8 +81,8 @@ def get_enhanced_elasticache_checks(ctx: ScanContext) -> dict[str, Any]:
                                 " (open-source Redis fork with feature parity)"
                             ),
                             "EstimatedSavings": (
-                                "Same pricing as Redis for identical node types;"
-                                " consider Valkey for feature parity/security updates"
+                                "Valkey is ~20% cheaper than Redis for identical node types;"
+                                " migrate for cost savings and open-source security updates"
                             ),
                             "CheckCategory": "Valkey Migration",
                         }

@@ -14,6 +14,7 @@ print("🔍 [services/nat_gateway.py] NAT Gateway module active")
 
 
 def get_nat_gateway_checks(ctx: ScanContext) -> dict[str, Any]:
+    nat_monthly = ctx.pricing_engine.get_nat_gateway_monthly_price() if ctx.pricing_engine is not None else 32.0
     """Category 2: NAT Gateway & VPC Design optimization checks"""
     checks: dict[str, list[dict[str, Any]]] = {
         "low_throughput_nat_gateways": [],
@@ -67,7 +68,7 @@ def get_nat_gateway_checks(ctx: ScanContext) -> dict[str, Any]:
                                 "Environment": environment,
                                 "ResourceName": nat_name,
                                 "Recommendation": "Consider NAT instance or scheduled shutdown for dev/test",
-                                "EstimatedSavings": "$32.85/month base + data processing fees",
+                                "EstimatedSavings": f"${nat_monthly + 0.85:.2f}/month base + data processing fees",
                                 "CheckCategory": "Dev/Test NAT Optimization",
                             }
                         )
@@ -110,7 +111,7 @@ def get_nat_gateway_checks(ctx: ScanContext) -> dict[str, Any]:
                         "AvailabilityZone": az,
                         "NatGatewayCount": count,
                         "Recommendation": f"{count} NAT Gateways in same AZ - review if all are needed",
-                        "EstimatedSavings": f"${(count - 1) * 32:.2f}/month if consolidated",
+                        "EstimatedSavings": f"${(count - 1) * nat_monthly:.2f}/month if consolidated",
                         "CheckCategory": "Multiple NAT Gateways",
                     }
                 )
@@ -135,7 +136,7 @@ def get_nat_gateway_checks(ctx: ScanContext) -> dict[str, Any]:
                         "VpcId": vpc_id,
                         "NatGatewayCount": count,
                         "Recommendation": f"{count} NAT Gateways in VPC - consider single NAT for cost optimization",
-                        "EstimatedSavings": f"${(count - 1) * 32:.2f}/month (reduced availability)",
+                        "EstimatedSavings": f"${(count - 1) * nat_monthly:.2f}/month (reduced availability)",
                         "CheckCategory": "Unnecessary NAT per AZ",
                     }
                 )

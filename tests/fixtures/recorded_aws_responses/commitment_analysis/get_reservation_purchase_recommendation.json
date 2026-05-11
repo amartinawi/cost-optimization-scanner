@@ -1,0 +1,12 @@
+{
+  "Recommendations": [
+    {
+      "RecommendationDetails": [
+        {
+          "InstanceType": "m5.large",
+          "EstimatedMonthlySavings": "45.00"
+        }
+      ]
+    }
+  ]
+}

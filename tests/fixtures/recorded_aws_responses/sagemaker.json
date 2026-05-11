@@ -1,0 +1,104 @@
+{
+  "service_name": "SageMaker",
+  "total_recommendations": 6,
+  "total_monthly_savings": 4231.20,
+  "sources": {
+    "idle_endpoints": {
+      "count": 2,
+      "recommendations": [
+        {
+          "endpoint_name": "fraud-detection-prod",
+          "instance_type": "ml.m5.xlarge",
+          "check_category": "Idle Endpoints",
+          "current_value": "Endpoint 'fraud-detection-prod' (ml.m5.xlarge) has 0 invocations in 7 days",
+          "recommended_value": "Delete endpoint or reduce instance count",
+          "monthly_savings": 576.40,
+          "reason": "SageMaker endpoint 'fraud-detection-prod' is active but received zero invocations in the last 7 days"
+        },
+        {
+          "endpoint_name": "image-classifier-v2",
+          "instance_type": "ml.c5.2xlarge",
+          "check_category": "Idle Endpoints",
+          "current_value": "Endpoint 'image-classifier-v2' (ml.c5.2xlarge) has 0 invocations in 7 days",
+          "recommended_value": "Delete endpoint or reduce instance count",
+          "monthly_savings": 1452.80,
+          "reason": "SageMaker endpoint 'image-classifier-v2' is active but received zero invocations in the last 7 days"
+        }
+      ]
+    },
+    "idle_notebooks": {
+      "count": 2,
+      "recommendations": [
+        {
+          "notebook_name": "eda-notebook-dev",
+          "instance_type": "ml.t3.medium",
+          "check_category": "Idle Notebooks",
+          "current_value": "Notebook 'eda-notebook-dev' (ml.t3.medium) is running",
+          "recommended_value": "Stop or delete idle notebook instance",
+          "monthly_savings": 76.50,
+          "reason": "SageMaker notebook 'eda-notebook-dev' (ml.t3.medium) is running; consider stopping if not actively in use"
+        },
+        {
+          "notebook_name": "training-analysis",
+          "instance_type": "ml.m5.large",
+          "check_category": "Idle Notebooks",
+          "current_value": "Notebook 'training-analysis' (ml.m5.large) is running",
+          "recommended_value": "Stop or delete idle notebook instance",
+          "monthly_savings": 153.00,
+          "reason": "SageMaker notebook 'training-analysis' (ml.m5.large) is running; consider stopping if not actively in use"
+        }
+      ]
+    },
+    "spot_training": {
+      "count": 1,
+      "recommendations": [
+        {
+          "job_name": "bert-finetune-2026-04-15",
+          "instance_type": "ml.p3.2xlarge",
+          "training_hours": 48.5,
+          "check_category": "Spot Training",
+          "current_value": "Training job 'bert-finetune-2026-04-15' ran 48.5h on-demand (ml.p3.2xlarge)",
+          "recommended_value": "Enable Managed Spot Training for similar future jobs",
+          "monthly_savings": 856.50,
+          "reason": "Training job 'bert-finetune-2026-04-15' ran 48.5h on-demand; Spot Training could save ~70% ($856.50 per equivalent run)"
+        }
+      ]
+    },
+    "multi_model_consolidation": {
+      "count": 1,
+      "recommendations": [
+        {
+          "instance_type": "ml.m5.xlarge",
+          "endpoint_count": 3,
+          "endpoints": "sentiment-prod, ner-prod, summarizer-prod",
+          "check_category": "Consolidation",
+          "current_value": "3 endpoints using ml.m5.xlarge",
+          "recommended_value": "Consolidate into fewer multi-model endpoints",
+          "monthly_savings": 1116.00,
+          "reason": "3 SageMaker endpoints use ml.m5.xlarge; consolidating onto multi-model endpoints could save ~30%"
+        }
+      ]
+    }
+  },
+  "optimization_descriptions": {
+    "idle_endpoints": {
+      "title": "Idle Endpoints",
+      "description": "Active endpoints with zero invocations over 7 days"
+    },
+    "idle_notebooks": {
+      "title": "Idle Notebooks",
+      "description": "Running notebook instances that may not be in use"
+    },
+    "spot_training": {
+      "title": "Spot Training Opportunities",
+      "description": "On-demand training jobs that could use Managed Spot Training"
+    },
+    "multi_model_consolidation": {
+      "title": "Multi-Model Endpoint Consolidation",
+      "description": "Endpoints with the same instance type that could be consolidated"
+    }
+  },
+  "active_endpoint_count": 5,
+  "idle_endpoint_count": 2,
+  "running_notebook_count": 2
+}

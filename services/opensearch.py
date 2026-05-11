@@ -74,6 +74,7 @@ def get_enhanced_opensearch_checks(ctx: ScanContext) -> dict[str, Any]:
                 instance_type = domain.get("ClusterConfig", {}).get("InstanceType", "")
                 instance_count = domain.get("ClusterConfig", {}).get("InstanceCount", 0)
                 storage_type = domain.get("EBSOptions", {}).get("VolumeType", "")
+                ebs_volume_size = domain.get("EBSOptions", {}).get("VolumeSize", 0)
 
                 if instance_count >= 2:
                     checks["reserved_instances"].append(
@@ -131,6 +132,7 @@ def get_enhanced_opensearch_checks(ctx: ScanContext) -> dict[str, Any]:
                         {
                             "DomainName": domain_name,
                             "StorageType": storage_type,
+                            "EBSVolumeSize": ebs_volume_size,
                             "Recommendation": "Migrate to gp3 volumes",
                             "EstimatedSavings": "20% storage cost",
                             "CheckCategory": "Storage Optimization",

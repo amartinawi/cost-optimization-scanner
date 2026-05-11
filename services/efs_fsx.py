@@ -104,7 +104,7 @@ def _estimate_efs_cost(size_gb: float, pricing_multiplier: float, is_one_zone: b
 
 def _estimate_fsx_cost(fs_type: str, capacity_gb: int, storage_type: str, pricing_multiplier: float) -> float:
     pricing: dict[str, dict[str, float]] = {
-        "LUSTRE": {"SSD": 0.145, "HDD": 0.040},
+        "LUSTRE": {"SSD": 0.154, "HDD": 0.025},
         "WINDOWS": {"SSD": 0.13, "HDD": 0.08},
         "ONTAP": {"SSD": 0.144, "HDD": 0.05},
         "OPENZFS": {"SSD": 0.20, "INTELLIGENT_TIERING": 0.10},

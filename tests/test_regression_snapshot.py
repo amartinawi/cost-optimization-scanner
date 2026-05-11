@@ -37,8 +37,8 @@ class TestGoldenJsonParity:
         required = {"account_id", "region", "profile", "scan_time", "services", "summary"}
         assert required.issubset(golden_json.keys()), f"Missing top-level keys: {required - set(golden_json.keys())}"
 
-    def test_golden_json_has_28_services(self, golden_json: dict) -> None:
-        """All 28 expected service keys are present."""
+    def test_golden_json_has_37_services(self, golden_json: dict) -> None:
+        """All 37 expected service keys are present."""
         expected_services = {
             "ec2",
             "ami",
@@ -68,6 +68,15 @@ class TestGoldenJsonParity:
             "glue",
             "athena",
             "batch",
+            "compute_optimizer",
+            "cost_optimization_hub",
+            "aurora",
+            "commitment_analysis",
+            "bedrock",
+            "sagemaker",
+            "network_cost",
+            "cost_anomaly",
+            "eks_cost",
         }
         actual = set(golden_json["services"].keys())
         assert actual == expected_services, (
@@ -134,6 +143,7 @@ class TestNormalizers:
     """Unit tests for the normalizer functions."""
 
     def test_normalize_timestamps(self) -> None:
+        """Verify ISO-8601 timestamps are replaced with the NORMALIZED sentinel."""
         from conftest import normalize_timestamps
 
         result = normalize_timestamps("scan at 2026-04-29T10:30:00+00:00 done")
@@ -141,6 +151,7 @@ class TestNormalizers:
         assert "<NORMALIZED>" in result
 
     def test_normalize_account_id(self) -> None:
+        """Verify 12-digit AWS account IDs are replaced with the NORMALIZED sentinel."""
         from conftest import normalize_account_id
 
         result = normalize_account_id('account_id: "123456789012"')
@@ -148,6 +159,7 @@ class TestNormalizers:
         assert "<NORMALIZED>" in result
 
     def test_normalize_account_id(self) -> None:
+        """Verify account ID normalisation via the tests.conftest import path."""
         from tests.conftest import normalize_account_id
 
         result = normalize_account_id('account_id: "123456789012"')
@@ -155,12 +167,14 @@ class TestNormalizers:
         assert "<NORMALIZED>" in result
 
     def test_normalize_currency(self) -> None:
+        """Verify currency values are rounded to nearest cent."""
         from conftest import normalize_currency
 
         result = normalize_currency("savings: $1,234.56/month")
         assert "$1234.56" in result  # Comma removed during normalization to 2 decimals
 
     def test_normalize_preserves_non_matching(self) -> None:
+        """Verify normalizer leaves strings without timestamps unchanged."""
         from tests.conftest import normalize_timestamps
 
         result = normalize_timestamps("no timestamps here")

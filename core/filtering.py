@@ -11,6 +11,7 @@ from core.contracts import ServiceModule
 
 
 def _build_alias_index(modules: list[ServiceModule]) -> dict[str, str]:
+    """Build a lower-cased alias-to-key lookup from all module cli_aliases."""
     index: dict[str, str] = {}
     for mod in modules:
         for alias in mod.cli_aliases:
@@ -23,6 +24,7 @@ def _resolve_tokens(
     alias_index: dict[str, str],
     modules: list[ServiceModule],
 ) -> set[str]:
+    """Resolve a set of CLI tokens to canonical module keys via alias index or direct match."""
     keys: set[str] = set()
     for token in tokens:
         token_lower = token.lower()

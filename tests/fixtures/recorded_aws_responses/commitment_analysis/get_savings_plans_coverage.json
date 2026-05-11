@@ -1,0 +1,20 @@
+{
+  "SavingsPlansCoverages": [
+    {
+      "Attributes": {"service": "Amazon EC2"},
+      "Coverage": {
+        "OnDemandCost": "500.00",
+        "CoveredCost": "350.00",
+        "CoveragePercentage": "70.0"
+      }
+    },
+    {
+      "Attributes": {"service": "AWS Lambda"},
+      "Coverage": {
+        "OnDemandCost": "100.00",
+        "CoveredCost": "90.00",
+        "CoveragePercentage": "90.0"
+      }
+    }
+  ]
+}

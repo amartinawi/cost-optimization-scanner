@@ -6,6 +6,7 @@ This module will later become TransferModule (T-XXX) implementing ServiceModule.
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from core.scan_context import ScanContext
@@ -39,26 +40,56 @@ def get_enhanced_transfer_checks(ctx: ScanContext) -> dict[str, Any]:
                 state = server.get("State")
                 protocols = server.get("Protocols", [])
 
-                if state == "ONLINE" and len(protocols) > 1:
-                    estimated_savings = "Variable – check AWS Pricing Calculator"
+                rec: dict[str, Any] = {
+                    "ServerId": server_id,
+                    "Protocols": protocols,
+                    "Region": ctx.region,
+                    "CheckCategory": "Protocol Optimization",
+                }
 
-                    checks["protocol_optimization"].append(
-                        {
-                            "ServerId": server_id,
-                            "Protocols": protocols,
-                            "Region": ctx.region,
-                            "Recommendation": (
-                                f"Review if all {len(protocols)} protocols are needed"
-                                " - each protocol has hourly charges"
-                            ),
-                            "EstimatedSavings": estimated_savings,
-                            "CheckCategory": "Protocol Optimization",
-                            "Note": (
-                                f"Protocol costs vary by region ({ctx.region}) and type."
-                                " Verify actual pricing in AWS Pricing Calculator before making changes."
-                            ),
-                        }
+                if state == "ONLINE" and len(protocols) > 1:
+                    removable = len(protocols) - 1
+                    rec["Recommendation"] = (
+                        f"Review if all {len(protocols)} protocols are needed - each protocol has hourly charges"
                     )
+                    rec["EstimatedSavings"] = f"${removable * 0.30 * 730:.2f}/mo from removing {removable} protocol(s)"
+                    rec["Note"] = (
+                        f"Protocol costs vary by region ({ctx.region}) and type."
+                        " Verify actual pricing in AWS Pricing Calculator before making changes."
+                    )
+                    checks["protocol_optimization"].append(rec)
+
+                if not ctx.fast_mode:
+                    try:
+                        cw = ctx.client("cloudwatch")
+                        end = datetime.now(timezone.utc)
+                        start = end - timedelta(days=14)
+                        uploaded = downloaded = 0.0
+                        for metric_name in ("BytesUploaded", "BytesDownloaded"):
+                            pts = cw.get_metric_statistics(
+                                Namespace="AWS/Transfer",
+                                MetricName=metric_name,
+                                Dimensions=[{"Name": "ServerId", "Value": server_id}],
+                                StartTime=start,
+                                EndTime=end,
+                                Period=86400 * 14,
+                                Statistics=["Sum"],
+                            )
+                            for dp in pts.get("Datapoints", []):
+                                if metric_name == "BytesUploaded":
+                                    uploaded += dp.get("Sum", 0)
+                                else:
+                                    downloaded += dp.get("Sum", 0)
+                        total_gb = (uploaded + downloaded) / (1024**3)
+                        if total_gb > 0:
+                            rec["DataTransferCostGB"] = round(total_gb, 2)
+                            rec["DataTransferCostNote"] = f"~${total_gb * 0.09:.2f}/mo S3 data transfer"
+                    except Exception:
+                        rec["DataTransferCostNote"] = (
+                            "CloudWatch unavailable — consider monitoring"
+                            " BytesUploaded/BytesDownloaded for S3 transfer cost"
+                            " (~$0.09/GB) awareness"
+                        )
 
                 if state in ["STOPPED", "OFFLINE"]:
                     checks["unused_servers"].append(

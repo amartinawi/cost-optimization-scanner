@@ -31,9 +31,11 @@ EXPECTED_SERVICE_KEYS = {
     "rds",
     "file_systems",
     "s3",
+    "sagemaker",
     "dynamodb",
     "containers",
     "network",
+    "network_cost",
     "monitoring",
     "elasticache",
     "opensearch",
@@ -53,6 +55,13 @@ EXPECTED_SERVICE_KEYS = {
     "glue",
     "athena",
     "batch",
+    "bedrock",
+    "compute_optimizer",
+    "cost_optimization_hub",
+    "aurora",
+    "commitment_analysis",
+    "cost_anomaly",
+    "eks_cost",
 }
 
 

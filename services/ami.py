@@ -105,6 +105,8 @@ def compute_ami_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> dic
                 if total_snapshot_size_gb == 0:
                     total_snapshot_size_gb = 8
 
+                # NOTE: Uses full EBS volume size, not incremental snapshot size.
+                # Actual incremental snapshots are typically 10-30% of full volume size.
                 monthly_snapshot_cost = total_snapshot_size_gb * 0.05 * pricing_multiplier
 
                 checks["old_amis"].append(
@@ -126,4 +128,8 @@ def compute_ami_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> dic
     except Exception as e:
         print(f"Warning: Could not get AMI checks: {e}")
 
-    return {"recommendations": checks["old_amis"], "total_count": len(checks["old_amis"])}
+    return {
+        "recommendations": checks.get("old_amis", []) + checks.get("unused_amis", []),
+        "total_count": len(checks.get("old_amis", []) + checks.get("unused_amis", [])),
+        **checks,
+    }

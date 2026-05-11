@@ -38,29 +38,46 @@ def get_enhanced_batch_checks(ctx: ScanContext) -> dict[str, Any]:
                     allocation_strategy = compute_resources.get("allocationStrategy", "BEST_FIT")
                     instance_types = compute_resources.get("instanceTypes", [])
 
-                    if allocation_strategy != "SPOT_CAPACITY_OPTIMIZED":
-                        checks["compute_environments"].append(
-                            {
-                                "ComputeEnvironmentName": ce_name,
-                                "Type": ce_type,
-                                "AllocationStrategy": allocation_strategy,
-                                "Recommendation": "Use SPOT_CAPACITY_OPTIMIZED for fault-tolerant workloads",
-                                "EstimatedSavings": "60-90% with Spot instances",
-                                "CheckCategory": "Batch Spot Optimization",
-                            }
-                        )
+                    is_fargate = ce_type == "MANAGED" and any(t.upper() == "FARGATE" for t in instance_types)
 
-                    has_graviton = any("6g" in inst or "7g" in inst for inst in instance_types)
-                    if not has_graviton and instance_types:
-                        checks["compute_environments"].append(
-                            {
-                                "ComputeEnvironmentName": ce_name,
-                                "InstanceTypes": instance_types,
-                                "Recommendation": "Consider Graviton instances for better price-performance",
-                                "EstimatedSavings": "20-40% cost reduction",
-                                "CheckCategory": "Batch Graviton Migration",
-                            }
-                        )
+                    if is_fargate:
+                        if allocation_strategy != "SPOT_CAPACITY_OPTIMIZED":
+                            checks["compute_environments"].append(
+                                {
+                                    "ComputeEnvironmentName": ce_name,
+                                    "Type": ce_type,
+                                    "ComputeType": "FARGATE",
+                                    "AllocationStrategy": allocation_strategy,
+                                    "Recommendation": "Use Fargate Spot for fault-tolerant batch workloads",
+                                    "EstimatedSavings": "70% with Fargate Spot",
+                                    "CheckCategory": "Batch Fargate Spot Optimization",
+                                }
+                            )
+                    else:
+                        if allocation_strategy != "SPOT_CAPACITY_OPTIMIZED":
+                            checks["compute_environments"].append(
+                                {
+                                    "ComputeEnvironmentName": ce_name,
+                                    "Type": ce_type,
+                                    "ComputeType": "EC2",
+                                    "AllocationStrategy": allocation_strategy,
+                                    "Recommendation": "Use SPOT_CAPACITY_OPTIMIZED for fault-tolerant workloads",
+                                    "EstimatedSavings": "60-90% with Spot instances",
+                                    "CheckCategory": "Batch Spot Optimization",
+                                }
+                            )
+
+                        has_graviton = any("6g" in inst or "7g" in inst for inst in instance_types)
+                        if not has_graviton and instance_types:
+                            checks["compute_environments"].append(
+                                {
+                                    "ComputeEnvironmentName": ce_name,
+                                    "InstanceTypes": instance_types,
+                                    "Recommendation": "Consider Graviton instances for better price-performance",
+                                    "EstimatedSavings": "20-40% cost reduction",
+                                    "CheckCategory": "Batch Graviton Migration",
+                                }
+                            )
 
         try:
             job_paginator = ctx.client("batch").get_paginator("describe_job_definitions")

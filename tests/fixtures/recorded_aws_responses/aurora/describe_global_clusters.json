@@ -1,0 +1,17 @@
+{
+  "GlobalClusters": [
+    {
+      "GlobalClusterIdentifier": "global-cluster-1",
+      "Members": [
+        {
+          "DBClusterArn": "arn:aws:rds:us-east-1:123456789012:cluster:aurora-cluster-2",
+          "IsWriter": true
+        },
+        {
+          "DBClusterArn": "arn:aws:rds:eu-west-1:123456789012:cluster:aurora-cluster-2-replica",
+          "IsWriter": false
+        }
+      ]
+    }
+  ]
+}

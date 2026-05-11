@@ -4,9 +4,8 @@
 
 The AWS Cost Optimization Scanner is a modular Python application that performs
 220+ cost optimization checks across 28 adapter modules covering 30 AWS service
-categories. The system was refactored from a single 8,500-line monolith into a
-clean layered architecture with typed contracts, a service registry, and
-isolated adapter modules.
+categories. The system uses a clean layered architecture with typed contracts,
+a service registry, and isolated adapter modules.
 
 ```
  cli.py                          cost_optimizer.py
@@ -49,13 +48,14 @@ the shared utilities in `services/`.
 
 | File | Lines | Class / Function | Purpose |
 |------|-------|-------------------|---------|
-| `contracts.py` | 109 | `ServiceModule`, `ServiceFindings`, `SourceBlock`, `StatCardSpec`, `GroupingSpec`, `Group`, `WarningRecord`, `PermissionIssueRecord` | Typed boundary between all layers |
-| `scan_context.py` | 50 | `ScanContext` | Region, account, client registry, warning/permission tracking |
-| `scan_orchestrator.py` | 67 | `ScanOrchestrator`, `safe_scan` | Iterates modules, pre-fetches advisor data, catches per-module failures |
-| `result_builder.py` | 59 | `ScanResultBuilder` | Serializes `ServiceFindings` to a JSON-compatible dict matching legacy format |
-| `client_registry.py` | 54 | `ClientRegistry` | Caching boto3 client factory with global-service routing |
-| `session.py` | 42 | `AwsSessionFactory` | boto3 session with adaptive retry (10 attempts) |
-| `filtering.py` | 58 | `resolve_cli_keys` | Resolves `--scan-only` / `--skip-service` CLI tokens to module keys via alias index |
+| `contracts.py` | 188 | `ServiceModule`, `ServiceFindings`, `SourceBlock`, `StatCardSpec`, `GroupingSpec`, `Group`, `WarningRecord`, `PermissionIssueRecord` | Typed boundary between all layers |
+| `scan_context.py` | 72 | `ScanContext` | Region, account, client registry, pricing engine, warning/permission tracking |
+| `pricing_engine.py` | 517 | `PricingEngine`, `PricingCache` | AWS Pricing API client with in-memory cache, 12 public methods for EC2/EBS/RDS/S3/storage/network pricing. PricingCache nested class with TTL eviction |
+| `scan_orchestrator.py` | 85 | `ScanOrchestrator`, `safe_scan` | Iterates modules, pre-fetches advisor data, catches per-module failures |
+| `result_builder.py` | 70 | `ScanResultBuilder` | Serializes `ServiceFindings` to a JSON-compatible dict matching legacy format |
+| `client_registry.py` | 62 | `ClientRegistry` | Caching boto3 client factory with global-service routing |
+| `session.py` | 50 | `AwsSessionFactory` | boto3 session with adaptive retry (10 attempts) |
+| `filtering.py` | 60 | `resolve_cli_keys` | Resolves `--scan-only` / `--skip-service` CLI tokens to module keys via alias index |
 
 ### contracts.py -- The Protocol Boundary
 
@@ -90,6 +90,8 @@ serialized output.
 - `region`, `account_id`, `profile`, `fast_mode` -- identity flags
 - `clients` -- the `ClientRegistry` for creating boto3 clients
 - `pricing_multiplier` -- regional pricing factor from `CostOptimizer.REGIONAL_PRICING`
+- `pricing_engine` -- `PricingEngine` instance for live AWS Pricing API lookups with in-memory cache
+- `fast_mode` -- skip CloudWatch-heavy scans for faster results
 - `old_snapshot_days` -- threshold for old EBS snapshot checks (default 90)
 - `cost_hub_splits` -- pre-fetched Cost Optimization Hub recommendations partitioned by service key
 - `warn()` / `permission_issue()` -- structured warning collection
@@ -196,31 +198,29 @@ Adapters subclass this and override only what they need.
 
 #### Adapter Categories by Savings Strategy
 
-**Flat-rate adapters (12)** -- Assign a fixed dollar savings per recommendation:
+**Live-pricing adapters (11)** -- Use AWS Pricing API or resource-size-aware calculations:
 
-| Adapter | Key | Flat Rate |
-|---------|-----|-----------|
-| `lightsail.py` | `lightsail` | $12/rec |
-| `redshift.py` | `redshift` | varies |
-| `dms.py` | `dms` | varies |
-| `quicksight.py` | `quicksight` | varies |
-| `apprunner.py` | `apprunner` | varies |
-| `transfer.py` | `transfer` | varies |
-| `msk.py` | `msk` | varies |
-| `workspaces.py` | `workspaces` | varies |
-| `mediastore.py` | `mediastore` | varies |
-| `glue.py` | `glue` | varies |
-| `athena.py` | `athena` | varies |
-| `batch.py` | `batch` | varies |
+| Adapter | Key | Pricing Method |
+|---------|-----|---------------|
+| `workspaces.py` | `workspaces` | `get_instance_monthly_price("AmazonWorkSpaces", bundle)` x 0.40 AutoStop savings |
+| `glue.py` | `glue` | `$0.44/DPU/hour` x DPU count x 160 hrs/month x 0.30 rightsizing |
+| `lightsail.py` | `lightsail` | `get_instance_monthly_price("AmazonLightsail", bundle)` |
+| `apprunner.py` | `apprunner` | `$0.064/vCPU/hour + $0.007/GB/hour` x 730 x 0.30 |
+| `transfer.py` | `transfer` | `$0.30/protocol/hour` x protocols x 730 |
+| `mediastore.py` | `mediastore` | `get_s3_monthly_price_per_gb("STANDARD")` x storage GB |
+| `quicksight.py` | `quicksight` | SPICE tier pricing ($0.25-$0.38/GB) x unused capacity |
+| `containers.py` | `containers` | Fargate rates ($0.04048/vCPU + $0.004445/GB/hour) x 730 |
+| `dynamodb.py` | `dynamodb` | RCU ($0.00013/hour) + WCU ($0.00065/hour) x 730 x discount |
+| `athena.py` | `athena` | CloudWatch ProcessedBytes -> $5/TB x 0.75 scan reduction |
+| `step_functions.py` | `step_functions` | CloudWatch ExecutionsStarted -> $0.025/1K transitions x 0.60 |
 
-**Parse-rate adapters (6)** -- Extract dollar amounts from recommendation text
+**Parse-rate adapters (5)** -- Extract dollar amounts from recommendation text
 using regex or keyword matching:
 
 | Adapter | Key | Parse Method |
 |---------|-----|-------------|
 | `cloudfront.py` | `cloudfront` | Fixed $25/rec |
 | `api_gateway.py` | `api_gateway` | Keyword-based |
-| `step_functions.py` | `step_functions` | Keyword-based |
 | `elasticache.py` | `elasticache` | Keyword-based |
 | `opensearch.py` | `opensearch` | Keyword-based |
 | `ami.py` | `ami` | `parse_dollar_savings()` |
@@ -243,8 +243,14 @@ Compute Optimizer integration:
 |---------|-----|-------------|
 | `file_systems.py` | `file_systems` | EFS (lifecycle, archive) + FSx (optimization) |
 | `containers.py` | `containers` | ECS + EKS + ECR |
-| `network.py` | `network` | Elastic IP + NAT Gateway + VPC Endpoints + Load Balancer + Auto Scaling |
+| `network.py` | `network` | Elastic IP + NAT Gateway + VPC Endpoints + Load Balancer + Auto Scaling (uses live pricing for sub-services) |
 | `monitoring.py` | `monitoring` | CloudWatch + CloudTrail + Backup + Route53 |
+
+**Remaining flat-rate adapters (1)** -- Only `batch.py` still uses flat-rate pricing.
+
+| Adapter | Key | Flat Rate |
+|---------|-----|-----------|
+| `batch.py` | `batch` | varies |
 
 ### Legacy Service Modules (`services/*.py`)
 
@@ -442,16 +448,17 @@ No changes to `core/` are required. The adapter is automatically available via
 
 ## Testing Strategy
 
-### Test Suite (575 lines across 5 files)
+### Test Suite (718 lines across 6 files, 153 tests: 152 pass + 1 skip)
 
 | File | Lines | Tests | Purpose |
 |------|-------|-------|---------|
-| `test_orchestrator.py` | 39 | 1 | ScanOrchestrator end-to-end with stubbed AWS |
-| `test_result_builder.py` | 80 | 6 | ScanResultBuilder serialization correctness |
-| `test_regression_snapshot.py` | 167 | 17 | Golden JSON snapshot comparison |
-| `test_reporter_snapshots.py` | 207 | 4 | Golden HTML snapshot comparison |
+| `test_orchestrator.py` | 44 | 1 | ScanOrchestrator end-to-end with stubbed AWS |
+| `test_result_builder.py` | 90 | 6 | ScanResultBuilder serialization correctness |
+| `test_regression_snapshot.py` | 172 | 17 | Golden JSON snapshot comparison |
+| `test_reporter_snapshots.py` | 218 | 4 | Golden HTML snapshot comparison |
 | `test_offline_scan.py` | 82 | 1 | Full offline scan with moto mock |
-| `conftest.py` | 283 | -- | Fixtures, normalizers, stubbed_aws |
+| `test_pricing_engine.py` | 143 | 22 | PricingEngine API lookups, cache TTL, failure handling (21 pass + 1 skip) |
+| `conftest.py` | 303 | -- | Fixtures, normalizers, stubbed_aws |
 
 ### Snapshot Testing
 
@@ -526,6 +533,84 @@ inject service-specific data (e.g., `instance_count`, `service_counts`,
 IAM, Cost Optimization Hub, etc.) to `us-east-1`. Adapters don't need to
 know which services are global -- they just call `ctx.client("cloudfront")`.
 
+### Live Pricing Engine
+
+`core/pricing_engine.py` provides centralized AWS Pricing API access. All
+pricing lookups go through `PricingEngine` which:
+
+- Uses the AWS Price List API (`pricing:GetProducts`) via `us-east-1` endpoint
+- Caches results in an in-memory `PricingCache` with configurable TTL (default 6 hours)
+- Provides 12 public methods covering EC2 instances, EBS volumes, RDS instances/storage, S3 storage classes, and generic instance/storage lookups
+- Returns `0.0` on any API failure, ensuring scans never crash due to pricing unavailability
+- Is injected into `ScanContext` at construction time, available to all adapters via `ctx.pricing_engine`
+
+Adapters that use CloudWatch metrics for pricing calculations (athena, step_functions) check `ctx.fast_mode` first and fall back to flat-rate estimates when true.
+
+---
+
+## AWS Well-Architected Framework Alignment
+
+Based on the [AWS Well-Architected Cost Optimization Pillar](https://docs.aws.amazon.com/wellarchitected/latest/cost-optimization-pillar/welcome.html), the scanner implements the five key cost optimization practices:
+
+### 1. Cloud Financial Management
+- Comprehensive cost analysis across 30 AWS services
+- Regional pricing calculations, savings estimates, confidence scoring
+- Provides clear understanding of costs and usage patterns
+
+### 2. Expenditure and Usage Awareness
+- CloudWatch metrics integration for accurate utilization analysis
+- 14-day analysis periods, usage pattern recognition, idle resource detection
+- Monitors and analyzes usage patterns to identify cost savings opportunities
+
+### 3. Cost-Effective Resources
+- Rightsizing recommendations, Reserved Instance analysis, Savings Plans evaluation
+- Instance type optimization, storage class recommendations, Graviton migration
+- Uses the right type and size of AWS resources for workloads
+
+### 4. Manage Demand and Supply Resources
+- Auto Scaling analysis, capacity optimization, scheduling recommendations
+- Static ASG detection, non-production scheduling, burst capacity analysis
+- Scales resources based on actual demand patterns
+
+### 5. Optimize Over Time
+- Continuous optimization checks, version migration recommendations
+- Previous generation detection (t2 to t3), engine version updates, lifecycle policies
+- Continuously evaluates and implements cost optimization opportunities
+
+### Regional Pricing Implementation
+
+The scanner uses regional pricing multipliers to adjust savings estimates based on where resources run. `cost_optimizer.py` contains the `REGIONAL_PRICING` dict with multipliers for 35 regions. Regions without explicit pricing data use a conservative 15% premium. All estimates are approximate; use the AWS Pricing Calculator for precise figures.
+
+---
+
+## AWS Pricing Models and Service Optimization Reference
+
+### AWS Pricing Models
+
+Based on [AWS Well-Architected Framework COST07-BP01](https://docs.aws.amazon.com/wellarchitected/latest/cost-optimization-pillar/cost_pricing_model_analysis.html), the scanner analyzes resources across these pricing models:
+
+**On-Demand**: Pay per hour or second without commitments. Scanner identifies opportunities to migrate to commitment-based pricing.
+
+**Savings Plans**: Up to 72% savings on EC2, Lambda, and Fargate with 1 or 3-year terms. Scanner recommends optimal plans based on usage patterns.
+
+**Reserved Instances**: Up to 75% savings by prepaying for capacity with 1 or 3-year terms. Scanner identifies RI opportunities and optimal coverage.
+
+**Spot Instances**: Up to 90% savings using spare AWS capacity, with 2-minute interruption notice. Scanner evaluates workload suitability.
+
+### Service-Specific Optimization Summary
+
+| Service | Key Optimization Checks |
+|---------|------------------------|
+| **EC2** | Rightsizing (CPU/memory/network), previous gen migration (t2 to t3, m4 to m5), Graviton recommendations, burstable credit analysis, RI coverage, Spot suitability |
+| **Lambda** | Memory right-sizing, ARM/Graviton2 migration (up to 34% better price-performance), provisioned concurrency review, VPC cold start costs |
+| **S3** | Storage class optimization (Standard, Standard-IA, One Zone-IA, Glacier variants), Intelligent-Tiering, lifecycle policies, multipart upload cleanup |
+| **EBS** | Unattached volume detection, gp2 to gp3 migration, snapshot lifecycle, IOPS utilization |
+| **RDS** | Multi-AZ in non-prod, instance rightsizing, gp2 to gp3 storage, backup retention, RI coverage |
+| **DynamoDB** | On-Demand vs Provisioned analysis, Auto Scaling review, reserved capacity, GSI optimization |
+| **ElastiCache** | Graviton migration, reserved nodes, cluster rightsizing, engine version review |
+| **Networking** | NAT Gateway alternatives (VPC Endpoints), unused Elastic IPs, load balancer consolidation, cross-region data transfer |
+| **Containers** | ECS Fargate vs EC2 comparison, task right-sizing, ECR lifecycle policies, EKS node optimization |
+
 ---
 
 ## File Map
@@ -540,13 +625,14 @@ Cost_OptV1_dev/
   requirements.txt                       boto3, botocore, python-dateutil
   core/
     __init__.py
-    contracts.py                  (109)  Protocol + dataclasses
-    scan_context.py               (50)   ScanContext
-    scan_orchestrator.py          (67)   ScanOrchestrator + safe_scan
-    result_builder.py             (59)   ScanResultBuilder
-    client_registry.py            (54)   ClientRegistry
-    session.py                    (42)   AwsSessionFactory
-    filtering.py                  (58)   resolve_cli_keys
+    contracts.py                  (188)  Protocol + dataclasses
+    scan_context.py               (72)   ScanContext
+    pricing_engine.py             (517)  PricingEngine + PricingCache
+    scan_orchestrator.py          (85)   ScanOrchestrator + safe_scan
+    result_builder.py             (70)   ScanResultBuilder
+    client_registry.py            (62)   ClientRegistry
+    session.py                    (50)   AwsSessionFactory
+    filtering.py                  (60)   resolve_cli_keys
   services/
     __init__.py                   (63)   ALL_MODULES registry (28 adapters)
     _base.py                      (32)   BaseServiceModule
@@ -583,12 +669,13 @@ Cost_OptV1_dev/
       workspaces.py               workspaces
     [legacy service modules]      ec2.py, s3.py, cloudfront.py, ...
   tests/
-    conftest.py                   (283)  Fixtures, normalizers, stubbed_aws
-    test_orchestrator.py          (39)   Orchestrator test
-    test_result_builder.py        (80)   Serialization tests
-    test_regression_snapshot.py   (167)  Golden JSON snapshots
-    test_reporter_snapshots.py    (207)  Golden HTML snapshots
+    conftest.py                   (303)  Fixtures, normalizers, stubbed_aws
+    test_orchestrator.py          (44)   Orchestrator test
+    test_result_builder.py        (90)   Serialization tests
+    test_regression_snapshot.py   (172)  Golden JSON snapshots
+    test_reporter_snapshots.py    (218)  Golden HTML snapshots
     test_offline_scan.py          (82)   Full offline scan
+    test_pricing_engine.py        (143)  PricingEngine tests (22 tests)
     fixtures/                            Golden files
     aws_stubs/                           Pre-built stub responses
 ```

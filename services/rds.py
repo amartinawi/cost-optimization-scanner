@@ -138,31 +138,14 @@ def get_rds_instance_count(ctx: ScanContext) -> dict[str, int]:
 
 
 def get_rds_compute_optimizer_recommendations(ctx: ScanContext) -> list[dict[str, Any]]:
-    """Get RDS recommendations from Compute Optimizer."""
-    compute_optimizer = ctx.client("compute-optimizer")
-    recommendations: list[dict[str, Any]] = []
-    try:
-        response = compute_optimizer.get_rds_database_recommendations()
-        recommendations.extend(response["rdsDBRecommendations"])
+    """Get RDS recommendations from Compute Optimizer.
 
-        while response.get("nextToken"):
-            response = compute_optimizer.get_rds_database_recommendations(nextToken=response["nextToken"])
-            recommendations.extend(response["rdsDBRecommendations"])
-    except Exception as e:
-        print(f"Warning: RDS Compute Optimizer not available: {e}")
-        if "OptInRequiredException" in str(e) or "not registered" in str(e):
-            opt_in_recommendation = {
-                "ResourceId": "compute-optimizer-service",
-                "ResourceType": "Service Configuration",
-                "Issue": "AWS Compute Optimizer not enabled",
-                "Recommendation": ("Enable AWS Compute Optimizer for RDS recommendations"),
-                "EstimatedMonthlySavings": "Variable - up to 25% on RDS instances",
-                "Action": ("Go to AWS Compute Optimizer console and opt-in to receive RDS rightsizing recommendations"),
-                "Priority": "Medium",
-                "Service": "Compute Optimizer",
-            }
-            recommendations.append(opt_in_recommendation)
-    return recommendations
+    Delegates to services.advisor — the canonical location for all
+    advisory-service (Cost Hub / Compute Optimizer) functions.
+    """
+    from services.advisor import get_rds_compute_optimizer_recommendations as _impl
+
+    return _impl(ctx)
 
 
 def get_enhanced_rds_checks(
@@ -262,7 +245,12 @@ def get_enhanced_rds_checks(
 
                 if backup_retention > 7:
                     extra_backup_days = backup_retention - 7
-                    backup_savings = allocated_storage * 0.095 * pricing_multiplier * extra_backup_days / 30
+                    backup_price = (
+                        ctx.pricing_engine.get_rds_backup_storage_price_per_gb()
+                        if ctx.pricing_engine
+                        else 0.095 * pricing_multiplier
+                    )
+                    backup_savings = allocated_storage * backup_price * extra_backup_days / 30
                     checks["backup_retention_excessive"].append(
                         {
                             "DBInstanceIdentifier": db_instance_id,
@@ -282,7 +270,12 @@ def get_enhanced_rds_checks(
                     )
 
                 if storage_type == "gp2":
-                    monthly_cost = allocated_storage * 0.115 * pricing_multiplier
+                    gp2_price = (
+                        ctx.pricing_engine.get_rds_monthly_storage_price_per_gb("gp2", multi_az=multi_az)
+                        if ctx.pricing_engine
+                        else 0.115 * pricing_multiplier
+                    )
+                    monthly_cost = allocated_storage * gp2_price
                     savings = monthly_cost * 0.20
                     checks["storage_optimization"].append(
                         {
@@ -433,7 +426,7 @@ def get_enhanced_rds_checks(
                                         " allocated storage estimate)"
                                     ),
                                     "EstimatedSavings": (
-                                        f"${snap_allocated_storage * 0.095 * pricing_multiplier:.2f}"
+                                        f"${snap_allocated_storage * (ctx.pricing_engine.get_rds_backup_storage_price_per_gb() if ctx.pricing_engine else 0.095 * pricing_multiplier):.2f}"
                                         "/month (coarse estimate)"
                                     ),
                                     "CheckCategory": "Old RDS Snapshots",
@@ -508,7 +501,7 @@ def get_enhanced_rds_checks(
                                             " storage estimate)"
                                         ),
                                         "EstimatedSavings": (
-                                            f"${cluster_allocated_storage * 0.095 * pricing_multiplier:.2f}"
+                                            f"${cluster_allocated_storage * (ctx.pricing_engine.get_rds_backup_storage_price_per_gb() if ctx.pricing_engine else 0.095 * pricing_multiplier):.2f}"
                                             "/month (coarse estimate)"
                                         ),
                                         "CheckCategory": ("Old Aurora Cluster Snapshots"),

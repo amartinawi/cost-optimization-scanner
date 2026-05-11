@@ -65,6 +65,8 @@ def get_enhanced_quicksight_checks(ctx: ScanContext) -> dict[str, Any]:
                             "UsedCapacityGB": round(used_capacity, 2),
                             "TotalCapacityGB": round(total_capacity, 2),
                             "UtilizationPercent": round((used_capacity / total_capacity) * 100, 1),
+                            "UnusedSpiceCapacityGB": round(total_capacity - used_capacity, 2),
+                            "Edition": capacity_config.get("PurchaseMode", "ENTERPRISE"),
                             "Recommendation": (
                                 f"SPICE capacity underutilized"
                                 f" ({round(used_capacity, 1)}/{round(total_capacity, 1)}"

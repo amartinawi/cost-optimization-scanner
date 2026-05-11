@@ -12,14 +12,31 @@ from services.ec2 import get_advanced_ec2_checks, get_ec2_instance_count, get_en
 
 
 class EC2Module(BaseServiceModule):
+    """ServiceModule adapter for EC2. Multi-source savings strategy."""
+
     key: str = "ec2"
     cli_aliases: tuple[str, ...] = ("ec2",)
     display_name: str = "EC2"
+    reads_fast_mode: bool = True
 
     def required_clients(self) -> tuple[str, ...]:
+        """Returns boto3 client names required for EC2 scanning."""
         return ("ec2", "compute-optimizer", "autoscaling")
 
     def scan(self, ctx: Any) -> ServiceFindings:
+        """Scan EC2 instances for cost optimization opportunities.
+
+        Consults Cost Optimization Hub, Compute Optimizer, enhanced checks,
+        and advanced EC2 service modules. Savings aggregated from all sources
+        using estimatedMonthlySavings and parse_dollar_savings.
+
+        Args:
+            ctx: ScanContext with region, clients, and pricing data.
+
+        Returns:
+            ServiceFindings with "cost_optimization_hub", "compute_optimizer",
+            "enhanced_checks", and "advanced_ec2_checks" SourceBlock entries.
+        """
         print("\U0001f50d [services/adapters/ec2.py] EC2 module active")
 
         cost_hub_recs = ctx.cost_hub_splits.get("ec2", [])

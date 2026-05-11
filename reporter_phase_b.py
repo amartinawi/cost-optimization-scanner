@@ -1,9 +1,27 @@
+"""Phase B renderer — function registry for source-specific HTML handlers.
+
+Provides specialised renderers for complex services (EC2, EBS, RDS, S3, etc.)
+and generic fallback renderers used by ``HTMLReportGenerator``.
+"""
+
 from typing import Any, Callable, Dict, List, Tuple
 
 Rec = Dict[str, Any]
 
 
+def _priority_class(rec: Rec) -> str:
+    p = str(rec.get("priority") or rec.get("Priority") or rec.get("severity") or "").strip().lower()
+    if p in ("high", "critical"):
+        return " high-priority"
+    if p in ("medium", "warning"):
+        return " medium-priority"
+    if p in ("low", "info", "informational"):
+        return " low-priority"
+    return ""
+
+
 def _render_ec2_enhanced_checks(recommendations: List[Rec], source_name: str, service_data: Dict) -> str:
+    """Renders EC2 enhanced-check recommendations grouped by category. Called by: HTMLReportGenerator._get_detailed_recommendations."""
     grouped_recs: Dict[str, List[Rec]] = {}
     for rec in recommendations:
         resource_id = rec.get(
@@ -40,7 +58,7 @@ def _render_ec2_enhanced_checks(recommendations: List[Rec], source_name: str, se
 
     content = ""
     for category, recs in grouped_recs.items():
-        content += '<div class="rec-item">'
+        content += f'<div class="rec-item{_priority_class(recs[0])}">'
         content += f"<h5>{category} ({len(recs)} resources)</h5>"
         content += f"<p><strong>Recommendation:</strong> {recs[0].get('Recommendation', 'Optimize resource')}</p>"
         content += f'<p class="savings"><strong>Estimated Savings:</strong> {recs[0].get("EstimatedSavings", "Cost optimization")}</p>'
@@ -57,6 +75,7 @@ def _render_ec2_enhanced_checks(recommendations: List[Rec], source_name: str, se
 
 
 def _render_ec2_cost_hub(recommendations: List[Rec], source_name: str, service_data: Dict) -> str:
+    """Renders EC2 Cost Optimization Hub recommendations grouped by action. Called by: HTMLReportGenerator._get_detailed_recommendations."""
     grouped_actions: Dict[str, List[Rec]] = {}
     for rec in recommendations:
         if "actionType" not in rec:
@@ -89,7 +108,7 @@ def _render_ec2_cost_hub(recommendations: List[Rec], source_name: str, service_d
     content = ""
     for action, recs in grouped_actions.items():
         total_savings = sum(r.get("estimatedMonthlySavings", 0) for r in recs)
-        content += '<div class="rec-item">'
+        content += f'<div class="rec-item{_priority_class(recs[0])}">'
         content += f"<h5>Action: {action} ({len(recs)} resources)</h5>"
         content += f'<p class="savings"><strong>Total Monthly Savings:</strong> ${total_savings:.2f}</p>'
         content += "<p><strong>Resources:</strong></p><ul>"
@@ -120,6 +139,7 @@ def _render_ec2_cost_hub(recommendations: List[Rec], source_name: str, service_d
 
 
 def _render_ec2_compute_optimizer(recommendations: List[Rec], source_name: str, service_data: Dict) -> str:
+    """Renders EC2 Compute Optimizer findings grouped by finding type. Called by: HTMLReportGenerator._get_detailed_recommendations."""
     grouped_findings: Dict[str, List[Rec]] = {}
     for rec in recommendations:
         if "instanceArn" not in rec:
@@ -134,7 +154,7 @@ def _render_ec2_compute_optimizer(recommendations: List[Rec], source_name: str, 
 
     content = ""
     for finding, recs in grouped_findings.items():
-        content += '<div class="rec-item">'
+        content += f'<div class="rec-item{_priority_class(recs[0])}">'
         content += f"<h5>Finding: {finding} ({len(recs)} instances)</h5>"
         content += "<p><strong>Instances:</strong></p><ul>"
         for rec in recs:
@@ -156,6 +176,7 @@ def _render_ec2_compute_optimizer(recommendations: List[Rec], source_name: str, 
 
 
 def _render_ebs_cost_hub(recommendations: List[Rec], source_name: str, service_data: Dict) -> str:
+    """Renders EBS Cost Optimization Hub recommendations grouped by action. Called by: HTMLReportGenerator._get_detailed_recommendations."""
     grouped_actions: Dict[str, List[Rec]] = {}
     for rec in recommendations:
         if "actionType" not in rec or "ebsVolume" not in rec.get("currentResourceDetails", {}):
@@ -172,7 +193,7 @@ def _render_ebs_cost_hub(recommendations: List[Rec], source_name: str, service_d
     content = ""
     for action, recs in grouped_actions.items():
         total_savings = sum(r.get("estimatedMonthlySavings", 0) for r in recs)
-        content += '<div class="rec-item">'
+        content += f'<div class="rec-item{_priority_class(recs[0])}">'
         content += f"<h5>Action: {action} ({len(recs)} volumes)</h5>"
         content += f'<p class="savings"><strong>Total Monthly Savings:</strong> ${total_savings:.2f}</p>'
         content += "<p><strong>Volumes:</strong></p><ul>"
@@ -189,8 +210,9 @@ def _render_ebs_cost_hub(recommendations: List[Rec], source_name: str, service_d
 
 
 def _render_ebs_unattached(recommendations: List[Rec], source_name: str, service_data: Dict) -> str:
+    """Renders unattached EBS volumes with deletion recommendations. Called by: HTMLReportGenerator._get_detailed_recommendations."""
     total_cost = sum(r.get("EstimatedMonthlyCost", 0) for r in recommendations)
-    content = '<div class="rec-item">'
+    content = f'<div class="rec-item{_priority_class(recommendations[0])}">'
     content += f"<h5>Unattached Volumes ({len(recommendations)} volumes)</h5>"
     content += f"<p><strong>Recommendation:</strong> Delete unattached volumes (create snapshots first if needed)</p>"
     content += f'<p class="savings"><strong>Total Monthly Savings:</strong> ${total_cost:.2f}</p>'
@@ -208,7 +230,8 @@ def _render_ebs_unattached(recommendations: List[Rec], source_name: str, service
 
 
 def _render_ebs_gp2_migration(recommendations: List[Rec], source_name: str, service_data: Dict) -> str:
-    content = '<div class="rec-item">'
+    """Renders gp2-to-gp3 migration recommendations for EBS. Called by: HTMLReportGenerator._get_detailed_recommendations."""
+    content = f'<div class="rec-item{_priority_class(recommendations[0])}">'
     content += f"<h5>gp2 to gp3 Migration ({len(recommendations)} volumes)</h5>"
     content += f"<p><strong>Recommendation:</strong> Migrate gp2 volumes to gp3 for 20% cost savings</p>"
     content += f'<p class="savings"><strong>Estimated Savings:</strong> 20% cost reduction</p>'
@@ -224,6 +247,7 @@ def _render_ebs_gp2_migration(recommendations: List[Rec], source_name: str, serv
 
 
 def _render_ebs_enhanced_checks(recommendations: List[Rec], source_name: str, service_data: Dict) -> str:
+    """Renders EBS enhanced-check recommendations grouped by category. Called by: HTMLReportGenerator._get_detailed_recommendations."""
     grouped_checks: Dict[str, List[Rec]] = {}
     for rec in recommendations:
         if "CheckCategory" not in rec:
@@ -253,7 +277,7 @@ def _render_ebs_enhanced_checks(recommendations: List[Rec], source_name: str, se
                 except (ValueError, AttributeError) as e:
                     print(f"⚠️ Could not parse EBS savings '{savings_str}': {str(e)}")
 
-        content += '<div class="rec-item">'
+        content += f'<div class="rec-item{_priority_class(recs[0])}">'
         content += f"<h5>{category} ({len(recs)} volumes)</h5>"
         content += f"<p><strong>Recommendation:</strong> {recs[0].get('Recommendation', 'Optimize volumes')}</p>"
         if total_savings > 0:
@@ -277,6 +301,7 @@ def _render_ebs_enhanced_checks(recommendations: List[Rec], source_name: str, se
 
 
 def _render_ebs_compute_optimizer(recommendations: List[Rec], source_name: str, service_data: Dict) -> str:
+    """Renders EBS Compute Optimizer findings grouped by finding type. Called by: HTMLReportGenerator._get_detailed_recommendations."""
     grouped_findings: Dict[str, List[Rec]] = {}
     for rec in recommendations:
         if "volumeArn" not in rec:
@@ -291,7 +316,7 @@ def _render_ebs_compute_optimizer(recommendations: List[Rec], source_name: str, 
 
     content = ""
     for finding, recs in grouped_findings.items():
-        content += '<div class="rec-item">'
+        content += f'<div class="rec-item{_priority_class(recs[0])}">'
         content += f"<h5>Finding: {finding} ({len(recs)} volumes)</h5>"
         content += "<p><strong>Volumes:</strong></p><ul>"
         for rec in recs:
@@ -307,6 +332,7 @@ def _render_ebs_compute_optimizer(recommendations: List[Rec], source_name: str, 
 
 
 def _render_rds_compute_optimizer(recommendations: List[Rec], source_name: str, service_data: Dict) -> str:
+    """Renders RDS Compute Optimizer findings grouped by finding type. Called by: HTMLReportGenerator._get_detailed_recommendations."""
     grouped_findings: Dict[str, List[Rec]] = {}
     for rec in recommendations:
         if "resourceArn" not in rec:
@@ -334,7 +360,7 @@ def _render_rds_compute_optimizer(recommendations: List[Rec], source_name: str, 
 
     content = ""
     for finding, recs in grouped_findings.items():
-        content += '<div class="rec-item">'
+        content += f'<div class="rec-item{_priority_class(recs[0])}">'
         count = len(recs)
         label = "database" if count == 1 else "databases"
         content += f"<h5>Finding: {finding} ({count} {label})</h5>"
@@ -372,6 +398,7 @@ def _render_rds_compute_optimizer(recommendations: List[Rec], source_name: str, 
 
 
 def _render_rds_enhanced_checks(recommendations: List[Rec], source_name: str, service_data: Dict) -> str:
+    """Renders RDS enhanced-check recommendations grouped by category. Called by: HTMLReportGenerator._get_detailed_recommendations."""
     grouped_categories: Dict[str, List[Rec]] = {}
     for rec in recommendations:
         category = rec.get("CheckCategory", "Other")
@@ -381,7 +408,7 @@ def _render_rds_enhanced_checks(recommendations: List[Rec], source_name: str, se
 
     content = ""
     for category, recs in grouped_categories.items():
-        content += '<div class="rec-item">'
+        content += f'<div class="rec-item{_priority_class(recs[0])}">'
 
         count = len(recs)
         if "Snapshot" in category:
@@ -417,9 +444,11 @@ def _render_rds_enhanced_checks(recommendations: List[Rec], source_name: str, se
             content += "<p><strong>Affected Databases:</strong></p><ul>"
 
         for rec in recs:
-            db_id = rec.get("DBInstanceIdentifier", rec.get("SnapshotId", "Unknown"))
-            engine = rec.get("engine", "")
-            engine_version = rec.get("engineVersion", "")
+            db_id = (
+                rec.get("DBInstanceIdentifier") or rec.get("DBClusterIdentifier") or rec.get("SnapshotId") or "Unknown"
+            )
+            engine = rec.get("Engine", rec.get("engine", ""))
+            engine_version = rec.get("EngineVersion", rec.get("engineVersion", ""))
             finding = rec.get("instanceFinding", rec.get("storageFinding", ""))
 
             if "Snapshot" in category:
@@ -442,6 +471,7 @@ def _render_rds_enhanced_checks(recommendations: List[Rec], source_name: str, se
 
 
 def _render_s3_enhanced_checks(recommendations: List[Rec], source_name: str, service_data: Dict) -> str:
+    """Renders S3 bucket recommendations grouped by optimisation type. Called by: HTMLReportGenerator._get_detailed_recommendations."""
     grouped_s3 = {
         "No Lifecycle Policy": [],
         "No Intelligent Tiering": [],
@@ -462,9 +492,6 @@ def _render_s3_enhanced_checks(recommendations: List[Rec], source_name: str, ser
             continue
 
         if bucket_name == "Unknown" and bucket_size == 0 and bucket_cost == 0:
-            continue
-
-        if bucket_size < 10 and rec.get("SizeGB") is not None:
             continue
 
         has_lifecycle = rec.get("HasLifecyclePolicy", False)
@@ -490,7 +517,7 @@ def _render_s3_enhanced_checks(recommendations: List[Rec], source_name: str, ser
         total_size = sum(b.get("SizeGB", 0) for b in buckets)
         total_cost = sum(b.get("EstimatedMonthlyCost", 0) for b in buckets)
 
-        content += '<div class="rec-item">'
+        content += f'<div class="rec-item{_priority_class(buckets[0])}">'
         content += f"<h5>{group_name} ({len(buckets)} buckets, {total_size:.2f} GB total)</h5>"
 
         if group_name == "No Lifecycle Policy":
@@ -531,6 +558,7 @@ def _render_s3_enhanced_checks(recommendations: List[Rec], source_name: str, ser
 
 
 def _render_dynamodb_enhanced_checks(recommendations: List[Rec], source_name: str, service_data: Dict) -> str:
+    """Renders DynamoDB recommendations grouped by billing optimisation. Called by: HTMLReportGenerator._get_detailed_recommendations."""
     grouped_dynamo = {
         "Provisioned to On-Demand": [],
         "On-Demand to Provisioned": [],
@@ -562,7 +590,7 @@ def _render_dynamodb_enhanced_checks(recommendations: List[Rec], source_name: st
         if not tables:
             continue
 
-        content += '<div class="rec-item">'
+        content += f'<div class="rec-item{_priority_class(tables[0])}">'
         content += f"<h5>{group_name} ({len(tables)} tables)</h5>"
 
         if group_name == "Provisioned to On-Demand":
@@ -586,6 +614,7 @@ def _render_dynamodb_enhanced_checks(recommendations: List[Rec], source_name: st
 
 
 def _render_containers_enhanced_checks(recommendations: List[Rec], source_name: str, service_data: Dict) -> str:
+    """Renders ECS/EKS/ECR recommendations grouped by check category. Called by: HTMLReportGenerator._get_detailed_recommendations."""
     grouped_containers = {
         "ECS Container Insights Required": [],
         "ECS Rightsizing - Metric-Backed": [],
@@ -622,7 +651,7 @@ def _render_containers_enhanced_checks(recommendations: List[Rec], source_name: 
         if not resources:
             continue
 
-        content += '<div class="rec-item">'
+        content += f'<div class="rec-item{_priority_class(resources[0])}">'
         content += f"<h5>{group_name} ({len(resources)} resources)</h5>"
 
         if group_name == "ECS Container Insights Required":
@@ -660,6 +689,7 @@ def _render_containers_enhanced_checks(recommendations: List[Rec], source_name: 
 
 
 def _render_elasticache_enhanced_checks(recommendations: List[Rec], source_name: str, service_data: Dict) -> str:
+    """Renders ElastiCache recommendations grouped by category. Called by: HTMLReportGenerator._get_detailed_recommendations."""
     grouped_elasticache: Dict[str, List[Rec]] = {}
     for rec in recommendations:
         category = rec.get("CheckCategory", "Other")
@@ -672,7 +702,7 @@ def _render_elasticache_enhanced_checks(recommendations: List[Rec], source_name:
         if not clusters:
             continue
 
-        content += '<div class="rec-item">'
+        content += f'<div class="rec-item{_priority_class(clusters[0])}">'
         label = "cluster" if len(clusters) == 1 else "clusters"
         content += f"<h5>{category} ({len(clusters)} {label})</h5>"
         content += f"<p><strong>Recommendation:</strong> {clusters[0].get('Recommendation', 'Optimize cluster')}</p>"
@@ -699,6 +729,7 @@ def _render_elasticache_enhanced_checks(recommendations: List[Rec], source_name:
 
 
 def _render_opensearch_enhanced_checks(recommendations: List[Rec], source_name: str, service_data: Dict) -> str:
+    """Renders OpenSearch recommendations grouped by category. Called by: HTMLReportGenerator._get_detailed_recommendations."""
     grouped_opensearch: Dict[str, List[Rec]] = {}
     for rec in recommendations:
         category = rec.get("CheckCategory", "Other")
@@ -711,7 +742,7 @@ def _render_opensearch_enhanced_checks(recommendations: List[Rec], source_name: 
         if not domains:
             continue
 
-        content += '<div class="rec-item">'
+        content += f'<div class="rec-item{_priority_class(domains[0])}">'
         label = "domain" if len(domains) == 1 else "domains"
         content += f"<h5>{category} ({len(domains)} {label})</h5>"
         content += f"<p><strong>Recommendation:</strong> {domains[0].get('Recommendation', 'Optimize domain')}</p>"
@@ -738,6 +769,7 @@ def _render_opensearch_enhanced_checks(recommendations: List[Rec], source_name: 
 
 
 def _render_network_enhanced_checks(recommendations: List[Rec], source_name: str, service_data: Dict) -> str:
+    """Renders network (EIP/NAT/LB/VPC) recommendations grouped by category. Called by: HTMLReportGenerator._get_detailed_recommendations."""
     grouped_network: Dict[str, List[Rec]] = {}
     for rec in recommendations:
         category = rec.get("CheckCategory", "Other")
@@ -750,7 +782,7 @@ def _render_network_enhanced_checks(recommendations: List[Rec], source_name: str
         if not resources:
             continue
 
-        content += '<div class="rec-item">'
+        content += f'<div class="rec-item{_priority_class(resources[0])}">'
         content += f"<h5>{category} ({len(resources)} resources)</h5>"
         content += f"<p><strong>Recommendation:</strong> {resources[0].get('Recommendation', 'Optimize resource')}</p>"
 
@@ -818,6 +850,7 @@ def _render_network_enhanced_checks(recommendations: List[Rec], source_name: str
 
 
 def _render_monitoring_enhanced_checks(recommendations: List[Rec], source_name: str, service_data: Dict) -> str:
+    """Renders CloudWatch/CloudTrail recommendations grouped by category. Called by: HTMLReportGenerator._get_detailed_recommendations."""
     grouped_monitoring: Dict[str, List[Rec]] = {}
     for rec in recommendations:
         category = rec.get("CheckCategory", "Other")
@@ -830,7 +863,7 @@ def _render_monitoring_enhanced_checks(recommendations: List[Rec], source_name: 
         if not resources:
             continue
 
-        content += '<div class="rec-item">'
+        content += f'<div class="rec-item{_priority_class(resources[0])}">'
         content += f"<h5>{category} ({len(resources)} resources)</h5>"
         content += f"<p><strong>Recommendation:</strong> {resources[0].get('Recommendation', 'Optimize resource')}</p>"
 
@@ -860,6 +893,7 @@ def _render_monitoring_enhanced_checks(recommendations: List[Rec], source_name: 
 
 
 def _render_additional_services(recommendations: List[Rec], source_name: str, service_data: Dict) -> str:
+    """Renders miscellaneous service recommendations grouped by category. Called by: HTMLReportGenerator._get_detailed_recommendations."""
     grouped_additional: Dict[str, List[Rec]] = {}
     for rec in recommendations:
         category = rec.get("CheckCategory", "Other")
@@ -872,7 +906,7 @@ def _render_additional_services(recommendations: List[Rec], source_name: str, se
         if not resources:
             continue
 
-        content += '<div class="rec-item">'
+        content += f'<div class="rec-item{_priority_class(resources[0])}">'
         content += f"<h5>{category} ({len(resources)} resources)</h5>"
         content += f"<p><strong>Recommendation:</strong> {resources[0].get('Recommendation', 'Optimize resource')}</p>"
 
@@ -893,7 +927,62 @@ def _render_additional_services(recommendations: List[Rec], source_name: str, se
     return content
 
 
+def _render_compute_optimizer_source(recommendations: List[Rec], source_name: str, service_data: Dict) -> str:
+    """Renders Compute Optimizer normalized recommendations grouped by finding type.
+
+    Works for all four CO source blocks: ebs_recommendations, lambda_recommendations,
+    ecs_recommendations, asg_recommendations. Expects recs with resource_id, resource_name,
+    finding, current_config, recommended_config, estimatedMonthlySavings.
+    Called by: HTMLReportGenerator._get_detailed_recommendations.
+    """
+    grouped: Dict[str, List[Rec]] = {}
+    for rec in recommendations:
+        finding = rec.get("finding", "Unknown")
+        if finding.lower() == "optimized":
+            continue
+        if finding not in grouped:
+            grouped[finding] = []
+        grouped[finding].append(rec)
+
+    if not grouped:
+        return ""
+
+    content = ""
+    for finding, recs in grouped.items():
+        total_savings = sum(r.get("estimatedMonthlySavings", 0) for r in recs)
+        label = "resource" if len(recs) == 1 else "resources"
+        content += f'<div class="rec-item{_priority_class(recs[0])}">'
+        content += f"<h5>Finding: {finding} ({len(recs)} {label})</h5>"
+        if total_savings > 0:
+            content += f'<p class="savings"><strong>Estimated Monthly Savings:</strong> ${total_savings:.2f}</p>'
+        content += "<p><strong>Resources:</strong></p><ul>"
+        for rec in recs:
+            resource_name = rec.get("resource_name") or rec.get("resource_id", "N/A")
+            current = rec.get("current_config", {})
+            recommended = rec.get("recommended_config", {})
+            savings = rec.get("estimatedMonthlySavings", 0)
+
+            line = resource_name
+            if isinstance(current, dict) and isinstance(recommended, dict) and recommended:
+                cur_val = current.get("instanceType") or current.get("memorySize") or current.get("volumeType")
+                rec_val = (
+                    recommended.get("instanceType") or recommended.get("memorySize") or recommended.get("volumeType")
+                )
+                if cur_val and rec_val and str(cur_val) != str(rec_val):
+                    line += f": {cur_val} → {rec_val}"
+            if savings > 0:
+                line += f" (${savings:.2f}/month)"
+            content += f"<li>{line}</li>"
+        content += "</ul></div>"
+    return content
+
+
 def render_generic_per_rec(service_key: str, recommendations: List[Rec], source_name: str = "") -> str:
+    """Render individual recommendations as separate HTML cards.
+
+    Dispatches to service-specific generic renderers based on *service_key*.
+    Called by: HTMLReportGenerator._get_detailed_recommendations.
+    """
     content = ""
     for rec in recommendations:
         if "CheckCategory" in rec and "Spot" in rec.get("CheckCategory", ""):
@@ -905,7 +994,7 @@ def render_generic_per_rec(service_key: str, recommendations: List[Rec], source_
         if finding == "optimized":
             continue
 
-        content += '<div class="rec-item">'
+        content += f'<div class="rec-item{_priority_class(rec)}">'
 
         if service_key == "ec2":
             content = _render_generic_ec2_rec(content, rec)
@@ -936,6 +1025,7 @@ def render_generic_per_rec(service_key: str, recommendations: List[Rec], source_
 
 
 def _render_generic_ec2_rec(content: str, rec: Rec) -> str:
+    """Render a single EC2 recommendation card. Called by: render_generic_per_rec."""
     if "CheckCategory" in rec:
         content += f"<h5>{rec.get('CheckCategory', 'EC2 Optimization')}: {rec.get('InstanceId', rec.get('ImageId', rec.get('AllocationId', 'Resource')))}</h5>"
         if "InstanceType" in rec:
@@ -985,6 +1075,7 @@ def _render_generic_ec2_rec(content: str, rec: Rec) -> str:
 
 
 def _render_generic_ebs_rec(content: str, rec: Rec) -> str:
+    """Render a single EBS recommendation card. Called by: render_generic_per_rec."""
     if "CheckCategory" in rec:
         content += f"<h5>{rec.get('CheckCategory', 'EBS Optimization')}: {rec.get('VolumeId', rec.get('SnapshotId', 'Resource'))}</h5>"
         if "Size" in rec:
@@ -1072,6 +1163,7 @@ def _render_generic_ebs_rec(content: str, rec: Rec) -> str:
 
 
 def _render_generic_rds_rec(content: str, rec: Rec) -> Tuple[bool, str]:
+    """Render a single RDS recommendation card. Called by: render_generic_per_rec."""
     instance_finding = rec.get("instanceFinding", "N/A")
     storage_finding = rec.get("storageFinding", "N/A")
     has_recommendations = rec.get("instanceRecommendationOptions") or rec.get("storageRecommendationOptions")
@@ -1129,6 +1221,7 @@ def _render_generic_rds_rec(content: str, rec: Rec) -> Tuple[bool, str]:
 
 
 def _render_generic_file_systems_rec(content: str, rec: Rec) -> str:
+    """Render a single file-system recommendation card. Called by: render_generic_per_rec."""
     if "FileSystemId" in rec and rec.get("FileSystemType"):
         fs_id = rec.get("FileSystemId", "N/A")
         fs_type = rec.get("FileSystemType", "N/A")
@@ -1167,9 +1260,15 @@ def _render_generic_file_systems_rec(content: str, rec: Rec) -> str:
             content += "</ul>"
 
     else:
-        fs_name = rec.get("Name", rec.get("FileSystemId", "N/A"))
+        fs_name = rec.get("Name") or rec.get("FileSystemId", "N/A")
+        if fs_name == "Unnamed":
+            fs_name = rec.get("FileSystemId", fs_name)
         content += f"<h5>EFS: {fs_name}</h5>"
-        content += f"<p>Size: {rec.get('SizeGB', 0)} GB</p>"
+        size_gb = rec.get("SizeGB", 0)
+        size_display = f"{size_gb:.2f} GB" if isinstance(size_gb, float) else f"{size_gb} GB"
+        if size_gb == 0 or (isinstance(size_gb, float) and size_gb < 0.1):
+            size_display = "Nearly empty (< 0.1 GB)"
+        content += f"<p>Size: {size_display}</p>"
         content += f"<p>Storage Class: {rec.get('StorageClass', 'N/A')}</p>"
         content += f"<p>Mount Targets: {rec.get('MountTargets', 0)}</p>"
         content += f'<p class="savings">Monthly Cost: ${rec.get("EstimatedMonthlyCost", 0):.2f}</p>'
@@ -1198,6 +1297,7 @@ def _render_generic_file_systems_rec(content: str, rec: Rec) -> str:
 
 
 def _render_generic_s3_rec(content: str, rec: Rec) -> Tuple[bool, str]:
+    """Render a single S3 bucket recommendation card. Called by: render_generic_per_rec."""
     bucket_name = rec.get("Name") or rec.get("BucketName", "Unknown")
     bucket_size = rec.get("SizeGB", 0)
     bucket_cost = rec.get("EstimatedMonthlyCost", 0)
@@ -1239,6 +1339,7 @@ def _render_generic_s3_rec(content: str, rec: Rec) -> Tuple[bool, str]:
 
 
 def _render_generic_dynamodb_rec(content: str, rec: Rec) -> str:
+    """Render a single DynamoDB table recommendation card. Called by: render_generic_per_rec."""
     content += f"<h5>DynamoDB Table: {rec.get('TableName', 'Unknown')}</h5>"
     content += f"<p><strong>Billing Mode:</strong> {rec.get('BillingMode', 'Unknown')}</p>"
     content += f"<p><strong>Status:</strong> {rec.get('TableStatus', 'Unknown')}</p>"
@@ -1273,6 +1374,7 @@ def _render_generic_dynamodb_rec(content: str, rec: Rec) -> str:
 
 
 def _render_generic_containers_rec(content: str, rec: Rec) -> str:
+    """Render a single container (ECS/EKS/ECR) recommendation card. Called by: render_generic_per_rec."""
     if "ClusterName" in rec:
         if "Version" in rec:
             content += f"<h5>EKS Cluster: {rec.get('ClusterName', 'Unknown')}</h5>"
@@ -1301,6 +1403,7 @@ def _render_generic_containers_rec(content: str, rec: Rec) -> str:
 
 
 def _render_generic_lambda_rec(content: str, rec: Rec) -> str:
+    """Render a single Lambda function recommendation card. Called by: render_generic_per_rec."""
     function_name = rec.get("FunctionName") or rec.get("resourceId", "Unknown")
     check_category = rec.get("CheckCategory", "Lambda Optimization")
 
@@ -1346,9 +1449,11 @@ def _render_generic_lambda_rec(content: str, rec: Rec) -> str:
 
 
 def _render_generic_other_rec(content: str, rec: Rec, source_name: str) -> str:
+    """Render a generic recommendation card for any service. Called by: render_generic_per_rec."""
     check_category = rec.get("CheckCategory", source_name.replace("_", " ").title())
     resource_id = (
-        rec.get("LoadBalancerName")
+        rec.get("resource_id")
+        or rec.get("LoadBalancerName")
         or rec.get("AutoScalingGroupName")
         or rec.get("VpcEndpointId")
         or rec.get("NatGatewayId")
@@ -1368,8 +1473,25 @@ def _render_generic_other_rec(content: str, rec: Rec, source_name: str) -> str:
         or rec.get("PlanName")
         or rec.get("ResourceId")
         or rec.get("SnapshotId")
+        or rec.get("DBClusterIdentifier")
+        or rec.get("DBInstanceIdentifier")
         or rec.get("dbClusterIdentifier")
         or rec.get("dbInstanceIdentifier")
+        or rec.get("ClusterName")
+        or rec.get("DomainName")
+        or rec.get("EndpointName")
+        or rec.get("NotebookInstanceName")
+        or rec.get("ProvisionedModelId")
+        or rec.get("KnowledgeBaseId")
+        or rec.get("AgentId")
+        or rec.get("ServerId")
+        or rec.get("ClusterArn", "").split("/")[-1]
+        or rec.get("ContainerName")
+        or rec.get("WorkgroupName")
+        or rec.get("WorkspaceId")
+        or rec.get("Namespace")
+        or rec.get("FileSystemId")
+        or rec.get("anomaly_id")
         or (f"{rec['BackupPlanCount']} backup plans" if rec.get("BackupPlanCount") else None)
         or (f"{rec['ALBCount']} ALBs" if rec.get("ALBCount") else None)
         or rec.get("resourceArn", "").split(":")[-1]
@@ -1394,6 +1516,7 @@ def _render_generic_other_rec(content: str, rec: Rec, source_name: str) -> str:
 
 
 def render_s3_top_tables(service_data: Dict) -> str:
+    """Render S3 top-10 tables for cost and size. Called by: HTMLReportGenerator._get_detailed_recommendations."""
     content = ""
     sources = service_data.get("sources", {})
     s3_data = sources.get("s3_bucket_analysis", {})
@@ -1431,10 +1554,302 @@ def render_s3_top_tables(service_data: Dict) -> str:
     return content
 
 
+def _render_ec2_advanced_checks(recommendations: List[Rec], source_name: str, service_data: Dict) -> str:
+    """Renders EC2 advanced-check recommendations grouped by category.
+
+    Handles data from ``services.ec2.get_advanced_ec2_checks`` which produces
+    records with InstanceId, InstanceType, Name, CheckCategory, Recommendation,
+    EstimatedSavings.
+    Called by: HTMLReportGenerator._get_detailed_recommendations.
+    """
+    grouped: Dict[str, List[Rec]] = {}
+    for rec in recommendations:
+        category = rec.get("CheckCategory", "Other")
+        if category not in grouped:
+            grouped[category] = []
+        grouped[category].append(rec)
+
+    content = ""
+    for category, recs in grouped.items():
+        content += f'<div class="rec-item{_priority_class(recs[0])}">'
+        label = "resource" if len(recs) == 1 else "resources"
+        content += f"<h5>{category} ({len(recs)} {label})</h5>"
+        content += f"<p><strong>Recommendation:</strong> {recs[0].get('Recommendation', 'Optimize resource')}</p>"
+
+        total_savings = 0.0
+        has_numeric = False
+        for rec in recs:
+            savings_str = rec.get("EstimatedSavings", "")
+            if isinstance(savings_str, (int, float)):
+                total_savings += float(savings_str)
+                has_numeric = True
+            elif isinstance(savings_str, str) and "$" in savings_str:
+                try:
+                    clean = savings_str.replace("$", "").replace("/month", "").split("(")[0].strip()
+                    total_savings += float(clean)
+                    has_numeric = True
+                except (ValueError, AttributeError):
+                    pass
+
+        if has_numeric and total_savings > 0:
+            content += f'<p class="savings"><strong>Estimated Savings:</strong> ${total_savings:.2f}/month</p>'
+        else:
+            content += f'<p class="savings"><strong>Estimated Savings:</strong> {recs[0].get("EstimatedSavings", "Cost optimization")}</p>'
+
+        content += "<p><strong>Affected Resources:</strong></p><ul>"
+        for rec in recs:
+            resource_id = rec.get("InstanceId", rec.get("resourceId", "Resource"))
+            instance_type = rec.get("InstanceType", "")
+            name = rec.get("Name", "")
+            display = resource_id
+            if name:
+                display = f"{name} ({resource_id})"
+            if instance_type:
+                display += f" [{instance_type}]"
+            content += f"<li>{display}</li>"
+        content += "</ul></div>"
+    return content
+
+
+def _render_eks_source(recommendations: List[Rec], source_name: str, service_data: Dict) -> str:
+    """Renders EKS cost visibility recommendations grouped by check_category.
+
+    Handles all 5 EKS source blocks: cluster_costs, node_group_optimization,
+    fargate_analysis, addon_costs, cost_hub_recommendations.  Records have
+    resource_id, check_type, check_category, monthly_savings, severity, reason.
+    Called by: HTMLReportGenerator._get_detailed_recommendations.
+    """
+    grouped: Dict[str, List[Rec]] = {}
+    for rec in recommendations:
+        category = rec.get("check_category", "Other")
+        if category not in grouped:
+            grouped[category] = []
+        grouped[category].append(rec)
+
+    content = ""
+    for category, recs in grouped.items():
+        total_savings = sum(r.get("monthly_savings", 0.0) for r in recs)
+        content += f'<div class="rec-item{_priority_class(recs[0])}">'
+        label = "finding" if len(recs) == 1 else "findings"
+        content += f"<h5>{category} ({len(recs)} {label})</h5>"
+        if total_savings > 0:
+            content += f'<p class="savings"><strong>Estimated Monthly Savings:</strong> ${total_savings:.2f}</p>'
+        content += "<p><strong>Resources:</strong></p><ul>"
+        for rec in recs:
+            resource_id = rec.get("resource_id", "N/A")
+            severity = rec.get("severity", "")
+            reason = rec.get("reason", rec.get("recommended_value", ""))
+            line = resource_id
+            if severity:
+                line += f" [{severity}]"
+            if reason:
+                line += f" — {reason}"
+            savings = rec.get("monthly_savings", 0.0)
+            if savings > 0:
+                line += f" (${savings:.2f}/month)"
+            content += f"<li>{line}</li>"
+        content += "</ul></div>"
+    return content
+
+
+def _render_cost_hub_source(recommendations: List[Rec], source_name: str, service_data: Dict) -> str:
+    """Renders Cost Optimization Hub recommendations as a human-readable table.
+
+    Groups recommendations by action type and displays resource details,
+    savings, and implementation effort in a structured card layout.
+    Called by: HTMLReportGenerator._get_detailed_recommendations.
+    """
+    if not recommendations:
+        return ""
+
+    grouped: Dict[str, List[Rec]] = {}
+    for rec in recommendations:
+        action = rec.get("actionType", "Unknown")
+        if action not in grouped:
+            grouped[action] = []
+        grouped[action].append(rec)
+
+    content = ""
+    for action_type, recs in grouped.items():
+        total_savings = sum(r.get("estimatedMonthlySavings", 0) for r in recs)
+        label = "recommendation" if len(recs) == 1 else "recommendations"
+        content += f'<div class="rec-item{_priority_class(recs[0])}">'
+
+        action_display = action_type.replace("_", " ").replace("Purchase", "Purchase ")
+        content += f"<h5>{action_display} ({len(recs)} {label})</h5>"
+
+        if total_savings > 0:
+            content += f'<p class="savings"><strong>Estimated Monthly Savings:</strong> ${total_savings:.2f}</p>'
+
+        effort = recs[0].get("implementationEffort", "")
+        if effort:
+            content += f"<p><strong>Implementation Effort:</strong> {effort}</p>"
+
+        content += "<table class='rec-table'><thead><tr>"
+        content += "<th>Action</th><th>Resource</th><th>Region</th><th>Monthly Savings</th>"
+        content += "</tr></thead><tbody>"
+
+        for rec in recs:
+            action = rec.get("actionType", "Unknown").replace("_", " ").replace("Purchase", "Purchase ")
+            resource_id = rec.get("resourceId", "") or ""
+            res_type = rec.get("currentResourceType", "N/A")
+            if resource_id and resource_id != "N/A":
+                resource_display = resource_id.split("/")[-1]
+            else:
+                resource_display = res_type
+            region = rec.get("region", "N/A")
+            savings = rec.get("estimatedMonthlySavings", 0)
+            content += f"<tr><td>{action}</td><td>{resource_display}</td><td>{region}</td>"
+            content += f"<td>${savings:.2f}</td></tr>"
+
+        content += "</tbody></table>"
+
+        rec_first = recs[0]
+        lookback = rec_first.get("costCalculationLookbackPeriodInDays", 30)
+        savings_pct = rec_first.get("estimatedSavingsPercentage", 0)
+        if savings_pct:
+            content += f"<p><small>Based on {lookback}-day analysis | {savings_pct:.0f}% estimated savings</small></p>"
+
+        content += "</div>"
+    return content
+
+
+def _render_cost_anomaly_source(recommendations: List[Rec], source_name: str, service_data: Dict) -> str:
+    """Renders Cost Anomaly Detection recommendations in a structured card layout.
+
+    Groups recommendations by check category and displays severity,
+    current state, recommended actions, and estimated savings.
+    Called by: HTMLReportGenerator._get_detailed_recommendations.
+    """
+    if not recommendations:
+        return ""
+
+    grouped: Dict[str, List[Rec]] = {}
+    for rec in recommendations:
+        category = rec.get("check_category", "Other")
+        if category not in grouped:
+            grouped[category] = []
+        grouped[category].append(rec)
+
+    content = ""
+    for category, recs in grouped.items():
+        total_savings = sum(r.get("monthly_savings", 0.0) for r in recs)
+        label = "item" if len(recs) == 1 else "items"
+        content += f'<div class="rec-item{_priority_class(recs[0])}">'
+        content += f"<h5>{category} ({len(recs)} {label})</h5>"
+
+        if total_savings > 0:
+            content += f'<p class="savings"><strong>Estimated Monthly Impact:</strong> ${total_savings:.2f}</p>'
+
+        content += "<table class='rec-table'><thead><tr>"
+        content += "<th>Resource</th><th>Severity</th><th>Current State</th><th>Recommendation</th>"
+        content += "</tr></thead><tbody>"
+
+        for rec in recs:
+            resource_id = rec.get("resource_id", "N/A")
+            severity = rec.get("severity", "")
+            current = rec.get("current_value", "")
+            recommended = rec.get("recommended_value", "")
+
+            severity_badge = ""
+            if severity == "HIGH":
+                severity_badge = '<span style="color:#e74c3c;font-weight:bold">HIGH</span>'
+            elif severity == "MEDIUM":
+                severity_badge = '<span style="color:#f39c12;font-weight:bold">MEDIUM</span>'
+            elif severity == "LOW":
+                severity_badge = '<span style="color:#27ae60;font-weight:bold">LOW</span>'
+            else:
+                severity_badge = severity
+
+            content += f"<tr><td>{resource_id}</td><td>{severity_badge}</td>"
+            content += f"<td>{current}</td><td>{recommended}</td></tr>"
+
+        content += "</tbody></table>"
+
+        reasons = list({r.get("reason", "") for r in recs if r.get("reason")})
+        if reasons:
+            content += "<p><strong>Details:</strong></p><ul>"
+            for reason in reasons[:3]:
+                content += f"<li>{reason}</li>"
+            content += "</ul>"
+
+        content += "</div>"
+    return content
+
+
+SOURCE_TYPE_MAP: Dict[Tuple[str, str], str] = {
+    ("compute_optimizer", "ebs_recommendations"): "ML Backed",
+    ("compute_optimizer", "lambda_recommendations"): "ML Backed",
+    ("compute_optimizer", "ecs_recommendations"): "ML Backed",
+    ("compute_optimizer", "asg_recommendations"): "ML Backed",
+    ("cost_optimization_hub", "savings_plans"): "Cost Hub",
+    ("cost_optimization_hub", "cross_service"): "Cost Hub",
+    ("cost_anomaly", "active_anomalies"): "Audit Based",
+    ("cost_anomaly", "anomaly_monitors"): "Audit Based",
+    ("cost_anomaly", "billing_alarms"): "Audit Based",
+}
+
+_GENERIC_SOURCE_TYPES: Dict[str, str] = {
+    "enhanced_checks": "Metric Backed",
+    "lifecycle_analysis": "Metric Backed",
+    "rightsizing": "ML Backed",
+    "idle_resources": "Static Analysis",
+    "cost_findings": "Static Analysis",
+    "general_recommendations": "Static Analysis",
+    "recommendations": "Cost Hub",
+    "sp_analysis": "Cost Hub",
+    "ri_analysis": "Cost Hub",
+    "reserved_instances": "Cost Hub",
+    "savings_plans": "Cost Hub",
+    "cost_optimization_hub": "Cost Hub",
+    "compute_optimizer": "Metric Backed",
+    "s3_bucket_analysis": "Metric Backed",
+    "dynamodb_table_analysis": "Metric Backed",
+    "efs_lifecycle_analysis": "Audit Based",
+    "old_amis": "Static Analysis",
+    "gp2_migration": "Metric Backed",
+    "unattached_volumes": "Static Analysis",
+    "tgw_vs_peering": "Metric Backed",
+    "node_group_optimization": "Metric Backed",
+    "fargate_analysis": "Metric Backed",
+    "cluster_costs": "Metric Backed",
+    "addon_costs": "Metric Backed",
+    "cost_hub_recommendations": "Cost Hub",
+    "cross_service": "Cost Hub",
+}
+
+
+def source_type_badge(service_key: str, source_name: str) -> str:
+    label = SOURCE_TYPE_MAP.get((service_key, source_name))
+    if not label:
+        label = _GENERIC_SOURCE_TYPES.get(source_name, "")
+    if not label:
+        return ""
+    css_class = {
+        "ML Backed": "badge-info",
+        "Cost Hub": "badge-warning",
+        "Metric Backed": "badge-success",
+        "Static Analysis": "badge-danger",
+        "Audit Based": "badge-danger",
+    }.get(label, "badge-info")
+    return f' <span class="badge {css_class}">{label}</span>'
+
+
 PHASE_B_HANDLERS: Dict[Tuple[str, str], Callable] = {
+    ("compute_optimizer", "ebs_recommendations"): _render_compute_optimizer_source,
+    ("compute_optimizer", "lambda_recommendations"): _render_compute_optimizer_source,
+    ("compute_optimizer", "ecs_recommendations"): _render_compute_optimizer_source,
+    ("compute_optimizer", "asg_recommendations"): _render_compute_optimizer_source,
+    ("cost_optimization_hub", "savings_plans"): _render_cost_hub_source,
+    ("cost_optimization_hub", "cross_service"): _render_cost_hub_source,
+    ("cost_anomaly", "active_anomalies"): _render_cost_anomaly_source,
+    ("cost_anomaly", "anomaly_monitors"): _render_cost_anomaly_source,
+    ("cost_anomaly", "billing_alarms"): _render_cost_anomaly_source,
+    ("cost_anomaly", "recommendations"): _render_cost_anomaly_source,
     ("ec2", "enhanced_checks"): _render_ec2_enhanced_checks,
     ("ec2", "cost_optimization_hub"): _render_ec2_cost_hub,
     ("ec2", "compute_optimizer"): _render_ec2_compute_optimizer,
+    ("ec2", "advanced_ec2_checks"): _render_ec2_advanced_checks,
     ("ebs", "cost_optimization_hub"): _render_ebs_cost_hub,
     ("ebs", "unattached_volumes"): _render_ebs_unattached,
     ("ebs", "gp2_migration"): _render_ebs_gp2_migration,
@@ -1443,14 +1858,22 @@ PHASE_B_HANDLERS: Dict[Tuple[str, str], Callable] = {
     ("rds", "compute_optimizer"): _render_rds_compute_optimizer,
     ("rds", "enhanced_checks"): _render_rds_enhanced_checks,
     ("s3", "enhanced_checks"): _render_s3_enhanced_checks,
+    ("s3", "s3_bucket_analysis"): _render_s3_enhanced_checks,
     ("dynamodb", "enhanced_checks"): _render_dynamodb_enhanced_checks,
     ("dynamodb", "dynamodb_table_analysis"): _render_dynamodb_enhanced_checks,
     ("containers", "enhanced_checks"): _render_containers_enhanced_checks,
     ("elasticache", "enhanced_checks"): _render_elasticache_enhanced_checks,
     ("opensearch", "enhanced_checks"): _render_opensearch_enhanced_checks,
     ("network", "enhanced_checks"): _render_network_enhanced_checks,
-    ("monitoring", "enhanced_checks"): _render_monitoring_enhanced_checks,
-    ("additional_services", "enhanced_checks"): _render_additional_services,
+    ("monitoring", "cloudwatch_checks"): _render_monitoring_enhanced_checks,
+    ("monitoring", "cloudtrail_checks"): _render_monitoring_enhanced_checks,
+    ("monitoring", "backup_checks"): _render_monitoring_enhanced_checks,
+    ("monitoring", "route53_checks"): _render_monitoring_enhanced_checks,
+    ("eks_cost", "cluster_costs"): _render_eks_source,
+    ("eks_cost", "node_group_optimization"): _render_eks_source,
+    ("eks_cost", "fargate_analysis"): _render_eks_source,
+    ("eks_cost", "addon_costs"): _render_eks_source,
+    ("eks_cost", "cost_hub_recommendations"): _render_eks_source,
 }
 
 _PHASE_A_SERVICES = frozenset(
@@ -1458,7 +1881,6 @@ _PHASE_A_SERVICES = frozenset(
         "file_systems",
         "lambda",
         "cloudfront",
-        "rds",
         "lightsail",
         "dms",
         "glue",
@@ -1467,7 +1889,6 @@ _PHASE_A_SERVICES = frozenset(
         "auto_scaling",
         "backup",
         "route53",
-        "monitoring",
     }
 )
 
@@ -1481,23 +1902,29 @@ _PHASE_B_SKIP_PER_REC = frozenset(
         "file_systems",
         "network",
         "monitoring",
-        "additional_services",
         "rds",
+        "eks_cost",
+        "cost_optimization_hub",
+        "cost_anomaly",
     }
 )
 
 
 def should_skip_section_header(service_key: str) -> bool:
+    """Return True if the section header should be omitted for this service."""
     return service_key in (_PHASE_B_SKIP_PER_REC | {"lightsail", "dms", "glue", "redshift"})
 
 
 def should_skip_source_loop(service_key: str) -> bool:
+    """Return True if Phase A rendering handles this service instead of source-loop."""
     return service_key in _PHASE_A_SERVICES
 
 
 def should_use_handler(service_key: str, source_name: str) -> bool:
+    """Return True if a Phase B handler exists for this (service, source) pair."""
     return (service_key, source_name) in PHASE_B_HANDLERS
 
 
 def should_fallback_to_per_rec(service_key: str) -> bool:
+    """Return True if the generic per-record renderer should be used for this service."""
     return service_key not in _PHASE_B_SKIP_PER_REC

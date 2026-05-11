@@ -22,10 +22,10 @@ LIGHTSAIL_OPTIMIZATION_DESCRIPTIONS: dict[str, dict[str, str]] = {
 
 _BUNDLE_COSTS: dict[str, float] = {
     "nano_2_0": 3.50,
-    "micro_2_0": 5.00,
-    "small_2_0": 10.00,
-    "medium_2_0": 20.00,
-    "large_2_0": 40.00,
+    "micro_2_0": 6.86,
+    "small_2_0": 13.72,
+    "medium_2_0": 27.45,
+    "large_2_0": 54.90,
     "xlarge_2_0": 80.00,
     "2xlarge_2_0": 160.00,
 }
@@ -97,7 +97,7 @@ def get_enhanced_lightsail_checks(ctx: ScanContext) -> dict[str, Any]:
                         "StaticIpName": static_ip.get("name"),
                         "IpAddress": static_ip.get("ipAddress"),
                         "Recommendation": "Release unused static IP to avoid charges",
-                        "EstimatedSavings": "$5.00/month",
+                        "EstimatedSavings": "$3.65/month",
                         "CheckCategory": "Unused Resource Cleanup",
                     }
                 )

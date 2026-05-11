@@ -1,0 +1,7 @@
+{
+  "DBClusterSnapshots": [
+    {"DBClusterSnapshotIdentifier": "snap-1"},
+    {"DBClusterSnapshotIdentifier": "snap-2"},
+    {"DBClusterSnapshotIdentifier": "snap-3"}
+  ]
+}

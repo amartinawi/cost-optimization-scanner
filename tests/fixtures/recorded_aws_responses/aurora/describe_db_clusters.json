@@ -1,0 +1,30 @@
+{
+  "DBClusters": [
+    {
+      "DBClusterIdentifier": "aurora-cluster-1",
+      "Engine": "aurora-mysql",
+      "EngineVersion": "8.0.mysql_aurora.3.05.2",
+      "Status": "available",
+      "ServerlessV2ScalingConfiguration": {
+        "MinCapacity": 0.5,
+        "MaxCapacity": 16
+      },
+      "AllocatedStorage": 100,
+      "BacktrackWindow": 86400,
+      "GlobalClusterIdentifier": null
+    },
+    {
+      "DBClusterIdentifier": "aurora-cluster-2",
+      "Engine": "aurora-postgresql",
+      "EngineVersion": "15.4",
+      "Status": "available",
+      "ServerlessV2ScalingConfiguration": {
+        "MinCapacity": 1,
+        "MaxCapacity": 64
+      },
+      "AllocatedStorage": 500,
+      "BacktrackWindow": 0,
+      "GlobalClusterIdentifier": "global-cluster-1"
+    }
+  ]
+}

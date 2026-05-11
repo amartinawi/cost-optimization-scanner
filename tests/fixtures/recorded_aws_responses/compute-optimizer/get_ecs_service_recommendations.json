@@ -1,0 +1,31 @@
+{
+  "ecsServiceRecommendations": [
+    {
+      "serviceArn": "arn:aws:ecs:us-east-1:123456789012:cluster/my-cluster/service/my-service",
+      "currentServiceConfiguration": {
+        "cpu": 512,
+        "memory": 1024
+      },
+      "finding": "Overprovisioned",
+      "serviceRecommendationOptions": [
+        {
+          "containerRecommendations": [
+            {
+              "containerName": "my-container",
+              "memory": 512,
+              "cpu": 256
+            }
+          ],
+          "savingsOpportunity": {
+            "estimatedMonthlySavings": {
+              "currency": "USD",
+              "value": 25.00
+            }
+          }
+        }
+      ],
+      "lookBackPeriodInDays": 14
+    }
+  ],
+  "nextToken": null
+}

@@ -15,6 +15,12 @@ from core.session import AwsSessionFactory
 
 
 class ClientRegistry:
+    """Caching boto3 client factory with global-service routing and aliases.
+
+    Global services (e.g. route53, cloudfront) are automatically routed to
+    us-east-1 when no explicit region is provided.
+    """
+
     _GLOBAL_SERVICES: frozenset[str] = frozenset(
         {
             "route53",
@@ -33,10 +39,12 @@ class ClientRegistry:
     _ALIASES: dict[str, str] = {"trustedadvisor": "support"}
 
     def __init__(self, session_factory: AwsSessionFactory) -> None:
+        """Initialise with an AWS session factory for client creation."""
         self._factory = session_factory
         self._cache: dict[tuple[str, str | None], BaseClient] = {}
 
     def client(self, name: str, region: str | None = None) -> Any:
+        """Return a cached boto3 client, handling aliases and global-service routing."""
         resolved = self._ALIASES.get(name, name)
         effective_region: str | None = region
         if resolved in self._GLOBAL_SERVICES and region is None:

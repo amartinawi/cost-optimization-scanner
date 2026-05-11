@@ -13,6 +13,7 @@ print("🔍 [services/elastic_ip.py] Elastic IP module active")
 
 
 def get_elastic_ip_checks(ctx: ScanContext) -> dict[str, Any]:
+    eip_monthly = ctx.pricing_engine.get_eip_monthly_price() if ctx.pricing_engine is not None else 3.65
     """Category 1: Elastic IPs & Public Addressing optimization checks"""
     checks: dict[str, list[dict[str, Any]]] = {
         "unassociated_eips": [],
@@ -49,7 +50,7 @@ def get_elastic_ip_checks(ctx: ScanContext) -> dict[str, Any]:
                         "PublicIp": public_ip,
                         "ResourceName": eip_name,
                         "Recommendation": "Release unassociated Elastic IP to avoid charges",
-                        "EstimatedSavings": "$3.65/month per EIP",
+                        "EstimatedSavings": f"${eip_monthly:.2f}/month per EIP",
                         "CheckCategory": "Unassociated EIPs",
                     }
                 )
@@ -68,7 +69,7 @@ def get_elastic_ip_checks(ctx: ScanContext) -> dict[str, Any]:
                             "InstanceId": instance_id,
                             "InstanceState": "stopped",
                             "Recommendation": "Release EIP from stopped instance or start instance",
-                            "EstimatedSavings": "$3.65/month per EIP",
+                            "EstimatedSavings": f"${eip_monthly:.2f}/month per EIP",
                             "CheckCategory": "EIPs on Stopped Instances",
                         }
                     )
@@ -82,7 +83,7 @@ def get_elastic_ip_checks(ctx: ScanContext) -> dict[str, Any]:
                         "EIPCount": eip_count,
                         "InstanceType": instance.get("InstanceType", "N/A"),
                         "Recommendation": f"Instance has {eip_count} EIPs - review if all are necessary",
-                        "EstimatedSavings": f"${(eip_count - 1) * 3.65:.2f}/month if reduced to 1 EIP",
+                        "EstimatedSavings": f"${(eip_count - 1) * eip_monthly:.2f}/month if reduced to 1 EIP",
                         "CheckCategory": "Multiple EIPs per Instance",
                     }
                 )
@@ -113,7 +114,7 @@ def get_elastic_ip_checks(ctx: ScanContext) -> dict[str, Any]:
                                     "PublicIp": instance.get("PublicIpAddress"),
                                     "SubnetId": subnet_id,
                                     "Recommendation": "Instance in private subnet has public IP - review necessity",
-                                    "EstimatedSavings": "$3.65/month per public IP if removed",
+                                    "EstimatedSavings": f"${eip_monthly:.2f}/month per public IP if removed",
                                     "CheckCategory": "Public IP Optimization",
                                 }
                             )

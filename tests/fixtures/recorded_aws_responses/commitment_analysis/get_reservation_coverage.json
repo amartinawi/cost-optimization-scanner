@@ -1,0 +1,18 @@
+{
+  "CoveragesByTime": [
+    {
+      "Groups": [
+        {
+          "Attributes": {"service": "Amazon EC2"},
+          "Coverage": {
+            "OnDemandCost": "300.00",
+            "CoveragePercentage": "60.0"
+          }
+        }
+      ]
+    }
+  ],
+  "Total": {
+    "CoveragePercentage": "60.0"
+  }
+}

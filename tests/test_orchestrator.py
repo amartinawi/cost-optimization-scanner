@@ -1,3 +1,5 @@
+"""Unit tests for ScanOrchestrator.safe_scan error isolation."""
+
 from __future__ import annotations
 
 from unittest.mock import MagicMock
@@ -8,6 +10,7 @@ from core.scan_context import ScanContext
 
 
 def _make_ctx() -> ScanContext:
+    """Build a minimal ScanContext with mocked client registry."""
     registry = MagicMock(spec=ClientRegistry)
     return ScanContext(
         region="us-east-1",
@@ -19,6 +22,7 @@ def _make_ctx() -> ScanContext:
 
 
 def _broken_module() -> MagicMock:
+    """Return a mock module whose scan() raises RuntimeError."""
     m = MagicMock()
     m.key = "broken"
     m.display_name = "Broken"
@@ -27,6 +31,7 @@ def _broken_module() -> MagicMock:
 
 
 def test_safe_scan_catches_exception():
+    """Verify safe_scan returns empty findings and logs a warning when a module raises."""
     ctx = _make_ctx()
     from core.scan_orchestrator import safe_scan
 

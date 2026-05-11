@@ -1,0 +1,98 @@
+{
+  "service_name": "Bedrock",
+  "total_recommendations": 5,
+  "total_monthly_savings": 1674.00,
+  "sources": {
+    "idle_provisioned_throughput": {
+      "count": 2,
+      "recommendations": [
+        {
+          "provisioned_model_id": "my-haiku-pt",
+          "model_id": "anthropic.claude-3-haiku",
+          "model_units": 1,
+          "check_category": "PT Analysis",
+          "current_value": "PT 'my-haiku-pt' with 1 unit(s), 0 invocations in 30 days",
+          "recommended_value": "Delete idle Provisioned Throughput",
+          "monthly_savings": 584.00,
+          "reason": "Provisioned Throughput 'my-haiku-pt' has zero invocations in 30 days — wasting $584.00/mo"
+        },
+        {
+          "provisioned_model_id": "my-titan-pt",
+          "model_id": "amazon.titan-text-lite",
+          "model_units": 1,
+          "check_category": "PT Analysis",
+          "current_value": "PT 'my-titan-pt' with 1 unit(s), 0 invocations in 30 days",
+          "recommended_value": "Delete idle Provisioned Throughput",
+          "monthly_savings": 219.00,
+          "reason": "Provisioned Throughput 'my-titan-pt' has zero invocations in 30 days — wasting $219.00/mo"
+        }
+      ]
+    },
+    "pt_breakeven_analysis": {
+      "count": 1,
+      "recommendations": [
+        {
+          "provisioned_model_id": "my-sonnet-pt",
+          "model_id": "anthropic.claude-3-sonnet",
+          "model_units": 1,
+          "check_category": "PT Analysis",
+          "current_value": "PT commitment $2920.00/mo, estimated on-demand $2200.00/mo",
+          "recommended_value": "Switch to on-demand pricing",
+          "monthly_savings": 720.00,
+          "reason": "On-demand estimated at $2200.00/mo vs PT cost $2920.00/mo — save $720.00/mo by switching"
+        }
+      ]
+    },
+    "idle_knowledge_bases": {
+      "count": 1,
+      "recommendations": [
+        {
+          "knowledge_base_id": "KB1A2B3C4D5",
+          "knowledge_base_name": "product-docs-kb",
+          "status": "ACTIVE",
+          "check_category": "Knowledge Base",
+          "current_value": "KB 'product-docs-kb' active, ~$146.00/mo OCU cost",
+          "recommended_value": "Review Knowledge Base usage and delete if unused",
+          "monthly_savings": 146.00,
+          "reason": "Knowledge Base 'product-docs-kb' may have idle OCU hours — estimated $146.00/mo if fully idle"
+        }
+      ]
+    },
+    "idle_agents": {
+      "count": 1,
+      "recommendations": [
+        {
+          "agent_id": "AG9X8Y7Z6W",
+          "agent_name": "customer-support-agent",
+          "status": "PREPARED",
+          "check_category": "Agent",
+          "current_value": "Agent 'customer-support-agent' (PREPARED)",
+          "recommended_value": "Review Agent invocation volume and delete if unused",
+          "monthly_savings": 5.00,
+          "reason": "Agent 'customer-support-agent' has no invocations detected — estimated $5.00/mo in underlying model costs"
+        }
+      ]
+    }
+  },
+  "optimization_descriptions": {
+    "idle_provisioned_throughput": {
+      "title": "Idle Provisioned Throughput",
+      "description": "Provisioned Throughputs with zero invocations over 30 days"
+    },
+    "pt_breakeven_analysis": {
+      "title": "PT Breakeven Analysis",
+      "description": "Provisioned Throughputs that cost more than on-demand pricing"
+    },
+    "idle_knowledge_bases": {
+      "title": "Idle Knowledge Bases",
+      "description": "Knowledge Bases with potentially unused OCU hours"
+    },
+    "idle_agents": {
+      "title": "Idle Agents",
+      "description": "Bedrock Agents with no invocation activity detected"
+    }
+  },
+  "pt_count": 3,
+  "kb_count": 1,
+  "agent_count": 1
+}

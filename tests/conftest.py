@@ -212,6 +212,25 @@ def _attach_stubbers(session: boto3.Session, region: str) -> Dict[str, Stubber]:
     return stubbers
 
 
+def pytest_addoption(parser):
+    parser.addoption("--live", action="store_true", default=False, help="Run tests with live AWS Pricing API")
+
+
+@pytest.fixture()
+def live_only(request):
+    if not request.config.getoption("--live"):
+        pytest.skip("Use --live to run against real AWS Pricing API")
+
+
+@pytest.fixture()
+def mock_pricing_engine():
+    from core.pricing_engine import PricingEngine
+
+    mock_client = MagicMock()
+    mock_client.get_products.return_value = {"PriceList": []}
+    return PricingEngine("us-east-1", mock_client)
+
+
 @pytest.fixture()
 def stubbed_aws():
     """Combine moto mock_aws with Stubber fallback for uncovered clients.
@@ -262,6 +281,7 @@ def stubbed_aws():
             resources: Dict[str, Any],
             stubber_map: Dict[str, Stubber],
         ) -> None:
+            """Initialise with a boto3 session, seeded resources, and active stubbers."""
             self.session = boto_session
             self.resources = resources
             self.stubbers = stubber_map

@@ -14,6 +14,18 @@ from botocore.exceptions import ClientError  # type: ignore[import-untyped]
 from core.scan_context import ScanContext
 
 EBS_OPTIMIZATION_DESCRIPTIONS: dict[str, dict[str, str]] = {
+    "compute_optimizer": {
+        "title": "Compute Optimizer EBS Recommendations",
+        "description": (
+            "AWS Compute Optimizer ML-driven rightsizing recommendations for EBS volumes"
+            " based on 14-day CloudWatch utilization patterns."
+        ),
+        "action": (
+            "1. Review Compute Optimizer finding and recommended volume type\n"
+            "2. Modify volume via AWS Console or CLI (no downtime)\n"
+            "3. Estimated savings: varies by recommendation"
+        ),
+    },
     "unattached_volumes": {
         "title": "Delete Unattached EBS Volumes",
         "description": (
@@ -26,6 +38,30 @@ EBS_OPTIMIZATION_DESCRIPTIONS: dict[str, dict[str, str]] = {
             "2. Delete unattached volume via AWS Console or CLI\n"
             "3. Estimated savings: 100% of volume storage cost"
             " (estimate based on current volume pricing)"
+        ),
+    },
+    "gp2_migration": {
+        "title": "Migrate gp2 to gp3 Volumes",
+        "description": (
+            "gp3 volumes offer up to 20% cost savings compared to gp2"
+            " with better performance baseline (3,000 IOPS vs size-dependent IOPS)."
+        ),
+        "action": (
+            "1. Modify volume type from gp2 to gp3 (no downtime)\n"
+            "2. Optionally adjust IOPS and throughput independently\n"
+            "3. Estimated savings: ~20% reduction in storage costs"
+            " (estimate based on current AWS pricing)"
+        ),
+    },
+    "enhanced_checks": {
+        "title": "Enhanced EBS Checks",
+        "description": (
+            "Additional EBS volume checks including io1-to-io2 upgrades, volume rightsizing, and old snapshot cleanup."
+        ),
+        "action": (
+            "1. Review individual recommendations for specifics\n"
+            "2. Apply volume type changes or size adjustments as needed\n"
+            "3. Estimated savings: varies by check type"
         ),
     },
     "gp2_to_gp3": {
@@ -125,33 +161,14 @@ def get_ebs_compute_optimizer_recs(
     ctx: ScanContext,
     pricing_multiplier: float,
 ) -> list[dict[str, Any]]:
-    """Get EBS recommendations from Compute Optimizer."""
-    compute_optimizer = ctx.client("compute-optimizer")
-    recommendations: list[dict[str, Any]] = []
-    try:
-        response = compute_optimizer.get_ebs_volume_recommendations()
-        recommendations.extend(response["volumeRecommendations"])
+    """Get EBS recommendations from Compute Optimizer.
 
-        # Handle pagination manually
-        while response.get("nextToken"):
-            response = compute_optimizer.get_ebs_volume_recommendations(nextToken=response["nextToken"])
-            recommendations.extend(response["volumeRecommendations"])
-    except Exception as e:
-        print(f"Warning: EBS Compute Optimizer not available: {e}")
-        # Add recommendation to enable Compute Optimizer
-        if "OptInRequiredException" in str(e) or "not registered" in str(e):
-            opt_in_recommendation = {
-                "ResourceId": "compute-optimizer-service",
-                "ResourceType": "Service Configuration",
-                "Issue": "AWS Compute Optimizer not enabled",
-                "Recommendation": "Enable AWS Compute Optimizer for EBS recommendations",
-                "EstimatedMonthlySavings": "Variable - up to 20% on EBS volumes",
-                "Action": ("Go to AWS Compute Optimizer console and opt-in to receive EBS rightsizing recommendations"),
-                "Priority": "Medium",
-                "Service": "Compute Optimizer",
-            }
-            recommendations.append(opt_in_recommendation)
-    return recommendations
+    Delegates to services.advisor — the canonical location for all
+    advisory-service (Cost Hub / Compute Optimizer) functions.
+    """
+    from services.advisor import get_ebs_compute_optimizer_recommendations
+
+    return get_ebs_compute_optimizer_recommendations(ctx)
 
 
 def get_unattached_volumes(
@@ -204,6 +221,7 @@ def get_unattached_volumes(
                                 volume.get("Iops"),
                                 volume.get("Throughput"),
                                 pricing_multiplier,
+                                ctx=ctx,
                             ),
                         }
                     )
@@ -226,6 +244,7 @@ def _estimate_volume_cost(
     iops: int | None = None,
     throughput: int | None = None,
     pricing_multiplier: float = 1.0,
+    ctx: ScanContext | None = None,
 ) -> float:
     """Estimate monthly cost for EBS volume including IOPS and throughput.
 
@@ -237,35 +256,39 @@ def _estimate_volume_cost(
         iops: Provisioned IOPS (for gp3, io1, io2)
         throughput: Provisioned throughput in MB/s (for gp3)
         pricing_multiplier: Regional pricing multiplier
+        ctx: ScanContext with optional pricing_engine for live pricing
 
     Returns:
         Estimated monthly cost in USD
     """
-    # January 2026 pricing per GB/month (us-east-1 baseline)
-    pricing: dict[str, float] = {
-        "gp2": 0.10,  # General Purpose SSD
-        "gp3": 0.08,  # General Purpose SSD (20% cheaper than gp2)
-        "io1": 0.125,  # Provisioned IOPS SSD
-        "io2": 0.125,  # Provisioned IOPS SSD (latest generation)
-        "st1": 0.045,  # Throughput Optimized HDD
-        "sc1": 0.025,  # Cold HDD
+    _FALLBACK: dict[str, float] = {
+        "gp2": 0.10,
+        "gp3": 0.08,
+        "io1": 0.125,
+        "io2": 0.125,
+        "st1": 0.045,
+        "sc1": 0.025,
     }
 
-    base_cost = size_gb * pricing.get(volume_type, 0.10) * pricing_multiplier
+    if ctx and ctx.pricing_engine:
+        gb_price = ctx.pricing_engine.get_ebs_monthly_price_per_gb(volume_type)
+    else:
+        gb_price = _FALLBACK.get(volume_type, 0.10) * pricing_multiplier
 
-    # Add IOPS costs
+    base_cost = size_gb * gb_price
+
     if iops and volume_type in ["gp3", "io1", "io2"]:
         if volume_type == "gp3":
-            # gp3: 3,000 IOPS included, $0.005/IOPS-month for additional
             extra_iops = max(0, iops - 3000)
             base_cost += extra_iops * 0.005 * pricing_multiplier
         elif volume_type in ["io1", "io2"]:
-            # io1/io2: $0.065/IOPS-month
-            base_cost += iops * 0.065 * pricing_multiplier
+            if ctx and ctx.pricing_engine:
+                iops_price = ctx.pricing_engine.get_ebs_iops_monthly_price(volume_type)
+            else:
+                iops_price = 0.065 * pricing_multiplier
+            base_cost += iops * iops_price
 
-    # Add throughput costs for gp3
     if throughput and volume_type == "gp3":
-        # gp3: 125 MB/s included, $0.04/MB/s-month for additional
         extra_throughput = max(0, throughput - 125)
         base_cost += extra_throughput * 0.04 * pricing_multiplier
 
@@ -461,7 +484,7 @@ def compute_ebs_checks(
                         "Encrypted": True,
                         "Recommendation": "Delete unused encrypted volume",
                         "EstimatedSavings": (
-                            f"${_estimate_volume_cost(volume['Size'], volume['VolumeType'], volume.get('Iops'), volume.get('Throughput'), pricing_multiplier):.2f}"  # noqa: E501
+                            f"${_estimate_volume_cost(volume['Size'], volume['VolumeType'], volume.get('Iops'), volume.get('Throughput'), pricing_multiplier, ctx=ctx):.2f}"  # noqa: E501
                             "/month"
                         ),
                     }

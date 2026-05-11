@@ -12,14 +12,30 @@ from services.route53 import get_route53_checks
 
 
 class MonitoringModule(BaseServiceModule):
+    """ServiceModule adapter for CloudWatch, CloudTrail, Backup, and Route53. Composite savings strategy."""
+
     key: str = "monitoring"
     cli_aliases: tuple[str, ...] = ("monitoring",)
     display_name: str = "Monitoring & Logging"
+    reads_fast_mode: bool = True
 
     def required_clients(self) -> tuple[str, ...]:
+        """Returns boto3 client names required for monitoring and logging scanning."""
         return ("cloudwatch", "logs", "cloudtrail", "backup", "route53")
 
     def scan(self, ctx: Any) -> ServiceFindings:
+        """Scan CloudWatch, CloudTrail, Backup, and Route53 for cost optimization.
+
+        Consults CloudWatch checks, CloudTrail checks, Backup checks, and
+        Route53 checks. Savings parsed from dollar-amount strings.
+
+        Args:
+            ctx: ScanContext with region, clients, and pricing data.
+
+        Returns:
+            ServiceFindings with cloudwatch_checks, cloudtrail_checks,
+            backup_checks, and route53_checks SourceBlock entries.
+        """
         print("\U0001f50d [services/adapters/monitoring.py] Monitoring module active")
 
         cw_result = get_cloudwatch_checks(ctx)

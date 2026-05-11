@@ -52,6 +52,7 @@ def get_enhanced_msk_checks(ctx: ScanContext) -> dict[str, Any]:
                             "EstimatedSavings": "$200/month potential",
                             "CheckCategory": "Cluster Rightsizing",
                             "Note": "Verify actual throughput and utilization before downsizing",
+                            "NumberOfBrokerNodes": cluster.get("NumberOfBrokerNodes", 3),
                         }
                     )
 

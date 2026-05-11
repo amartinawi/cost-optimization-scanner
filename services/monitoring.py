@@ -68,8 +68,15 @@ def get_cloudwatch_checks(ctx: ScanContext) -> dict[str, Any]:
 
     try:
         logs = ctx.client("logs")
-        log_groups_response = logs.describe_log_groups()
-        log_groups = log_groups_response.get("logGroups", [])
+        log_groups: list[dict[str, Any]] = []
+        log_groups_params: dict[str, Any] = {}
+        while True:
+            log_groups_response = logs.describe_log_groups(**log_groups_params)
+            log_groups.extend(log_groups_response.get("logGroups", []))
+            next_token = log_groups_response.get("nextToken")
+            if not next_token:
+                break
+            log_groups_params["nextToken"] = next_token
 
         for log_group in log_groups:
             log_group_name = log_group.get("logGroupName")
@@ -83,7 +90,7 @@ def get_cloudwatch_checks(ctx: ScanContext) -> dict[str, Any]:
                         "StoredBytes": stored_bytes,
                         "StoredGB": round(stored_bytes / (1024**3), 2),
                         "Recommendation": "Set retention policy to prevent unlimited log growth",
-                        "EstimatedSavings": f"${stored_bytes * 0.03 / (1024**3):.2f}/month with 30-day retention",
+                        "EstimatedSavings": f"${stored_bytes * 0.57 / (1024**3):.2f}/month with 30-day retention",
                         "CheckCategory": "Never-Expiring Log Groups",
                     }
                 )
@@ -189,7 +196,7 @@ def get_cloudtrail_checks(ctx: ScanContext) -> dict[str, Any]:
 
         trail_names: set[str] = set()
 
-        for trail in trails:
+        for trail_index, trail in enumerate(trails):
             trail_name = trail.get("Name")
             trail_arn = trail.get("TrailARN")
             is_multi_region = trail.get("IsMultiRegionTrail", False)
@@ -197,14 +204,15 @@ def get_cloudtrail_checks(ctx: ScanContext) -> dict[str, Any]:
 
             trail_names.add(trail_name)
 
-            if is_multi_region:
+            # First CloudTrail trail in each region is free; only flag additional trails
+            if is_multi_region and trail_index > 0:
                 checks["multi_region_trails"].append(
                     {
                         "TrailName": trail_name,
                         "TrailARN": trail_arn,
                         "S3Bucket": s3_bucket,
                         "Recommendation": "Multi-region trail - verify if all regions needed",
-                        "EstimatedSavings": "Single-region trail costs ~90% less",
+                        "EstimatedSavings": "$0.00/month — single-region trail costs ~90% less",
                         "CheckCategory": "Multi-Region CloudTrail",
                     }
                 )
@@ -226,7 +234,7 @@ def get_cloudtrail_checks(ctx: ScanContext) -> dict[str, Any]:
                                     "TrailName": trail_name,
                                     "ResourceType": resource_type,
                                     "Recommendation": "Data events enabled for all S3 buckets - very expensive",
-                                    "EstimatedSavings": "Limit to specific buckets for 80-95% savings",
+                                    "EstimatedSavings": "$0.00/month — limit to specific buckets for 80-95% savings",
                                     "CheckCategory": "S3 Data Events All Buckets",
                                 }
                             )
@@ -237,7 +245,7 @@ def get_cloudtrail_checks(ctx: ScanContext) -> dict[str, Any]:
                                     "TrailName": trail_name,
                                     "ResourceType": resource_type,
                                     "Recommendation": "Data events enabled for all Lambda functions - expensive",
-                                    "EstimatedSavings": "Limit to specific functions for significant savings",
+                                    "EstimatedSavings": "$0.00/month — limit to specific functions for significant savings",
                                     "CheckCategory": "Lambda Data Events All Functions",
                                 }
                             )
@@ -277,7 +285,7 @@ def get_cloudtrail_checks(ctx: ScanContext) -> dict[str, Any]:
                     "Recommendation": (
                         f"{len(trail_names)} trails detected - review event selectors to avoid duplication"
                     ),
-                    "EstimatedSavings": "Consolidate overlapping trails to reduce costs",
+                    "EstimatedSavings": "$0.00/month — consolidate overlapping trails to reduce costs",
                     "CheckCategory": "Multiple CloudTrail Trails",
                 }
             )

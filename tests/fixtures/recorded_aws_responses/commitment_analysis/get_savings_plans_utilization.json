@@ -1,0 +1,13 @@
+{
+  "SavingsPlansUtilizations": {
+    "Total": {
+      "UtilizationPercentage": "92.5",
+      "TotalSavings": {"currency": "USD", "value": 450.00},
+      "TotalAmortizedCommitment": {
+        "TotalHourlyCommitment": "1.50",
+        "AmortizedUpfrontCost": "0.00",
+        "AmortizedRecurringCost": "1095.00"
+      }
+    }
+  }
+}

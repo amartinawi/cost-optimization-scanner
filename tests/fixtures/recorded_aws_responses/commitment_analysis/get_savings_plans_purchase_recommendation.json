@@ -1,0 +1,18 @@
+{
+  "SavingsPlansPurchaseRecommendation": [
+    {
+      "SavingsPlansPurchaseRecommendationSummary": {
+        "EstimatedMonthlySavings": "180.00",
+        "HourlyCommitment": "0.80",
+        "EstimatedUpfrontCost": "0.00"
+      }
+    }
+  ],
+  "SavingsPlansPurchaseRecommendationDetail": [
+    {
+      "AccountId": "123456789012",
+      "EstimatedMonthlySavings": "180.00",
+      "HourlyCommitment": "0.80"
+    }
+  ]
+}

@@ -1,4 +1,49 @@
 {
-  "items": [],
+  "items": [
+    {
+      "recommendationId": "rec-sp-001",
+      "recommendationType": "ComputeSavingsPlans",
+      "currentResourceType": "SavingsPlans",
+      "recommendedResourceType": "SavingsPlans",
+      "estimatedMonthlySavings": {
+        "currency": "USD",
+        "value": 150.00
+      },
+      "region": "us-east-1"
+    },
+    {
+      "recommendationId": "rec-sp-002",
+      "recommendationType": "RdsComputeSavingsPlans",
+      "currentResourceType": "SavingsPlans",
+      "recommendedResourceType": "SavingsPlans",
+      "estimatedMonthlySavings": {
+        "currency": "USD",
+        "value": 75.00
+      },
+      "region": "us-east-1"
+    },
+    {
+      "recommendationId": "rec-sp-003",
+      "recommendationType": "Ec2InstanceSavingsPlans",
+      "currentResourceType": "SavingsPlans",
+      "recommendedResourceType": "SavingsPlans",
+      "estimatedMonthlySavings": {
+        "currency": "USD",
+        "value": 200.00
+      },
+      "region": "us-east-1"
+    },
+    {
+      "recommendationId": "rec-cross-001",
+      "recommendationType": "UnknownResourceType",
+      "currentResourceType": "Unknown",
+      "recommendedResourceType": "Unknown",
+      "estimatedMonthlySavings": {
+        "currency": "USD",
+        "value": 30.00
+      },
+      "region": "us-east-1"
+    }
+  ],
   "nextToken": null
 }

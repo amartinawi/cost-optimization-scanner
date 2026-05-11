@@ -382,6 +382,31 @@ S3_REGIONAL_MULTIPLIERS: dict[str, dict[str, float]] = {
 }
 
 S3_OPTIMIZATION_DESCRIPTIONS: dict[str, dict[str, str]] = {
+    "s3_bucket_analysis": {
+        "title": "S3 Bucket Cost Analysis",
+        "description": (
+            "Analysis of S3 bucket configurations for lifecycle policies,"
+            " Intelligent-Tiering adoption, storage class optimization, and unused bucket detection."
+        ),
+        "action": (
+            "1. Review buckets without lifecycle policies\n"
+            "2. Enable Intelligent-Tiering for variable access patterns\n"
+            "3. Transition old data to lower-cost storage classes\n"
+            "4. Estimated savings: 40-95% depending on optimization type"
+        ),
+    },
+    "enhanced_checks": {
+        "title": "Enhanced S3 Checks",
+        "description": (
+            "Additional S3 checks including multipart upload cleanup,"
+            " versioning review, and cross-region replication analysis."
+        ),
+        "action": (
+            "1. Configure lifecycle rules to abort incomplete uploads\n"
+            "2. Review bucket versioning and replication settings\n"
+            "3. Estimated savings: variable based on findings"
+        ),
+    },
     "lifecycle_policies": {
         "title": "Configure S3 Lifecycle Policies",
         "description": (
@@ -437,12 +462,20 @@ S3_OPTIMIZATION_DESCRIPTIONS: dict[str, dict[str, str]] = {
 }
 
 
+_SC_MAP = {"GLACIER_FLEXIBLE_RETRIEVAL": "GLACIER", "GLACIER_INSTANT_RETRIEVAL": "GLACIER_IR"}
+
+
 def _calculate_s3_storage_cost(
     size_gb: float,
     storage_class: str,
     region: str,
+    ctx: ScanContext | None = None,
 ) -> float:
     try:
+        if ctx and ctx.pricing_engine:
+            engine_key = _SC_MAP.get(storage_class, storage_class)
+            price = ctx.pricing_engine.get_s3_monthly_price_per_gb(engine_key)
+            return round(size_gb * price, 2)
         base_cost = S3_STORAGE_COSTS.get(storage_class, S3_STORAGE_COSTS["STANDARD"])
         regional_multiplier = S3_REGIONAL_MULTIPLIERS.get(region, {}).get(storage_class, 1.0)
         return round(size_gb * base_cost * regional_multiplier, 2)
@@ -509,9 +542,14 @@ def _estimate_s3_bucket_cost(
                         "IntelligentTieringStorage": "INTELLIGENT_TIERING",
                     }.get(storage_class, "STANDARD")
 
-                    base_cost = S3_STORAGE_COSTS[cost_key]
-                    regional_multiplier = S3_REGIONAL_MULTIPLIERS.get(bucket_region, {}).get(cost_key, 1.0)
-                    regional_cost = base_cost * regional_multiplier
+                    base_cost = S3_STORAGE_COSTS.get(
+                        cost_key, S3_STORAGE_COSTS.get("GLACIER_FLEXIBLE_RETRIEVAL", S3_STORAGE_COSTS["STANDARD"])
+                    )
+                    if ctx.pricing_engine:
+                        regional_cost = ctx.pricing_engine.get_s3_monthly_price_per_gb(cost_key)
+                    else:
+                        regional_multiplier = S3_REGIONAL_MULTIPLIERS.get(bucket_region, {}).get(cost_key, 1.0)
+                        regional_cost = base_cost * regional_multiplier
                     storage_cost = class_size_gb * regional_cost
 
                     if cost_key == "INTELLIGENT_TIERING":
@@ -526,15 +564,20 @@ def _estimate_s3_bucket_cost(
                 continue
 
         if total_accounted_gb < size_gb * 0.1:
-            base_cost = S3_STORAGE_COSTS["STANDARD"]
-            regional_multiplier = S3_REGIONAL_MULTIPLIERS.get(bucket_region, {}).get("STANDARD", 1.0)
-            regional_cost = base_cost * regional_multiplier
-            total_cost = size_gb * regional_cost
+            if ctx.pricing_engine:
+                total_cost = size_gb * ctx.pricing_engine.get_s3_monthly_price_per_gb("STANDARD")
+            else:
+                base_cost = S3_STORAGE_COSTS["STANDARD"]
+                regional_multiplier = S3_REGIONAL_MULTIPLIERS.get(bucket_region, {}).get("STANDARD", 1.0)
+                regional_cost = base_cost * regional_multiplier
+                total_cost = size_gb * regional_cost
 
         return round(total_cost, 2)
 
     except Exception as e:
         print(f"⚠️ Error calculating S3 storage cost: {str(e)}")
+        if ctx.pricing_engine:
+            return round(size_gb * ctx.pricing_engine.get_s3_monthly_price_per_gb("STANDARD"), 2)
         base_cost = S3_STORAGE_COSTS["STANDARD"]
         regional_multiplier = S3_REGIONAL_MULTIPLIERS.get(bucket_region, {}).get("STANDARD", 1.0)
         regional_cost = base_cost * regional_multiplier
@@ -619,7 +662,7 @@ def get_s3_bucket_analysis(
                         )
                         print(f"⚠️ Fast mode: {bucket_name} size is sample-based estimate only")
                         bucket_info["EstimatedMonthlyCost"] = _calculate_s3_storage_cost(
-                            bucket_info["SizeGB"], "STANDARD", bucket_region
+                            bucket_info["SizeGB"], "STANDARD", bucket_region, ctx=ctx
                         )
                 except Exception as e:
                     print(f"⚠️ Error analyzing bucket {bucket_name}: {str(e)}")
@@ -662,7 +705,7 @@ def get_s3_bucket_analysis(
                         bucket_info["SizeBytes"] = int(total_size_gb * (1024**3))
                         bucket_info["SizeGB"] = total_size_gb
                         bucket_info["EstimatedMonthlyCost"] = _calculate_s3_storage_cost(
-                            total_size_gb, "STANDARD", bucket_region
+                            total_size_gb, "STANDARD", bucket_region, ctx=ctx
                         )
 
                 except Exception as e:
@@ -714,6 +757,11 @@ def get_s3_bucket_analysis(
 
             if not bucket_info["HasLifecyclePolicy"] and not bucket_info["HasIntelligentTiering"]:
                 bucket_info["OptimizationOpportunities"].append("High priority: No cost optimization configured")
+
+            if bucket_info["OptimizationOpportunities"]:
+                bucket_info["SavingsDelta"] = round(bucket_info["EstimatedMonthlyCost"] * 0.40, 2)
+            else:
+                bucket_info["SavingsDelta"] = 0
 
             bucket_metrics.append(bucket_info)
             analysis["optimization_opportunities"].append(bucket_info)
