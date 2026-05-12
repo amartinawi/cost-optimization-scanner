@@ -239,37 +239,52 @@ def _render_ebs_unattached(recommendations: List[Rec], source_name: str, service
 
 def _render_ebs_gp2_migration(recommendations: List[Rec], source_name: str, service_data: Dict) -> str:
     """Renders gp2-to-gp3 migration recommendations for EBS. Called by: HTMLReportGenerator._get_detailed_recommendations."""
+    if not recommendations:
+        return ""
+    # Sum the per-volume EstimatedSavings strings written by the adapter.
+    total_savings = 0.0
+    for rec in recommendations:
+        savings_str = rec.get("EstimatedSavings", "")
+        if "$" in savings_str:
+            try:
+                total_savings += float(savings_str.replace("$", "").split("/")[0])
+            except (ValueError, AttributeError) as e:
+                logger.debug("Could not parse gp2 migration savings %r: %s", savings_str, e)
     content = f'<div class="rec-item{_priority_class(recommendations[0])}">'
     content += f"<h5>gp2 to gp3 Migration ({len(recommendations)} volumes)</h5>"
-    content += f"<p><strong>Recommendation:</strong> Migrate gp2 volumes to gp3 for 20% cost savings</p>"
-    content += f'<p class="savings"><strong>Estimated Savings:</strong> 20% cost reduction</p>'
+    content += "<p><strong>Recommendation:</strong> Migrate gp2 volumes to gp3 for 20% cost savings</p>"
+    content += f'<p class="savings"><strong>Estimated Savings:</strong> ${total_savings:.2f}/month</p>'
     content += "<p><strong>Volumes:</strong></p><ul>"
-
     for rec in recommendations:
         volume_id = rec.get("VolumeId", "N/A")
         size = rec.get("Size", 0)
-        content += f"<li>{volume_id}: {size} GB</li>"
-
+        per_vol = rec.get("EstimatedSavings", "")
+        if "$" in per_vol:
+            content += f"<li>{volume_id}: {size} GB — <span class=\"savings\">{per_vol}</span></li>"
+        else:
+            content += f"<li>{volume_id}: {size} GB</li>"
     content += "</ul></div>"
     return content
 
 
 def _render_ebs_enhanced_checks(recommendations: List[Rec], source_name: str, service_data: Dict) -> str:
-    """Renders EBS enhanced-check recommendations grouped by category. Called by: HTMLReportGenerator._get_detailed_recommendations."""
+    """Renders EBS enhanced-check recommendations grouped by category.
+
+    Called by: HTMLReportGenerator._get_detailed_recommendations.
+
+    ``"Unattached Volumes"`` is the only category filtered out — it has a
+    dedicated ``unattached_volumes`` source / renderer to avoid double rendering.
+    Snapshot and encrypted-volume categories are rendered here alongside other
+    enhanced checks (previously dropped, see audit finding L3-EBS-001).
+    """
     grouped_checks: Dict[str, List[Rec]] = {}
     for rec in recommendations:
         if "CheckCategory" not in rec:
             continue
-
         category = rec.get("CheckCategory", "Other")
-
-        if "snapshot" in category.lower():
-            continue
-        if "unused encrypted" in category.lower():
-            continue
+        # Unattached is rendered by _render_ebs_unattached against its own source.
         if "unattached" in category.lower():
             continue
-
         if category not in grouped_checks:
             grouped_checks[category] = []
         grouped_checks[category].append(rec)
@@ -283,7 +298,7 @@ def _render_ebs_enhanced_checks(recommendations: List[Rec], source_name: str, se
                 try:
                     total_savings += float(savings_str.replace("$", "").split("/")[0])
                 except (ValueError, AttributeError) as e:
-                    print(f"⚠️ Could not parse EBS savings '{savings_str}': {str(e)}")
+                    logger.debug("Could not parse EBS savings %r: %s", savings_str, e)
 
         content += f'<div class="rec-item{_priority_class(recs[0])}">'
         content += f"<h5>{category} ({len(recs)} volumes)</h5>"

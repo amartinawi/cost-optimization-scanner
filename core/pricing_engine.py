@@ -57,9 +57,18 @@ FALLBACK_EBS_GB_MONTH: dict[str, float] = {
     "sc1": 0.025,
 }
 FALLBACK_EBS_IOPS_MONTH: dict[str, float] = {
+    "gp3": 0.005,
     "io1": 0.065,
     "io2": 0.065,
 }
+# AWS io2 IOPS pricing is tiered (us-east-1 rates; other regions scale ~linearly):
+#   0–32,000 IOPS:        $0.065/IOPS-month
+#   32,001–64,000 IOPS:   $0.0455/IOPS-month
+#   >64,000 IOPS:         $0.032/IOPS-month
+FALLBACK_IO2_IOPS_TIER2_MONTH: float = 0.0455
+FALLBACK_IO2_IOPS_TIER3_MONTH: float = 0.032
+FALLBACK_EBS_SNAPSHOT_GB_MONTH: float = 0.05
+FALLBACK_EBS_SNAPSHOT_ARCHIVE_GB_MONTH: float = 0.0125
 FALLBACK_RDS_STORAGE_GB_MONTH: dict[str, float] = {
     "gp2": 0.115,
     "gp3": 0.115,
@@ -225,7 +234,12 @@ class PricingEngine:
         return price
 
     def get_ebs_iops_monthly_price(self, volume_type: str) -> float:
-        """$/IOPS-month for provisioned IOPS volume types (io1, io2)."""
+        """$/IOPS-month for provisioned IOPS volume types (gp3, io1, io2).
+
+        Note: io2 uses tiered pricing above 32,000 IOPS — this method returns
+        only the base tier rate. Use :meth:`get_ebs_io2_iops_cost` for volumes
+        with > 32,000 provisioned IOPS to capture the tiered discount.
+        """
         key = ("ebs_iops", volume_type)
         if (cached := self._get_cached(key)) is not None:
             return cached
@@ -234,6 +248,55 @@ class PricingEngine:
             price = self._use_fallback(
                 FALLBACK_EBS_IOPS_MONTH.get(volume_type, 0.065) * self._fallback_multiplier,
                 f"Pricing API unavailable for EBS IOPS {volume_type} in {self._region}; using fallback",
+            )
+        self._cache.set(key, price)
+        return price
+
+    def get_ebs_io2_iops_cost(self, iops: int) -> float:
+        """Total $/month for `iops` provisioned IOPS on an io2 volume.
+
+        AWS io2 tiers (us-east-1, regional multiplier applied uniformly):
+          0–32,000        IOPS @ base rate (≈ $0.065)
+          32,001–64,000   IOPS @ tier 2 rate (≈ $0.0455, 30 % discount)
+          > 64,000        IOPS @ tier 3 rate (≈ $0.032, 51 % discount)
+
+        Flat-multiply by the base rate overcounts savings on big io2 volumes.
+        """
+        if iops <= 0:
+            return 0.0
+        base_rate = self.get_ebs_iops_monthly_price("io2")
+        # Apply the same scaling factor that base_rate has relative to the
+        # us-east-1 reference so tier 2/3 rates stay region-consistent.
+        ratio = base_rate / FALLBACK_EBS_IOPS_MONTH["io2"] if FALLBACK_EBS_IOPS_MONTH["io2"] else 1.0
+        tier2_rate = FALLBACK_IO2_IOPS_TIER2_MONTH * ratio
+        tier3_rate = FALLBACK_IO2_IOPS_TIER3_MONTH * ratio
+        cost = min(iops, 32000) * base_rate
+        if iops > 32000:
+            cost += min(iops - 32000, 32000) * tier2_rate
+        if iops > 64000:
+            cost += (iops - 64000) * tier3_rate
+        return cost
+
+    def get_ebs_snapshot_price_per_gb(self, *, archive_tier: bool = False) -> float:
+        """$/GB/month for EBS Snapshots in self._region.
+
+        Args:
+            archive_tier: When True, returns the Snapshot Archive tier
+                ($0.0125/GB-Mo us-east-1, 90-day minimum retention) instead
+                of Standard ($0.05/GB-Mo us-east-1).
+        """
+        key = ("ebs_snapshot", "archive" if archive_tier else "standard")
+        if (cached := self._get_cached(key)) is not None:
+            return cached
+        price = self._fetch_ebs_snapshot_price(archive_tier=archive_tier)
+        if price is None:
+            fallback = (
+                FALLBACK_EBS_SNAPSHOT_ARCHIVE_GB_MONTH if archive_tier else FALLBACK_EBS_SNAPSHOT_GB_MONTH
+            )
+            price = self._use_fallback(
+                fallback * self._fallback_multiplier,
+                f"Pricing API unavailable for EBS Snapshot {'Archive' if archive_tier else 'Standard'}"
+                f" in {self._region}; using fallback",
             )
         self._cache.set(key, price)
         return price
@@ -513,6 +576,15 @@ class PricingEngine:
             {"Type": "TERM_MATCH", "Field": "volumeApiName", "Value": volume_type},
             {"Type": "TERM_MATCH", "Field": "location", "Value": self._display_name},
             {"Type": "TERM_MATCH", "Field": "productFamily", "Value": "System Operation"},
+        ]
+        return self._call_pricing_api("AmazonEC2", filters)
+
+    def _fetch_ebs_snapshot_price(self, *, archive_tier: bool = False) -> float | None:
+        usagetype_value = "EBS:SnapshotArchiveStorage" if archive_tier else "EBS:SnapshotUsage"
+        filters = [
+            {"Type": "TERM_MATCH", "Field": "location", "Value": self._display_name},
+            {"Type": "TERM_MATCH", "Field": "productFamily", "Value": "Storage Snapshot"},
+            {"Type": "TERM_MATCH", "Field": "usagetype", "Value": usagetype_value},
         ]
         return self._call_pricing_api("AmazonEC2", filters)
 

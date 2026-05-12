@@ -11,8 +11,12 @@ from core.pricing_engine import (
     FALLBACK_ALB_MONTH,
     FALLBACK_EBS_GB_MONTH,
     FALLBACK_EBS_IOPS_MONTH,
+    FALLBACK_EBS_SNAPSHOT_ARCHIVE_GB_MONTH,
+    FALLBACK_EBS_SNAPSHOT_GB_MONTH,
     FALLBACK_EFS_GB_MONTH,
     FALLBACK_EIP_MONTH,
+    FALLBACK_IO2_IOPS_TIER2_MONTH,
+    FALLBACK_IO2_IOPS_TIER3_MONTH,
     FALLBACK_NAT_MONTH,
     FALLBACK_RDS_BACKUP_GB_MONTH,
     FALLBACK_RDS_INSTANCE_MONTHLY,
@@ -169,6 +173,58 @@ class TestPricingEngine:
         engine.get_rds_instance_monthly_price("postgres", "db.t3.medium", multi_az=False)
         engine.get_rds_instance_monthly_price("postgres", "db.t3.medium", multi_az=True)
         assert engine._pricing.get_products.call_count == 2
+
+    def test_ebs_snapshot_standard_fallback(self):
+        engine = _make_engine(api_return=None)
+        assert engine.get_ebs_snapshot_price_per_gb() == FALLBACK_EBS_SNAPSHOT_GB_MONTH
+
+    def test_ebs_snapshot_archive_fallback(self):
+        engine = _make_engine(api_return=None)
+        archive_price = engine.get_ebs_snapshot_price_per_gb(archive_tier=True)
+        assert archive_price == FALLBACK_EBS_SNAPSHOT_ARCHIVE_GB_MONTH
+        # Archive should be cheaper than Standard.
+        assert archive_price < FALLBACK_EBS_SNAPSHOT_GB_MONTH
+
+    def test_ebs_snapshot_caches_separately_per_tier(self):
+        engine = _make_engine(api_return=0.05)
+        engine.get_ebs_snapshot_price_per_gb()
+        engine.get_ebs_snapshot_price_per_gb(archive_tier=True)
+        assert engine._pricing.get_products.call_count == 2
+
+    def test_ebs_gp3_iops_fallback(self):
+        engine = _make_engine(api_return=None)
+        assert engine.get_ebs_iops_monthly_price("gp3") == FALLBACK_EBS_IOPS_MONTH["gp3"]
+
+    def test_ebs_io2_iops_cost_single_tier(self):
+        """Below 32k IOPS, io2 cost = iops × base rate."""
+        engine = _make_engine(api_return=None)
+        cost = engine.get_ebs_io2_iops_cost(16000)
+        assert cost == pytest.approx(16000 * FALLBACK_EBS_IOPS_MONTH["io2"])
+
+    def test_ebs_io2_iops_cost_two_tiers(self):
+        """48k IOPS spans tier 1 (0-32k) and tier 2 (32k-64k)."""
+        engine = _make_engine(api_return=None)
+        cost = engine.get_ebs_io2_iops_cost(48000)
+        expected = (
+            32000 * FALLBACK_EBS_IOPS_MONTH["io2"]
+            + 16000 * FALLBACK_IO2_IOPS_TIER2_MONTH
+        )
+        assert cost == pytest.approx(expected)
+
+    def test_ebs_io2_iops_cost_three_tiers(self):
+        """80k IOPS spans all three tiers."""
+        engine = _make_engine(api_return=None)
+        cost = engine.get_ebs_io2_iops_cost(80000)
+        expected = (
+            32000 * FALLBACK_EBS_IOPS_MONTH["io2"]
+            + 32000 * FALLBACK_IO2_IOPS_TIER2_MONTH
+            + 16000 * FALLBACK_IO2_IOPS_TIER3_MONTH
+        )
+        assert cost == pytest.approx(expected)
+
+    def test_ebs_io2_iops_cost_zero_iops(self):
+        engine = _make_engine(api_return=None)
+        assert engine.get_ebs_io2_iops_cost(0) == 0.0
 
 
 class TestPricingEngineLiveOption:

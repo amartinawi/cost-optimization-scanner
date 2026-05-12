@@ -6,12 +6,51 @@ This module will later become EbsModule (T-325) implementing ServiceModule.
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from typing import Any
 
 from botocore.exceptions import ClientError  # type: ignore[import-untyped]
 
 from core.scan_context import ScanContext
+
+logger = logging.getLogger(__name__)
+
+
+def _snapshot_price_per_gb(ctx: ScanContext, pricing_multiplier: float) -> float:
+    """$/GB-month for EBS Standard Snapshots, region-correct when possible."""
+    if ctx.pricing_engine:
+        return ctx.pricing_engine.get_ebs_snapshot_price_per_gb()
+    return 0.05 * pricing_multiplier
+
+
+def _gp3_iops_price(ctx: ScanContext, pricing_multiplier: float) -> float:
+    """$/IOPS-month for gp3 provisioned IOPS, region-correct when possible."""
+    if ctx.pricing_engine:
+        return ctx.pricing_engine.get_ebs_iops_monthly_price("gp3")
+    return 0.005 * pricing_multiplier
+
+
+def _io2_iops_cost(ctx: ScanContext, iops: int, pricing_multiplier: float) -> float:
+    """Total $/month for `iops` provisioned IOPS on io2, respecting AWS tiers.
+
+    Tiers (us-east-1): $0.065 for 0–32,000, $0.0455 for 32,001–64,000,
+    $0.032 for > 64,000. Uses PricingEngine when available so the region
+    is taken into account.
+    """
+    if iops <= 0:
+        return 0.0
+    if ctx.pricing_engine:
+        return ctx.pricing_engine.get_ebs_io2_iops_cost(iops)
+    base = 0.065 * pricing_multiplier
+    tier2 = 0.0455 * pricing_multiplier
+    tier3 = 0.032 * pricing_multiplier
+    cost = min(iops, 32000) * base
+    if iops > 32000:
+        cost += min(iops - 32000, 32000) * tier2
+    if iops > 64000:
+        cost += (iops - 64000) * tier3
+    return cost
 
 EBS_OPTIMIZATION_DESCRIPTIONS: dict[str, dict[str, str]] = {
     "compute_optimizer": {
@@ -112,23 +151,24 @@ def get_ebs_volume_count(ctx: ScanContext) -> dict[str, int]:
     Returns:
         Dict with volume counts by state (attached/unattached) and type (gp2/gp3/io1/io2)
     """
-    print("🔍 [services/ebs.py] EBS module active")
+    logger.debug("EBS module active")
     ec2 = ctx.client("ec2")
+    empty: dict[str, int] = {
+        "total": 0,
+        "attached": 0,
+        "unattached": 0,
+        "gp2": 0,
+        "gp3": 0,
+        "io1": 0,
+        "io2": 0,
+    }
     try:
         paginator = ec2.get_paginator("describe_volumes")
         volumes: list[dict[str, Any]] = []
         for page in paginator.paginate():
             volumes.extend(page.get("Volumes", []))
 
-        counts: dict[str, int] = {
-            "total": len(volumes),
-            "attached": 0,
-            "unattached": 0,
-            "gp2": 0,
-            "gp3": 0,
-            "io1": 0,
-            "io2": 0,
-        }
+        counts: dict[str, int] = {**empty, "total": len(volumes)}
 
         for volume in volumes:
             # Count by attachment state
@@ -145,16 +185,20 @@ def get_ebs_volume_count(ctx: ScanContext) -> dict[str, int]:
         return counts
     except ClientError as e:
         error_code = e.response["Error"]["Code"]
-        if error_code == "UnauthorizedOperation":
-            print("Warning: Missing IAM permission for describe_volumes")
+        if error_code in ("UnauthorizedOperation", "AccessDenied"):
+            ctx.permission_issue(
+                f"describe_volumes denied: {error_code}",
+                service="ebs",
+                action="ec2:DescribeVolumes",
+            )
         elif error_code == "RequestLimitExceeded":
-            print("Warning: Rate limit exceeded for describe_volumes (retries exhausted)")
+            ctx.warn("Rate limit exceeded for describe_volumes (retries exhausted)", service="ebs")
         else:
-            print(f"Warning: Could not get EBS volume count: {e}")
-        return {"total": 0, "attached": 0, "unattached": 0, "gp2": 0, "gp3": 0, "io1": 0, "io2": 0}
+            ctx.warn(f"Could not get EBS volume count: {e}", service="ebs")
+        return empty
     except Exception as e:
-        print(f"Warning: Unexpected error getting EBS volume count: {e}")
-        return {"total": 0, "attached": 0, "unattached": 0, "gp2": 0, "gp3": 0, "io1": 0, "io2": 0}
+        ctx.warn(f"Unexpected error getting EBS volume count: {e}", service="ebs")
+        return empty
 
 
 def get_ebs_compute_optimizer_recs(
@@ -227,14 +271,21 @@ def get_unattached_volumes(
                     )
     except ClientError as e:
         error_code = e.response["Error"]["Code"]
-        if error_code == "UnauthorizedOperation":
-            print("Warning: Missing IAM permission for describe_volumes")
+        if error_code in ("UnauthorizedOperation", "AccessDenied"):
+            ctx.permission_issue(
+                f"describe_volumes (unattached scan) denied: {error_code}",
+                service="ebs",
+                action="ec2:DescribeVolumes",
+            )
         elif error_code == "RequestLimitExceeded":
-            print("Warning: Rate limit exceeded for describe_volumes (retries exhausted)")
+            ctx.warn(
+                "Rate limit exceeded for describe_volumes (unattached scan; retries exhausted)",
+                service="ebs",
+            )
         else:
-            print(f"Warning: Could not get unattached volumes: {e}")
+            ctx.warn(f"Could not get unattached volumes: {e}", service="ebs")
     except Exception as e:
-        print(f"Warning: Unexpected error getting unattached volumes: {e}")
+        ctx.warn(f"Unexpected error getting unattached volumes: {e}", service="ebs")
     return unattached
 
 
@@ -330,7 +381,10 @@ def compute_ebs_checks(
     }
 
     try:
-        # Check for gp2 volumes that can migrate to gp3
+        # Check for gp2 volumes that can migrate to gp3.
+        # Per-volume savings are filled in by the EBS adapter (it has access
+        # to the region-correct gp2/gp3 prices via PricingEngine without
+        # re-multiplying by ctx.pricing_multiplier).
         paginator = ec2.get_paginator("describe_volumes")
         for page in paginator.paginate(Filters=[{"Name": "volume-type", "Values": ["gp2"]}]):
             for volume in page.get("Volumes", []):
@@ -340,7 +394,7 @@ def compute_ebs_checks(
                         "Size": volume["Size"],
                         "CurrentType": "gp2",
                         "RecommendedType": "gp3",
-                        "EstimatedSavings": "Estimated 20% cost reduction",
+                        "EstimatedSavings": "$0.00/month - adapter computes per-volume",
                         "CheckCategory": "Volume Type Optimization",
                     }
                 )
@@ -363,7 +417,7 @@ def compute_ebs_checks(
                             "Recommendation": (
                                 f"High-IOPS volume ({iops} IOPS) - verify utilization with CloudWatch metrics"
                             ),
-                            "EstimatedSavings": ("Enable CloudWatch monitoring to validate IOPS usage"),
+                            "EstimatedSavings": "$0.00/month - enable CloudWatch monitoring to validate IOPS usage",
                             "CheckCategory": "Underutilized Volumes",
                         }
                     )
@@ -383,7 +437,7 @@ def compute_ebs_checks(
                     "Recommendation": (
                         f"Account has {snapshot_count} snapshots - consider implementing automated lifecycle management"
                     ),
-                    "EstimatedSavings": ("Automated cleanup of old snapshots can reduce storage costs"),
+                    "EstimatedSavings": "$0.00/month - quantify after enabling Data Lifecycle Manager",
                     "CheckCategory": "Snapshot Lifecycle",
                 }
             )
@@ -400,7 +454,7 @@ def compute_ebs_checks(
                 if volume_type == "gp3" and iops > 3000 + size * 30:  # gp3: 3000 baseline + reasonable ratio
                     recommended_iops = 3000 + size * 30
                     extra_iops = iops - recommended_iops
-                    savings = extra_iops * 0.005 * pricing_multiplier
+                    savings = extra_iops * _gp3_iops_price(ctx, pricing_multiplier)
                     checks["over_provisioned_iops"].append(
                         {
                             "VolumeId": volume["VolumeId"],
@@ -412,11 +466,21 @@ def compute_ebs_checks(
                     )
                 elif volume_type in ["io1", "io2"] and iops > size * 50:  # io1/io2: check for over-provisioning
                     recommended_iops = size * 30
-                    extra_iops = iops - recommended_iops
-                    savings = extra_iops * 0.065 * pricing_multiplier
+                    if volume_type == "io2":
+                        savings = _io2_iops_cost(ctx, iops, pricing_multiplier) - _io2_iops_cost(
+                            ctx, recommended_iops, pricing_multiplier
+                        )
+                    else:  # io1 — flat $0.065/IOPS-mo
+                        extra_iops = iops - recommended_iops
+                        if ctx.pricing_engine:
+                            iops_rate = ctx.pricing_engine.get_ebs_iops_monthly_price("io1")
+                        else:
+                            iops_rate = 0.065 * pricing_multiplier
+                        savings = extra_iops * iops_rate
                     checks["over_provisioned_iops"].append(
                         {
                             "VolumeId": volume["VolumeId"],
+                            "VolumeType": volume_type,
                             "CurrentIOPS": iops,
                             "RecommendedIOPS": recommended_iops,
                             "Recommendation": "Reduce provisioned IOPS based on actual usage",
@@ -425,6 +489,7 @@ def compute_ebs_checks(
                     )
 
         # Check for old snapshots (>90 days for Snapshots tab) - with pagination
+        snapshot_rate = _snapshot_price_per_gb(ctx, pricing_multiplier)
         paginator = ec2.get_paginator("describe_snapshots")
         for page in paginator.paginate(OwnerIds=["self"]):
             for snapshot in page["Snapshots"]:
@@ -441,7 +506,7 @@ def compute_ebs_checks(
                                 " (Note: Actual savings may be lower due to incremental storage)"
                             ),
                             "EstimatedSavings": (
-                                f"${snapshot['VolumeSize'] * 0.05 * pricing_multiplier:.2f}/month (max estimate)"
+                                f"${snapshot['VolumeSize'] * snapshot_rate:.2f}/month (max estimate)"
                             ),
                         }
                     )
@@ -463,7 +528,7 @@ def compute_ebs_checks(
                             ),
                             "CheckCategory": "Orphaned Snapshots",
                             "EstimatedSavings": (
-                                f"${snapshot['VolumeSize'] * 0.05 * pricing_multiplier:.2f}/month (max estimate)"
+                                f"${snapshot['VolumeSize'] * snapshot_rate:.2f}/month (max estimate)"
                             ),
                         }
                     )
@@ -491,7 +556,7 @@ def compute_ebs_checks(
                 )
 
     except Exception as e:
-        print(f"Warning: Could not perform enhanced EBS checks: {e}")
+        ctx.warn(f"Could not perform enhanced EBS checks: {e}", service="ebs")
 
     # Convert to recommendations format
     recommendations: list[dict[str, Any]] = []
