@@ -6,10 +6,73 @@ This module will later become S3Module (T-3xx) implementing ServiceModule.
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from botocore.config import Config  # type: ignore[import-untyped]
+from botocore.exceptions import (  # type: ignore[import-untyped]
+    ClientError,
+    ConnectTimeoutError,
+    EndpointConnectionError,
+    ReadTimeoutError,
+)
+
 from core.scan_context import ScanContext
+
+logger = logging.getLogger(__name__)
+
+# Per-bucket CloudWatch calls run against the bucket's *home* region. If that
+# region is suffering an outage (e.g. me-south-1 Bahrain / me-central-1 UAE),
+# the default boto retry config (10 attempts, 60s timeouts) can stall the
+# entire scan for many minutes per bucket. These shorter timeouts plus a
+# session-scoped dead-region set let us fail fast and stop hammering an
+# unreachable endpoint after the first failure.
+_BUCKET_CW_TIMEOUT_CONFIG: Config = Config(
+    connect_timeout=5,
+    read_timeout=10,
+    retries={"max_attempts": 2, "mode": "standard"},
+)
+
+_DEAD_CW_REGIONS: set[str] = set()
+
+
+def _is_endpoint_unreachable(exc: BaseException) -> bool:
+    """Return True for errors indicating the CloudWatch endpoint is unreachable."""
+    if isinstance(exc, (ConnectTimeoutError, EndpointConnectionError, ReadTimeoutError)):
+        return True
+    if isinstance(exc, ClientError):
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code in ("RequestTimeout", "EndpointConnectionError", "ServiceUnavailable"):
+            return True
+    msg = str(exc).lower()
+    return "connect timeout" in msg or "read timeout" in msg or "endpoint" in msg and "unreachable" in msg
+
+
+def _bucket_cloudwatch_client(ctx: ScanContext, bucket_region: str) -> Any | None:
+    """Return a CloudWatch client for bucket_region with tight timeouts, or None if region is known-dead."""
+    if bucket_region in _DEAD_CW_REGIONS:
+        return None
+    # Build the client directly (bypasses ClientRegistry default config) so we
+    # can apply short-timeout retries without polluting the shared retry config.
+    factory = ctx.clients._factory  # AwsSessionFactory  # noqa: SLF001
+    return factory.session().client(
+        "cloudwatch",
+        region_name=bucket_region,
+        config=_BUCKET_CW_TIMEOUT_CONFIG,
+    )
+
+
+def _mark_region_dead(ctx: ScanContext, bucket_region: str, reason: str) -> None:
+    """Cache a region as unreachable so subsequent buckets skip CloudWatch fast."""
+    if bucket_region in _DEAD_CW_REGIONS:
+        return
+    _DEAD_CW_REGIONS.add(bucket_region)
+    ctx.warn(
+        f"CloudWatch endpoint unreachable for region {bucket_region}; "
+        f"skipping S3 size metrics for all remaining buckets in this region ({reason})",
+        service="s3",
+    )
 
 S3_STORAGE_COSTS: dict[str, float] = {
     "STANDARD": 0.023,
@@ -500,7 +563,10 @@ def _estimate_s3_bucket_cost(
     bucket_region: str,
 ) -> float:
     try:
-        cloudwatch = ctx.client("cloudwatch", region=bucket_region)
+        cloudwatch = _bucket_cloudwatch_client(ctx, bucket_region)
+        if cloudwatch is None:
+            # Region marked dead earlier in the scan — fall through to size-only fallback.
+            raise ConnectTimeoutError(endpoint_url=f"monitoring.{bucket_region}.amazonaws.com")
 
         storage_classes = [
             "StandardStorage",
@@ -560,7 +626,10 @@ def _estimate_s3_bucket_cost(
                     total_cost += storage_cost
 
             except Exception as e:
-                print(f"⚠️ Error calculating S3 costs for bucket {bucket_name}: {str(e)}")
+                if _is_endpoint_unreachable(e):
+                    _mark_region_dead(ctx, bucket_region, f"S3 cost-estimate for {bucket_name}/{storage_class}")
+                    break  # Stop iterating storage classes — endpoint is gone.
+                logger.debug("Error calculating S3 costs for %s: %s", bucket_name, e)
                 continue
 
         if total_accounted_gb < size_gb * 0.1:
@@ -668,9 +737,16 @@ def get_s3_bucket_analysis(
                     print(f"⚠️ Error analyzing bucket {bucket_name}: {str(e)}")
             else:
                 try:
-                    bucket_cloudwatch_client = ctx.client("cloudwatch", region=bucket_region)
+                    bucket_cloudwatch_client = _bucket_cloudwatch_client(ctx, bucket_region)
+                    if bucket_cloudwatch_client is None:
+                        # Region already marked dead — skip CloudWatch entirely for this bucket.
+                        bucket_info["MetricsSkipped"] = (
+                            f"CloudWatch endpoint unreachable in {bucket_region}"
+                        )
+                        continue
 
                     total_size_gb = 0
+                    region_dead_mid_loop = False
                     storage_classes = [
                         "StandardStorage",
                         "StandardIAStorage",
@@ -698,8 +774,26 @@ def get_s3_bucket_analysis(
                                 class_size_gb = size_response["Datapoints"][-1]["Average"] / (1024**3)
                                 total_size_gb += class_size_gb
                         except Exception as e:
-                            print(f"⚠️ Error getting S3 metrics for {bucket_name}, class {storage_class}: {str(e)}")
+                            if _is_endpoint_unreachable(e):
+                                _mark_region_dead(
+                                    ctx,
+                                    bucket_region,
+                                    f"S3 size metric for {bucket_name}/{storage_class}",
+                                )
+                                region_dead_mid_loop = True
+                                break  # Stop iterating storage classes for this bucket.
+                            logger.debug(
+                                "Error getting S3 metrics for %s/%s: %s",
+                                bucket_name,
+                                storage_class,
+                                e,
+                            )
                             continue
+
+                    if region_dead_mid_loop:
+                        bucket_info["MetricsSkipped"] = (
+                            f"CloudWatch endpoint unreachable in {bucket_region}"
+                        )
 
                     if total_size_gb > 0:
                         bucket_info["SizeBytes"] = int(total_size_gb * (1024**3))
@@ -709,7 +803,10 @@ def get_s3_bucket_analysis(
                         )
 
                 except Exception as e:
-                    print(f"⚠️ Error calculating S3 costs for bucket {bucket_name}: {str(e)}")
+                    if _is_endpoint_unreachable(e):
+                        _mark_region_dead(ctx, bucket_region, f"S3 cost-calc for {bucket_name}")
+                    else:
+                        logger.debug("Error calculating S3 costs for bucket %s: %s", bucket_name, e)
                     continue
 
             try:
