@@ -1,0 +1,288 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-05-13T00:00:00Z",
+  "title": "Design System: AWS Cost Optimization Scanner Report",
+  "extensions": {
+    "colorMeta": {
+      "primary": {
+        "role": "primary",
+        "displayName": "Ledger Blue",
+        "canonical": "#1976d2",
+        "tonalRamp": ["#0d47a1", "#1565c0", "#1976d2", "#1e88e5", "#2196f3", "#42a5f5", "#64b5f6", "#90caf9"]
+      },
+      "primary-deep": {
+        "role": "primary",
+        "displayName": "Ledger Blue Deep",
+        "canonical": "#0d47a1",
+        "tonalRamp": ["#062c66", "#0a3d8a", "#0d47a1", "#1052b8", "#1565c0", "#1976d2", "#1e88e5", "#42a5f5"]
+      },
+      "secondary": {
+        "role": "secondary",
+        "displayName": "Audit Amber",
+        "canonical": "#ff9800",
+        "tonalRamp": ["#e65100", "#ef6c00", "#f57c00", "#fb8c00", "#ff9800", "#ffa726", "#ffb74d", "#ffcc80"]
+      },
+      "success": {
+        "role": "status-success",
+        "displayName": "Evidence Green",
+        "canonical": "#4caf50",
+        "tonalRamp": ["#1b5e20", "#2e7d32", "#388e3c", "#43a047", "#4caf50", "#66bb6a", "#81c784", "#a5d6a7"]
+      },
+      "danger": {
+        "role": "status-danger",
+        "displayName": "Breach Red",
+        "canonical": "#f44336",
+        "tonalRamp": ["#b71c1c", "#c62828", "#d32f2f", "#e53935", "#f44336", "#ef5350", "#e57373", "#ef9a9a"]
+      },
+      "info": {
+        "role": "status-info",
+        "displayName": "Signal Blue",
+        "canonical": "#2196f3",
+        "tonalRamp": ["#01579b", "#0277bd", "#0288d1", "#039be5", "#03a9f4", "#29b6f6", "#4fc3f7", "#81d4fa"]
+      },
+      "warning": {
+        "role": "status-warning",
+        "displayName": "Audit Amber",
+        "canonical": "#ff9800",
+        "tonalRamp": ["#e65100", "#ef6c00", "#f57c00", "#fb8c00", "#ff9800", "#ffa726", "#ffb74d", "#ffcc80"]
+      },
+      "surface": {
+        "role": "neutral-surface",
+        "displayName": "Paper White",
+        "canonical": "#ffffff",
+        "tonalRamp": ["#212121", "#424242", "#616161", "#757575", "#9e9e9e", "#bdbdbd", "#e0e0e0", "#ffffff"]
+      },
+      "background": {
+        "role": "neutral-background",
+        "displayName": "Vellum",
+        "canonical": "#f5f5f5",
+        "tonalRamp": ["#121212", "#1e1e1e", "#2c2c2c", "#424242", "#757575", "#bdbdbd", "#e0e0e0", "#f5f5f5"]
+      },
+      "text-primary": {
+        "role": "neutral-text",
+        "displayName": "Ink",
+        "canonical": "#212121",
+        "tonalRamp": ["#000000", "#212121", "#424242", "#616161", "#757575", "#9e9e9e", "#bdbdbd", "#e0e0e0"]
+      },
+      "text-secondary": {
+        "role": "neutral-text-muted",
+        "displayName": "Ink Muted",
+        "canonical": "#757575",
+        "tonalRamp": ["#212121", "#424242", "#616161", "#757575", "#9e9e9e", "#bdbdbd", "#e0e0e0", "#f5f5f5"]
+      },
+      "hairline": {
+        "role": "neutral-border",
+        "displayName": "Hairline",
+        "canonical": "#e0e0e0",
+        "tonalRamp": ["#212121", "#424242", "#616161", "#9e9e9e", "#bdbdbd", "#e0e0e0", "#eeeeee", "#f5f5f5"]
+      }
+    },
+    "typographyMeta": {
+      "display": { "displayName": "Display", "purpose": "Hero report title. One per document." },
+      "headline": { "displayName": "Headline", "purpose": "Service-section titles. One per service tab." },
+      "metric": { "displayName": "Metric", "purpose": "Executive summary numerics. Weight 400, never bold." },
+      "title": { "displayName": "Title", "purpose": "Recommendation card titles and section titles inside tabs." },
+      "body": { "displayName": "Body", "purpose": "Recommendation paragraphs and prose. Cap line length 65–75ch." },
+      "label": { "displayName": "Label", "purpose": "Card subtitles, tab buttons, table headers. Uppercase + tracked." },
+      "micro-label": { "displayName": "Micro Label", "purpose": "Badges, tab-count chips." },
+      "mono": { "displayName": "Mono", "purpose": "AWS resource IDs, metric names, code spans." }
+    },
+    "shadows": [
+      {
+        "name": "shadow-1",
+        "value": "0 1px 3px rgba(0,0,0,0.12), 0 1px 2px rgba(0,0,0,0.24)",
+        "purpose": "Legacy. Currently on .rec-item and .recommendations-table. Target state: removed; replaced by 1px Hairline border."
+      },
+      {
+        "name": "shadow-2",
+        "value": "0 3px 6px rgba(0,0,0,0.16), 0 3px 6px rgba(0,0,0,0.23)",
+        "purpose": "Legacy. Currently on summary cards and tabs container. Target state: kept on floating pill buttons (theme-toggle, export) only."
+      },
+      {
+        "name": "shadow-3",
+        "value": "0 10px 20px rgba(0,0,0,0.19), 0 6px 6px rgba(0,0,0,0.23)",
+        "purpose": "Hover-elevation theatre. Target state: removed from hover states; permitted on back-to-top FAB only."
+      },
+      {
+        "name": "shadow-4",
+        "value": "0 14px 28px rgba(0,0,0,0.25), 0 10px 10px rgba(0,0,0,0.22)",
+        "purpose": "Deep hover elevation. Banned in target state."
+      },
+      {
+        "name": "shadow-5",
+        "value": "0 19px 38px rgba(0,0,0,0.30), 0 15px 12px rgba(0,0,0,0.22)",
+        "purpose": "Unused at rest. Banned in target state."
+      }
+    ],
+    "motion": [
+      {
+        "name": "ease-material",
+        "value": "cubic-bezier(0.4, 0, 0.2, 1)",
+        "purpose": "Default Material easing on the current code. Target state: replace with exponential-out (cubic-bezier(0.16, 1, 0.3, 1)) on new animations per impeccable laws."
+      },
+      {
+        "name": "duration-fast",
+        "value": "0.15s",
+        "purpose": "Row hover, link color shifts."
+      },
+      {
+        "name": "duration-base",
+        "value": "0.2s",
+        "purpose": "Theme-toggle, export pill state."
+      },
+      {
+        "name": "duration-emphasized",
+        "value": "0.3s",
+        "purpose": "Card hover, tab fade-in, summary stripe scale."
+      }
+    ],
+    "breakpoints": [
+      { "name": "mobile", "value": "600px" },
+      { "name": "tablet", "value": "768px" },
+      { "name": "desktop", "value": "960px" }
+    ]
+  },
+  "components": [
+    {
+      "name": "Summary Card (Executive Metric)",
+      "kind": "card",
+      "refersTo": "card-summary",
+      "description": "Top-of-page executive metric card. Used in the four-card grid for total recommendations, monthly savings, services scanned, annual savings.",
+      "html": "<div class=\"ds-summary-card\" role=\"status\" aria-label=\"Estimated Monthly Savings: $4,127.50\">\n  <h3 class=\"ds-summary-card__label\">Estimated Monthly Savings</h3>\n  <div class=\"ds-summary-card__value\">$4,127.50</div>\n  <div class=\"ds-summary-card__subtitle\">Backed by CloudWatch + Pricing API</div>\n</div>",
+      "css": ".ds-summary-card { background: #ffffff; padding: 24px; border-radius: 8px; box-shadow: 0 3px 6px rgba(0,0,0,0.16), 0 3px 6px rgba(0,0,0,0.23); transition: box-shadow 0.3s cubic-bezier(0.4,0,0.2,1), transform 0.3s cubic-bezier(0.4,0,0.2,1); position: relative; overflow: hidden; font-family: Roboto, 'Segoe UI', sans-serif; color: #212121; will-change: transform; } .ds-summary-card::before { content: ''; position: absolute; top: 0; left: 0; width: 4px; height: 100%; background: #1976d2; transform: scaleY(0); transition: transform 0.3s cubic-bezier(0.4,0,0.2,1); } .ds-summary-card:hover { box-shadow: 0 14px 28px rgba(0,0,0,0.25), 0 10px 10px rgba(0,0,0,0.22); transform: translateY(-4px); } .ds-summary-card:hover::before { transform: scaleY(1); } .ds-summary-card__label { font-size: 0.875rem; font-weight: 500; margin: 0 0 12px 0; text-transform: uppercase; letter-spacing: 1px; color: #757575; } .ds-summary-card__value { font-size: 2.5rem; font-weight: 400; color: #212121; line-height: 1; font-variant-numeric: tabular-nums; letter-spacing: -0.01em; } .ds-summary-card__subtitle { font-size: 0.875rem; color: #757575; margin-top: 8px; }"
+    },
+    {
+      "name": "Stat Card (Per-Service Rollup)",
+      "kind": "card",
+      "refersTo": "card-stat",
+      "description": "Smaller rollup card used inside service tabs (Old Snapshots, Potential Monthly Savings, etc.).",
+      "html": "<div class=\"ds-stat-card ds-stat-card--savings\">\n  <h4 class=\"ds-stat-card__label\">Potential Monthly Savings</h4>\n  <div class=\"ds-stat-card__value\">$1,284.00</div>\n</div>",
+      "css": ".ds-stat-card { background: #f5f5f5; padding: 16px; border-radius: 8px; text-align: center; border: 1px solid #e0e0e0; transition: background 0.3s cubic-bezier(0.4,0,0.2,1), box-shadow 0.3s cubic-bezier(0.4,0,0.2,1), transform 0.3s cubic-bezier(0.4,0,0.2,1); font-family: Roboto, sans-serif; } .ds-stat-card:hover { background: #ffffff; box-shadow: 0 1px 3px rgba(0,0,0,0.12), 0 1px 2px rgba(0,0,0,0.24); transform: translateY(-2px); } .ds-stat-card__label { font-size: 0.8125rem; color: #757575; margin: 0 0 8px 0; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 500; } .ds-stat-card__value { font-size: 1.75rem; font-weight: 400; color: #212121; font-variant-numeric: tabular-nums; } .ds-stat-card--savings { background: rgba(76, 175, 80, 0.1); border: 1px solid rgba(76, 175, 80, 0.3); } .ds-stat-card--savings .ds-stat-card__value { color: #4caf50; }"
+    },
+    {
+      "name": "Tab Button (Active)",
+      "kind": "nav",
+      "refersTo": "button-tab-active",
+      "description": "Active service tab. Inactive variants drop the underline scale and use Ink Muted text.",
+      "html": "<button class=\"ds-tab-button ds-tab-button--active\" role=\"tab\" aria-selected=\"true\">\n  EC2<span class=\"ds-tab-count\">14</span>\n</button>",
+      "css": ".ds-tab-button { flex: 0 0 auto; min-width: 160px; padding: 16px 24px; background: transparent; border: none; cursor: pointer; font-weight: 500; font-size: 0.875rem; transition: all 0.3s cubic-bezier(0.4,0,0.2,1); color: #757575; text-align: center; text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 2px solid transparent; position: relative; font-family: Roboto, sans-serif; } .ds-tab-button::after { content: ''; position: absolute; bottom: 0; left: 0; right: 0; height: 2px; background: #1976d2; transform: scaleX(0); transition: transform 0.3s cubic-bezier(0.4,0,0.2,1); } .ds-tab-button:hover { background: rgba(128,128,128,0.08); color: #212121; } .ds-tab-button--active { color: #1976d2; font-weight: 600; } .ds-tab-button--active::after { transform: scaleX(1); } .ds-tab-button:focus-visible { outline: 2px solid #1976d2; outline-offset: 2px; } .ds-tab-count { display: inline-flex; align-items: center; justify-content: center; min-width: 18px; height: 18px; padding: 0 5px; margin-left: 6px; font-size: 0.65rem; font-weight: 600; border-radius: 9px; background: #f5f5f5; color: #757575; line-height: 1; vertical-align: middle; font-variant-numeric: tabular-nums; }"
+    },
+    {
+      "name": "Recommendation Card (High Priority — current banned baseline)",
+      "kind": "card",
+      "refersTo": "card-rec-high",
+      "description": "Recommendation card with left-stripe priority indicator. The 4px colored left-stripe is the absolute-banned pattern per impeccable laws — documented here as current state, slated for replacement with a leading priority badge.",
+      "html": "<article class=\"ds-rec-item ds-rec-item--high\">\n  <h5 class=\"ds-rec-item__title\">Rightsize 3 over-provisioned RDS instances</h5>\n  <p class=\"ds-rec-item__body\"><strong>Source:</strong> CloudWatch CPUUtilization (14-day p95 &lt; 8%), Pricing API us-east-1.</p>\n  <p class=\"ds-rec-item__body\">Three <code>db.r6g.2xlarge</code> instances have sustained low utilization. Downsize to <code>db.r6g.large</code> after Multi-AZ failover.</p>\n  <span class=\"ds-rec-item__savings\">$612/month</span>\n</article>",
+      "css": ".ds-rec-item { background: #ffffff; border-radius: 8px; padding: 24px; margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.12), 0 1px 2px rgba(0,0,0,0.24); transition: all 0.3s cubic-bezier(0.4,0,0.2,1); border-left: 4px solid #1976d2; font-family: Roboto, sans-serif; color: #212121; } .ds-rec-item:hover { box-shadow: 0 10px 20px rgba(0,0,0,0.19), 0 6px 6px rgba(0,0,0,0.23); transform: translateX(4px); } .ds-rec-item--high { border-left-color: #f44336; } .ds-rec-item--medium { border-left-color: #ff9800; } .ds-rec-item--low { border-left-color: #4caf50; } .ds-rec-item__title { font-size: 1.125rem; font-weight: 500; color: #212121; margin: 0 0 12px 0; } .ds-rec-item__body { margin: 0 0 12px 0; color: #757575; line-height: 1.7; font-size: 1rem; } .ds-rec-item__body strong { color: #212121; font-weight: 500; } .ds-rec-item__body code { background: #f5f5f5; padding: 2px 8px; border-radius: 4px; font-family: 'Roboto Mono', 'SF Mono', Consolas, monospace; font-size: 0.875rem; color: #1976d2; } .ds-rec-item__savings { color: #4caf50; font-weight: 700; background: rgba(76, 175, 80, 0.1); padding: 8px 16px; border-radius: 4px; display: inline-block; margin: 8px 0 0 0; font-size: 1.125rem; font-variant-numeric: tabular-nums; letter-spacing: -0.01em; }"
+    },
+    {
+      "name": "Badge (Status Chip)",
+      "kind": "chip",
+      "refersTo": "chip-badge-success",
+      "description": "Inline pill chip with semantic foreground/background pair. Success variant shown; warning, danger, info use the same shape with their tonal pairs.",
+      "html": "<span class=\"ds-badge ds-badge--success\">Savings Verified</span> <span class=\"ds-badge ds-badge--warning\">Estimate</span> <span class=\"ds-badge ds-badge--danger\">High Priority</span> <span class=\"ds-badge ds-badge--info\">Compute Optimizer</span>",
+      "css": ".ds-badge { display: inline-flex; align-items: center; padding: 4px 12px; font-size: 0.75rem; font-weight: 500; text-align: center; white-space: nowrap; border-radius: 16px; text-transform: uppercase; letter-spacing: 0.5px; font-family: Roboto, sans-serif; margin-right: 6px; } .ds-badge--success { color: #1b5e20; background-color: #e8f5e9; } .ds-badge--warning { color: #e65100; background-color: #fff3e0; } .ds-badge--danger { color: #b71c1c; background-color: #ffebee; } .ds-badge--info { color: #01579b; background-color: #e1f5fe; }"
+    },
+    {
+      "name": "Info Box (Pricing Note — current banned baseline)",
+      "kind": "custom",
+      "refersTo": "info-box",
+      "description": "Pricing note / info callout with semantic-tinted background. The 4px colored left-stripe is the absolute-banned pattern, documented as current state; target uses a full 1px Hairline border in the semantic hue + leading icon instead.",
+      "html": "<div class=\"ds-info-box\">\n  <svg class=\"ds-info-box__icon\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><line x1=\"12\" y1=\"1\" x2=\"12\" y2=\"23\"/><path d=\"M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6\"/></svg>\n  <div>\n    <p>Savings estimates based on AWS Pricing API data for <strong>us-east-1</strong>. Some services use regional pricing estimates.</p>\n  </div>\n</div>",
+      "css": ".ds-info-box { background: rgba(33, 150, 243, 0.1); padding: 16px; border-radius: 8px; border-left: 4px solid #2196f3; margin: 16px 0; color: #212121; font-family: Roboto, sans-serif; display: flex; align-items: flex-start; gap: 12px; line-height: 1.6; } .ds-info-box__icon { width: 20px; height: 20px; color: #2196f3; flex-shrink: 0; margin-top: 2px; } .ds-info-box p { margin: 0; font-size: 0.9rem; } .ds-info-box strong { color: #212121; font-weight: 500; }"
+    },
+    {
+      "name": "Recommendations Table",
+      "kind": "custom",
+      "refersTo": "table-rec",
+      "description": "Standard recommendations table with uppercase-tracked headers and Hairline row separators.",
+      "html": "<table class=\"ds-rec-table\">\n  <thead><tr><th>Resource</th><th>Check</th><th>Severity</th><th class=\"ds-rec-table__num\">Monthly Savings</th></tr></thead>\n  <tbody>\n    <tr><td><code>i-0abc123def4</code></td><td>Idle EC2 (14-day p95 CPU &lt; 2%)</td><td><span class=\"ds-badge ds-badge--danger\">High</span></td><td class=\"ds-rec-table__num\">$284.40</td></tr>\n    <tr><td><code>vol-09bcd45ef6</code></td><td>Unattached EBS gp2</td><td><span class=\"ds-badge ds-badge--warning\">Medium</span></td><td class=\"ds-rec-table__num\">$48.20</td></tr>\n    <tr><td><code>snap-aabbccdd0</code></td><td>Snapshot &gt; 2y, source AMI deregistered</td><td><span class=\"ds-badge ds-badge--info\">Low</span></td><td class=\"ds-rec-table__num\">$11.05</td></tr>\n  </tbody>\n</table>",
+      "css": ".ds-rec-table { width: 100%; border-collapse: collapse; margin: 16px 0; background: #ffffff; border-radius: 8px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.12), 0 1px 2px rgba(0,0,0,0.24); font-family: Roboto, sans-serif; font-size: 0.875rem; color: #212121; } .ds-rec-table th { background: #f5f5f5; padding: 16px; text-align: left; font-weight: 500; font-size: 0.875rem; color: #757575; text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 1px solid #e0e0e0; } .ds-rec-table td { padding: 16px; border-bottom: 1px solid #e0e0e0; vertical-align: top; color: #212121; } .ds-rec-table tr:hover td { background-color: rgba(25, 118, 210, 0.06); transition: background-color 0.15s ease; } .ds-rec-table tr:last-child td { border-bottom: none; } .ds-rec-table code { background: #f5f5f5; padding: 2px 8px; border-radius: 4px; font-family: 'Roboto Mono', monospace; font-size: 0.875rem; color: #1976d2; } .ds-rec-table__num { text-align: right; font-variant-numeric: tabular-nums; } .ds-badge { display: inline-flex; align-items: center; padding: 4px 12px; font-size: 0.75rem; font-weight: 500; white-space: nowrap; border-radius: 16px; text-transform: uppercase; letter-spacing: 0.5px; } .ds-badge--danger { color: #b71c1c; background-color: #ffebee; } .ds-badge--warning { color: #e65100; background-color: #fff3e0; } .ds-badge--info { color: #01579b; background-color: #e1f5fe; }"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Audit Trail",
+    "overview": "The report is an evidence chain in document form. Every number on the page should be traceable back to a CloudWatch metric, a Pricing API call, or a Cost Hub recommendation; every visual element on the page should support that chain rather than ornament it. The reader is a senior practitioner — a FinOps engineer, a cloud architect defending a proposal, an SRE auditing a recommendation before acting — who needs to verify the report's claims as quickly as they accept them. The system serves that act of verification.\n\nThis DESIGN.md documents the live visual baseline in html_report_generator.py as it ships today: a Material Design v1 vocabulary (Roboto, blue/orange/red semantics, five-step elevation shadow scale, gradient hero header, left-stripe priority cards). That baseline predates PRODUCT.md and is being navigated away from. The Named Rules and Do's and Don'ts carry the strategic direction forward — restrained palette, hairline-led depth, color used only as a status channel — so any future variant generated against this spec drifts toward the audit-grade target rather than reinforcing the SaaS-dashboard baseline.\n\nThe system explicitly rejects three lanes: cluttered analytics dashboards (Datadog at its worst), reflexive AI-startup styling (purple gradients, glassmorphism, gradient text), and enterprise PowerPoint heaviness. It also rejects its own current Material-cliché surface where that surface contradicts the audit voice.",
+    "keyCharacteristics": [
+      "One document, three reading depths (executive scan, FinOps audit, DevOps drill-down) — hierarchy, not separate templates.",
+      "Numbers are typographically first-class; everything else supports them.",
+      "Status is encoded in label + position + color, never color alone. Print and colorblind reads are equal to color-screen reads.",
+      "Flat by default. Depth comes from hairlines and tonal background steps; shadows are reserved for genuinely floating chrome.",
+      "The Material baseline is documented honestly here; the rules pull it toward the target."
+    ],
+    "rules": [
+      {
+        "name": "The Status-Channel Rule",
+        "body": "Color in this system is reserved for status (severity, savings, anomaly, info). Color is forbidden as section dressing, decorative accent, or category-coding. If a colored element does not encode status, recolor it Ink or remove the color.",
+        "section": "colors"
+      },
+      {
+        "name": "The Three-Channel Rule",
+        "body": "Every status signal must be expressed through at least three of: typographic weight, an explicit label word (HIGH, Savings, Recommended), a position cue (left-stripe, badge corner, priority sort order), and color. Color alone is forbidden. This survives colorblind reads and black-and-white prints.",
+        "section": "colors"
+      },
+      {
+        "name": "The No-Decorative-Gradient Rule",
+        "body": "Gradients are forbidden everywhere except the legacy hero header, which is on the redesign list. No gradient text, no gradient buttons, no gradient backgrounds on cards.",
+        "section": "colors"
+      },
+      {
+        "name": "The Numbers-First Rule",
+        "body": "Numeric figures use weight 400, never 700. Bold numerics in a financial document read as advertising; weight 400 at the assigned size reads as a stated fact. The exception is .rec-item .savings (700), which is a callout-within-prose, not a headline number.",
+        "section": "typography"
+      },
+      {
+        "name": "The Tabular Figures Rule",
+        "body": "Any element rendering aligned numerics (tables, decimal columns, the executive summary grid) must specify font-variant-numeric: tabular-nums so digits don't shift width between rows. Roboto supports it; replacements must too.",
+        "section": "typography"
+      },
+      {
+        "name": "The Uppercase-Means-Label Rule",
+        "body": "Uppercase text is reserved for labels, badges, and tab buttons. Body prose and headlines stay in their natural case. Uppercase headings are forbidden.",
+        "section": "typography"
+      },
+      {
+        "name": "The Flat-By-Default Rule",
+        "body": "Surfaces are flat at rest unless they actually float over scrolling content. A card sitting in document flow is not floating and does not earn a shadow. Hairline + tonal step is the depth tool.",
+        "section": "elevation"
+      },
+      {
+        "name": "The No-Hover-Elevation Rule",
+        "body": "Hover is not a moment to inflate elevation. The current translateY(-4px) + shadow-4 hover on summary cards is the SaaS-dashboard tic the redesign moves away from. New components: hover changes border color, background tonality, or text weight only.",
+        "section": "elevation"
+      },
+      {
+        "name": "The Floating-Chrome Exception",
+        "body": "Shadows are permitted on elements that genuinely overlap content during scroll: the theme-toggle pill, the export pill, the back-to-top FAB, and modal scrims. Maximum shadow-3.",
+        "section": "elevation"
+      }
+    ],
+    "dos": [
+      "Do treat color as a status channel. If a colored element does not encode status (severity, savings, anomaly, info), recolor it Ink or remove it. The Status-Channel Rule.",
+      "Do express every status signal through at least three of: typographic weight, an explicit label word, a position cue, and color. Never color alone. The Three-Channel Rule.",
+      "Do keep surfaces flat at rest. Use 1px Hairline and tonal background steps for depth. The Flat-By-Default Rule.",
+      "Do show provenance on every recommendation: CloudWatch metric reference, Pricing API source, Cost Hub trace. The audit chain is the product.",
+      "Do apply font-variant-numeric: tabular-nums on every element rendering aligned figures (tables, the executive summary, decimal columns).",
+      "Do test every status color in deuteranopia and protanopia simulation before introducing it. The Three-Channel Rule must survive both.",
+      "Do verify print output and screen output are equivalent in information density before shipping a new section. The print stylesheet is a first-class output, not a fallback.",
+      "Do keep one Display element per page and one Headline per service tab. Hierarchy collapses when these multiply."
+    ],
+    "donts": [
+      "Don't use border-left (or border-right) greater than 1px as a colored stripe on cards, recommendation items, info boxes, or callouts. This is the absolute-banned pattern. The current .rec-item.high-priority { border-left-color: var(--danger) } treatment is on the redesign list — do not propagate it to new components. Use full Hairline borders, leading badges, or sort order instead.",
+      "Don't introduce gradient text (background-clip: text). The current report has no gradient text; keep it that way. The No-Decorative-Gradient Rule.",
+      "Don't add new gradient backgrounds. The legacy hero header is grandfathered and on the redesign list. New gradients are forbidden everywhere — cards, buttons, sections, charts, badges.",
+      "Don't add glassmorphism (backdrop-filter: blur(...)) to new components. The legacy header-info-item chips use it; do not extend the pattern.",
+      "Don't use bold weight (700) on metric figures. Numbers in this report use weight 400. Bold numerics read as advertising. The Numbers-First Rule.",
+      "Don't rely on color alone to communicate severity, savings, success, or anomaly. The colorblind read and the black-and-white print must be equivalent to the color screen read.",
+      "Don't look like a cluttered analytics dashboard. Every badge needs a reason. Every status color needs a label. The stated primary anti-reference.",
+      "Don't look like a generic Material Design SaaS dashboard. The current report has a Material baseline that is being navigated away from — gradient header, equal-weight summary card grid, left-stripe priority cards, Material 5-step elevation scale. The redesign target is the Audit Trail, not Material 2014.",
+      "Don't look like AI-tool slop: purple/pink gradients, glassmorphism cards, neon-on-dark, hero-metric templates with gradient text. Reflexive 2025 AI-startup styling is explicitly out of scope.",
+      "Don't look like corporate enterprise PowerPoint: stock photos, navy + light-blue + orange palette, 'Executive Dashboard 2024' template energy.",
+      "Don't inflate hover states with elevation theatre (translateY + shadow upgrade). Hover changes border or background tone only. The No-Hover-Elevation Rule.",
+      "Don't introduce a serif anywhere except the existing print stylesheet. The serif swap is a deliberate, scoped move; replicating it on screen breaks the system.",
+      "Don't use uppercase headlines or section titles. Uppercase is reserved for labels, badges, and tab buttons. The Uppercase-Means-Label Rule.",
+      "Don't add a card grid of identical-looking cards (icon + heading + paragraph repeated four times). The executive summary is the system's only repeating card grid and it earns it through differentiated metrics.",
+      "Don't use the hero-metric template (big gradient number + small label + supporting stats + accent). The executive summary already implements the restrained version; do not push it toward marketing-page energy."
+    ]
+  }
+}

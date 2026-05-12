@@ -565,6 +565,15 @@ class HTMLReportGenerator:
             --shadow-4: 0 14px 28px rgba(0,0,0,0.25), 0 10px 10px rgba(0,0,0,0.22);
             --shadow-5: 0 19px 38px rgba(0,0,0,0.30), 0 15px 12px rgba(0,0,0,0.22);
             --hover-bg: rgba(25, 118, 210, 0.06);
+            --badge-success-fg: #1b5e20;
+            --badge-success-bg: #e8f5e9;
+            --badge-warning-fg: #e65100;
+            --badge-warning-bg: #fff3e0;
+            --badge-danger-fg: #b71c1c;
+            --badge-danger-bg: #ffebee;
+            --badge-info-fg: #01579b;
+            --badge-info-bg: #e1f5fe;
+            --ease-out-quart: cubic-bezier(0.16, 1, 0.3, 1);
         }
         
         [data-theme="dark"] {
@@ -588,6 +597,14 @@ class HTMLReportGenerator:
             --shadow-4: 0 14px 28px rgba(0,0,0,0.6), 0 10px 10px rgba(0,0,0,0.7);
             --shadow-5: 0 19px 38px rgba(0,0,0,0.7), 0 15px 12px rgba(0,0,0,0.8);
             --hover-bg: rgba(66, 165, 245, 0.12);
+            --badge-success-fg: #81c784;
+            --badge-success-bg: rgba(76, 175, 80, 0.2);
+            --badge-warning-fg: #ffcc80;
+            --badge-warning-bg: rgba(255, 152, 0, 0.2);
+            --badge-danger-fg: #ef9a9a;
+            --badge-danger-bg: rgba(244, 67, 54, 0.2);
+            --badge-info-fg: #64b5f6;
+            --badge-info-bg: rgba(33, 150, 243, 0.2);
         }
         
         [data-theme="dark"] .success {
@@ -613,71 +630,55 @@ class HTMLReportGenerator:
             padding: 24px;
         }
         
-        /* Material Header */
-        .header { 
-            background: linear-gradient(135deg, var(--primary-dark) 0%, var(--primary) 100%);
-            color: white; 
-            padding: 48px 32px; 
+        /* Header — Audit Trail flat treatment */
+        .header {
+            background: var(--surface);
+            color: var(--text-primary);
+            padding: 48px 32px;
             border-radius: 8px;
             margin-bottom: 24px;
-            box-shadow: var(--shadow-3);
+            border: 1px solid var(--divider);
             position: relative;
             overflow: hidden;
         }
-        
-        .header::before {
-            content: '';
-            position: absolute;
-            top: -50%;
-            right: -10%;
-            width: clamp(300px, 50vw, 500px);
-            height: clamp(300px, 50vw, 500px);
-            background: radial-gradient(circle, rgba(255,255,255,0.1) 0%, transparent 70%);
-            border-radius: 50%;
-        }
-        
-        .header h1 { 
-            font-size: 2.75rem;
+
+        .header h1 {
+            font-size: clamp(1.75rem, 4vw, 2.75rem);
             font-weight: 400;
             margin-bottom: 8px;
-            position: relative;
-            z-index: 1;
             letter-spacing: -0.5px;
+            color: var(--text-primary);
         }
-        
-        .header .subtitle { 
+
+        .header .subtitle {
             font-size: 1.25rem;
-            opacity: 0.9;
             font-weight: 300;
-            position: relative;
-            z-index: 1;
+            color: var(--text-secondary);
         }
-        
-        .header-info { 
-            display: grid; 
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); 
-            gap: 16px; 
+
+        .header-info {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 16px;
             margin-top: 32px;
-            position: relative;
-            z-index: 1;
         }
-        
+
         .header-info-item {
-            background: rgba(255,255,255,0.15);
+            background: var(--background);
             padding: 16px;
             border-radius: 8px;
-            backdrop-filter: blur(10px);
-            border: 1px solid rgba(255,255,255,0.2);
+            border: 1px solid var(--divider);
+            color: var(--text-primary);
         }
-        
+
         .header-info-item strong {
             display: block;
-            font-size: 0.875rem;
-            opacity: 0.8;
+            font-size: 0.75rem;
+            color: var(--text-secondary);
             margin-bottom: 4px;
             text-transform: uppercase;
             letter-spacing: 0.5px;
-            font-weight: 500;
+            font-weight: 600;
         }
         
         /* Material Summary Cards */
@@ -695,38 +696,16 @@ class HTMLReportGenerator:
             background: var(--surface);
             padding: 24px;
             border-radius: 8px;
-            box-shadow: var(--shadow-2);
-            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            border: 1px solid var(--divider);
+            transition: border-color 0.2s var(--ease-out-quart);
             position: relative;
-            overflow: hidden;
-            will-change: transform;
         }
-        
-        .summary-card:hover {
-            box-shadow: var(--shadow-4);
-            transform: translateY(-4px);
-            z-index: 1;
-        }
-        
-        .summary-card::before {
-            content: '';
-            position: absolute;
-            top: 0;
-            left: 0;
-            width: 4px;
-            height: 100%;
-            background: var(--primary);
-            transform: scaleY(0);
-            transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-        }
-        
-        .summary-card:hover { box-shadow: var(--shadow-4); transform: translateY(-4px); z-index: 1; }
 
-        .summary-card:hover::before {
-            transform: scaleY(1);
+        .summary-card:hover {
+            border-color: var(--primary);
         }
-        
-        .summary-card h3 { 
+
+        .summary-card h3 {
             font-size: 0.875rem;
             font-weight: 500;
             margin-bottom: 12px;
@@ -734,14 +713,16 @@ class HTMLReportGenerator:
             letter-spacing: 1px;
             color: var(--text-secondary);
         }
-        
-        .summary-card .value { 
+
+        .summary-card .value {
             font-size: 2.5rem;
             font-weight: 400;
             color: var(--text-primary);
             line-height: 1;
+            font-variant-numeric: tabular-nums;
+            letter-spacing: -0.01em;
         }
-        
+
         .summary-card .subtitle {
             font-size: 0.875rem;
             color: var(--text-secondary);
@@ -774,7 +755,7 @@ class HTMLReportGenerator:
         }
         
         .tab-buttons::-webkit-scrollbar-thumb {
-            background: var(--primary);
+            background: var(--text-secondary);
             border-radius: 4px;
         }
         
@@ -810,7 +791,7 @@ class HTMLReportGenerator:
             cursor: pointer;
             font-weight: 500;
             font-size: 0.875rem;
-            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            transition: all 0.3s var(--ease-out-quart);
             color: var(--text-secondary);
             text-align: center;
             text-transform: uppercase;
@@ -828,7 +809,7 @@ class HTMLReportGenerator:
             height: 2px;
             background: var(--primary);
             transform: scaleX(0);
-            transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            transition: transform 0.3s var(--ease-out-quart);
         }
         
         .tab-button:hover {
@@ -849,7 +830,7 @@ class HTMLReportGenerator:
             display: none;
             padding: 32px;
             min-height: 300px;
-            animation: fadeIn 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            animation: fadeIn 0.3s var(--ease-out-quart);
         }
         
         .tab-content.active { 
@@ -887,16 +868,15 @@ class HTMLReportGenerator:
             padding: 16px;
             border-radius: 8px;
             text-align: center;
-            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            transition: background-color 0.2s var(--ease-out-quart), border-color 0.2s var(--ease-out-quart);
             border: 1px solid var(--divider);
         }
-        
+
         .stat-card:hover {
             background: var(--surface);
-            box-shadow: var(--shadow-1);
-            transform: translateY(-2px);
+            border-color: var(--text-secondary);
         }
-        
+
         .stat-card h4 {
             font-size: 0.8125rem;
             color: var(--text-secondary);
@@ -905,11 +885,12 @@ class HTMLReportGenerator:
             letter-spacing: 0.5px;
             font-weight: 500;
         }
-        
+
         .stat-card .value {
             font-size: 1.75rem;
             font-weight: 400;
             color: var(--text-primary);
+            font-variant-numeric: tabular-nums;
         }
         
         /* Value status colors */
@@ -979,28 +960,57 @@ class HTMLReportGenerator:
             border-radius: 8px;
             padding: 24px;
             margin-bottom: 16px;
-            box-shadow: var(--shadow-1);
-            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-            border-left: 4px solid var(--primary);
+            border: 1px solid var(--divider);
+            transition: border-color 0.2s var(--ease-out-quart);
+            position: relative;
         }
-        
+
         .rec-item:hover {
-            box-shadow: var(--shadow-3);
-            transform: translateX(4px);
+            border-color: var(--text-secondary);
         }
-        
-        .rec-item.high-priority {
-            border-left-color: var(--danger);
+
+        .rec-item.high-priority { border-color: var(--danger); }
+        .rec-item.medium-priority { border-color: var(--warning); }
+        .rec-item.low-priority { border-color: var(--success); }
+
+        .rec-item.high-priority:hover,
+        .rec-item.medium-priority:hover,
+        .rec-item.low-priority:hover {
+            filter: brightness(0.98);
         }
-        
-        .rec-item.medium-priority {
-            border-left-color: var(--warning);
+
+        .rec-item.high-priority::before,
+        .rec-item.medium-priority::before,
+        .rec-item.low-priority::before {
+            display: inline-block;
+            font-size: 0.7rem;
+            font-weight: 600;
+            letter-spacing: 0.5px;
+            text-transform: uppercase;
+            padding: 3px 10px;
+            border-radius: 16px;
+            margin-bottom: 12px;
+            font-variant-numeric: tabular-nums;
         }
-        
-        .rec-item.low-priority {
-            border-left-color: var(--success);
+
+        .rec-item.high-priority::before {
+            content: "High priority";
+            color: var(--badge-danger-fg);
+            background: var(--badge-danger-bg);
         }
-        
+
+        .rec-item.medium-priority::before {
+            content: "Medium priority";
+            color: var(--badge-warning-fg);
+            background: var(--badge-warning-bg);
+        }
+
+        .rec-item.low-priority::before {
+            content: "Low priority";
+            color: var(--badge-success-fg);
+            background: var(--badge-success-bg);
+        }
+
         .rec-item h5 {
             font-size: 1.125rem;
             font-weight: 500;
@@ -1019,7 +1029,7 @@ class HTMLReportGenerator:
             font-weight: 500;
         }
         
-        .rec-item .savings { 
+        .rec-item .savings {
             color: var(--success);
             font-weight: 700;
             background: rgba(76, 175, 80, 0.1);
@@ -1029,6 +1039,7 @@ class HTMLReportGenerator:
             margin: 8px 0;
             font-size: 1.125rem;
             letter-spacing: -0.01em;
+            font-variant-numeric: tabular-nums;
         }
         
         /* Recommendation Detail Tables (Cost Hub, Anomaly, etc.) */
@@ -1055,6 +1066,7 @@ class HTMLReportGenerator:
             border-bottom: 1px solid var(--border);
             color: var(--text-primary);
             vertical-align: top;
+            font-variant-numeric: tabular-nums;
         }
         .rec-table tr:last-child td {
             border-bottom: none;
@@ -1081,45 +1093,28 @@ class HTMLReportGenerator:
         }
         
         .badge-warning {
-            color: #e65100;
-            background-color: #fff3e0;
+            color: var(--badge-warning-fg);
+            background-color: var(--badge-warning-bg);
         }
-        
+
         .badge-info {
-            color: #01579b;
-            background-color: #e1f5fe;
+            color: var(--badge-info-fg);
+            background-color: var(--badge-info-bg);
         }
-        
+
         .source-badge {
             display: inline-block;
             margin: 8px 0;
         }
-        
+
         .badge-success {
-            color: #1b5e20;
-            background-color: #e8f5e9;
+            color: var(--badge-success-fg);
+            background-color: var(--badge-success-bg);
         }
-        
+
         .badge-danger {
-            color: #b71c1c;
-            background-color: #ffebee;
-        }
-        
-        [data-theme="dark"] .badge-warning {
-            color: #ffcc80;
-            background-color: rgba(255, 152, 0, 0.2);
-        }
-        [data-theme="dark"] .badge-info {
-            color: #64b5f6;
-            background-color: rgba(33, 150, 243, 0.2);
-        }
-        [data-theme="dark"] .badge-success {
-            color: #81c784;
-            background-color: rgba(76, 175, 80, 0.2);
-        }
-        [data-theme="dark"] .badge-danger {
-            color: #ef9a9a;
-            background-color: rgba(244, 67, 54, 0.2);
+            color: var(--badge-danger-fg);
+            background-color: var(--badge-danger-bg);
         }
         
         /* Material Tables */
@@ -1153,6 +1148,7 @@ class HTMLReportGenerator:
             border-bottom: 1px solid var(--divider);
             vertical-align: top;
             color: var(--text-primary);
+            font-variant-numeric: tabular-nums;
         }
         
         .recommendations-table tr:hover,
@@ -1175,31 +1171,31 @@ class HTMLReportGenerator:
             color: var(--primary);
         }
         
-        /* Material Success/Info Boxes */
+        /* Status callouts — full thin borders, no side-stripes */
         .success {
             color: var(--success);
             font-weight: 500;
             background: rgba(76, 175, 80, 0.1);
             padding: 16px;
             border-radius: 8px;
-            border-left: 4px solid var(--success);
+            border: 1px solid var(--success);
             margin: 16px 0;
         }
-        
+
         .info-box {
             background: rgba(33, 150, 243, 0.1);
             padding: 16px;
             border-radius: 8px;
-            border-left: 4px solid var(--info);
+            border: 1px solid var(--info);
             margin: 16px 0;
             color: var(--text-primary);
         }
-        
+
         .info-note, .pricing-note {
             background: rgba(33, 150, 243, 0.1);
-            border-left: 4px solid var(--info);
-            padding: 10px 15px;
-            margin: 10px 0;
+            border: 1px solid var(--info);
+            padding: 12px 16px;
+            margin: 16px 0;
             border-radius: 4px;
             font-size: 0.9em;
             color: var(--text-primary);
@@ -1207,12 +1203,12 @@ class HTMLReportGenerator:
         .info-note p, .pricing-note p {
             margin: 4px 0;
         }
-        
+
         .warning-box {
             background: rgba(255, 152, 0, 0.1);
             padding: 16px;
             border-radius: 8px;
-            border-left: 4px solid var(--warning);
+            border: 1px solid var(--warning);
             margin: 16px 0;
             color: var(--text-primary);
         }
@@ -1227,21 +1223,21 @@ class HTMLReportGenerator:
         }
         
         .top-buckets-table h4 {
-            background: var(--primary);
-            color: white;
+            background: var(--background);
+            color: var(--text-primary);
             padding: 20px 24px;
             margin: 0;
             font-size: 1.125rem;
             font-weight: 500;
+            border-bottom: 1px solid var(--divider);
         }
-        
+
         .affected-resources {
             margin: 24px 0;
             padding: 24px;
             background: var(--surface);
             border-radius: 8px;
-            border-left: 4px solid var(--primary);
-            box-shadow: var(--shadow-1);
+            border: 1px solid var(--divider);
         }
         
         .resource-group {
@@ -1282,7 +1278,7 @@ class HTMLReportGenerator:
             text-decoration: none;
             font-weight: 500;
             cursor: pointer;
-            transition: color 0.2s cubic-bezier(0.4, 0.0, 0.2, 1);
+            transition: color 0.2s var(--ease-out-quart);
         }
         
         .show-more-link:hover {
@@ -1314,7 +1310,7 @@ class HTMLReportGenerator:
             padding: 16px 24px;
             border-radius: 8px;
             margin-bottom: 24px;
-            border-left: 4px solid var(--warning);
+            border: 1px solid var(--warning);
             font-size: 1rem;
             color: var(--text-primary);
         }
@@ -1328,13 +1324,12 @@ class HTMLReportGenerator:
             padding: 16px;
             margin: 12px 0;
             border-radius: 8px;
-            border-left: 4px solid var(--success);
-            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            border: 1px solid var(--success);
+            transition: background-color 0.2s var(--ease-out-quart);
         }
-        
+
         .opportunity:hover {
-            transform: translateX(4px);
-            box-shadow: var(--shadow-1);
+            background: rgba(76, 175, 80, 0.15);
         }
         
         /* Material Footer */
@@ -1437,8 +1432,7 @@ class HTMLReportGenerator:
         }
 
         .theme-toggle:hover {
-            box-shadow: var(--shadow-3);
-            transform: translateY(-1px);
+            border-color: var(--text-secondary);
         }
         
         .icon {
@@ -1488,8 +1482,7 @@ class HTMLReportGenerator:
             visibility: visible;
         }
         .back-to-top:hover {
-            transform: translateY(-2px);
-            box-shadow: var(--shadow-4);
+            background: var(--primary-dark);
         }
 
         /* Export Button */
@@ -1512,8 +1505,7 @@ class HTMLReportGenerator:
             color: var(--text-primary);
         }
         .export-btn:hover {
-            box-shadow: var(--shadow-3);
-            transform: translateY(-1px);
+            border-color: var(--text-secondary);
         }
         .export-btn:focus-visible {
             outline: 2px solid var(--primary);
@@ -1550,7 +1542,6 @@ class HTMLReportGenerator:
             .theme-toggle { display: none; }
             .export-btn { display: none; }
             .back-to-top { display: none; }
-            .header::before { display: none; }
             .tab-content { display: block !important; page-break-inside: avoid; }
             .rec-item { page-break-inside: avoid; }
             canvas { max-width: 100%; page-break-inside: avoid; }
