@@ -166,7 +166,7 @@ class CostAnomalyModule(BaseServiceModule):
             start = end - timedelta(days=30)
 
             resp = ce.get_anomalies(
-                DateRange={"StartDate": start.isoformat(), "EndDate": end.isoformat()},
+                DateInterval={"StartDate": start.isoformat(), "EndDate": end.isoformat()},
                 TotalImpact={"NumericOperator": "GREATER_THAN", "StartValue": 0},
             )
 
