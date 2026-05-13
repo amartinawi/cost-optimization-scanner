@@ -32,47 +32,53 @@ colors:
   badge-info-bg: "#e1f5fe"
 typography:
   display:
-    fontFamily: "Roboto, 'Segoe UI', -apple-system, BlinkMacSystemFont, sans-serif"
+    fontFamily: "Newsreader, 'Iowan Old Style', Georgia, 'Times New Roman', serif"
     fontSize: "clamp(1.75rem, 4vw, 2.75rem)"
     fontWeight: 400
     lineHeight: 1.1
-    letterSpacing: "-0.5px"
+    letterSpacing: "-0.005em"
   headline:
-    fontFamily: "Roboto, sans-serif"
+    fontFamily: "Newsreader, Georgia, serif"
     fontSize: "2rem"
     fontWeight: 400
     lineHeight: 1.2
-    letterSpacing: "-0.5px"
+    letterSpacing: "-0.005em"
+  summary-headline:
+    fontFamily: "Newsreader, Georgia, serif"
+    fontSize: "clamp(1.125rem, 2vw, 1.375rem)"
+    fontWeight: 400
+    fontStyle: "italic"
+    lineHeight: 1.55
   metric:
-    fontFamily: "Roboto, sans-serif"
+    fontFamily: "'IBM Plex Sans', sans-serif"
     fontSize: "2.5rem"
     fontWeight: 400
     lineHeight: 1
     letterSpacing: "-0.01em"
   title:
-    fontFamily: "Roboto, sans-serif"
+    fontFamily: "'IBM Plex Sans', sans-serif"
     fontSize: "1.125rem"
     fontWeight: 500
     lineHeight: 1.4
   body:
-    fontFamily: "Roboto, sans-serif"
+    fontFamily: "'IBM Plex Sans', sans-serif"
     fontSize: "1rem"
     fontWeight: 400
     lineHeight: 1.6
   label:
-    fontFamily: "Roboto, sans-serif"
+    fontFamily: "'IBM Plex Sans', sans-serif"
     fontSize: "0.875rem"
     fontWeight: 500
     lineHeight: 1.4
     letterSpacing: "0.5px"
   micro-label:
-    fontFamily: "Roboto, sans-serif"
+    fontFamily: "'IBM Plex Sans', sans-serif"
     fontSize: "0.75rem"
     fontWeight: 600
     lineHeight: 1.2
     letterSpacing: "0.5px"
   mono:
-    fontFamily: "'Roboto Mono', 'SF Mono', Consolas, monospace"
+    fontFamily: "'IBM Plex Mono', 'SF Mono', Consolas, monospace"
     fontSize: "0.875rem"
     fontWeight: 400
     lineHeight: 1.5
@@ -165,7 +171,7 @@ components:
 
 The report is an evidence chain in document form. Every number on the page should be traceable back to a CloudWatch metric, a Pricing API call, or a Cost Hub recommendation; every visual element on the page should support that chain rather than ornament it. The reader is a senior practitioner — a FinOps engineer, a cloud architect defending a proposal, an SRE auditing a recommendation before acting — who needs to verify the report's claims as quickly as they accept them. The system serves that act of verification.
 
-This DESIGN.md documents the live visual baseline in `html_report_generator.py` as it ships today: a Material Design v1 vocabulary (Roboto, blue/orange/red semantics, five-step elevation shadow scale, gradient hero header, left-stripe priority cards). That baseline predates `PRODUCT.md` and is being navigated away from. The Named Rules and Do's and Don'ts below carry the strategic direction forward — restrained palette, hairline-led depth, color used only as a status channel — so any future variant generated against this spec drifts toward the audit-grade target rather than reinforcing the SaaS-dashboard baseline.
+This DESIGN.md documents the live visual baseline in `html_report_generator.py` as it ships today. The system has migrated off its original Material Design v1 vocabulary: the gradient hero header, the side-stripe priority cards, the glassmorphism info chips, the Roboto + Roboto Mono pairing, the hover-elevation theatre, and the Material 5-step shadow scale all retired across the polish, trust-and-a11y, and shape passes (commits `50c6b2f`, `c766165`, `0adffec`, `65feb65`). The current surface is **Newsreader + IBM Plex Sans + IBM Plex Mono** on a flat, hairline-led, status-color-only Material-derived palette, with an editorial executive sentence, a savings-sorted sticky jump-nav rail, and source-confidence rendered as a typographic prefix on every recommendation title. The Named Rules and Do's and Don'ts below are the standing guardrails: any future variant generated against this spec stays in the audit-grade lane and resists drift back to the SaaS-dashboard baseline.
 
 The system explicitly rejects three lanes: cluttered analytics dashboards (Datadog at its worst), reflexive AI-startup styling (purple gradients, glassmorphism, gradient text), and enterprise PowerPoint heaviness. It also rejects its own current Material-cliché surface where that surface contradicts the audit voice.
 
@@ -230,10 +236,11 @@ Soft chips for inline labels, not the heavy semantic colors. Each is a foregroun
 
 ## 3. Typography
 
-**Display & Body:** Roboto (300 / 400 / 500 / 700), with fallbacks to Segoe UI, -apple-system, BlinkMacSystemFont, sans-serif. Loaded via Google Fonts CDN.
-**Mono:** Roboto Mono (400 / 500), with fallbacks to SF Mono, Consolas, monospace. Used for AWS resource identifiers, CloudWatch metric names, and code spans inside tables.
+**Display:** **Newsreader** (Production Type, 300 / 400 / 500 / 600 with optical-sizing), serving the report title, every service-section title, and the executive summary sentence. Fallbacks: Iowan Old Style, Georgia, Times New Roman. Newsreader is a contemporary editorial serif designed for the New York Times prototypes; its tabular figures, generous x-height, and italic carry the "Stripe Atlas / FT Lex / Pitchbook tearsheet" warmth without the obvious Garamond / Playfair reflex.
+**Body & labels:** **IBM Plex Sans** (300 / 400 / 500 / 600 / 700), serving body copy, tab buttons, chips, table cells, every UI label. Fallbacks: Segoe UI, -apple-system, BlinkMacSystemFont, sans-serif. Plex was designed for IBM's brand voice ("trust + intelligence"), is audit-credible, and is the deliberate non-Inter / non-Roboto choice. Both Plex and Newsreader load from Google Fonts CDN.
+**Mono:** **IBM Plex Mono** (400 / 500 / 600). Used for AWS resource identifiers, CloudWatch metric names, ARNs, and code spans inside tables. Matches Plex Sans's underlying skeleton.
 
-**Character:** Roboto is the most-saturated UI typeface there is. It is recognizably Material and recognizably 2014. Future variants may swap it (Inter, IBM Plex Sans, or a neutral grotesque) without changing the hierarchy below. The hierarchy is the doctrine; the family is replaceable.
+**Character:** A serif-display + sans-body pairing in the editorial-financial lane. Newsreader on the headline + executive sentence carries the premium-paper signal; Plex Sans on body copy and chrome reads as "designed for trust" without veering into ornament. The pairing reads as "Stripe Atlas summary" / "FT Lex column" / "Pitchbook tearsheet," explicitly not "navy-and-gold private bank" and explicitly not "Material 2014." The hierarchy is the doctrine; if either family is swapped later, a serif-display + sans-body pairing in the same lane (e.g., Söhne + Tiempos for paid foundries, or Crimson Pro + Inter as a last-resort free pairing) is what the substitute must achieve.
 
 ### Hierarchy
 
@@ -251,7 +258,7 @@ Soft chips for inline labels, not the heavy semantic colors. Each is a foregroun
 
 **The Numbers-First Rule.** Numeric figures use weight 400, never 700. Bold numerics in a financial document read as advertising; weight 400 at the assigned size reads as a stated fact. The exception is `.rec-item .savings` (700), which is a callout-within-prose, not a headline number.
 
-**The Tabular Figures Rule.** Any element rendering aligned numerics (tables, decimal columns, the executive summary grid) must specify `font-variant-numeric: tabular-nums` so digits don't shift width between rows. Roboto supports it; replacements must too.
+**The Tabular Figures Rule.** Any element rendering aligned numerics (tables, decimal columns, the executive summary sentence's dollar amounts) must specify `font-variant-numeric: tabular-nums` so digits don't shift width between rows. Both Newsreader and IBM Plex Sans / Plex Mono ship with first-class tabular figures; any replacement face must too.
 
 **The Uppercase-Means-Label Rule.** Uppercase text is reserved for labels, badges, and tab buttons. Body prose and headlines stay in their natural case. Uppercase headings are forbidden.
 
@@ -344,7 +351,7 @@ A `@media print` stylesheet ships in `html_report_generator.py`:
 - All tab content reveals (`display: block !important`), with `page-break-inside: avoid` on `.rec-item`, `.recommendations-table`, and `canvas`.
 - `prefers-reduced-motion: reduce` cancels all transitions and animations.
 
-This is the only place in the system where the Roboto-to-Georgia swap is permitted. Do not introduce a serif anywhere else.
+The print path continues to swap to Georgia as the body face (the existing carve-out predates the type-system overhaul). Newsreader display headlines remain in print since Newsreader is itself a serif.
 
 ## 6. Do's and Don'ts
 

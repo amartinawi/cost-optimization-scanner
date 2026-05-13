@@ -517,7 +517,9 @@ class HTMLReportGenerator:
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>AWS Cost Optimization Report - {self.scan_results["region"]}</title>
-    <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&family=Roboto+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Newsreader:opsz,wght@6..72,300;6..72,400;6..72,500;6..72,600&family=IBM+Plex+Sans:wght@300;400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     {self._get_css()}
 </head>
@@ -632,14 +634,35 @@ class HTMLReportGenerator:
             background: rgba(76, 175, 80, 0.15);
         }
         
-        body { 
-            font-family: 'Roboto', 'Segoe UI', -apple-system, BlinkMacSystemFont, sans-serif;
-            line-height: 1.6; 
+        body {
+            font-family: 'IBM Plex Sans', 'Segoe UI', -apple-system, BlinkMacSystemFont, sans-serif;
+            line-height: 1.6;
             color: var(--text-primary);
             background: var(--background);
             min-height: 100vh;
             -webkit-font-smoothing: antialiased;
             -moz-osx-font-smoothing: grayscale;
+            font-feature-settings: "ss01", "cv05";
+        }
+
+        /* Display family: Newsreader, the editorial serif. Used on the report
+           title, service-section titles, and the executive summary sentence.
+           PRODUCT.md: Stripe Atlas / FT Lex / Pitchbook tearsheet feel. */
+        .header h1,
+        .service-title,
+        .summary-headline,
+        .empty-state h3 {
+            font-family: 'Newsreader', 'Iowan Old Style', Georgia, 'Times New Roman', serif;
+            font-optical-sizing: auto;
+            letter-spacing: -0.005em;
+        }
+        .summary-headline {
+            font-style: italic;
+            font-weight: 400;
+        }
+        .summary-headline strong {
+            font-style: normal;
+            font-weight: 600;
         }
         
         .container { 
@@ -1129,7 +1152,7 @@ class HTMLReportGenerator:
            typesetting itself rather than as a separate chip. PRODUCT.md:
            "the audit chain is the product." */
         .source-section[data-source] .rec-item > h4::before {
-            font-family: 'Roboto Mono', 'SF Mono', Consolas, monospace;
+            font-family: 'IBM Plex Mono', 'SF Mono', Consolas, monospace;
             font-weight: 600;
             font-size: 0.75em;
             letter-spacing: 0.5px;
@@ -1306,7 +1329,7 @@ class HTMLReportGenerator:
             background: var(--background);
             padding: 2px 8px;
             border-radius: 4px;
-            font-family: 'Roboto Mono', 'Courier New', monospace;
+            font-family: 'IBM Plex Mono', 'Courier New', monospace;
             font-size: 0.875rem;
             color: var(--primary);
         }
@@ -3505,7 +3528,7 @@ class HTMLReportGenerator:
             const textColor = isDark ? '#ffffff' : '#212121';
             const gridColor = isDark ? '#333333' : '#e0e0e0';
             
-            Chart.defaults.font.family = "'Roboto', -apple-system, BlinkMacSystemFont, sans-serif";
+            Chart.defaults.font.family = "'IBM Plex Sans', -apple-system, BlinkMacSystemFont, sans-serif";
             
             // AWS Theme Colors
             const awsColors = Array.from({{length: Math.max(chartData.length, 10)}}, (_, i) => 
@@ -3549,8 +3572,8 @@ class HTMLReportGenerator:
                                 }}
                             }},
                             tooltip: {{
-                                titleFont: {{ family: "'Roboto', sans-serif" }},
-                                bodyFont: {{ family: "'Roboto', sans-serif" }},
+                                titleFont: {{ family: "'IBM Plex Sans', sans-serif" }},
+                                bodyFont: {{ family: "'IBM Plex Sans', sans-serif" }},
                                 titleColor: textColor,
                                 bodyColor: textColor,
                                 backgroundColor: isDark ? '#333333' : '#ffffff',
@@ -3599,8 +3622,8 @@ class HTMLReportGenerator:
                                 display: false
                             }},
                             tooltip: {{
-                                titleFont: {{ family: "'Roboto', sans-serif" }},
-                                bodyFont: {{ family: "'Roboto', sans-serif" }},
+                                titleFont: {{ family: "'IBM Plex Sans', sans-serif" }},
+                                bodyFont: {{ family: "'IBM Plex Sans', sans-serif" }},
                                 titleColor: textColor,
                                 bodyColor: textColor,
                                 backgroundColor: isDark ? '#333333' : '#ffffff',
