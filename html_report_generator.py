@@ -650,19 +650,12 @@ class HTMLReportGenerator:
            PRODUCT.md: Stripe Atlas / FT Lex / Pitchbook tearsheet feel. */
         .header h1,
         .service-title,
-        .summary-headline,
+        .summary-figure__amount,
+        .summary-figure__caption,
         .empty-state h3 {
             font-family: 'Newsreader', 'Iowan Old Style', Georgia, 'Times New Roman', serif;
             font-optical-sizing: auto;
             letter-spacing: -0.005em;
-        }
-        .summary-headline {
-            font-style: italic;
-            font-weight: 400;
-        }
-        .summary-headline strong {
-            font-style: normal;
-            font-weight: 600;
         }
         
         .container { 
@@ -722,23 +715,122 @@ class HTMLReportGenerator:
             font-weight: 600;
         }
         
-        /* Material Summary Cards */
+        /* Executive Summary — structured as figure + caption + facts row.
+           The dollar amount is the visual anchor; three labeled facts beneath
+           carry annual, top services, and open risks. PRODUCT.md: numbers
+           are first-class, narrative supports them. */
         .summary {
-            margin-bottom: 24px;
+            margin-bottom: 32px;
         }
 
-        .summary-headline {
-            font-size: clamp(1.125rem, 2vw, 1.375rem);
-            font-weight: 400;
-            line-height: 1.55;
+        .summary-figure {
+            display: flex;
+            align-items: baseline;
+            flex-wrap: wrap;
+            gap: 12px;
+            margin: 0 0 4px 0;
             color: var(--text-primary);
-            margin: 0 0 16px 0;
-            max-width: 75ch;
             font-variant-numeric: tabular-nums;
+            line-height: 1;
         }
-        .summary-headline strong {
+        .summary-figure__amount {
+            font-size: clamp(2rem, 5vw, 3.25rem);
+            font-weight: 400;
+            letter-spacing: -0.02em;
+        }
+        .summary-figure__period {
+            font-family: 'IBM Plex Sans', sans-serif;
+            font-style: normal;
+            font-size: clamp(0.875rem, 1.2vw, 1rem);
+            font-weight: 500;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            color: var(--text-secondary);
+        }
+        .summary-figure__caption {
+            font-family: 'Newsreader', Georgia, serif;
+            font-style: italic;
+            font-size: 1rem;
+            color: var(--text-secondary);
+            margin: 0 0 24px 0;
+        }
+
+        .summary-facts {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 0;
+            margin: 0;
+            padding: 0;
+            border-top: 1px solid var(--divider);
+            border-bottom: 1px solid var(--divider);
+        }
+        .summary-fact {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+            padding: 16px 20px;
+            border-left: 1px solid var(--divider);
+        }
+        .summary-fact:first-child {
+            border-left: none;
+            padding-left: 0;
+        }
+        .summary-fact dt {
+            font-family: 'IBM Plex Sans', sans-serif;
+            font-size: 0.6875rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            color: var(--text-secondary);
+            margin: 0;
+        }
+        .summary-fact dd {
+            font-family: 'IBM Plex Sans', sans-serif;
+            font-size: 1.0625rem;
+            font-weight: 500;
+            color: var(--text-primary);
+            margin: 0;
+            font-variant-numeric: tabular-nums;
+            line-height: 1.3;
+        }
+        .summary-fact__qual {
+            display: block;
+            font-size: 0.8125rem;
+            font-weight: 400;
+            color: var(--text-secondary);
+            margin-top: 2px;
+        }
+        .summary-fact__qual strong {
             font-weight: 600;
             color: var(--text-primary);
+        }
+
+        .risk-tag {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 3px 10px;
+            border-radius: 12px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            font-variant-numeric: tabular-nums;
+        }
+        .risk-tag strong { font-weight: 700; }
+        .risk-tag--high {
+            color: var(--badge-danger-fg);
+            background: var(--badge-danger-bg);
+        }
+        .risk-tag--info {
+            color: var(--badge-info-fg);
+            background: var(--badge-info-bg);
+        }
+
+        @media (max-width: 768px) {
+            .summary-facts { grid-template-columns: 1fr; }
+            .summary-fact { border-left: none; border-top: 1px solid var(--divider); padding: 12px 0; }
+            .summary-fact:first-child { padding-top: 16px; }
         }
 
         .visually-hidden {
@@ -1772,18 +1864,62 @@ class HTMLReportGenerator:
             margin-bottom: 16px;
             font-size: 0.875rem;
         }
+        /* Hover-edge auto-hide. Rail rests as a 6px sliver against the
+           viewport edge so it does not occupy content space; hovering it
+           (or keyboard-focusing any link inside) slides it back into view.
+           transform is composited, not a layout property, per the motion
+           rules in DESIGN.md / impeccable. */
         @media (min-width: 1400px) {
             .jump-nav {
                 display: block;
                 position: fixed;
                 top: 100px;
-                left: max(16px, calc(50% - 720px - 240px));
+                left: 0;
                 width: 220px;
                 max-height: calc(100vh - 140px);
                 overflow-y: auto;
                 z-index: 40;
                 margin-bottom: 0;
+                transform: translateX(-214px);
+                transition: transform 0.32s var(--ease-out-quart),
+                            box-shadow 0.2s var(--ease-out-quart);
+                border-radius: 0 8px 8px 0;
+                border-left: none;
             }
+            .jump-nav::after {
+                /* Vertical handle on the exposed sliver. Hints there is
+                   something to summon without putting chrome on the page. */
+                content: "";
+                position: absolute;
+                right: 1px;
+                top: 50%;
+                transform: translateY(-50%);
+                width: 3px;
+                height: 32px;
+                border-radius: 3px;
+                background: var(--text-secondary);
+                opacity: 0.35;
+                transition: opacity 0.2s var(--ease-out-quart);
+                pointer-events: none;
+            }
+            .jump-nav:hover,
+            .jump-nav:focus-within {
+                transform: translateX(0);
+                box-shadow: 0 12px 32px rgba(0,0,0,0.08);
+            }
+            .jump-nav:hover::after,
+            .jump-nav:focus-within::after {
+                opacity: 0;
+            }
+        }
+        @media (min-width: 1400px) and (prefers-reduced-motion: reduce) {
+            /* Honor reduced-motion: keep rail fully visible at rest rather
+               than relying on a slide-in animation to summon it. */
+            .jump-nav {
+                transform: translateX(0);
+                box-shadow: 0 12px 32px rgba(0,0,0,0.08);
+            }
+            .jump-nav::after { display: none; }
         }
         .jump-nav__heading {
             text-transform: uppercase;
@@ -2076,12 +2212,10 @@ class HTMLReportGenerator:
     def _get_summary(self) -> str:
         """Render the Audit Trail executive summary.
 
-        One sentence carries the headline (defensible monthly savings, annual
-        figure, top two services by savings with their share of total, risk
-        signal count). The reconciliation footnote stays below, surfacing the
-        dedup math when the per-service sum diverges from the headline. No
-        four-card grid: the cards were template furniture, the sentence is
-        the audit voice.
+        Structured form: a single defensible-monthly figure as the visual
+        anchor, plus three labeled facts (Annual / Top services / Open risks)
+        beneath it. The reconciliation footnote stays below, surfacing the
+        dedup math when the per-service sum diverges from the headline.
         """
         summary = self.scan_results.get("summary", {})
         total_savings = float(summary.get("total_monthly_savings", 0) or 0)
@@ -2110,40 +2244,57 @@ class HTMLReportGenerator:
         high_count = risk_counts["high"]
         anomaly_count = risk_counts["anomalies"]
 
-        # Compose the sentence.
-        sentence_parts: List[str] = [
-            f'This account can defensibly save <strong>${total_savings:,.2f}/month</strong>'
-            f' (<strong>${total_savings * 12:,.0f}/year</strong>).'
-        ]
+        # Top services value: "Cost Optimization Hub, RDS (83%)" or single name.
         if len(top_two) >= 2 and top_share > 0:
-            sentence_parts.append(
-                f'<strong>{html.escape(top_two[0][0])}</strong> (${top_two[0][1]:,.0f}) and '
-                f'<strong>{html.escape(top_two[1][0])}</strong> (${top_two[1][1]:,.0f}) '
-                f'hold <strong>{top_share * 100:.0f}%</strong> of that.'
+            top_services_value = (
+                f'{html.escape(top_two[0][0])}, {html.escape(top_two[1][0])} '
+                f'<span class="summary-fact__qual">'
+                f'<strong>{top_share * 100:.0f}%</strong> of total</span>'
             )
         elif len(top_two) == 1:
-            sentence_parts.append(
-                f'<strong>{html.escape(top_two[0][0])}</strong> (${top_two[0][1]:,.0f}) '
-                f'is the largest opportunity.'
+            top_services_value = (
+                f'{html.escape(top_two[0][0])} '
+                f'<span class="summary-fact__qual">largest opportunity</span>'
             )
+        else:
+            top_services_value = '<span class="summary-fact__qual">no defensible savings located</span>'
 
+        # Open risks value: prefer HIGH severity, fall back to active anomalies.
         if high_count > 0:
-            severity_word = "risk is" if high_count == 1 else "risks are"
-            sentence_parts.append(
-                f'<strong>{high_count}</strong> HIGH-severity {severity_word} open.'
+            risks_value = (
+                f'<span class="risk-tag risk-tag--high"><strong>{high_count}</strong> HIGH</span>'
             )
         elif anomaly_count > 0:
-            anomaly_word = "anomaly is" if anomaly_count == 1 else "anomalies are"
-            sentence_parts.append(
-                f'<strong>{anomaly_count}</strong> active cost {anomaly_word} flagged.'
+            anomaly_noun = "anomaly" if anomaly_count == 1 else "anomalies"
+            risks_value = (
+                f'<span class="risk-tag risk-tag--info"><strong>{anomaly_count}</strong> '
+                f'active cost {anomaly_noun}</span>'
             )
-
-        sentence = " ".join(sentence_parts)
+        else:
+            risks_value = '<span class="summary-fact__qual">none open</span>'
 
         out = (
             '<section class="summary" aria-labelledby="summary-heading">'
             '<h2 id="summary-heading" class="visually-hidden">Executive Summary</h2>'
-            f'<p class="summary-headline">{sentence}</p>'
+            '<div class="summary-figure">'
+            f'<span class="summary-figure__amount">${total_savings:,.2f}</span>'
+            '<span class="summary-figure__period">per month</span>'
+            '</div>'
+            '<p class="summary-figure__caption">defensibly recoverable</p>'
+            '<dl class="summary-facts">'
+            '<div class="summary-fact">'
+            '<dt>Annual</dt>'
+            f'<dd>${total_savings * 12:,.0f}</dd>'
+            '</div>'
+            '<div class="summary-fact">'
+            '<dt>Top services</dt>'
+            f'<dd>{top_services_value}</dd>'
+            '</div>'
+            '<div class="summary-fact">'
+            '<dt>Open risks</dt>'
+            f'<dd>{risks_value}</dd>'
+            '</div>'
+            '</dl>'
         )
 
         # Reconciliation footnote: only when per-service sum diverges from the
