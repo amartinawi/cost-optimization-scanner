@@ -450,71 +450,125 @@ class CommitmentAnalysisModule(BaseServiceModule):
 
         return recs
 
+    # Reservation / Savings Plans purchase recommendations fan out across
+    # the full (term, payment) matrix so the operator can compare scenarios
+    # rather than relying on a single AWS-default combination. Each call is
+    # independent: if any combination is denied (SCP) or throttles, the
+    # others continue. The Cost Explorer API is rate-limited; the matrix
+    # is small (12 calls per scan) and cached server-side.
+    _SP_TERMS: tuple[tuple[str, str], ...] = (("ONE_YEAR", "1yr"), ("THREE_YEARS", "3yr"))
+    _SP_PAYMENTS: tuple[tuple[str, str], ...] = (
+        ("NO_UPFRONT", "No Upfront"),
+        ("PARTIAL_UPFRONT", "Partial Upfront"),
+        ("ALL_UPFRONT", "All Upfront"),
+    )
+    _SP_TYPES: tuple[str, ...] = ("COMPUTE_SP",)
+    _RI_SERVICES: tuple[str, ...] = ("Amazon EC2",)
+
     def _fetch_sp_recommendations(self, ce: Any) -> list[dict[str, Any]]:
-        """Fetch Compute Savings Plans purchase recommendations.
+        """Fetch Compute Savings Plans purchase recommendations across the
+        full (term, payment) matrix.
+
+        Six calls per SavingsPlansType: 2 terms times 3 payment options.
+        Each rec carries explicit term and payment metadata so the renderer
+        can surface them on the rec-item title.
 
         Args:
             ce: Cost Explorer boto3 client.
 
         Returns:
-            List of SP purchase recommendation dicts.
+            List of SP purchase recommendation dicts, one per matching
+            (sp_type, term, payment) cell that returned a non-empty result.
         """
         recs: list[dict[str, Any]] = []
 
-        for sp_type in ("COMPUTE_SP",):
-            try:
-                resp = ce.get_savings_plans_purchase_recommendation(
-                    SavingsPlansType=sp_type,
-                    TermInYears="ONE_YEAR",
-                    PaymentOption="NO_UPFRONT",
-                    LookbackPeriodInDays="THIRTY_DAYS",
-                )
-                for rec in resp.get("SavingsPlansPurchaseRecommendation", []):
-                    savings_detail = rec.get("SavingsPlansPurchaseRecommendationSummary", {})
-                    monthly_savings = float(savings_detail.get("EstimatedMonthlySavings", "0"))
-
-                    hourly_commit = float(savings_detail.get("HourlyCommitment", "0"))
-                    upfront = float(savings_detail.get("EstimatedUpfrontCost", "0"))
-
-                    recs.append(
-                        {
-                            "resource_id": f"{sp_type}_1yr_no_upfront",
-                            "check_type": "purchase",
-                            "check_category": "SP Purchase Recommendation",
-                            "current_value": f"${hourly_commit:.4f}/hr commitment",
-                            "recommended_value": f"${hourly_commit:.4f}/hr Compute SP (1yr, No Upfront)",
-                            "monthly_savings": round(monthly_savings, 2),
-                            "severity": "LOW",
-                            "reason": f"Estimated ${monthly_savings:.2f}/mo savings with ${hourly_commit:.4f}/hr commitment",
-                            "upfront_cost": upfront,
-                        }
-                    )
-
-                for rec_detail in resp.get("SavingsPlansPurchaseRecommendationDetail", []):
-                    monthly_savings = float(rec_detail.get("EstimatedMonthlySavings", "0"))
-                    hourly_commit = float(rec_detail.get("HourlyCommitment", "0"))
-                    if hourly_commit <= 0 and monthly_savings <= 0:
+        for sp_type in self._SP_TYPES:
+            for term_api, term_label in self._SP_TERMS:
+                for payment_api, payment_label in self._SP_PAYMENTS:
+                    scenario = f"({term_label}, {payment_label})"
+                    try:
+                        resp = ce.get_savings_plans_purchase_recommendation(
+                            SavingsPlansType=sp_type,
+                            TermInYears=term_api,
+                            PaymentOption=payment_api,
+                            LookbackPeriodInDays="THIRTY_DAYS",
+                        )
+                    except Exception as e:
+                        print(f"Warning: SP purchase recommendation failed for {sp_type} {scenario}: {e}")
                         continue
 
-                    recs.append(
-                        {
-                            "resource_id": rec_detail.get("AccountId", sp_type),
-                            "check_type": "purchase",
-                            "check_category": "SP Purchase Recommendation",
-                            "current_value": "On-Demand",
-                            "recommended_value": f"${hourly_commit:.4f}/hr Compute SP",
-                            "monthly_savings": round(monthly_savings, 2),
-                            "severity": "LOW",
-                            "reason": f"Account {rec_detail.get('AccountId', 'N/A')}: estimated ${monthly_savings:.2f}/mo savings",
-                        }
-                    )
-            except Exception as e:
-                print(f"Warning: SP purchase recommendation failed for {sp_type}: {e}")
+                    for rec in resp.get("SavingsPlansPurchaseRecommendation", []):
+                        savings_detail = rec.get("SavingsPlansPurchaseRecommendationSummary", {})
+                        monthly_savings = float(savings_detail.get("EstimatedMonthlySavings", "0"))
+                        hourly_commit = float(savings_detail.get("HourlyCommitment", "0"))
+                        upfront = float(savings_detail.get("EstimatedUpfrontCost", "0"))
+
+                        if monthly_savings <= 0 and hourly_commit <= 0:
+                            continue
+
+                        recs.append(
+                            {
+                                "resource_id": f"{sp_type}_{term_label}_{payment_label.lower().replace(' ', '_')}",
+                                "check_type": "purchase",
+                                "check_category": f"SP Purchase Recommendation {scenario}",
+                                "term": term_label,
+                                "payment_option": payment_label,
+                                "sp_type": sp_type,
+                                "current_value": f"${hourly_commit:.4f}/hr commitment",
+                                "recommended_value": (
+                                    f"${hourly_commit:.4f}/hr Compute SP "
+                                    f"({term_label}, {payment_label})"
+                                ),
+                                "monthly_savings": round(monthly_savings, 2),
+                                "severity": "LOW",
+                                "reason": (
+                                    f"{term_label} {payment_label}: "
+                                    f"${monthly_savings:.2f}/mo at "
+                                    f"${hourly_commit:.4f}/hr commitment, "
+                                    f"upfront ${upfront:,.2f}"
+                                ),
+                                "upfront_cost": upfront,
+                            }
+                        )
+
+                    for rec_detail in resp.get("SavingsPlansPurchaseRecommendationDetail", []):
+                        monthly_savings = float(rec_detail.get("EstimatedMonthlySavings", "0"))
+                        hourly_commit = float(rec_detail.get("HourlyCommitment", "0"))
+                        if hourly_commit <= 0 and monthly_savings <= 0:
+                            continue
+
+                        recs.append(
+                            {
+                                "resource_id": rec_detail.get("AccountId", sp_type),
+                                "check_type": "purchase",
+                                "check_category": f"SP Purchase Recommendation {scenario}",
+                                "term": term_label,
+                                "payment_option": payment_label,
+                                "sp_type": sp_type,
+                                "current_value": "On-Demand",
+                                "recommended_value": (
+                                    f"${hourly_commit:.4f}/hr Compute SP "
+                                    f"({term_label}, {payment_label})"
+                                ),
+                                "monthly_savings": round(monthly_savings, 2),
+                                "severity": "LOW",
+                                "reason": (
+                                    f"Account {rec_detail.get('AccountId', 'N/A')} "
+                                    f"({term_label} {payment_label}): "
+                                    f"${monthly_savings:.2f}/mo savings"
+                                ),
+                            }
+                        )
 
         return recs
 
     def _fetch_ri_recommendations(self, ce: Any) -> list[dict[str, Any]]:
-        """Fetch Reserved Instance purchase recommendations for EC2.
+        """Fetch Reserved Instance purchase recommendations across the
+        full (term, payment) matrix per service.
+
+        Six calls per service: 2 terms times 3 payment options. Each rec
+        carries explicit term and payment metadata so the renderer can
+        surface them on the rec-item title.
 
         Args:
             ce: Cost Explorer boto3 client.
@@ -524,36 +578,66 @@ class CommitmentAnalysisModule(BaseServiceModule):
         """
         recs: list[dict[str, Any]] = []
 
-        try:
-            resp = ce.get_reservation_purchase_recommendation(
-                Service="Amazon EC2",
-                LookbackPeriodInDays="THIRTY_DAYS",
-            )
-            for rec in resp.get("Recommendations", []):
-                details = rec.get("RecommendationDetails", [])
-                if not details:
-                    continue
+        for service in self._RI_SERVICES:
+            for term_api, term_label in self._SP_TERMS:
+                for payment_api, payment_label in self._SP_PAYMENTS:
+                    scenario = f"({term_label}, {payment_label})"
+                    try:
+                        resp = ce.get_reservation_purchase_recommendation(
+                            Service=service,
+                            LookbackPeriodInDays="THIRTY_DAYS",
+                            TermInYears=term_api,
+                            PaymentOption=payment_api,
+                        )
+                    except Exception as e:
+                        print(f"Warning: RI purchase recommendation failed for {service} {scenario}: {e}")
+                        continue
 
-                monthly_savings = 0.0
-                for d in details:
-                    monthly_savings += float(d.get("EstimatedMonthlySavings", "0"))
+                    for rec in resp.get("Recommendations", []):
+                        details = rec.get("RecommendationDetails", [])
+                        if not details:
+                            continue
 
-                instance_type = details[0].get("InstanceType", "Unknown") if details else "Unknown"
+                        monthly_savings = sum(
+                            float(d.get("EstimatedMonthlySavings", "0")) for d in details
+                        )
+                        upfront_cost = sum(
+                            float(d.get("UpfrontCost", "0")) for d in details
+                        )
+                        instance_type = details[0].get("InstanceType", "Unknown")
 
-                recs.append(
-                    {
-                        "resource_id": f"EC2 RI {instance_type}",
-                        "check_type": "purchase",
-                        "check_category": "RI Purchase Recommendation",
-                        "current_value": "On-Demand",
-                        "recommended_value": f"Reserved Instance ({instance_type})",
-                        "monthly_savings": round(monthly_savings, 2),
-                        "severity": "LOW",
-                        "reason": f"Estimated ${monthly_savings:.2f}/mo savings via RI for {instance_type}",
-                    }
-                )
-        except Exception as e:
-            print(f"Warning: RI purchase recommendation failed: {e}")
+                        if monthly_savings <= 0:
+                            continue
+
+                        recs.append(
+                            {
+                                "resource_id": (
+                                    f"{service.replace(' ', '')}_RI_{instance_type}_"
+                                    f"{term_label}_{payment_label.lower().replace(' ', '_')}"
+                                ),
+                                "check_type": "purchase",
+                                "check_category": (
+                                    f"RI Purchase Recommendation {scenario}"
+                                ),
+                                "term": term_label,
+                                "payment_option": payment_label,
+                                "service": service,
+                                "current_value": "On-Demand",
+                                "recommended_value": (
+                                    f"Reserved Instance {instance_type} "
+                                    f"({term_label}, {payment_label})"
+                                ),
+                                "monthly_savings": round(monthly_savings, 2),
+                                "severity": "LOW",
+                                "reason": (
+                                    f"{service} RI {instance_type} "
+                                    f"{term_label} {payment_label}: "
+                                    f"${monthly_savings:.2f}/mo savings, "
+                                    f"upfront ${upfront_cost:,.2f}"
+                                ),
+                                "upfront_cost": upfront_cost,
+                            }
+                        )
 
         return recs
 
