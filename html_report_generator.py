@@ -1254,19 +1254,19 @@ class HTMLReportGenerator:
             vertical-align: 1px;
         }
         .source-section[data-source="Metric Backed"] .rec-item > h4::before {
-            content: "METRIC \00b7";
+            content: "METRIC ·";
             color: var(--success);
         }
         .source-section[data-source="ML Backed"] .rec-item > h4::before {
-            content: "ML \00b7";
+            content: "ML ·";
             color: var(--info);
         }
         .source-section[data-source="Cost Hub"] .rec-item > h4::before {
-            content: "COST HUB \00b7";
+            content: "COST HUB ·";
             color: var(--warning);
         }
         .source-section[data-source="Audit Based"] .rec-item > h4::before {
-            content: "AUDIT \00b7";
+            content: "AUDIT ·";
             color: var(--text-secondary);
         }
         /* The source-section wrapper itself is structural only; no margin
@@ -1745,7 +1745,7 @@ class HTMLReportGenerator:
             border-left: none;
         }
         .savings.investigation::before {
-            content: "Needs data \00b7 ";
+            content: "Needs data · ";
             font-weight: 600;
             color: var(--text-secondary);
         }
