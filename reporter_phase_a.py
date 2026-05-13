@@ -81,7 +81,7 @@ def render_file_systems(sources: Dict[str, Any]) -> str:
 
         content += f'<div class="rec-item{_priority_class(filesystems[0])}">'
         label = "file system" if len(filesystems) == 1 else "file systems"
-        content += f"<h5>{group_name} ({len(filesystems)} {label})</h5>"
+        content += f"<h4>{group_name} ({len(filesystems)} {label})</h4>"
 
         if group_name == "EFS No Lifecycle":
             content += "<p><strong>Recommendation:</strong> Enable lifecycle policies to move infrequently accessed files to IA storage (Save 80%)</p>"
@@ -366,7 +366,7 @@ def _render_rds_group(content: str, category: str, resources: List[Rec], descrip
     label = "resource" if len(resources) == 1 else "resources"
 
     content += f'<div class="rec-item{_priority_class(resources[0])}">'
-    content += f"<h5>{category} ({len(resources)} {label})</h5>"
+    content += f"<h4>{category} ({len(resources)} {label})</h4>"
 
     if resources:
         recommendations = [r.get("Recommendation", "") for r in resources if r.get("Recommendation")]
@@ -443,7 +443,7 @@ def render_grouped_by_category(
 
         content += f'<div class="rec-item{_priority_class(resources[0])}">'
         label = singular if len(resources) == 1 else plural
-        content += f"<h5>{category} ({len(resources)} {label})</h5>"
+        content += f"<h4>{category} ({len(resources)} {label})</h4>"
 
         if resources:
             content += (

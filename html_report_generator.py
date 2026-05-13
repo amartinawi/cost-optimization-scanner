@@ -30,6 +30,7 @@ Version: 2.5.9
 Last Updated: 2026-01-24
 """
 
+import base64
 import copy
 import html
 import json
@@ -411,9 +412,9 @@ def _enrich_s3_stats(stats_html: str, service_data: Dict[str, Any], config: Dict
     top_size = s3_data.get("top_size_buckets", [])
 
     if top_cost:
-        stats_html += f'<div class="stat-card"><h4>Highest Cost Bucket</h4><div class="value">${top_cost[0].get("EstimatedMonthlyCost", 0):.2f}/mo</div></div>'
+        stats_html += f'<div class="stat-card"><div class="stat-label">Highest Cost Bucket</div><div class="value">${top_cost[0].get("EstimatedMonthlyCost", 0):.2f}/mo</div></div>'
     if top_size:
-        stats_html += f'<div class="stat-card"><h4>Largest Bucket</h4><div class="value">{top_size[0].get("SizeGB", 0):.1f} GB</div></div>'
+        stats_html += f'<div class="stat-card"><div class="stat-label">Largest Bucket</div><div class="value">{top_size[0].get("SizeGB", 0):.1f} GB</div></div>'
     return stats_html
 
 
@@ -504,7 +505,7 @@ class HTMLReportGenerator:
     {self._get_css()}
 </head>
 <body>
-    <svg xmlns="http://www.w3.org/2000/svg" style="display:none">
+    <svg xmlns="http://www.w3.org/2000/svg" style="display:none" aria-hidden="true" focusable="false">
 <symbol id="icon-chart" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="18" y="3" width="4" height="18"/><rect x="10" y="8" width="4" height="13"/><rect x="2" y="13" width="4" height="8"/></symbol>
 <symbol id="icon-lightbulb" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18h6M10 22h4M15.09 14.41c.38-.38.67-.84.85-1.35A4.5 4.5 0 0 0 12 6.5a4.5 4.5 0 0 0-3.94 6.56c.18.51.47.97.85 1.35V17h6v-2.59z"/></symbol>
 <symbol id="icon-clipboard" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="8" y="2" width="8" height="4" rx="1" ry="1"/><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/></symbol>
@@ -729,11 +730,11 @@ class HTMLReportGenerator:
             margin-top: 8px;
         }
         
-        /* Material Tabs */
+        /* Tabs */
         .tabs {
             background: var(--surface);
             border-radius: 8px;
-            box-shadow: var(--shadow-2);
+            border: 1px solid var(--divider);
             overflow: hidden;
             margin-bottom: 24px;
         }
@@ -779,7 +780,10 @@ class HTMLReportGenerator:
             pointer-events: none;
             z-index: 1;
             opacity: 1;
-            transition: opacity 0.3s;
+            transition: opacity 0.2s var(--ease-out-quart);
+        }
+        .tabs.scroll-at-end::after {
+            opacity: 0;
         }
         
         .tab-button {
@@ -826,6 +830,72 @@ class HTMLReportGenerator:
             transform: scaleX(1);
         }
         
+        /* Priority filter strip — dims non-matching rec-items across all tabs */
+        .priority-filter {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 8px;
+            padding: 12px 24px;
+            border-bottom: 1px solid var(--divider);
+            background: var(--surface);
+            font-size: 0.8125rem;
+        }
+        .priority-filter-label {
+            color: var(--text-secondary);
+            font-weight: 500;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-right: 4px;
+        }
+        .priority-filter-chip {
+            padding: 4px 12px;
+            border: 1px solid var(--divider);
+            background: var(--surface);
+            color: var(--text-secondary);
+            border-radius: 16px;
+            cursor: pointer;
+            font-size: 0.75rem;
+            font-weight: 500;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            transition: background 0.15s, color 0.15s, border-color 0.15s;
+        }
+        .priority-filter-chip:hover {
+            border-color: var(--text-secondary);
+            color: var(--text-primary);
+        }
+        .priority-filter-chip.active {
+            background: var(--text-primary);
+            color: var(--surface);
+            border-color: var(--text-primary);
+        }
+        .priority-filter-chip.priority-high.active {
+            background: var(--badge-danger-fg);
+            border-color: var(--badge-danger-fg);
+            color: var(--surface);
+        }
+        .priority-filter-chip.priority-medium.active {
+            background: var(--badge-warning-fg);
+            border-color: var(--badge-warning-fg);
+            color: var(--surface);
+        }
+        .priority-filter-chip.priority-low.active {
+            background: var(--badge-success-fg);
+            border-color: var(--badge-success-fg);
+            color: var(--surface);
+        }
+        .priority-filter-chip:focus-visible {
+            outline: 2px solid var(--primary);
+            outline-offset: 2px;
+        }
+        body[data-priority-filter="high"] .rec-item:not(.high-priority),
+        body[data-priority-filter="medium"] .rec-item:not(.medium-priority),
+        body[data-priority-filter="low"] .rec-item:not(.low-priority) {
+            opacity: 0.25;
+            transition: opacity 0.2s var(--ease-out-quart);
+        }
+
         .tab-content {
             display: none;
             padding: 32px;
@@ -877,6 +947,7 @@ class HTMLReportGenerator:
             border-color: var(--text-secondary);
         }
 
+        .stat-card .stat-label,
         .stat-card h4 {
             font-size: 0.8125rem;
             color: var(--text-secondary);
@@ -950,11 +1021,12 @@ class HTMLReportGenerator:
             border-radius: 4px;
         }
         
-        /* Material Recommendation Cards */
+        /* Recommendation Cards — flat at rest, priority encoded by leading badge.
+           Border shifts to priority hue on hover (per DESIGN.md). */
         .recommendation-list {
             margin-top: 24px;
         }
-        
+
         .rec-item {
             background: var(--surface);
             border-radius: 8px;
@@ -969,15 +1041,9 @@ class HTMLReportGenerator:
             border-color: var(--text-secondary);
         }
 
-        .rec-item.high-priority { border-color: var(--danger); }
-        .rec-item.medium-priority { border-color: var(--warning); }
-        .rec-item.low-priority { border-color: var(--success); }
-
-        .rec-item.high-priority:hover,
-        .rec-item.medium-priority:hover,
-        .rec-item.low-priority:hover {
-            filter: brightness(0.98);
-        }
+        .rec-item.high-priority:hover { border-color: var(--danger); }
+        .rec-item.medium-priority:hover { border-color: var(--warning); }
+        .rec-item.low-priority:hover { border-color: var(--success); }
 
         .rec-item.high-priority::before,
         .rec-item.medium-priority::before,
@@ -1011,6 +1077,7 @@ class HTMLReportGenerator:
             background: var(--badge-success-bg);
         }
 
+        .rec-item h4,
         .rec-item h5 {
             font-size: 1.125rem;
             font-weight: 500;
@@ -1117,7 +1184,7 @@ class HTMLReportGenerator:
             background-color: var(--badge-danger-bg);
         }
         
-        /* Material Tables */
+        /* Tables — flat, hairline-led */
         .recommendations-table,
         .top-buckets-table table {
             width: 100%;
@@ -1126,7 +1193,7 @@ class HTMLReportGenerator:
             background: var(--surface);
             border-radius: 8px;
             overflow: hidden;
-            box-shadow: var(--shadow-1);
+            border: 1px solid var(--divider);
         }
         
         .recommendations-table th,
@@ -1213,13 +1280,48 @@ class HTMLReportGenerator:
             color: var(--text-primary);
         }
         
-        /* Material Sections */
+        /* Sections — flat, hairline-led */
         .top-buckets-table {
             margin: 24px 0;
             background: var(--surface);
             border-radius: 8px;
             overflow: hidden;
-            box-shadow: var(--shadow-2);
+            border: 1px solid var(--divider);
+        }
+
+        .bucket-sort-toggle {
+            display: inline-flex;
+            gap: 4px;
+            margin: 12px 0;
+            padding: 4px;
+            background: var(--background);
+            border-radius: 18px;
+            border: 1px solid var(--divider);
+        }
+        .bucket-sort-btn {
+            padding: 4px 12px;
+            background: transparent;
+            border: none;
+            border-radius: 16px;
+            cursor: pointer;
+            font-size: 0.75rem;
+            font-weight: 500;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            color: var(--text-secondary);
+            transition: background 0.15s, color 0.15s;
+        }
+        .bucket-sort-btn:hover {
+            color: var(--text-primary);
+        }
+        .bucket-sort-btn.active {
+            background: var(--surface);
+            color: var(--text-primary);
+            box-shadow: 0 0 0 1px var(--divider);
+        }
+        .bucket-sort-btn:focus-visible {
+            outline: 2px solid var(--primary);
+            outline-offset: 2px;
         }
         
         .top-buckets-table h4 {
@@ -1273,6 +1375,71 @@ class HTMLReportGenerator:
             line-height: 1.6;
         }
         
+        /* Collapsed list overflow */
+        .rec-item li.hidden-overflow,
+        .resource-list li.hidden-overflow {
+            display: none;
+        }
+        .show-more-toggle {
+            display: inline-block;
+            margin: 8px 0 16px;
+            padding: 6px 12px;
+            background: var(--background);
+            border: 1px solid var(--divider);
+            border-radius: 16px;
+            color: var(--text-secondary);
+            cursor: pointer;
+            font-size: 0.75rem;
+            font-weight: 500;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            transition: background 0.15s, color 0.15s, border-color 0.15s;
+        }
+        .show-more-toggle:hover {
+            border-color: var(--text-secondary);
+            color: var(--text-primary);
+        }
+        .show-more-toggle:focus-visible {
+            outline: 2px solid var(--primary);
+            outline-offset: 2px;
+        }
+
+        /* Copy-resource-ID button */
+        .copy-id {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 22px;
+            height: 22px;
+            margin-right: 6px;
+            padding: 0;
+            border: 1px solid var(--divider);
+            background: var(--surface);
+            color: var(--text-secondary);
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.875rem;
+            line-height: 1;
+            vertical-align: middle;
+            transition: background 0.15s, color 0.15s, border-color 0.15s;
+        }
+        .copy-id:hover {
+            border-color: var(--primary);
+            color: var(--primary);
+        }
+        .copy-id:focus-visible {
+            outline: 2px solid var(--primary);
+            outline-offset: 2px;
+        }
+        .copy-id.copied {
+            background: var(--badge-success-bg);
+            color: var(--badge-success-fg);
+            border-color: var(--badge-success-fg);
+        }
+        .copy-id.copied::after {
+            content: " ✓";
+        }
+
         .show-more-link {
             color: var(--primary);
             text-decoration: none;
@@ -1314,7 +1481,130 @@ class HTMLReportGenerator:
             font-size: 1rem;
             color: var(--text-primary);
         }
-        
+
+        /* Top-line risks row — gives executive readers 10-second confidence */
+        .risks-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 12px;
+            margin-top: 16px;
+            margin-bottom: 8px;
+            font-variant-numeric: tabular-nums;
+        }
+        .risk-pill {
+            display: inline-flex;
+            align-items: baseline;
+            gap: 6px;
+            padding: 6px 12px;
+            border-radius: 16px;
+            font-size: 0.75rem;
+            font-weight: 500;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            border: 1px solid var(--divider);
+            color: var(--text-secondary);
+            background: var(--surface);
+        }
+        .risk-pill strong {
+            font-size: 0.95rem;
+            font-weight: 600;
+            color: var(--text-primary);
+        }
+        .risk-pill.risk-high {
+            color: var(--badge-danger-fg);
+            background: var(--badge-danger-bg);
+            border-color: transparent;
+        }
+        .risk-pill.risk-high strong { color: var(--badge-danger-fg); }
+        .risk-pill.risk-medium {
+            color: var(--badge-warning-fg);
+            background: var(--badge-warning-bg);
+            border-color: transparent;
+        }
+        .risk-pill.risk-medium strong { color: var(--badge-warning-fg); }
+        .risk-pill.risk-low {
+            color: var(--badge-success-fg);
+            background: var(--badge-success-bg);
+            border-color: transparent;
+        }
+        .risk-pill.risk-low strong { color: var(--badge-success-fg); }
+        .risk-pill.risk-info {
+            color: var(--badge-info-fg);
+            background: var(--badge-info-bg);
+            border-color: transparent;
+        }
+        .risk-pill.risk-info strong { color: var(--badge-info-fg); }
+
+        /* Reconciliation footnote — surfaces the dedup math */
+        .reconciliation-note {
+            margin: 12px 0 0;
+            font-size: 0.8125rem;
+            color: var(--text-secondary);
+            line-height: 1.6;
+            font-variant-numeric: tabular-nums;
+        }
+        .reconciliation-note strong {
+            color: var(--text-primary);
+            font-weight: 600;
+        }
+
+        /* Investigation savings — quieter than confirmed savings */
+        .savings.investigation,
+        .rec-item .savings.investigation {
+            background: transparent;
+            color: var(--text-secondary);
+            font-weight: 500;
+            border-left: none;
+        }
+        .savings.investigation::before {
+            content: "Needs data \00b7 ";
+            font-weight: 600;
+            color: var(--text-secondary);
+        }
+
+        /* Glossary block — defines source-confidence badges */
+        .glossary {
+            background: var(--surface);
+            border: 1px solid var(--divider);
+            border-radius: 8px;
+            padding: 16px 20px;
+            margin: 16px 0;
+            font-size: 0.875rem;
+            color: var(--text-primary);
+        }
+        .glossary h3 {
+            font-size: 0.75rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            color: var(--text-secondary);
+            margin-bottom: 12px;
+        }
+        .glossary dl {
+            display: grid;
+            grid-template-columns: max-content 1fr;
+            gap: 8px 16px;
+            margin: 0;
+        }
+        .glossary dt {
+            font-weight: 600;
+            color: var(--text-primary);
+        }
+        .glossary dd {
+            margin: 0;
+            color: var(--text-secondary);
+            line-height: 1.5;
+        }
+        @media (max-width: 600px) {
+            .glossary dl {
+                grid-template-columns: 1fr;
+                gap: 4px;
+            }
+            .glossary dt {
+                margin-top: 8px;
+            }
+        }
+
         .opportunities {
             margin-top: 24px;
         }
@@ -1332,7 +1622,7 @@ class HTMLReportGenerator:
             background: rgba(76, 175, 80, 0.15);
         }
         
-        /* Material Footer */
+        /* Footer */
         .footer {
             margin-top: 48px;
             padding: 32px;
@@ -1340,13 +1630,38 @@ class HTMLReportGenerator:
             border-radius: 8px;
             text-align: center;
             color: var(--text-secondary);
-            border-top: 1px solid var(--divider);
-            box-shadow: var(--shadow-1);
+            border: 1px solid var(--divider);
+        }
+
+        /* Visually-hidden but available to screen readers (WCAG SC 1.1.1 fallback) */
+        .visually-hidden {
+            position: absolute !important;
+            width: 1px !important;
+            height: 1px !important;
+            padding: 0 !important;
+            margin: -1px !important;
+            overflow: hidden !important;
+            clip: rect(0, 0, 0, 0) !important;
+            white-space: nowrap !important;
+            border: 0 !important;
         }
         
         .footer p {
             margin: 8px 0;
             font-size: 0.875rem;
+        }
+        .footer-link {
+            color: var(--primary);
+            text-decoration: none;
+            font-weight: 500;
+        }
+        .footer-link:hover {
+            text-decoration: underline;
+        }
+        .footer-link:focus-visible {
+            outline: 2px solid var(--primary);
+            outline-offset: 2px;
+            border-radius: 2px;
         }
         
         /* Responsive Design */
@@ -1389,7 +1704,7 @@ class HTMLReportGenerator:
             background: var(--surface);
             border-radius: 8px;
             padding: 24px;
-            box-shadow: var(--shadow-1);
+            border: 1px solid var(--divider);
         }
         
         .chart-section h3 {
@@ -1587,12 +1902,20 @@ class HTMLReportGenerator:
         summary = self.scan_results.get("summary", {})
         total_recommendations = summary.get("total_recommendations", 0)
         total_savings = summary.get("total_monthly_savings", 0)
-        services_with_recommendations = sum(
-            1
-            for service_data in self.scan_results["services"].values()
-            if service_data.get("total_recommendations", 0) > 0
-        )
         total_services_scanned = len(self.scan_results.get("services", {}))
+
+        # Per-service savings sum used by reconciliation footnote — the adversarial reader
+        # mentally adds the per-tab totals; if the headline differs, surface the dedup math
+        # rather than letting the discrepancy register as inattention. Mirrors the visible
+        # display logic in _get_service_content so the numbers line up with each tab.
+        raw_per_service_sum = 0.0
+        for service_key, service_data in self.scan_results["services"].items():
+            calculated = self._calculate_service_savings(service_key, service_data)
+            canonical = service_data.get("total_monthly_savings", 0) or 0
+            shown = calculated if calculated > 0 else canonical
+            raw_per_service_sum += float(shown)
+
+        risk_counts = self._count_priorities_by_severity()
 
         html = f"""<div class="summary">
             <h2>Executive Summary</h2>
@@ -1601,8 +1924,8 @@ class HTMLReportGenerator:
                     <h3>Total Recommendations</h3>
                     <div class="value">{total_recommendations}</div>
                 </div>
-                <div class="summary-card" role="status" aria-label="Estimated Monthly Savings: ${total_savings:.2f}">
-                    <h3>Estimated Monthly Savings</h3>
+                <div class="summary-card" role="status" aria-label="Defensible Monthly Savings: ${total_savings:.2f}">
+                    <h3>Defensible Monthly Savings</h3>
                     <div class="value">${total_savings:.2f}</div>
                 </div>
                 <div class="summary-card" role="status" aria-label="Services Scanned: {total_services_scanned}">
@@ -1615,12 +1938,67 @@ class HTMLReportGenerator:
                 </div>
             </div>"""
 
+        # Top-line risks row — gives the architect / leader persona 10-second confidence.
+        html += (
+            '<div class="risks-row" role="group" aria-label="Top-line risks">'
+            f'<span class="risk-pill risk-high"><strong>{risk_counts["high"]}</strong> HIGH</span>'
+            f'<span class="risk-pill risk-medium"><strong>{risk_counts["medium"]}</strong> MEDIUM</span>'
+            f'<span class="risk-pill risk-low"><strong>{risk_counts["low"]}</strong> LOW</span>'
+            f'<span class="risk-pill risk-info"><strong>{risk_counts["anomalies"]}</strong> active anomalies</span>'
+            f'<span class="risk-pill risk-info"><strong>{risk_counts["billing_alarms"]}</strong> billing alarms</span>'
+            "</div>"
+        )
+
+        # Reconciliation footnote — only render if the per-service sum diverges from the
+        # headline by more than $1 (avoid noise from rounding).
+        dedup_delta = raw_per_service_sum - float(total_savings)
+        if dedup_delta > 1.0:
+            html += (
+                '<p class="reconciliation-note">'
+                f"Per-tab sum: <strong>${raw_per_service_sum:,.2f}</strong> "
+                f"&minus; deduplication adjustment <strong>${dedup_delta:,.2f}</strong> "
+                f"(Cost Optimization Hub recommendations counted once across overlapping services) "
+                f"= headline <strong>${total_savings:,.2f}</strong>."
+                "</p>"
+            )
+
         graviton_count = self._count_graviton_exclusions()
         if graviton_count > 0:
             html += f'<div class="info-note"><p><svg class="icon icon-sm"><use href="#icon-clipboard"/></svg> Note: {graviton_count} Graviton migration recommendations excluded from per-service detail. These require architecture-level review and are available via AWS Compute Optimizer.</p></div>'
 
         html += "</div>"
         return html
+
+    def _count_priorities_by_severity(self) -> Dict[str, int]:
+        """Aggregate HIGH/MEDIUM/LOW counts + anomaly + billing-alarm risk signals.
+
+        Returns a dict with keys ``high``, ``medium``, ``low``, ``anomalies``,
+        ``billing_alarms``. Walks every service's filtered recommendations once.
+        """
+        counts = {"high": 0, "medium": 0, "low": 0, "anomalies": 0, "billing_alarms": 0}
+        for service_key, service_data in self.scan_results.get("services", {}).items():
+            filtered = self._filter_recommendations(service_data)
+            for source_data in filtered.get("sources", {}).values():
+                if isinstance(source_data, dict):
+                    recs = source_data.get("recommendations", []) or []
+                elif isinstance(source_data, list):
+                    recs = source_data
+                else:
+                    recs = []
+                for rec in recs:
+                    priority = str(
+                        rec.get("priority") or rec.get("Priority") or rec.get("severity") or rec.get("Severity") or ""
+                    ).strip().lower()
+                    if priority in ("high", "critical"):
+                        counts["high"] += 1
+                    elif priority in ("medium", "warning"):
+                        counts["medium"] += 1
+                    elif priority in ("low", "info", "informational"):
+                        counts["low"] += 1
+            if service_key == "cost_anomaly":
+                counts["anomalies"] = service_data.get("active_anomalies_count", 0) or 0
+                counts["billing_alarms"] = service_data.get("billing_alarms_count", 0) or 0
+        return counts
 
     def _get_tabs(self) -> str:
         """Get tabs section"""
@@ -1669,20 +2047,21 @@ class HTMLReportGenerator:
         # Tab contents
         tab_contents = ""
 
-        # Add Executive Summary tab content first (always active)
-        tab_contents += '<div id="executive-summary" class="tab-content active" role="tabpanel" id="panel-executive-summary" aria-labelledby="tab-executive-summary">'
+        # Add Executive Summary tab content first (always active). Panel id is the
+        # `panel-` prefixed form so it matches `aria-controls` from the tab button.
+        tab_contents += '<div id="panel-executive-summary" class="tab-content active" role="tabpanel" aria-labelledby="tab-executive-summary">'
         tab_contents += self._get_executive_summary_content()
         tab_contents += "</div>"
 
         # Add main service tabs with Snapshots and AMIs
-        for i, (service_key, service_data) in enumerate(services.items()):
+        for service_key, service_data in services.items():
             # Skip tabs with no recommendations
             if service_data.get("total_recommendations", 0) == 0:
                 continue
 
             # No longer active since Executive Summary is active
             tab_contents += (
-                f'<div id="{service_key}" class="tab-content" role="tabpanel" aria-labelledby="tab-{service_key}">'
+                f'<div id="panel-{html.escape(service_key)}" class="tab-content" role="tabpanel" aria-labelledby="tab-{html.escape(service_key)}">'
             )
             if service_key == "ami" and amis_data["count"] > 0:
                 tab_contents += self._get_amis_content(amis_data)
@@ -1694,7 +2073,7 @@ class HTMLReportGenerator:
             # Add Snapshots tab content right after EBS
             if service_key == "ebs" and snapshots_data["count"] > 0:
                 tab_contents += (
-                    '<div id="snapshots" class="tab-content" role="tabpanel" aria-labelledby="tab-snapshots">'
+                    '<div id="panel-snapshots" class="tab-content" role="tabpanel" aria-labelledby="tab-snapshots">'
                 )
                 tab_contents += self._get_snapshots_content(snapshots_data)
                 tab_contents += "</div>"
@@ -1703,7 +2082,7 @@ class HTMLReportGenerator:
         if snapshots_data["count"] > 0 and not any(
             s.get("total_recommendations", 0) > 0 for k, s in services.items() if k == "ebs"
         ):
-            tab_contents += '<div id="snapshots" class="tab-content" role="tabpanel" aria-labelledby="tab-snapshots">'
+            tab_contents += '<div id="panel-snapshots" class="tab-content" role="tabpanel" aria-labelledby="tab-snapshots">'
             tab_contents += self._get_snapshots_content(snapshots_data)
             tab_contents += "</div>"
 
@@ -1711,11 +2090,22 @@ class HTMLReportGenerator:
         if amis_data["count"] > 0 and not any(
             s.get("total_recommendations", 0) > 0 for k, s in services.items() if k == "ami"
         ):
-            tab_contents += '<div id="amis" class="tab-content" role="tabpanel" aria-labelledby="tab-amis">'
+            tab_contents += '<div id="panel-amis" class="tab-content" role="tabpanel" aria-labelledby="tab-amis">'
             tab_contents += self._get_amis_content(amis_data)
             tab_contents += "</div>"
 
-        return f'<div class="tabs">{tab_buttons}{tab_contents}</div>'
+        # Priority filter strip — dims non-matching .rec-item across all tabs.
+        filter_strip = (
+            '<div class="priority-filter" role="group" aria-label="Filter recommendations by priority">'
+            '<span class="priority-filter-label">Filter:</span>'
+            '<button type="button" class="priority-filter-chip active" data-priority-filter="all" aria-pressed="true">All</button>'
+            '<button type="button" class="priority-filter-chip priority-high" data-priority-filter="high" aria-pressed="false">High priority</button>'
+            '<button type="button" class="priority-filter-chip priority-medium" data-priority-filter="medium" aria-pressed="false">Medium</button>'
+            '<button type="button" class="priority-filter-chip priority-low" data-priority-filter="low" aria-pressed="false">Low</button>'
+            "</div>"
+        )
+
+        return f'<div class="tabs">{tab_buttons}{filter_strip}{tab_contents}</div>'
 
     def _extract_snapshots_data(self, services: Dict[str, Any]) -> Dict[str, Any]:
         """Extract all snapshot-related recommendations from services"""
@@ -1831,9 +2221,9 @@ class HTMLReportGenerator:
         content += '<h2 class="service-title">Snapshots Cost Optimization</h2>'
         content += '<div class="service-stats">'
         content += (
-            f'<div class="stat-card"><h4>Old Snapshots</h4><div class="value">{snapshots_data["count"]}</div></div>'
+            f'<div class="stat-card"><div class="stat-label">Old Snapshots</div><div class="value">{snapshots_data["count"]}</div></div>'
         )
-        content += f'<div class="stat-card"><h4>Potential Monthly Savings</h4><div class="value savings">${total_savings:.2f}</div></div>'
+        content += f'<div class="stat-card"><div class="stat-label">Potential Monthly Savings</div><div class="value savings">${total_savings:.2f}</div></div>'
         content += "</div></div>"
 
         # Use standard recommendations section format
@@ -1866,7 +2256,7 @@ class HTMLReportGenerator:
                 total_size += snap.get("VolumeSize", 0)
 
             content += f'<div class="rec-item">'
-            content += f"<h5>Snapshots aged {age_range} ({len(snapshots)} snapshots, {total_size} GB total)</h5>"
+            content += f"<h4>Snapshots aged {age_range} ({len(snapshots)} snapshots, {total_size} GB total)</h4>"
             content += (
                 f"<p><strong>Recommendation:</strong> Review and delete old snapshots that are no longer needed</p>"
             )
@@ -1890,7 +2280,27 @@ class HTMLReportGenerator:
         # Group AMIs by age range
         age_groups = {"90-180 days": [], "180-365 days": [], "1-2 years": [], "2+ years": []}
 
+        # Dedupe by ImageId — the same AMI can surface from multiple sources
+        # (EBS enhanced checks + the AMI service adapter). Prefer the entry with the
+        # most specific EstimatedSavings string (longest non-empty form wins).
+        seen: Dict[str, Dict[str, Any]] = {}
         for rec in amis_data["recommendations"]:
+            image_id = rec.get("ImageId") or rec.get("ami_id") or ""
+            if not image_id:
+                seen[f"_unkeyed_{id(rec)}"] = rec  # unkeyed entries are preserved as-is
+                continue
+            existing = seen.get(image_id)
+            if existing is None:
+                seen[image_id] = rec
+                continue
+            new_sv = str(rec.get("EstimatedSavings") or "")
+            old_sv = str(existing.get("EstimatedSavings") or "")
+            if len(new_sv) > len(old_sv):
+                seen[image_id] = rec
+
+        deduped_recs = list(seen.values())
+
+        for rec in deduped_recs:
             age_days = rec.get("AgeDays", 0)
             if age_days <= 180:
                 age_groups["90-180 days"].append(rec)
@@ -1901,11 +2311,13 @@ class HTMLReportGenerator:
             else:
                 age_groups["2+ years"].append(rec)
 
+        deduped_count = sum(len(g) for g in age_groups.values())
+
         # Use standard service header format
         content = '<div class="service-header">'
         content += '<h2 class="service-title">AMI Cost Optimization</h2>'
         content += '<div class="service-stats">'
-        content += f'<div class="stat-card"><h4>Old AMIs</h4><div class="value">{amis_data["count"]}</div></div>'
+        content += f'<div class="stat-card"><div class="stat-label">Old AMIs</div><div class="value">{deduped_count}</div></div>'
         content += "</div></div>"
 
         # Use standard recommendations section format
@@ -1915,7 +2327,7 @@ class HTMLReportGenerator:
         # Calculate total savings
         total_savings = sum(ami.get("EstimatedMonthlySavings", 0) for amis in age_groups.values() for ami in amis)
 
-        content += f'<div class="rec-summary"><strong>Total Recommendations:</strong> {amis_data["count"]} | '
+        content += f'<div class="rec-summary"><strong>Total Recommendations:</strong> {deduped_count} | '
         content += (
             f'<strong>Estimated Monthly Savings:</strong> <span class="savings">${total_savings:.2f}</span></div>'
         )
@@ -1930,7 +2342,7 @@ class HTMLReportGenerator:
             group_savings = sum(ami.get("EstimatedMonthlySavings", 0) for ami in amis)
 
             content += f'<div class="rec-item">'
-            content += f"<h5>AMIs aged {age_range} ({len(amis)} images)</h5>"
+            content += f"<h4>AMIs aged {age_range} ({len(amis)} images)</h4>"
             content += f"<p><strong>Recommendation:</strong> Review and deregister unused AMIs to eliminate snapshot storage costs</p>"
             content += f'<p class="savings"><strong>Estimated Savings:</strong> ${group_savings:.2f}/month</p>'
             content += "<p><strong>AMIs:</strong></p><ul>"
@@ -1974,20 +2386,17 @@ class HTMLReportGenerator:
         <div class="service-header">
             <h2 class="service-title"><svg class="icon icon-sm"><use href="#icon-chart"/></svg> Executive Summary</h2>
             <div class="service-stats">
-                <div class="stat-card">
-                    <h4>Total Monthly Savings</h4>
+                <div class="stat-card"><div class="stat-label">Total Monthly Savings</div>
                     <div class="value savings">$"""
             + f"{total_savings:.2f}"
             + """</div>
                 </div>
-                <div class="stat-card">
-                    <h4>Total Recommendations</h4>
+                <div class="stat-card"><div class="stat-label">Total Recommendations</div>
                     <div class="value">"""
             + str(total_recommendations)
             + """</div>
                 </div>
-                <div class="stat-card">
-                    <h4>Services Scanned</h4>
+                <div class="stat-card"><div class="stat-label">Services Scanned</div>
                     <div class="value">"""
             + str(services_scanned)
             + """</div>
@@ -2001,28 +2410,69 @@ class HTMLReportGenerator:
         if graviton_count > 0:
             content += f'<div class="info-note"><p><svg class="icon icon-sm"><use href="#icon-clipboard"/></svg> Note: {graviton_count} Graviton migration recommendations excluded from per-service detail. These require architecture-level review and are available via AWS Compute Optimizer.</p></div>'
 
-        content += """
+        # Accessible data table fallback for the canvas charts — visually hidden
+        # but read aloud by screen readers. PRODUCT.md commits to colorblind- and
+        # SR-equivalent reads.
+        chart_table_rows = ""
+        chart_services = [
+            (k, v.get("service_name", k.title()), self._calculate_service_savings(k, v))
+            for k, v in services.items()
+            if v.get("total_recommendations", 0) > 0
+        ]
+        chart_services.sort(key=lambda t: t[2], reverse=True)
+        for _, name, sav in chart_services:
+            chart_table_rows += f"<tr><td>{html.escape(name)}</td><td>${sav:,.2f}</td></tr>"
+
+        content += f"""
         <div class="charts-container">
             <div class="chart-section">
-                <h3>Cost Savings Distribution by Service</h3>
+                <h3 id="pie-chart-heading">Cost Savings Distribution by Service</h3>
                 <div class="chart-wrapper">
-                    <canvas id="savingsPieChart" width="400" height="400" role="img" aria-label="Cost breakdown pie chart showing savings by service"></canvas>
+                    <canvas id="savingsPieChart" width="400" height="400" role="img" aria-labelledby="pie-chart-heading" aria-describedby="chart-data-table"></canvas>
                     <noscript><p class="chart-fallback">Enable JavaScript to view the cost savings pie chart.</p></noscript>
                 </div>
             </div>
             <div class="chart-section">
-                <h3>Top Services by Savings Potential</h3>
+                <h3 id="bar-chart-heading">Top Services by Savings Potential</h3>
                 <div class="chart-wrapper">
-                    <canvas id="savingsBarChart" width="400" height="400" role="img" aria-label="Monthly savings bar chart by service"></canvas>
+                    <canvas id="savingsBarChart" width="400" height="400" role="img" aria-labelledby="bar-chart-heading" aria-describedby="chart-data-table"></canvas>
                     <noscript><p class="chart-fallback">Enable JavaScript to view the savings bar chart.</p></noscript>
                 </div>
             </div>
         </div>
+        <table id="chart-data-table" class="visually-hidden" aria-label="Chart data: monthly savings by service">
+            <caption>Monthly savings by service (text equivalent of the charts above).</caption>
+            <thead><tr><th scope="col">Service</th><th scope="col">Monthly savings</th></tr></thead>
+            <tbody>{chart_table_rows}</tbody>
+        </table>
         """
 
         content += self._get_trends_section()
+        content += self._get_glossary_section()
 
         return content
+
+    def _get_glossary_section(self) -> str:
+        """Render the source-confidence glossary.
+
+        Surfaces the meaning of the four source badges so adversarial readers
+        can immediately judge how much evidence backs each recommendation.
+        """
+        return (
+            '<section class="glossary" aria-labelledby="glossary-title">'
+            '<h3 id="glossary-title">Source-confidence legend</h3>'
+            "<dl>"
+            '<dt><span class="badge badge-success">Metric Backed</span></dt>'
+            "<dd>Recommendation derived from CloudWatch metrics observed over the lookback window (typically 14&ndash;30 days). Highest confidence; defendable in review.</dd>"
+            '<dt><span class="badge badge-info">ML Backed</span></dt>'
+            "<dd>AWS Compute Optimizer or another AWS ML service produced the rightsizing call from utilization patterns. High confidence; subject to AWS&rsquo;s own confidence rating.</dd>"
+            '<dt><span class="badge badge-warning">Cost Hub</span></dt>'
+            "<dd>AWS Cost Optimization Hub recommendation. Savings already deduplicated against per-service recommendations &mdash; see headline reconciliation footnote.</dd>"
+            '<dt><span class="badge badge-danger">Audit Based</span></dt>'
+            "<dd>Configuration audit only (no CloudWatch metric backing). Verify operational fit before acting &mdash; the recommendation is structurally correct but lacks runtime evidence.</dd>"
+            "</dl>"
+            "</section>"
+        )
 
     def _get_trends_section(self) -> str:
         trend = self.scan_results.get("trend_analysis")
@@ -2037,14 +2487,14 @@ class HTMLReportGenerator:
         days_back = trend.get("days_back", 90)
 
         stat_cards = (
-            '<div class="stat-card"><h4>90-Day Total Spend</h4>'
+            '<div class="stat-card"><div class="stat-label">90-Day Total Spend</div>'
             f'<div class="value">${total_spend:,.2f}</div></div>'
-            '<div class="stat-card"><h4>Spend Change</h4>'
+            '<div class="stat-card"><div class="stat-label">Spend Change</div>'
             f'<div class="value">{spend_change_pct:+.1f}%</div></div>'
         )
         if forecast and isinstance(forecast, (int, float)):
             stat_cards += (
-                f'<div class="stat-card"><h4>30-Day Forecast</h4><div class="value">${forecast:,.2f}</div></div>'
+                f'<div class="stat-card"><div class="stat-label">30-Day Forecast</div><div class="value">${forecast:,.2f}</div></div>'
             )
 
         chart_html = ""
@@ -2212,7 +2662,7 @@ class HTMLReportGenerator:
                 if resources:
                     total_savings = sum(r["savings"] for r in resources)
                     content += f'<div class="resource-group">'
-                    content += f"<h5>{group_name} ({len(resources)} resources)</h5>"
+                    content += f"<h4>{group_name} ({len(resources)} resources)</h4>"
                     if total_savings > 0:
                         content += f'<p class="group-savings">Potential Monthly Savings: ${total_savings:.2f}</p>'
 
@@ -2291,7 +2741,12 @@ class HTMLReportGenerator:
         filtered_service_data = self._filter_recommendations(service_data)
 
         content = f'<div class="service-header">'
-        content += f'<h2 class="service-title">{html.escape(str(filtered_service_data["service_name"]))} Cost Optimization</h2>'
+        service_name_raw = str(filtered_service_data["service_name"])
+        if any(token in service_name_raw.lower() for token in ("cost", "optimizer", "optimization", "anomaly", "visibility", "hub")):
+            service_title = html.escape(service_name_raw)
+        else:
+            service_title = f"{html.escape(service_name_raw)} Cost Optimization"
+        content += f'<h2 class="service-title">{service_title}</h2>'
         content += self._get_service_stats(service_key, filtered_service_data)
         content += "</div>"
 
@@ -2386,18 +2841,18 @@ class HTMLReportGenerator:
         if "direct_key" in config:
             for label, _field in config["cards"]:
                 value = service_data.get(config["direct_key"], 0)
-                stats_html += f'<div class="stat-card"><h4>{label}</h4><div class="value">{value}</div></div>'
+                stats_html += f'<div class="stat-card"><div class="stat-label">{label}</div><div class="value">{value}</div></div>'
         elif "multi_source_cards" in config:
             for label, sub_key, field in config["multi_source_cards"]:
                 sub_dict = service_data.get(sub_key, {})
                 stats_html += (
-                    f'<div class="stat-card"><h4>{label}</h4><div class="value">{sub_dict.get(field, 0)}</div></div>'
+                    f'<div class="stat-card"><div class="stat-label">{label}</div><div class="value">{sub_dict.get(field, 0)}</div></div>'
                 )
         else:
             counts = service_data.get(config.get("count_key", ""), {})
             for label, field in config["cards"]:
                 stats_html += (
-                    f'<div class="stat-card"><h4>{label}</h4><div class="value">{counts.get(field, 0)}</div></div>'
+                    f'<div class="stat-card"><div class="stat-label">{label}</div><div class="value">{counts.get(field, 0)}</div></div>'
                 )
 
         enrichment = _STATS_ENRICHMENTS.get(service_key)
@@ -2489,7 +2944,7 @@ class HTMLReportGenerator:
                     badge = source_type_badge(service_key, source_name)
                     if not should_skip_section_header(service_key):
                         content += f"<h4>{source_name.replace('_', ' ').title()}: {total_count} items{badge}</h4>"
-                    else:
+                    elif badge:
                         content += f'<div class="source-badge">{badge}</div>'
                     content += handler_output
                     continue
@@ -2504,10 +2959,23 @@ class HTMLReportGenerator:
         return content
 
     def _get_footer(self) -> str:
-        """Get footer section"""
+        """Get footer section.
+
+        Embeds the raw scan-result JSON as a data: URL so the page is self-contained
+        — readers can re-open the snapshot in any JSON viewer without needing the
+        originating filesystem.
+        """
+        # Compact JSON keeps the data URL small; whitespace is not load-bearing in
+        # downstream tools.
+        json_blob = json.dumps(self.scan_results, separators=(",", ":"))
+        encoded = base64.b64encode(json_blob.encode("utf-8")).decode("ascii")
+        region = html.escape(str(self.scan_results.get("region", "report")))
+        scan_time = str(self.scan_results.get("scan_time", ""))[:10].replace(":", "-")
+        filename = f"aws-cost-scan-{region}-{scan_time}.json" if scan_time else f"aws-cost-scan-{region}.json"
         return f"""<div class="footer">
             <p>Generated by AWS Cost Optimization Scanner on {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</p>
             <p>Report covers {self.scan_results["summary"]["total_services_scanned"]} AWS services with {self.scan_results["summary"]["total_recommendations"]} optimization recommendations</p>
+            <p><a class="footer-link" href="data:application/json;base64,{encoded}" download="{filename}">Download raw scan results (JSON)</a></p>
         </div>"""
 
     def _get_savings_plans_content(self, sp_data: Dict[str, Any]) -> str:
@@ -2522,8 +2990,8 @@ class HTMLReportGenerator:
         content = '<div class="service-header">'
         content += '<h2 class="service-title">Savings Plans Cost Optimization</h2>'
         content += '<div class="service-stats">'
-        content += f'<div class="stat-card"><h4>Active Plans</h4><div class="value">{summary.get("total_active_plans", 0)}</div></div>'
-        content += f'<div class="stat-card"><h4>Total Commitment</h4><div class="value">${summary.get("total_commitment", 0):.2f}/hr</div></div>'
+        content += f'<div class="stat-card"><div class="stat-label">Active Plans</div><div class="value">{summary.get("total_active_plans", 0)}</div></div>'
+        content += f'<div class="stat-card"><div class="stat-label">Total Commitment</div><div class="value">${summary.get("total_commitment", 0):.2f}/hr</div></div>'
 
         if utilization:
             util_pct = utilization.get("utilization_percentage", 0)
@@ -2531,14 +2999,14 @@ class HTMLReportGenerator:
             status_class = (
                 "success" if util_status == "Good" else "warning" if util_status == "Needs Attention" else "danger"
             )
-            content += f'<div class="stat-card"><h4>Utilization</h4><div class="value {status_class}">{util_pct:.1f}%</div></div>'
+            content += f'<div class="stat-card"><div class="stat-label">Utilization</div><div class="value {status_class}">{util_pct:.1f}%</div></div>'
 
         if coverage:
             cov_pct = coverage.get("coverage_percentage", 0)
             cov_status = coverage.get("status", "Unknown")
             status_class = "success" if cov_status == "Good" else "warning" if cov_status == "Moderate" else "danger"
             content += (
-                f'<div class="stat-card"><h4>Coverage</h4><div class="value {status_class}">{cov_pct:.1f}%</div></div>'
+                f'<div class="stat-card"><div class="stat-label">Coverage</div><div class="value {status_class}">{cov_pct:.1f}%</div></div>'
             )
 
         content += "</div></div>"
@@ -2555,7 +3023,7 @@ class HTMLReportGenerator:
                 payment = plan.get("paymentOption", "N/A")
 
                 content += '<div class="rec-item">'
-                content += f"<h5>{plan_type} Savings Plan</h5>"
+                content += f"<h4>{plan_type} Savings Plan</h4>"
                 content += f"<p><strong>Commitment:</strong> ${commitment:.2f}/hour</p>"
                 if plan_type == "EC2Instance":
                     content += f"<p><strong>Instance Family:</strong> {family} | <strong>Region:</strong> {region}</p>"
@@ -2569,7 +3037,7 @@ class HTMLReportGenerator:
             content += '<div class="recommendation-section">'
             content += '<h3 class="section-title"><svg class="icon icon-sm"><use href="#icon-lightbulb"/></svg> Utilization Analysis</h3>'
             content += '<div class="rec-item">'
-            content += f"<h5>Overall Utilization: {utilization.get('utilization_percentage', 0):.1f}% ({utilization.get('status', 'Unknown')})</h5>"
+            content += f"<h4>Overall Utilization: {utilization.get('utilization_percentage', 0):.1f}% ({utilization.get('status', 'Unknown')})</h4>"
             content += f"<p><strong>Total Commitment:</strong> ${utilization.get('total_commitment', '0')}</p>"
             content += f"<p><strong>Used Commitment:</strong> ${utilization.get('used_commitment', '0')}</p>"
             content += f'<p><strong>Unused Commitment:</strong> <span class="danger">${utilization.get("unused_commitment", "0")}</span></p>'
@@ -2580,7 +3048,7 @@ class HTMLReportGenerator:
             content += '<div class="recommendation-section">'
             content += '<h3 class="section-title"><svg class="icon icon-sm"><use href="#icon-lightbulb"/></svg> Coverage Analysis</h3>'
             content += '<div class="rec-item">'
-            content += f"<h5>Coverage: {coverage.get('coverage_percentage', 0):.1f}% ({coverage.get('status', 'Unknown')})</h5>"
+            content += f"<h4>Coverage: {coverage.get('coverage_percentage', 0):.1f}% ({coverage.get('status', 'Unknown')})</h4>"
             content += f"<p><strong>On-Demand Cost:</strong> ${coverage.get('on_demand_cost', 0):.2f}</p>"
             content += f"<p><strong>Spend Covered by Savings Plans:</strong> ${coverage.get('spend_covered', '0')}</p>"
             content += f"<p><strong>Total Cost:</strong> ${coverage.get('total_cost', '0')}</p>"
@@ -2595,7 +3063,7 @@ class HTMLReportGenerator:
                 badge_class = "danger" if severity == "High" else "warning" if severity == "Medium" else "success"
 
                 content += f'<div class="rec-item">'
-                content += f'<h5>{rec.get("type", "Recommendation")} <span class="badge badge-{badge_class}">{severity}</span></h5>'
+                content += f'<h4>{rec.get("type", "Recommendation")} <span class="badge badge-{badge_class}">{severity}</span></h4>'
                 content += f"<p><strong>Finding:</strong> {rec.get('finding', 'N/A')}</p>"
                 content += f"<p><strong>Recommendation:</strong> {rec.get('recommendation', 'N/A')}</p>"
                 if "potential_monthly_savings" in rec:
@@ -2614,7 +3082,7 @@ class HTMLReportGenerator:
             content += "<p>The following instance families are not covered by EC2 Instance Savings Plans:</p>"
             for family_info in uncovered_families:
                 content += '<div class="rec-item">'
-                content += f"<h5>{family_info.get('family', 'Unknown')} Family</h5>"
+                content += f"<h4>{family_info.get('family', 'Unknown')} Family</h4>"
                 content += f"<p><strong>Instance Count:</strong> {family_info.get('instance_count', 0)}</p>"
                 content += f"<p><strong>Instance Types:</strong> {', '.join(family_info.get('instance_types', []))}</p>"
                 content += f"<p><strong>Recommendation:</strong> {family_info.get('recommendation', 'N/A')}</p>"
@@ -2633,7 +3101,7 @@ class HTMLReportGenerator:
                 badge_class = "danger" if severity == "High" else "warning" if severity == "Medium" else "success"
 
                 content += f'<div class="rec-item">'
-                content += f'<h5>{rec.get("type", "Recommendation")} <span class="badge badge-{badge_class}">{severity}</span></h5>'
+                content += f'<h4>{rec.get("type", "Recommendation")} <span class="badge badge-{badge_class}">{severity}</span></h4>'
                 content += f"<p><strong>Recommendation:</strong> {rec.get('recommendation', 'N/A')}</p>"
                 content += f'<p class="savings"><strong>Potential Monthly Savings:</strong> {rec.get("potential_monthly_savings", "N/A")} ({rec.get("savings_percentage", "N/A")})</p>'
                 content += f"<p><strong>Implementation Effort:</strong> {rec.get('implementation_effort', 'N/A')}</p>"
@@ -2726,21 +3194,53 @@ class HTMLReportGenerator:
         function showTab(tabId, evt) {{
             const contents = document.querySelectorAll('.tab-content');
             contents.forEach(content => content.classList.remove('active'));
-            
+
             const buttons = document.querySelectorAll('.tab-button');
-            buttons.forEach(button => button.classList.remove('active'));
-            
-            document.getElementById(tabId).classList.add('active');
-            
-            if (evt && evt.target) {{
-                evt.target.classList.add('active');
+            buttons.forEach(button => {{
+                button.classList.remove('active');
+                button.setAttribute('aria-selected', 'false');
+                button.setAttribute('tabindex', '-1');
+            }});
+
+            const panel = document.getElementById('panel-' + tabId);
+            if (panel) panel.classList.add('active');
+
+            const tabButton = document.getElementById('tab-' + tabId);
+            if (tabButton) {{
+                tabButton.classList.add('active');
+                tabButton.setAttribute('aria-selected', 'true');
+                tabButton.setAttribute('tabindex', '0');
+                if (evt && evt.type !== 'load') tabButton.focus();
             }}
-            
+
             // Clear filter when switching to executive summary
             if (tabId === 'executive-summary') {{
                 currentFilter = null;
                 updateFilterIndicators();
             }}
+        }}
+
+        // WAI-ARIA tab keyboard pattern: roving tabindex + Left/Right/Home/End.
+        function handleTabKey(evt) {{
+            const target = evt.currentTarget;
+            const tablist = target.closest('[role="tablist"]');
+            if (!tablist) return;
+            const tabs = Array.from(tablist.querySelectorAll('[role="tab"]'));
+            const idx = tabs.indexOf(target);
+            if (idx < 0) return;
+
+            let next = -1;
+            switch (evt.key) {{
+                case 'ArrowRight': next = (idx + 1) % tabs.length; break;
+                case 'ArrowLeft': next = (idx - 1 + tabs.length) % tabs.length; break;
+                case 'Home': next = 0; break;
+                case 'End': next = tabs.length - 1; break;
+                default: return;
+            }}
+            evt.preventDefault();
+            const nextTab = tabs[next];
+            const nextId = nextTab.id.replace(/^tab-/, '');
+            showTab(nextId, evt);
         }}
         
         function filterByService(serviceKey) {{
@@ -2955,7 +3455,153 @@ class HTMLReportGenerator:
         document.addEventListener('DOMContentLoaded', function() {{
             initializeTheme();
             initializeCharts();
+            initializeTabKeyboardNav();
+            initializeCopyButtons();
+            initializePriorityFilter();
+            initializeBucketSort();
+            initializeShowMore();
         }});
+
+        // S3 top-bucket sort toggle: client-side sort by cost or size.
+        function initializeBucketSort() {{
+            document.querySelectorAll('.bucket-sort-toggle').forEach(function(group) {{
+                const buttons = group.querySelectorAll('.bucket-sort-btn');
+                const table = group.parentElement.querySelector('.top-buckets-table table tbody');
+                if (!table) return;
+                buttons.forEach(function(btn) {{
+                    btn.addEventListener('click', function() {{
+                        const key = btn.getAttribute('data-bucket-sort') || 'cost';
+                        buttons.forEach(function(b) {{
+                            const isMatch = b === btn;
+                            b.classList.toggle('active', isMatch);
+                            b.setAttribute('aria-pressed', isMatch ? 'true' : 'false');
+                        }});
+                        const rows = Array.from(table.querySelectorAll('tr'));
+                        rows.sort(function(a, b) {{
+                            const av = parseFloat(a.getAttribute('data-' + key) || '0');
+                            const bv = parseFloat(b.getAttribute('data-' + key) || '0');
+                            return bv - av;
+                        }});
+                        rows.forEach(function(r) {{ table.appendChild(r); }});
+                    }});
+                }});
+            }});
+        }}
+
+        // Collapse long resource lists inside rec-item to first 5 entries with toggle.
+        function initializeShowMore() {{
+            const COLLAPSE_THRESHOLD = 5;
+            const resourceIdRe = /^(i|vol|snap|ami|fs|nat|vpc|eks|eni|db|cluster|sg|rtb|igw|tgw|peering)-[a-z0-9]+/i;
+            document.querySelectorAll('.rec-item ul, .resource-list').forEach(function(list) {{
+                const items = Array.from(list.querySelectorAll(':scope > li'));
+                // Decorate resource IDs with copy buttons (best-effort, only when an
+                // obvious AWS resource ID prefix sits at the start of the li text).
+                items.forEach(function(li) {{
+                    if (li.querySelector('.copy-id')) return;
+                    const text = (li.textContent || '').trim();
+                    const match = text.match(resourceIdRe);
+                    if (!match) return;
+                    const btn = document.createElement('button');
+                    btn.type = 'button';
+                    btn.className = 'copy-id';
+                    btn.setAttribute('data-copy', match[0]);
+                    btn.setAttribute('aria-label', 'Copy resource ID ' + match[0]);
+                    btn.title = 'Copy ' + match[0];
+                    btn.textContent = '⧉';
+                    li.prepend(btn);
+                }});
+
+                if (items.length <= COLLAPSE_THRESHOLD) return;
+                items.forEach(function(li, idx) {{
+                    if (idx >= COLLAPSE_THRESHOLD) li.classList.add('hidden-overflow');
+                }});
+                const toggle = document.createElement('button');
+                toggle.type = 'button';
+                toggle.className = 'show-more-toggle';
+                const hiddenCount = items.length - COLLAPSE_THRESHOLD;
+                toggle.textContent = 'Show all ' + items.length + ' (+' + hiddenCount + ' hidden)';
+                toggle.setAttribute('aria-expanded', 'false');
+                toggle.addEventListener('click', function() {{
+                    const expanded = toggle.getAttribute('aria-expanded') === 'true';
+                    items.forEach(function(li, idx) {{
+                        if (idx >= COLLAPSE_THRESHOLD) {{
+                            li.classList.toggle('hidden-overflow', expanded);
+                        }}
+                    }});
+                    toggle.setAttribute('aria-expanded', expanded ? 'false' : 'true');
+                    toggle.textContent = expanded
+                        ? 'Show all ' + items.length + ' (+' + hiddenCount + ' hidden)'
+                        : 'Show fewer';
+                }});
+                list.insertAdjacentElement('afterend', toggle);
+            }});
+
+            // Re-wire any copy buttons we just injected so they fire navigator.clipboard.
+            initializeCopyButtons();
+        }}
+
+        // Priority filter chips: dim non-matching rec-items across all tabs.
+        function initializePriorityFilter() {{
+            const chips = document.querySelectorAll('.priority-filter-chip');
+            chips.forEach(function(chip) {{
+                chip.addEventListener('click', function() {{
+                    const value = chip.getAttribute('data-priority-filter') || 'all';
+                    chips.forEach(function(c) {{
+                        const isMatch = c === chip;
+                        c.classList.toggle('active', isMatch);
+                        c.setAttribute('aria-pressed', isMatch ? 'true' : 'false');
+                    }});
+                    if (value === 'all') {{
+                        document.body.removeAttribute('data-priority-filter');
+                    }} else {{
+                        document.body.setAttribute('data-priority-filter', value);
+                    }}
+                }});
+            }});
+        }}
+
+        // Wire WAI-ARIA tab keyboard navigation + roving tabindex.
+        function initializeTabKeyboardNav() {{
+            const tablist = document.querySelector('.tab-buttons[role="tablist"]');
+            if (!tablist) return;
+            const tabs = tablist.querySelectorAll('[role="tab"]');
+            tabs.forEach(function(tab) {{
+                const isActive = tab.getAttribute('aria-selected') === 'true';
+                tab.setAttribute('tabindex', isActive ? '0' : '-1');
+                tab.addEventListener('keydown', handleTabKey);
+            }});
+
+            // Toggle the right-edge fade gradient when the strip is scrolled to its end.
+            const tabsContainer = tablist.closest('.tabs');
+            if (!tabsContainer) return;
+            const updateFade = function() {{
+                const atEnd = tablist.scrollLeft + tablist.clientWidth >= tablist.scrollWidth - 2;
+                tabsContainer.classList.toggle('scroll-at-end', atEnd);
+            }};
+            tablist.addEventListener('scroll', updateFade, {{ passive: true }});
+            window.addEventListener('resize', updateFade);
+            updateFade();
+        }}
+
+        // Wire copy-to-clipboard buttons on resource ids.
+        function initializeCopyButtons() {{
+            document.querySelectorAll('.copy-id').forEach(function(btn) {{
+                btn.addEventListener('click', function(evt) {{
+                    evt.stopPropagation();
+                    const value = btn.getAttribute('data-copy');
+                    if (!value || !navigator.clipboard) return;
+                    navigator.clipboard.writeText(value).then(function() {{
+                        const orig = btn.getAttribute('aria-label') || 'Copy';
+                        btn.classList.add('copied');
+                        btn.setAttribute('aria-label', 'Copied');
+                        setTimeout(function() {{
+                            btn.classList.remove('copied');
+                            btn.setAttribute('aria-label', orig);
+                        }}, 1500);
+                    }});
+                }});
+            }});
+        }}
         </script>"""
 
 

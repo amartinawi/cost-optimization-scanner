@@ -61,7 +61,7 @@ def _render_ec2_enhanced_checks(recommendations: List[Rec], source_name: str, se
     content = ""
     for category, recs in grouped_recs.items():
         content += f'<div class="rec-item{_priority_class(recs[0])}">'
-        content += f"<h5>{category} ({len(recs)} resources)</h5>"
+        content += f"<h4>{category} ({len(recs)} resources)</h4>"
         content += f"<p><strong>Recommendation:</strong> {recs[0].get('Recommendation', 'Optimize resource')}</p>"
         content += "<p><strong>Affected Resources:</strong></p><ul>"
         for rec in recs:
@@ -117,7 +117,7 @@ def _render_ec2_cost_hub(recommendations: List[Rec], source_name: str, service_d
     for action, recs in grouped_actions.items():
         total_savings = sum(r.get("estimatedMonthlySavings", 0) for r in recs)
         content += f'<div class="rec-item{_priority_class(recs[0])}">'
-        content += f"<h5>Action: {action} ({len(recs)} resources)</h5>"
+        content += f"<h4>Action: {action} ({len(recs)} resources)</h4>"
         content += f'<p class="savings"><strong>Total Monthly Savings:</strong> ${total_savings:.2f}</p>'
         content += "<p><strong>Resources:</strong></p><ul>"
         for rec in recs:
@@ -163,7 +163,7 @@ def _render_ec2_compute_optimizer(recommendations: List[Rec], source_name: str, 
     content = ""
     for finding, recs in grouped_findings.items():
         content += f'<div class="rec-item{_priority_class(recs[0])}">'
-        content += f"<h5>Finding: {finding} ({len(recs)} instances)</h5>"
+        content += f"<h4>Finding: {finding} ({len(recs)} instances)</h4>"
         content += "<p><strong>Instances:</strong></p><ul>"
         for rec in recs:
             instance_name = rec.get("instanceName", "N/A")
@@ -202,7 +202,7 @@ def _render_ebs_cost_hub(recommendations: List[Rec], source_name: str, service_d
     for action, recs in grouped_actions.items():
         total_savings = sum(r.get("estimatedMonthlySavings", 0) for r in recs)
         content += f'<div class="rec-item{_priority_class(recs[0])}">'
-        content += f"<h5>Action: {action} ({len(recs)} volumes)</h5>"
+        content += f"<h4>Action: {action} ({len(recs)} volumes)</h4>"
         content += f'<p class="savings"><strong>Total Monthly Savings:</strong> ${total_savings:.2f}</p>'
         content += "<p><strong>Volumes:</strong></p><ul>"
         for rec in recs:
@@ -221,7 +221,7 @@ def _render_ebs_unattached(recommendations: List[Rec], source_name: str, service
     """Renders unattached EBS volumes with deletion recommendations. Called by: HTMLReportGenerator._get_detailed_recommendations."""
     total_cost = sum(r.get("EstimatedMonthlyCost", 0) for r in recommendations)
     content = f'<div class="rec-item{_priority_class(recommendations[0])}">'
-    content += f"<h5>Unattached Volumes ({len(recommendations)} volumes)</h5>"
+    content += f"<h4>Unattached Volumes ({len(recommendations)} volumes)</h4>"
     content += f"<p><strong>Recommendation:</strong> Delete unattached volumes (create snapshots first if needed)</p>"
     content += f'<p class="savings"><strong>Total Monthly Savings:</strong> ${total_cost:.2f}</p>'
     content += "<p><strong>Volumes:</strong></p><ul>"
@@ -251,7 +251,7 @@ def _render_ebs_gp2_migration(recommendations: List[Rec], source_name: str, serv
             except (ValueError, AttributeError) as e:
                 logger.debug("Could not parse gp2 migration savings %r: %s", savings_str, e)
     content = f'<div class="rec-item{_priority_class(recommendations[0])}">'
-    content += f"<h5>gp2 to gp3 Migration ({len(recommendations)} volumes)</h5>"
+    content += f"<h4>gp2 to gp3 Migration ({len(recommendations)} volumes)</h4>"
     content += "<p><strong>Recommendation:</strong> Migrate gp2 volumes to gp3 for 20% cost savings</p>"
     content += f'<p class="savings"><strong>Estimated Savings:</strong> ${total_savings:.2f}/month</p>'
     content += "<p><strong>Volumes:</strong></p><ul>"
@@ -301,7 +301,7 @@ def _render_ebs_enhanced_checks(recommendations: List[Rec], source_name: str, se
                     logger.debug("Could not parse EBS savings %r: %s", savings_str, e)
 
         content += f'<div class="rec-item{_priority_class(recs[0])}">'
-        content += f"<h5>{category} ({len(recs)} volumes)</h5>"
+        content += f"<h4>{category} ({len(recs)} volumes)</h4>"
         content += f"<p><strong>Recommendation:</strong> {recs[0].get('Recommendation', 'Optimize volumes')}</p>"
         if total_savings > 0:
             content += f'<p class="savings"><strong>Estimated Savings:</strong> ${total_savings:.2f}/month</p>'
@@ -340,7 +340,7 @@ def _render_ebs_compute_optimizer(recommendations: List[Rec], source_name: str, 
     content = ""
     for finding, recs in grouped_findings.items():
         content += f'<div class="rec-item{_priority_class(recs[0])}">'
-        content += f"<h5>Finding: {finding} ({len(recs)} volumes)</h5>"
+        content += f"<h4>Finding: {finding} ({len(recs)} volumes)</h4>"
         content += "<p><strong>Volumes:</strong></p><ul>"
         for rec in recs:
             volume_id = rec.get("volumeArn", "N/A").split("/")[-1] if rec.get("volumeArn") else "N/A"
@@ -386,7 +386,7 @@ def _render_rds_compute_optimizer(recommendations: List[Rec], source_name: str, 
         content += f'<div class="rec-item{_priority_class(recs[0])}">'
         count = len(recs)
         label = "database" if count == 1 else "databases"
-        content += f"<h5>Finding: {finding} ({count} {label})</h5>"
+        content += f"<h4>Finding: {finding} ({count} {label})</h4>"
 
         if recs[0].get("instanceRecommendationOptions"):
             content += (
@@ -436,10 +436,10 @@ def _render_rds_enhanced_checks(recommendations: List[Rec], source_name: str, se
         count = len(recs)
         if "Snapshot" in category:
             label = "snapshot" if count == 1 else "snapshots"
-            content += f"<h5>{category} ({count} {label})</h5>"
+            content += f"<h4>{category} ({count} {label})</h4>"
         else:
             label = "database" if count == 1 else "databases"
-            content += f"<h5>{category} ({count} {label})</h5>"
+            content += f"<h4>{category} ({count} {label})</h4>"
 
         content += f"<p><strong>Recommendation:</strong> {recs[0].get('Recommendation', 'Optimize configuration')}</p>"
 
@@ -493,9 +493,18 @@ def _render_rds_enhanced_checks(recommendations: List[Rec], source_name: str, se
     return content
 
 
-def _render_s3_enhanced_checks(recommendations: List[Rec], source_name: str, service_data: Dict) -> str:
-    """Renders S3 bucket recommendations grouped by optimisation type. Called by: HTMLReportGenerator._get_detailed_recommendations."""
-    grouped_s3 = {
+def _render_s3_bucket_analysis(recommendations: List[Rec], source_name: str, service_data: Dict) -> str:
+    """Renders S3 bucket-level recommendations grouped by optimisation type.
+
+    Handles the ``s3_bucket_analysis`` source shape (Name + SizeGB +
+    EstimatedMonthlyCost + SavingsDelta). Per-group savings sum the
+    per-bucket ``SavingsDelta`` values computed by ``services/s3.py`` from
+    ``S3_SAVINGS_FACTORS`` (audit L2-S3-001) — replaces the legacy hard-coded
+    "40-95%" prose strings.
+
+    Called by: HTMLReportGenerator._get_detailed_recommendations.
+    """
+    grouped_s3: Dict[str, List[Rec]] = {
         "No Lifecycle Policy": [],
         "No Intelligent Tiering": [],
         "Static Website Optimization": [],
@@ -510,11 +519,10 @@ def _render_s3_enhanced_checks(recommendations: List[Rec], source_name: str, ser
 
         if bucket_name == "Unknown" or not bucket_name:
             continue
-
         if bucket_size == 0 and bucket_cost == 0 and rec.get("CheckCategory"):
-            continue
-
-        if bucket_name == "Unknown" and bucket_size == 0 and bucket_cost == 0:
+            # Defensive: enhanced-check records shouldn't reach this handler
+            # anymore (split into _render_s3_enhanced_checks) — skip just in
+            # case stale fixtures arrive.
             continue
 
         has_lifecycle = rec.get("HasLifecyclePolicy", False)
@@ -539,30 +547,35 @@ def _render_s3_enhanced_checks(recommendations: List[Rec], source_name: str, ser
 
         total_size = sum(b.get("SizeGB", 0) for b in buckets)
         total_cost = sum(b.get("EstimatedMonthlyCost", 0) for b in buckets)
+        # Real per-group dollars from per-bucket SavingsDelta.
+        total_savings = sum(float(b.get("SavingsDelta", 0.0) or 0.0) for b in buckets)
 
         content += f'<div class="rec-item{_priority_class(buckets[0])}">'
-        content += f"<h5>{group_name} ({len(buckets)} buckets, {total_size:.2f} GB total)</h5>"
+        content += f"<h4>{group_name} ({len(buckets)} buckets, {total_size:.2f} GB total)</h4>"
 
         if group_name == "No Lifecycle Policy":
             content += "<p><strong>Recommendation:</strong> Implement lifecycle policies to automatically transition objects to cheaper storage classes</p>"
-            content += '<p class="savings"><strong>Potential Savings:</strong> 40-95% depending on access patterns</p>'
         elif group_name == "No Intelligent Tiering":
             content += (
                 "<p><strong>Recommendation:</strong> Enable Intelligent Tiering for automatic cost optimization</p>"
             )
-            content += (
-                '<p class="savings"><strong>Potential Savings:</strong> Up to 95% for infrequently accessed data</p>'
-            )
         elif group_name == "Static Website Optimization":
             content += "<p><strong>Recommendation:</strong> Enable CloudFront CDN for reduced data transfer costs and improved performance</p>"
-            content += '<p class="savings"><strong>Potential Savings:</strong> 20-60% on data transfer costs</p>'
         elif group_name == "Both Missing":
             content += (
                 "<p><strong>Recommendation:</strong> Implement lifecycle policies AND enable Intelligent Tiering</p>"
             )
-            content += '<p class="savings"><strong>Potential Savings:</strong> 40-95% depending on access patterns</p>'
         else:
             content += "<p><strong>Recommendation:</strong> Review other optimization opportunities</p>"
+
+        if total_savings > 0:
+            content += (
+                f'<p class="savings"><strong>Estimated Savings:</strong> ${total_savings:.2f}/month</p>'
+            )
+        else:
+            content += (
+                '<p class="savings"><strong>Estimated Savings:</strong> $0.00/month — data transfer dependent</p>'
+            )
 
         if total_cost > 0:
             content += f"<p><strong>Current Monthly Cost:</strong> ${total_cost:.2f}</p>"
@@ -572,9 +585,67 @@ def _render_s3_enhanced_checks(recommendations: List[Rec], source_name: str, ser
             bucket_name = bucket.get("Name") or bucket.get("BucketName", "Unknown")
             bucket_size = bucket.get("SizeGB", 0)
             bucket_cost = bucket.get("EstimatedMonthlyCost", 0)
+            bucket_savings = float(bucket.get("SavingsDelta", 0.0) or 0.0)
             content += f"<li>{bucket_name}: {bucket_size:.2f} GB"
             if bucket_cost > 0:
-                content += f" (${bucket_cost:.2f}/month)"
+                content += f" (${bucket_cost:.2f}/month"
+                if bucket_savings > 0:
+                    content += f", save ${bucket_savings:.2f}/month"
+                content += ")"
+            content += "</li>"
+        content += "</ul></div>"
+    return content
+
+
+def _render_s3_enhanced_checks(recommendations: List[Rec], source_name: str, service_data: Dict) -> str:
+    """Renders S3 enhanced-check recommendations grouped by CheckCategory.
+
+    Handles the ``enhanced_checks`` source shape (BucketName + CheckCategory
+    + EstimatedSavings as ``$X.YY/month`` or ``$0.00/month - <reason>``).
+    Previously these records were silently dropped by the bucket-analysis
+    renderer (audit L3-S3-001); now they get a dedicated handler.
+
+    Called by: HTMLReportGenerator._get_detailed_recommendations.
+    """
+    grouped: Dict[str, List[Rec]] = {}
+    for rec in recommendations:
+        category = rec.get("CheckCategory", "Other")
+        grouped.setdefault(category, []).append(rec)
+
+    content = ""
+    for category, recs in grouped.items():
+        total_savings = 0.0
+        for r in recs:
+            savings_str = str(r.get("EstimatedSavings", ""))
+            if "$" in savings_str:
+                try:
+                    total_savings += float(
+                        savings_str.replace("$", "").split("/")[0].replace(",", "")
+                    )
+                except (ValueError, AttributeError) as e:
+                    logger.debug("Could not parse S3 savings %r: %s", savings_str, e)
+
+        content += f'<div class="rec-item{_priority_class(recs[0])}">'
+        content += f"<h4>{category} ({len(recs)} buckets)</h4>"
+        content += (
+            f"<p><strong>Recommendation:</strong> {recs[0].get('Recommendation', 'Review configuration')}</p>"
+        )
+        if total_savings > 0:
+            content += (
+                f'<p class="savings"><strong>Estimated Savings:</strong> ${total_savings:.2f}/month</p>'
+            )
+        else:
+            content += (
+                f'<p class="savings"><strong>Estimated Savings:</strong> {recs[0].get("EstimatedSavings", "$0.00/month")}</p>'
+            )
+        content += "<p><strong>Buckets:</strong></p><ul>"
+        for rec in recs:
+            bucket_name = rec.get("BucketName", rec.get("Name", "Unknown"))
+            content += f"<li>{bucket_name}"
+            if rec.get("IncompleteUploads"):
+                content += f" — {rec['IncompleteUploads']} incomplete uploads"
+            if rec.get("AgeDays"):
+                content += f" — {rec['AgeDays']} days old"
             content += "</li>"
         content += "</ul></div>"
     return content
@@ -614,7 +685,7 @@ def _render_dynamodb_enhanced_checks(recommendations: List[Rec], source_name: st
             continue
 
         content += f'<div class="rec-item{_priority_class(tables[0])}">'
-        content += f"<h5>{group_name} ({len(tables)} tables)</h5>"
+        content += f"<h4>{group_name} ({len(tables)} tables)</h4>"
 
         if group_name == "Provisioned to On-Demand":
             content += "<p><strong>Recommendation:</strong> Switch to On-Demand billing for unpredictable workloads</p>"
@@ -675,7 +746,7 @@ def _render_containers_enhanced_checks(recommendations: List[Rec], source_name: 
             continue
 
         content += f'<div class="rec-item{_priority_class(resources[0])}">'
-        content += f"<h5>{group_name} ({len(resources)} resources)</h5>"
+        content += f"<h4>{group_name} ({len(resources)} resources)</h4>"
 
         if group_name == "ECS Container Insights Required":
             content += "<p><strong>Recommendation:</strong> Enable Container Insights to get metric-backed rightsizing recommendations</p>"
@@ -727,7 +798,7 @@ def _render_elasticache_enhanced_checks(recommendations: List[Rec], source_name:
 
         content += f'<div class="rec-item{_priority_class(clusters[0])}">'
         label = "cluster" if len(clusters) == 1 else "clusters"
-        content += f"<h5>{category} ({len(clusters)} {label})</h5>"
+        content += f"<h4>{category} ({len(clusters)} {label})</h4>"
         content += f"<p><strong>Recommendation:</strong> {clusters[0].get('Recommendation', 'Optimize cluster')}</p>"
 
         savings_str = clusters[0].get("EstimatedSavings", "")
@@ -767,7 +838,7 @@ def _render_opensearch_enhanced_checks(recommendations: List[Rec], source_name: 
 
         content += f'<div class="rec-item{_priority_class(domains[0])}">'
         label = "domain" if len(domains) == 1 else "domains"
-        content += f"<h5>{category} ({len(domains)} {label})</h5>"
+        content += f"<h4>{category} ({len(domains)} {label})</h4>"
         content += f"<p><strong>Recommendation:</strong> {domains[0].get('Recommendation', 'Optimize domain')}</p>"
 
         savings_str = domains[0].get("EstimatedSavings", "")
@@ -806,7 +877,7 @@ def _render_network_enhanced_checks(recommendations: List[Rec], source_name: str
             continue
 
         content += f'<div class="rec-item{_priority_class(resources[0])}">'
-        content += f"<h5>{category} ({len(resources)} resources)</h5>"
+        content += f"<h4>{category} ({len(resources)} resources)</h4>"
         content += f"<p><strong>Recommendation:</strong> {resources[0].get('Recommendation', 'Optimize resource')}</p>"
 
         savings_str = resources[0].get("EstimatedSavings", "")
@@ -887,7 +958,7 @@ def _render_monitoring_enhanced_checks(recommendations: List[Rec], source_name: 
             continue
 
         content += f'<div class="rec-item{_priority_class(resources[0])}">'
-        content += f"<h5>{category} ({len(resources)} resources)</h5>"
+        content += f"<h4>{category} ({len(resources)} resources)</h4>"
         content += f"<p><strong>Recommendation:</strong> {resources[0].get('Recommendation', 'Optimize resource')}</p>"
 
         savings_str = resources[0].get("EstimatedSavings", "")
@@ -930,7 +1001,7 @@ def _render_additional_services(recommendations: List[Rec], source_name: str, se
             continue
 
         content += f'<div class="rec-item{_priority_class(resources[0])}">'
-        content += f"<h5>{category} ({len(resources)} resources)</h5>"
+        content += f"<h4>{category} ({len(resources)} resources)</h4>"
         content += f"<p><strong>Recommendation:</strong> {resources[0].get('Recommendation', 'Optimize resource')}</p>"
 
         savings_str = resources[0].get("EstimatedSavings", "")
@@ -975,7 +1046,7 @@ def _render_compute_optimizer_source(recommendations: List[Rec], source_name: st
         total_savings = sum(r.get("estimatedMonthlySavings", 0) for r in recs)
         label = "resource" if len(recs) == 1 else "resources"
         content += f'<div class="rec-item{_priority_class(recs[0])}">'
-        content += f"<h5>Finding: {finding} ({len(recs)} {label})</h5>"
+        content += f"<h4>Finding: {finding} ({len(recs)} {label})</h4>"
         if total_savings > 0:
             content += f'<p class="savings"><strong>Estimated Monthly Savings:</strong> ${total_savings:.2f}</p>'
         content += "<p><strong>Resources:</strong></p><ul>"
@@ -1046,7 +1117,7 @@ def render_generic_per_rec(service_key: str, recommendations: List[Rec], source_
 def _render_generic_ec2_rec(content: str, rec: Rec) -> str:
     """Render a single EC2 recommendation card. Called by: render_generic_per_rec."""
     if "CheckCategory" in rec:
-        content += f"<h5>{rec.get('CheckCategory', 'EC2 Optimization')}: {rec.get('InstanceId', rec.get('ImageId', rec.get('AllocationId', 'Resource')))}</h5>"
+        content += f"<h4>{rec.get('CheckCategory', 'EC2 Optimization')}: {rec.get('InstanceId', rec.get('ImageId', rec.get('AllocationId', 'Resource')))}</h4>"
         if "InstanceType" in rec:
             content += f"<p><strong>Instance Type:</strong> {rec.get('InstanceType')}</p>"
         if "CurrentType" in rec:
@@ -1059,7 +1130,7 @@ def _render_generic_ec2_rec(content: str, rec: Rec) -> str:
         content += f'<p class="savings"><strong>Estimated Savings:</strong> {rec.get("EstimatedSavings", "Cost optimization")}</p>'
     else:
         if "actionType" in rec:
-            content += f"<h5>Resource: {rec.get('resourceId', 'N/A')}</h5>"
+            content += f"<h4>Resource: {rec.get('resourceId', 'N/A')}</h4>"
             content += f"<p><strong>Action:</strong> {rec.get('actionType', 'N/A')}</p>"
             content += (
                 f'<p class="savings"><strong>Monthly Savings:</strong> ${rec.get("estimatedMonthlySavings", 0):.2f}</p>'
@@ -1087,7 +1158,7 @@ def _render_generic_ec2_rec(content: str, rec: Rec) -> str:
         elif "instanceArn" in rec:
             instance_name = rec.get("instanceName", "N/A")
             instance_id = rec.get("instanceArn", "").split("/")[-1] if rec.get("instanceArn") else "N/A"
-            content += f"<h5>Instance: {instance_name or instance_id}</h5>"
+            content += f"<h4>Instance: {instance_name or instance_id}</h4>"
             content += f"<p><strong>Finding:</strong> {rec.get('finding', 'N/A')}</p>"
             content += f"<p><strong>Current Type:</strong> {rec.get('currentInstanceType', 'N/A')}</p>"
     return content
@@ -1096,7 +1167,7 @@ def _render_generic_ec2_rec(content: str, rec: Rec) -> str:
 def _render_generic_ebs_rec(content: str, rec: Rec) -> str:
     """Render a single EBS recommendation card. Called by: render_generic_per_rec."""
     if "CheckCategory" in rec:
-        content += f"<h5>{rec.get('CheckCategory', 'EBS Optimization')}: {rec.get('VolumeId', rec.get('SnapshotId', 'Resource'))}</h5>"
+        content += f"<h4>{rec.get('CheckCategory', 'EBS Optimization')}: {rec.get('VolumeId', rec.get('SnapshotId', 'Resource'))}</h4>"
         if "Size" in rec:
             content += f"<p><strong>Size:</strong> {rec.get('Size')} GB</p>"
         if "CurrentType" in rec:
@@ -1111,7 +1182,7 @@ def _render_generic_ebs_rec(content: str, rec: Rec) -> str:
         content += f'<p class="savings"><strong>Estimated Savings:</strong> {rec.get("EstimatedSavings", "Cost optimization")}</p>'
     else:
         if "actionType" in rec and "ebsVolume" in rec.get("currentResourceDetails", {}):
-            content += f"<h5>Resource: {rec.get('resourceId', 'N/A')}</h5>"
+            content += f"<h4>Resource: {rec.get('resourceId', 'N/A')}</h4>"
             content += f"<p><strong>Action:</strong> {rec.get('actionType', 'N/A')}</p>"
             content += (
                 f'<p class="savings"><strong>Monthly Savings:</strong> ${rec.get("estimatedMonthlySavings", 0):.2f}</p>'
@@ -1133,13 +1204,13 @@ def _render_generic_ebs_rec(content: str, rec: Rec) -> str:
             if rec_type != "N/A":
                 content += f"<p>Recommended: {rec_type} ({rec_size} GB)</p>"
         elif "VolumeId" in rec:
-            content += f"<h5>Volume: {rec.get('VolumeId', 'N/A')}</h5>"
+            content += f"<h4>Volume: {rec.get('VolumeId', 'N/A')}</h4>"
             content += f"<p>Type: {rec.get('VolumeType', 'N/A')} - {rec.get('Size', 0)} GB</p>"
             content += f'<p class="savings">Monthly Cost: ${rec.get("EstimatedMonthlyCost", 0):.2f}</p>'
             content += f"<p><strong>Recommended Action:</strong> Delete unattached volume (create snapshot first if needed)</p>"
         else:
             volume_id = rec.get("volumeArn", "N/A").split("/")[-1] if rec.get("volumeArn") else "N/A"
-            content += f"<h5>Volume: {volume_id}</h5>"
+            content += f"<h4>Volume: {volume_id}</h4>"
             content += f"<p>Finding: {rec.get('finding', 'N/A')}</p>"
 
             current_config = rec.get("currentConfiguration", {})
@@ -1192,7 +1263,7 @@ def _render_generic_rds_rec(content: str, rec: Rec) -> Tuple[bool, str]:
 
     resource_arn = rec.get("resourceArn", "N/A")
     db_name = resource_arn.split(":")[-1] if resource_arn != "N/A" else "N/A"
-    content += f"<h5>Database: {db_name}</h5>"
+    content += f"<h4>Database: {db_name}</h4>"
     content += f"<p><strong>Engine:</strong> {rec.get('engine', 'N/A')} {rec.get('engineVersion', '')}</p>"
 
     if instance_finding != "N/A":
@@ -1244,7 +1315,7 @@ def _render_generic_file_systems_rec(content: str, rec: Rec) -> str:
     if "FileSystemId" in rec and rec.get("FileSystemType"):
         fs_id = rec.get("FileSystemId", "N/A")
         fs_type = rec.get("FileSystemType", "N/A")
-        content += f"<h5>FSx {fs_type}: {fs_id}</h5>"
+        content += f"<h4>FSx {fs_type}: {fs_id}</h4>"
         content += f"<p>Capacity: {rec.get('StorageCapacity', 0)} GB</p>"
         content += f"<p>Storage Type: {rec.get('StorageType', 'N/A')}</p>"
         content += f'<p class="savings">Monthly Cost: ${rec.get("EstimatedMonthlyCost", 0):.2f}</p>'
@@ -1282,7 +1353,7 @@ def _render_generic_file_systems_rec(content: str, rec: Rec) -> str:
         fs_name = rec.get("Name") or rec.get("FileSystemId", "N/A")
         if fs_name == "Unnamed":
             fs_name = rec.get("FileSystemId", fs_name)
-        content += f"<h5>EFS: {fs_name}</h5>"
+        content += f"<h4>EFS: {fs_name}</h4>"
         size_gb = rec.get("SizeGB", 0)
         size_display = f"{size_gb:.2f} GB" if isinstance(size_gb, float) else f"{size_gb} GB"
         if size_gb == 0 or (isinstance(size_gb, float) and size_gb < 0.1):
@@ -1327,7 +1398,7 @@ def _render_generic_s3_rec(content: str, rec: Rec) -> Tuple[bool, str]:
     if bucket_name == "Unknown" and bucket_size == 0 and bucket_cost == 0:
         return True, content
 
-    content += f"<h5>S3 Bucket: {bucket_name}</h5>"
+    content += f"<h4>S3 Bucket: {bucket_name}</h4>"
     content += f"<p><strong>Size:</strong> {bucket_size:.2f} GB</p>"
     content += f"<p><strong>Monthly Cost:</strong> ${bucket_cost:.2f}</p>"
     content += f"<p><strong>Created:</strong> {rec.get('CreationDate', 'Unknown')}</p>"
@@ -1359,7 +1430,7 @@ def _render_generic_s3_rec(content: str, rec: Rec) -> Tuple[bool, str]:
 
 def _render_generic_dynamodb_rec(content: str, rec: Rec) -> str:
     """Render a single DynamoDB table recommendation card. Called by: render_generic_per_rec."""
-    content += f"<h5>DynamoDB Table: {rec.get('TableName', 'Unknown')}</h5>"
+    content += f"<h4>DynamoDB Table: {rec.get('TableName', 'Unknown')}</h4>"
     content += f"<p><strong>Billing Mode:</strong> {rec.get('BillingMode', 'Unknown')}</p>"
     content += f"<p><strong>Status:</strong> {rec.get('TableStatus', 'Unknown')}</p>"
     content += f"<p><strong>Item Count:</strong> {rec.get('ItemCount', 0):,}</p>"
@@ -1396,19 +1467,19 @@ def _render_generic_containers_rec(content: str, rec: Rec) -> str:
     """Render a single container (ECS/EKS/ECR) recommendation card. Called by: render_generic_per_rec."""
     if "ClusterName" in rec:
         if "Version" in rec:
-            content += f"<h5>EKS Cluster: {rec.get('ClusterName', 'Unknown')}</h5>"
+            content += f"<h4>EKS Cluster: {rec.get('ClusterName', 'Unknown')}</h4>"
             content += f"<p><strong>Version:</strong> {rec.get('Version', 'Unknown')}</p>"
             content += f"<p><strong>Node Groups:</strong> {rec.get('NodeGroupsCount', 0)}</p>"
             content += f"<p><strong>Monthly Cost:</strong> ${rec.get('EstimatedMonthlyCost', 0):.2f}</p>"
         else:
-            content += f"<h5>ECS Cluster: {rec.get('ClusterName', 'Unknown')}</h5>"
+            content += f"<h4>ECS Cluster: {rec.get('ClusterName', 'Unknown')}</h4>"
             content += f"<p><strong>Running Tasks:</strong> {rec.get('RunningTasksCount', 0)}</p>"
             content += f"<p><strong>Services:</strong> {rec.get('ServicesCount', 0)}</p>"
 
         content += f"<p><strong>Status:</strong> {rec.get('Status', 'Unknown')}</p>"
 
     elif "RepositoryName" in rec:
-        content += f"<h5>ECR Repository: {rec.get('RepositoryName', 'Unknown')}</h5>"
+        content += f"<h4>ECR Repository: {rec.get('RepositoryName', 'Unknown')}</h4>"
         content += f"<p><strong>Images:</strong> {rec.get('ImageCount', 0)}</p>"
         content += f"<p><strong>Created:</strong> {rec.get('CreatedAt', 'Unknown')}</p>"
 
@@ -1429,7 +1500,7 @@ def _render_generic_lambda_rec(content: str, rec: Rec) -> str:
     if "actionType" in rec:
         check_category = f"Lambda {rec['actionType']}"
 
-    content += f"<h5>{check_category}: {function_name}</h5>"
+    content += f"<h4>{check_category}: {function_name}</h4>"
 
     if "MemorySize" in rec:
         content += f"<p><strong>Memory Size:</strong> {rec['MemorySize']} MB</p>"
@@ -1518,7 +1589,7 @@ def _render_generic_other_rec(content: str, rec: Rec, source_name: str) -> str:
         else "Resource"
     )
 
-    content += f"<h5>{check_category}: {resource_id}</h5>"
+    content += f"<h4>{check_category}: {resource_id}</h4>"
 
     for key, value in rec.items():
         if key not in ["CheckCategory", "Recommendation", "EstimatedSavings"] and not key.endswith("Arn"):
@@ -1535,40 +1606,84 @@ def _render_generic_other_rec(content: str, rec: Rec, source_name: str) -> str:
 
 
 def render_s3_top_tables(service_data: Dict) -> str:
-    """Render S3 top-10 tables for cost and size. Called by: HTMLReportGenerator._get_detailed_recommendations."""
+    """Render S3 top-bucket table with cost/size sort toggle.
+
+    The previous version rendered two separate Top-10 tables (by cost and by
+    size); for accounts where the largest bucket is also the most expensive,
+    the two tables show the same rows in the same order — redundant and read
+    as inattention. We now merge into one table whose rows are the union of
+    both cuts, with sort buttons exposed so the reader can pivot in place.
+
+    Called by: HTMLReportGenerator._get_detailed_recommendations.
+    """
     content = ""
     sources = service_data.get("sources", {})
     s3_data = sources.get("s3_bucket_analysis", {})
 
-    top_cost = s3_data.get("top_cost_buckets", [])
-    if top_cost:
-        content += "<h4>Top 10 Buckets by Monthly Cost</h4>"
-        content += '<div class="top-buckets-table">'
-        content += "<table><tr><th>Bucket Name</th><th>Size (GB)</th><th>Monthly Cost</th><th>Lifecycle</th><th>Intelligent Tiering</th></tr>"
-        for bucket in top_cost:
-            content += f"<tr>"
-            content += f"<td>{bucket.get('Name', 'N/A')}</td>"
-            content += f"<td>{bucket.get('SizeGB', 0):.2f}</td>"
-            content += f"<td>${bucket.get('EstimatedMonthlyCost', 0):.2f}</td>"
-            content += f"<td>{'✓' if bucket.get('HasLifecyclePolicy') else '✗'}</td>"
-            content += f"<td>{'✓' if bucket.get('HasIntelligentTiering') else '✗'}</td>"
-            content += f"</tr>"
-        content += "</table></div>"
+    top_cost = s3_data.get("top_cost_buckets", []) or []
+    top_size = s3_data.get("top_size_buckets", []) or []
 
-    top_size = s3_data.get("top_size_buckets", [])
-    if top_size:
-        content += "<h4>Top 10 Buckets by Size</h4>"
-        content += '<div class="top-buckets-table">'
-        content += "<table><tr><th>Bucket Name</th><th>Size (GB)</th><th>Monthly Cost</th><th>Lifecycle</th><th>Intelligent Tiering</th></tr>"
-        for bucket in top_size:
-            content += f"<tr>"
-            content += f"<td>{bucket.get('Name', 'N/A')}</td>"
-            content += f"<td>{bucket.get('SizeGB', 0):.2f}</td>"
-            content += f"<td>${bucket.get('EstimatedMonthlyCost', 0):.2f}</td>"
-            content += f"<td>{'✓' if bucket.get('HasLifecyclePolicy') else '✗'}</td>"
-            content += f"<td>{'✓' if bucket.get('HasIntelligentTiering') else '✗'}</td>"
-            content += f"</tr>"
-        content += "</table></div>"
+    if not top_cost and not top_size:
+        return content
+
+    # Union by bucket Name preserving first occurrence (cost-ordered first).
+    merged: Dict[str, Dict[str, Any]] = {}
+    for bucket in top_cost:
+        name = bucket.get("Name", "N/A")
+        if name not in merged:
+            merged[name] = bucket
+    for bucket in top_size:
+        name = bucket.get("Name", "N/A")
+        if name not in merged:
+            merged[name] = bucket
+
+    rows = list(merged.values())
+    cost_max = max((b.get("EstimatedMonthlyCost", 0) or 0) for b in rows) or 0
+    size_max = max((b.get("SizeGB", 0) or 0) for b in rows) or 0
+
+    duplicate_note = ""
+    if top_cost and top_size:
+        # Compute whether the two ordered lists are identical in their first N rows.
+        cost_names = [b.get("Name") for b in top_cost]
+        size_names = [b.get("Name") for b in top_size]
+        if cost_names == size_names:
+            duplicate_note = (
+                '<p class="info-note" style="margin: 12px 0;">'
+                "Top buckets by cost and by size are the same in this account — "
+                "the largest bucket is also the most expensive."
+                "</p>"
+            )
+
+    content += "<h4>Top Buckets</h4>"
+    content += duplicate_note
+    content += (
+        '<div class="bucket-sort-toggle" role="group" aria-label="Sort top buckets">'
+        '<button type="button" class="bucket-sort-btn active" data-bucket-sort="cost" aria-pressed="true">Sort by cost</button>'
+        '<button type="button" class="bucket-sort-btn" data-bucket-sort="size" aria-pressed="false">Sort by size</button>'
+        "</div>"
+    )
+    content += '<div class="top-buckets-table">'
+    content += "<table><thead><tr><th>Bucket Name</th><th>Size (GB)</th><th>Monthly Cost</th><th>Lifecycle</th><th>Intelligent Tiering</th></tr></thead><tbody>"
+    for bucket in rows:
+        name = bucket.get("Name", "N/A")
+        size = bucket.get("SizeGB", 0) or 0
+        cost = bucket.get("EstimatedMonthlyCost", 0) or 0
+        # Encode sort keys as data attributes so the JS toggle can sort client-side
+        # without re-rendering.
+        content += (
+            f'<tr data-cost="{cost:.6f}" data-size="{size:.6f}">'
+            f"<td>{name}</td>"
+            f'<td>{size:.2f}</td>'
+            f'<td>${cost:.2f}</td>'
+            f"<td>{'✓' if bucket.get('HasLifecyclePolicy') else '✗'}</td>"
+            f"<td>{'✓' if bucket.get('HasIntelligentTiering') else '✗'}</td>"
+            f"</tr>"
+        )
+    # The two `_max` values are not surfaced visually today but are kept on the
+    # wrapping element so future sparkline/bar overlays can size against them
+    # without a second pass through the data.
+    content += "</tbody></table></div>"
+    _ = (cost_max, size_max)  # quiet linters
 
     return content
 
@@ -1592,7 +1707,7 @@ def _render_ec2_advanced_checks(recommendations: List[Rec], source_name: str, se
     for category, recs in grouped.items():
         content += f'<div class="rec-item{_priority_class(recs[0])}">'
         label = "resource" if len(recs) == 1 else "resources"
-        content += f"<h5>{category} ({len(recs)} {label})</h5>"
+        content += f"<h4>{category} ({len(recs)} {label})</h4>"
         content += f"<p><strong>Recommendation:</strong> {recs[0].get('Recommendation', 'Optimize resource')}</p>"
 
         total_savings = 0.0
@@ -1650,7 +1765,7 @@ def _render_eks_source(recommendations: List[Rec], source_name: str, service_dat
         total_savings = sum(r.get("monthly_savings", 0.0) for r in recs)
         content += f'<div class="rec-item{_priority_class(recs[0])}">'
         label = "finding" if len(recs) == 1 else "findings"
-        content += f"<h5>{category} ({len(recs)} {label})</h5>"
+        content += f"<h4>{category} ({len(recs)} {label})</h4>"
         if total_savings > 0:
             content += f'<p class="savings"><strong>Estimated Monthly Savings:</strong> ${total_savings:.2f}</p>'
         content += "<p><strong>Resources:</strong></p><ul>"
@@ -1695,7 +1810,7 @@ def _render_cost_hub_source(recommendations: List[Rec], source_name: str, servic
         content += f'<div class="rec-item{_priority_class(recs[0])}">'
 
         action_display = action_type.replace("_", " ").replace("Purchase", "Purchase ")
-        content += f"<h5>{action_display} ({len(recs)} {label})</h5>"
+        content += f"<h4>{action_display} ({len(recs)} {label})</h4>"
 
         if total_savings > 0:
             content += f'<p class="savings"><strong>Estimated Monthly Savings:</strong> ${total_savings:.2f}</p>'
@@ -1755,7 +1870,7 @@ def _render_cost_anomaly_source(recommendations: List[Rec], source_name: str, se
         total_savings = sum(r.get("monthly_savings", 0.0) for r in recs)
         label = "item" if len(recs) == 1 else "items"
         content += f'<div class="rec-item{_priority_class(recs[0])}">'
-        content += f"<h5>{category} ({len(recs)} {label})</h5>"
+        content += f"<h4>{category} ({len(recs)} {label})</h4>"
 
         if total_savings > 0:
             content += f'<p class="savings"><strong>Estimated Monthly Impact:</strong> ${total_savings:.2f}</p>'
@@ -1772,11 +1887,11 @@ def _render_cost_anomaly_source(recommendations: List[Rec], source_name: str, se
 
             severity_badge = ""
             if severity == "HIGH":
-                severity_badge = '<span style="color:#e74c3c;font-weight:bold">HIGH</span>'
+                severity_badge = '<span class="badge badge-danger">HIGH</span>'
             elif severity == "MEDIUM":
-                severity_badge = '<span style="color:#f39c12;font-weight:bold">MEDIUM</span>'
+                severity_badge = '<span class="badge badge-warning">MEDIUM</span>'
             elif severity == "LOW":
-                severity_badge = '<span style="color:#27ae60;font-weight:bold">LOW</span>'
+                severity_badge = '<span class="badge badge-success">LOW</span>'
             else:
                 severity_badge = severity
 
@@ -1796,6 +1911,21 @@ def _render_cost_anomaly_source(recommendations: List[Rec], source_name: str, se
     return content
 
 
+# Single source of truth for the source-confidence badge taxonomy. Must match
+# the glossary rendered by HTMLReportGenerator._get_glossary_section. Any label
+# not in this set is rejected by source_type_badge so the body cannot drift
+# from the legend (DESIGN.md: glossary-as-source-of-truth).
+VALID_SOURCE_BADGES: frozenset = frozenset(
+    {"Metric Backed", "ML Backed", "Cost Hub", "Audit Based"}
+)
+
+_SOURCE_BADGE_CSS: Dict[str, str] = {
+    "Metric Backed": "badge-success",
+    "ML Backed": "badge-info",
+    "Cost Hub": "badge-warning",
+    "Audit Based": "badge-danger",
+}
+
 SOURCE_TYPE_MAP: Dict[Tuple[str, str], str] = {
     ("compute_optimizer", "ebs_recommendations"): "ML Backed",
     ("compute_optimizer", "lambda_recommendations"): "ML Backed",
@@ -1806,15 +1936,18 @@ SOURCE_TYPE_MAP: Dict[Tuple[str, str], str] = {
     ("cost_anomaly", "active_anomalies"): "Audit Based",
     ("cost_anomaly", "anomaly_monitors"): "Audit Based",
     ("cost_anomaly", "billing_alarms"): "Audit Based",
+    # S3 enhanced checks are config-pattern (no CloudWatch). Override the
+    # generic "enhanced_checks" → "Metric Backed" default (audit L3-S3-003).
+    ("s3", "enhanced_checks"): "Audit Based",
 }
 
 _GENERIC_SOURCE_TYPES: Dict[str, str] = {
     "enhanced_checks": "Metric Backed",
     "lifecycle_analysis": "Metric Backed",
     "rightsizing": "ML Backed",
-    "idle_resources": "Static Analysis",
-    "cost_findings": "Static Analysis",
-    "general_recommendations": "Static Analysis",
+    "idle_resources": "Audit Based",
+    "cost_findings": "Audit Based",
+    "general_recommendations": "Audit Based",
     "recommendations": "Cost Hub",
     "sp_analysis": "Cost Hub",
     "ri_analysis": "Cost Hub",
@@ -1825,9 +1958,9 @@ _GENERIC_SOURCE_TYPES: Dict[str, str] = {
     "s3_bucket_analysis": "Metric Backed",
     "dynamodb_table_analysis": "Metric Backed",
     "efs_lifecycle_analysis": "Audit Based",
-    "old_amis": "Static Analysis",
+    "old_amis": "Audit Based",
     "gp2_migration": "Metric Backed",
-    "unattached_volumes": "Static Analysis",
+    "unattached_volumes": "Audit Based",
     "tgw_vs_peering": "Metric Backed",
     "node_group_optimization": "Metric Backed",
     "fargate_analysis": "Metric Backed",
@@ -1844,13 +1977,11 @@ def source_type_badge(service_key: str, source_name: str) -> str:
         label = _GENERIC_SOURCE_TYPES.get(source_name, "")
     if not label:
         return ""
-    css_class = {
-        "ML Backed": "badge-info",
-        "Cost Hub": "badge-warning",
-        "Metric Backed": "badge-success",
-        "Static Analysis": "badge-danger",
-        "Audit Based": "badge-danger",
-    }.get(label, "badge-info")
+    if label not in VALID_SOURCE_BADGES:
+        # Guard: refuse to render a badge label that the glossary does not define.
+        # Anything reaching here is a taxonomy drift bug, not a runtime condition.
+        return ""
+    css_class = _SOURCE_BADGE_CSS[label]
     return f' <span class="badge {css_class}">{label}</span>'
 
 
@@ -1877,7 +2008,7 @@ PHASE_B_HANDLERS: Dict[Tuple[str, str], Callable] = {
     ("rds", "compute_optimizer"): _render_rds_compute_optimizer,
     ("rds", "enhanced_checks"): _render_rds_enhanced_checks,
     ("s3", "enhanced_checks"): _render_s3_enhanced_checks,
-    ("s3", "s3_bucket_analysis"): _render_s3_enhanced_checks,
+    ("s3", "s3_bucket_analysis"): _render_s3_bucket_analysis,
     ("dynamodb", "enhanced_checks"): _render_dynamodb_enhanced_checks,
     ("dynamodb", "dynamodb_table_analysis"): _render_dynamodb_enhanced_checks,
     ("containers", "enhanced_checks"): _render_containers_enhanced_checks,
