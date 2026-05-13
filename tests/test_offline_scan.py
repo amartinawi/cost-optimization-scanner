@@ -57,7 +57,9 @@ EXPECTED_SERVICE_KEYS = {
     "batch",
     "bedrock",
     "compute_optimizer",
-    "cost_optimization_hub",
+    # cost_optimization_hub retired from ALL_MODULES (2026-05-14):
+    # findings are now distributed into per-service tabs via
+    # ScanOrchestrator._prefetch_advisor_data + ctx.cost_hub_splits.
     "aurora",
     "commitment_analysis",
     "cost_anomaly",

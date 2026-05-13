@@ -99,15 +99,27 @@ class CommitmentAnalysisModule(BaseServiceModule):
         all_recs = sp_util_recs + sp_cov_recs + ri_util_recs + ri_cov_recs + expiry_recs + purchase_recs
         total_savings = sum(r.get("monthly_savings", 0.0) for r in all_recs)
 
+        # Cost Optimization Hub RI / Savings Plans purchase recommendations
+        # the orchestrator routed here after the standalone CoH tab retired.
+        # Render alongside the CE-API derived data so commitment_analysis is
+        # the single home for every reservation / SP signal.
+        cost_hub_recs = ctx.cost_hub_splits.get("commitment_analysis", [])
+        cost_hub_savings = sum(
+            float(r.get("estimatedMonthlySavings", 0) or 0) for r in cost_hub_recs
+        )
+
         exp_30 = sum(1 for r in expiry_recs if r.get("severity") == "HIGH")
         exp_60 = sum(1 for r in expiry_recs if r.get("severity") == "MEDIUM")
         exp_90 = sum(1 for r in expiry_recs if r.get("severity") == "LOW")
 
         return ServiceFindings(
             service_name="Commitment Analysis",
-            total_recommendations=len(all_recs),
-            total_monthly_savings=round(total_savings, 2),
+            total_recommendations=len(all_recs) + len(cost_hub_recs),
+            total_monthly_savings=round(total_savings + cost_hub_savings, 2),
             sources={
+                "cost_optimization_hub": SourceBlock(
+                    count=len(cost_hub_recs), recommendations=tuple(cost_hub_recs)
+                ),
                 "sp_utilization": SourceBlock(
                     count=len(sp_util_recs),
                     recommendations=tuple(sp_util_recs),

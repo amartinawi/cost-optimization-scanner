@@ -16,7 +16,6 @@ from services.adapters.commitment_analysis import CommitmentAnalysisModule
 from services.adapters.compute_optimizer import ComputeOptimizerModule
 from services.adapters.containers import ContainersModule
 from services.adapters.cost_anomaly import CostAnomalyModule
-from services.adapters.cost_optimization_hub import CostOptimizationHubModule
 from services.adapters.dms import DmsModule
 from services.adapters.dynamodb import DynamoDbModule
 from services.adapters.ebs import EbsModule
@@ -72,7 +71,10 @@ ALL_MODULES: list[Any] = [
     AthenaModule(),
     BatchModule(),
     ComputeOptimizerModule(),
-    CostOptimizationHubModule(),
+    # CostOptimizationHubModule retired from ALL_MODULES (2026-05-14): its
+    # findings are distributed into per-service tabs via ScanOrchestrator
+    # ._prefetch_advisor_data + ctx.cost_hub_splits. The aggregate tab
+    # duplicated information that already lived under EC2, RDS, EBS, etc.
     AuroraModule(),
     CommitmentAnalysisModule(),
     BedrockModule(),

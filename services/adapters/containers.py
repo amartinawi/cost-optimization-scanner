@@ -93,12 +93,26 @@ class ContainersModule(BaseServiceModule):
             else:
                 savings += monthly_ondemand * 0.30 if monthly_ondemand > 0 else 60.0 * ctx.pricing_multiplier
 
+        # Cost Optimization Hub recs that the orchestrator bucketed into
+        # this service (EcsService / EcsTask / EcsCluster). Render alongside
+        # the enhanced container checks so the Containers tab is the single
+        # home for everything ECS / EKS related (replaces the retired
+        # standalone Cost Optimization Hub tab).
+        cost_hub_recs = ctx.cost_hub_splits.get("containers", [])
+        for rec in cost_hub_recs:
+            savings += float(rec.get("estimatedMonthlySavings", 0) or 0)
+
+        total_recs = len(enhanced_recs) + len(cost_hub_recs)
+
         return ServiceFindings(
             service_name="Containers",
-            total_recommendations=len(enhanced_recs),
+            total_recommendations=total_recs,
             total_monthly_savings=savings,
             sources={
                 "enhanced_checks": SourceBlock(count=len(enhanced_recs), recommendations=tuple(enhanced_recs)),
+                "cost_optimization_hub": SourceBlock(
+                    count=len(cost_hub_recs), recommendations=tuple(cost_hub_recs)
+                ),
             },
             extras={
                 "service_counts": {

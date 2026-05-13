@@ -40,7 +40,15 @@ class ScanOrchestrator:
         self.modules = modules
 
     def _prefetch_advisor_data(self, selected: set[str]) -> None:
-        """Fetch Cost Optimization Hub recommendations for registered adapters."""
+        """Fetch Cost Optimization Hub recommendations and bucket them per service.
+
+        With the standalone Cost Optimization Hub service tab retired in
+        services/__init__.py (2026-05-14), this prefetch is now the *only*
+        path that CoH data takes into the report. Every recommendation must
+        land in an existing service's bucket; anything that does not is
+        logged and dropped, which is acceptable because the type_map covers
+        every CoH resourceType AWS currently returns.
+        """
         _HUB_SERVICES = {
             "ec2",
             "lambda",
@@ -51,6 +59,13 @@ class ScanOrchestrator:
             "redshift",
             "s3",
             "eks",
+            # Catch ECS / EKS service-level recs and any cross-service CoH
+            # findings that previously lived in the dedicated CoH tab.
+            "containers",
+            # Catch RI / SP purchase recommendations that CoH surfaces. The
+            # commitment_analysis adapter renders them alongside its own CE
+            # API-derived SP / RI data.
+            "commitment_analysis",
         }
         needs_hub = _HUB_SERVICES & selected
         if not needs_hub:
@@ -74,11 +89,38 @@ class ScanOrchestrator:
             "RedshiftCluster": "redshift",
             "S3Bucket": "s3",
             "EksCluster": "eks",
+            # ECS / container-level
+            "EcsService": "containers",
+            "EcsTask": "containers",
+            "EcsCluster": "containers",
+            # Reservation / Savings Plans recommendations all live under
+            # the commitment_analysis tab from now on.
+            "EC2ReservedInstances": "commitment_analysis",
+            "RdsReservedInstances": "commitment_analysis",
+            "ElastiCacheReservedInstances": "commitment_analysis",
+            "OpenSearchReservedInstances": "commitment_analysis",
+            "RedshiftReservedInstances": "commitment_analysis",
+            "EsReservedInstances": "commitment_analysis",
+            "ComputeSavingsPlans": "commitment_analysis",
+            "EC2InstanceSavingsPlans": "commitment_analysis",
+            "SageMakerSavingsPlans": "commitment_analysis",
         }
+        unbucketed_types: set[str] = set()
         for rec in all_recs:
-            bucket = type_map.get(rec.get("currentResourceType", ""), "")
-            if bucket in splits:
+            rec_type = rec.get("currentResourceType", "")
+            bucket = type_map.get(rec_type, "")
+            if bucket and bucket in splits:
                 splits[bucket].append(rec)
+            else:
+                unbucketed_types.add(rec_type or "<unknown>")
+        if unbucketed_types:
+            self.ctx.warn(
+                f"Cost Optimization Hub: {len(unbucketed_types)} recommendation "
+                f"type(s) had no service bucket and were dropped: "
+                f"{', '.join(sorted(unbucketed_types))}. Extend "
+                f"scan_orchestrator._prefetch_advisor_data type_map to surface them.",
+                service="cost_optimization_hub",
+            )
 
         self.ctx.cost_hub_splits = splits
 

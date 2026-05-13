@@ -2012,8 +2012,14 @@ PHASE_B_HANDLERS: Dict[Tuple[str, str], Callable] = {
     ("compute_optimizer", "lambda_recommendations"): _render_compute_optimizer_source,
     ("compute_optimizer", "ecs_recommendations"): _render_compute_optimizer_source,
     ("compute_optimizer", "asg_recommendations"): _render_compute_optimizer_source,
+    # Legacy bindings retained for any in-flight scan JSON that predates
+    # the cost_optimization_hub adapter retirement (services/__init__.py,
+    # 2026-05-14). New scans never emit these source pairs.
     ("cost_optimization_hub", "savings_plans"): _render_cost_hub_source,
     ("cost_optimization_hub", "cross_service"): _render_cost_hub_source,
+    # CoH recommendations the orchestrator routes into per-service tabs.
+    ("containers", "cost_optimization_hub"): _render_cost_hub_source,
+    ("commitment_analysis", "cost_optimization_hub"): _render_cost_hub_source,
     ("cost_anomaly", "active_anomalies"): _render_cost_anomaly_source,
     ("cost_anomaly", "anomaly_monitors"): _render_cost_anomaly_source,
     ("cost_anomaly", "billing_alarms"): _render_cost_anomaly_source,
