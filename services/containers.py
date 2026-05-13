@@ -5,10 +5,13 @@ Extracted from CostOptimizer as free functions taking ScanContext.
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from core.scan_context import ScanContext
+
+logger = logging.getLogger(__name__)
 
 print("\U0001f50d [services/containers.py] Containers module active")
 
@@ -297,7 +300,12 @@ def get_enhanced_container_checks(ctx: ScanContext) -> dict[str, Any]:
             active_services = cluster.get("activeServicesCount", 0)
             running_tasks = cluster.get("runningTasksCount", 0)
 
-            print(f"Debug: Cluster {cluster_name} - Active Services: {active_services}, Running Tasks: {running_tasks}")
+            logger.debug(
+                "Cluster %s active services=%d running tasks=%d",
+                cluster_name,
+                active_services,
+                running_tasks,
+            )
 
             if active_services == 0 and running_tasks == 0:
                 checks["unused_clusters"].append(
