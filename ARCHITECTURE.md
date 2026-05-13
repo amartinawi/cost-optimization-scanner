@@ -3,7 +3,7 @@
 ## System Overview
 
 The AWS Cost Optimization Scanner is a modular Python application that performs
-260+ cost optimization checks across 37 adapter modules covering 37 AWS service
+260+ cost optimization checks across 36 adapter modules covering 36 AWS service
 categories. The system uses a clean layered architecture with typed contracts,
 a service registry, and isolated adapter modules.
 
@@ -21,8 +21,8 @@ a service registry, and isolated adapter modules.
                         |
          +----------------+----------------+
          |                |                |
-   ALL_MODULES[0]   ALL_MODULES[1]  ... ALL_MODULES[36]
-   (37 adapters in services/adapters/*.py)
+   ALL_MODULES[0]   ALL_MODULES[1]  ... ALL_MODULES[35]
+   (36 adapters in services/adapters/*.py)
          |                |                |
          +----------------+----------------+
                         |
@@ -107,11 +107,24 @@ to `us-east-1` automatically.
 1. Calls `resolve_cli_keys()` to determine which module keys to scan
 2. Calls `_prefetch_advisor_data()` -- fetches all Cost Optimization Hub
    recommendations once, splits them into `ctx.cost_hub_splits` by resource
-   type (`Ec2Instance` -> `"ec2"`, `LambdaFunction` -> `"lambda"`, etc.)
+   type. The `type_map` covers `Ec2Instance` -> `"ec2"`, `LambdaFunction` ->
+   `"lambda"`, `EbsVolume` -> `"ebs"`, `RdsDbInstance` / `RdsDbCluster` ->
+   `"rds"`, `S3Bucket` -> `"s3"`, `ElastiCacheCluster` -> `"elasticache"`,
+   `OpenSearchDomain` -> `"opensearch"`, `RedshiftCluster` -> `"redshift"`,
+   `EksCluster` -> `"eks"`, `EcsService` / `EcsTask` / `EcsCluster` ->
+   `"containers"`, and every reservation / savings-plan type
+   (`*ReservedInstances`, `ComputeSavingsPlans`, `EC2InstanceSavingsPlans`,
+   `SageMakerSavingsPlans`) -> `"commitment_analysis"`. Anything unrecognised
+   is recorded via `ctx.warn` so the map can be extended deliberately rather
+   than silently dropped.
 3. Iterates `self.modules`, calling `safe_scan(module, ctx)` for each
    selected module
 4. `safe_scan()` catches any exception, logs a warning, and returns an
    empty `ServiceFindings` so one broken module never crashes the scan
+
+The dedicated `CostOptimizationHubModule` was retired from `ALL_MODULES` on
+2026-05-14. CoH data now flows exclusively through the per-service tabs
+populated from `ctx.cost_hub_splits`; the aggregate tab no longer exists.
 
 ### client_registry.py -- Client Caching
 
@@ -162,9 +175,11 @@ modes. Tokens are matched case-insensitively.
 
 ### Module Registry (`services/__init__.py`)
 
-`ALL_MODULES` is an ordered list of 28 instantiated adapter classes. The order
-determines scan and report output order. Adding a new adapter requires only
-instantiating it and appending to this list.
+`ALL_MODULES` is an ordered list of 36 instantiated adapter classes. The
+runtime tab order in the report is recomputed at render time, sorted by
+each service's total monthly savings descending so the architect-skim
+lands on the services that hold the most money first. Adding a new adapter
+requires only instantiating it and appending to this list.
 
 ### Base Class (`services/_base.py`)
 
@@ -188,7 +203,7 @@ Adapters subclass this and override only what they need.
 
 ### Adapter Files (`services/adapters/*.py`)
 
-37 adapter files (excluding `__pycache__`). Each adapter is a thin class that:
+36 adapter files (excluding `__pycache__`). Each adapter is a thin class that:
 
 1. Declares `key`, `cli_aliases`, `display_name`, `required_clients()`
 2. In `scan()`, calls one or more analysis functions from the legacy service
@@ -517,8 +532,12 @@ per service.
 
 Cost Optimization Hub recommendations are fetched once in
 `_prefetch_advisor_data()` and partitioned into `ctx.cost_hub_splits` by
-resource type. Complex adapters (EC2, EBS, RDS, Lambda) read from this cache
-rather than making separate API calls, reducing API throttling risk.
+resource type. Every per-service adapter that has a corresponding bucket
+(EC2, EBS, RDS, Lambda, S3, ElastiCache, OpenSearch, Redshift, EKS,
+Containers, Commitment Analysis) reads from this cache rather than making
+separate API calls, reducing API throttling risk. Since 2026-05-14 the
+aggregate `CostOptimizationHubModule` is retired and the per-service
+distribution is the only path CoH data takes into the report.
 
 ### Extras Spreading
 
@@ -634,7 +653,7 @@ cost-optimization-scanner/
     session.py                    (50)   AwsSessionFactory
     filtering.py                  (60)   resolve_cli_keys
   services/
-    __init__.py                   (63)   ALL_MODULES registry (37 adapters)
+    __init__.py                   (63)   ALL_MODULES registry (36 adapters)
     _base.py                      (32)   BaseServiceModule
     _savings.py                   (16)   parse_dollar_savings
     advisor.py                    (153)  Cost Hub + Compute Optimizer

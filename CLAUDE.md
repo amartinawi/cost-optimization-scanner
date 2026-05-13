@@ -2,7 +2,7 @@
 
 ## Project Context
 
-AWS cost optimization scanner with modular ServiceModule architecture. Scans 37 AWS services, generates HTML reports with recommendations and savings estimates.
+AWS cost optimization scanner with modular ServiceModule architecture. Scans 36 AWS services and generates an audit-grade HTML report (Newsreader display + IBM Plex Sans/Mono body, savings-sorted tabs, sticky auto-hide jump-nav rail, structured executive summary, source-confidence typographic prefixes, priority filter, self-contained JSON download).
 
 ## Quick Reference
 
@@ -19,7 +19,7 @@ AWS cost optimization scanner with modular ServiceModule architecture. Scans 37 
 
 - **Protocol**: `ServiceModule` in `core/contracts.py` — all adapters implement this
 - **Registration**: `services/__init__.py` `ALL_MODULES` list — append-only
-- **Adapters**: `services/adapters/*.py` — 37 adapters, each wraps one AWS service
+- **Adapters**: `services/adapters/*.py` — 36 adapters, each wraps one AWS service. AWS Cost Optimization Hub findings are not a separate adapter; the orchestrator buckets them per-service via `ctx.cost_hub_splits`.
 - **Legacy shims**: `services/*.py` — thin wrappers, DO NOT modify (use adapters/)
 - **Pricing**: `core/pricing_engine.py` (`PricingEngine`) — live AWS pricing API
 - **Scan flow**: `cost_optimizer.py` → `ScanOrchestrator` → adapters → `ResultBuilder` → HTML report

@@ -9,7 +9,7 @@ Shared infrastructure for the AWS Cost Optimization Scanner. Adapters depend on 
 | `contracts.py` | 188 | `ServiceModule` Protocol, `ServiceFindings`, `SourceBlock`, `StatCardSpec`, `GroupingSpec`, `Group`, `WarningRecord`, `PermissionIssueRecord` |
 | `pricing_engine.py` | 517 | AWS Pricing API client with `PricingCache` (6-hour TTL). 12 public methods |
 | `scan_context.py` | 72 | `ScanContext` — region, account, clients, `pricing_engine`, `fast_mode`, `pricing_multiplier` |
-| `scan_orchestrator.py` | 85 | `ScanOrchestrator`, `safe_scan` — iterates modules, pre-fetches advisor data |
+| `scan_orchestrator.py` | 143 | `ScanOrchestrator`, `safe_scan` — iterates modules, pre-fetches AWS Cost Optimization Hub recommendations and buckets them into `ctx.cost_hub_splits` for per-service adapters to consume (replaces the retired aggregate CoH tab) |
 | `result_builder.py` | 70 | `ScanResultBuilder` — serializes `ServiceFindings` to JSON dict |
 | `client_registry.py` | 62 | `ClientRegistry` — caching boto3 client factory with global-service routing |
 | `session.py` | 50 | `AwsSessionFactory` — boto3 session with adaptive retry (10 attempts) |

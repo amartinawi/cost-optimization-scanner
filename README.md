@@ -3,15 +3,15 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Version](https://img.shields.io/badge/Version-3.0.0-blue)](https://github.com/amartinawi/cost-optimization-scanner)
 
-A production-ready, read-only AWS cost optimization scanner that analyzes **37 AWS service categories** across **all AWS regions** with **260+ automated checks**. Outputs JSON scan results and interactive HTML reports with per-service tabs, executive summary charts, and dark mode support.
+A production-ready, read-only AWS cost optimization scanner that analyzes **36 AWS service categories** across **all AWS regions** with **260+ automated checks**. Outputs JSON scan results and an audit-grade HTML report (Newsreader + IBM Plex type system, sticky savings-sorted jump-nav rail, source-confidence taxonomy, structured executive summary, and dark mode).
 
-Built for FinOps teams, DevOps engineers, and cloud architects who need actionable cost savings recommendations backed by real CloudWatch metrics — not guesswork.
+Built for FinOps teams, DevOps engineers, and cloud architects who need actionable cost savings recommendations backed by real CloudWatch metrics, not guesswork.
 
 ## Features
 
-- **37 ServiceModule adapters** performing 260+ optimization checks across 37 AWS service categories
-- **CloudWatch metric-backed analysis** — 14-day CPU/memory/network utilization prevents false positives
-- **Interactive HTML reports** — per-service tabs, executive dashboard with charts, dark mode
+- **36 ServiceModule adapters** performing 260+ optimization checks across 36 AWS service categories. AWS Cost Optimization Hub findings are routed into the relevant service tabs (EC2, RDS, EBS, Lambda, Containers, Commitment Analysis, etc.) rather than living in a separate aggregate tab.
+- **CloudWatch metric-backed analysis** — 14-day CPU/memory/network utilization prevents false positives.
+- **Audit-grade HTML report** — Newsreader (display) + IBM Plex Sans / Mono (body / code) type system, structured executive summary (headline figure + Annual / Top services / Open risks facts), savings-sorted tabs with compact dollar chips, sticky auto-hide jump-nav rail (>= 1400px viewport), source-confidence taxonomy rendered as a typographic prefix on every recommendation title (METRIC, ML, COST HUB, AUDIT), priority filter strip (High / Medium / Low / All), self-contained scan-JSON download link, and dark mode.
 - **Service filtering** via `--scan-only` / `--skip-service` with alias resolution (50–80% faster targeted scans)
 - **Live AWS Pricing API** — real-time pricing via `core/pricing_engine.py` with in-memory cache, 12 pricing methods across 19 adapters; regional multipliers as fallback for 35 regions
 - **Historical spend trend analysis** — Cost Explorer-powered 30/90/180-day trend tracking with anomaly detection and forecasting
@@ -35,18 +35,20 @@ cost-optimization-scanner/
     filtering.py                  --scan-only / --skip-service resolver
     trend_analysis.py             Historical Cost Explorer trend analysis (30/90/180-day)
   services/
-    __init__.py                   ALL_MODULES registry (37 adapter instances)
+    __init__.py                   ALL_MODULES registry (36 adapter instances)
     _base.py                      BaseServiceModule default implementations
     _savings.py                   parse_dollar_savings helper
     advisor.py                    Cost Hub + Compute Optimizer utilities
-    adapters/                     37 ServiceModule adapter files (one per service)
-  html_report_generator.py        HTML report generation (2,432 lines)
+    adapters/                     36 ServiceModule adapter files (one per service)
+  html_report_generator.py        HTML report generation
   reporter_phase_a.py             Descriptor-driven grouped service rendering
   reporter_phase_b.py             Function registry for source-specific handlers
   tests/                          pytest suite (5 test files + fixtures + stubs)
 ```
 
-The `ServiceModule` Protocol in `core/contracts.py` defines the adapter interface. Each of the 37 adapters in `services/adapters/` implements `scan(ctx) → ServiceFindings`. The `ALL_MODULES` list in `services/__init__.py` is the single registry — adding a new adapter means appending one instance. The `core/trend_analysis.py` module enriches scans with historical Cost Explorer trends and anomaly data as a cross-cutting concern.
+The `ServiceModule` Protocol in `core/contracts.py` defines the adapter interface. Each of the 36 adapters in `services/adapters/` implements `scan(ctx) → ServiceFindings`. The `ALL_MODULES` list in `services/__init__.py` is the single registry — adding a new adapter means appending one instance. The `core/trend_analysis.py` module enriches scans with historical Cost Explorer trends and anomaly data as a cross-cutting concern.
+
+The Cost Optimization Hub data feed is still active: `ScanOrchestrator._prefetch_advisor_data` (`core/scan_orchestrator.py`) makes one API call per scan and buckets each recommendation into the matching service via `ctx.cost_hub_splits`. Per-service adapters (EC2, RDS, EBS, Lambda, Containers, Commitment Analysis, etc.) consume their bucket and render the recommendations inline alongside their CloudWatch / Compute Optimizer findings.
 
 ## Requirements
 
@@ -141,14 +143,15 @@ python3 cli.py us-east-1 --scan-only file_systems
 | Athena | `athena` | `athena.py` | CloudWatch scan-volume pricing, workgroup scan limits |
 | Batch | `batch` | `batch.py` | Spot allocation strategy, Graviton instances |
 | Aurora | `aurora` | `aurora.py` | Cluster rightsizing, Global Clusters, snapshot retention, Graviton migration |
-| Commitment Analysis | `commitment_analysis`, `commitments`, `savings_plans`, `ri` | `commitment_analysis.py` | Savings Plans utilization/coverage, RI utilization/coverage, purchase recommendations |
+| Commitment Analysis | `commitment_analysis`, `commitments`, `savings_plans`, `ri` | `commitment_analysis.py` | Savings Plans utilization/coverage, RI utilization/coverage, full (term × payment) purchase-recommendation matrix: 1yr / 3yr × No Upfront / Partial Upfront / All Upfront; absorbs Cost Optimization Hub RI / SP findings via `ctx.cost_hub_splits` |
 | Compute Optimizer | `compute_optimizer`, `co` | `compute_optimizer.py` | EC2, EBS, and RDS rightsizing recommendations from AWS Compute Optimizer |
-| Cost Optimization Hub | `cost_optimization_hub`, `cost_hub`, `hub` | `cost_optimization_hub.py` | Aggregated cost recommendations from AWS Cost Optimization Hub |
 | Bedrock | `bedrock` | `bedrock.py` | Provisioned throughput idle analysis, knowledge base optimization, agent utilization |
 | SageMaker | `sagemaker` | `sagemaker.py` | Idle endpoints/notebooks, spot training adoption, multi-model consolidation |
 | Network Cost | `network_cost` | `network_cost.py` | Cross-region/AZ transfer analysis, internet egress, TGW vs peering |
 | Cost Anomaly Detection | `cost_anomaly`, `anomaly` | `cost_anomaly.py` | Anomaly monitors, spend pattern analysis, billing alarm gap detection |
 | EKS Cost Visibility | `eks_cost`, `eks_visibility` | `eks_cost.py` | Control plane costs, node group optimization, Fargate vs EC2 comparison, Container Insights coverage |
+
+> **Cost Optimization Hub routing.** AWS Cost Optimization Hub no longer has a dedicated tab. The orchestrator (`core/scan_orchestrator.py`) fetches CoH recommendations once per scan and buckets them by `currentResourceType` into the matching service: `Ec2Instance` → EC2, `RdsDbInstance` / `RdsDbCluster` → RDS, `EbsVolume` → EBS, `LambdaFunction` → Lambda, `S3Bucket` → S3, `ElastiCacheCluster` → ElastiCache, `OpenSearchDomain` → OpenSearch, `RedshiftCluster` → Redshift, `EksCluster` → EKS Cost Visibility, `EcsService` / `EcsTask` / `EcsCluster` → Containers, and every `*ReservedInstances` / `*SavingsPlans` → Commitment Analysis. Each rec-item in the report renders with a `COST HUB ·` typographic prefix on the title so the source-of-evidence stays visible inline.
 
 ## Adding a New Service Adapter
 

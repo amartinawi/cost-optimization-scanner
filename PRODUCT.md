@@ -39,11 +39,11 @@ Numbers carry the weight of the page. Color is functional only, used to encode s
 The report must NOT look like any of the following. Each becomes a forceful Don't in DESIGN.md:
 
 - **Cluttered analytics dashboards.** Datadog and New Relic at their worst: every widget styled differently, badges and chips everywhere, no hierarchy, status colors competing with brand colors. Stated directly by the user as the primary anti-reference.
-- **Generic Material Design SaaS dashboard.** The current baseline of the report: gradient hero header, equal-weight summary card grids, colored left-stripe borders as priority signals, Material 5-step elevation shadow scale, Roboto-on-light-grey. This is the look the redesign is moving away from.
+- **Generic Material Design SaaS dashboard.** Gradient hero header, equal-weight summary card grids, colored left-stripe borders as priority signals, Material 5-step elevation shadow scale, Roboto-on-light-grey. Was the inherited baseline; retired across commits 50c6b2f → 65feb65. New variants must not reintroduce any of those elements.
 - **AI-tool slop aesthetic.** Purple/pink gradients, glassmorphism on cards, neon-on-dark, gradient text, hero-metric templates. Reflexive 2025-era AI-startup styling.
 - **Corporate enterprise PowerPoint.** Navy + light-blue + orange, stock photography, "Executive Dashboard" template energy, IBM-watson heaviness.
 
-The first two are the live risk; the report currently is one of them and is moving toward not being either.
+The live risk is now drift: every future component must be checked against this list before it ships, because the report has already escaped these lanes once and the next round of changes is what carries the risk of regression.
 
 ## Design Principles
 
