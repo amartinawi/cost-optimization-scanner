@@ -1992,6 +1992,21 @@ def source_type_badge(service_key: str, source_name: str) -> str:
     return f' <span class="badge {css_class}">{label}</span>'
 
 
+def source_type_label(service_key: str, source_name: str) -> str:
+    """Return the bare source-confidence label for the (service, source) pair.
+
+    Used to drive the typographic prefix that renders on every rec-item title
+    (CSS :before via data-source attribute). Returns the empty string when no
+    taxonomy entry applies, so callers can omit the wrapper entirely.
+    """
+    label = SOURCE_TYPE_MAP.get((service_key, source_name))
+    if not label:
+        label = _GENERIC_SOURCE_TYPES.get(source_name, "")
+    if not label or label not in VALID_SOURCE_BADGES:
+        return ""
+    return label
+
+
 PHASE_B_HANDLERS: Dict[Tuple[str, str], Callable] = {
     ("compute_optimizer", "ebs_recommendations"): _render_compute_optimizer_source,
     ("compute_optimizer", "lambda_recommendations"): _render_compute_optimizer_source,

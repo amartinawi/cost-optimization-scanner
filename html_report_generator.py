@@ -703,7 +703,29 @@ class HTMLReportGenerator:
         .summary {
             margin-bottom: 24px;
         }
-        
+
+        .summary-headline {
+            font-size: clamp(1.125rem, 2vw, 1.375rem);
+            font-weight: 400;
+            line-height: 1.55;
+            color: var(--text-primary);
+            margin: 0 0 16px 0;
+            max-width: 75ch;
+            font-variant-numeric: tabular-nums;
+        }
+        .summary-headline strong {
+            font-weight: 600;
+            color: var(--text-primary);
+        }
+
+        .visually-hidden {
+            position: absolute !important;
+            width: 1px; height: 1px;
+            padding: 0; margin: -1px;
+            overflow: hidden; clip: rect(0, 0, 0, 0);
+            white-space: nowrap; border: 0;
+        }
+
         .summary-grid {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
@@ -1101,6 +1123,40 @@ class HTMLReportGenerator:
             color: var(--text-primary);
             margin-bottom: 12px;
         }
+
+        /* Source-confidence typographic prefix on every rec-item title.
+           The audit chain (METRIC, ML, COST HUB, AUDIT) lives in the
+           typesetting itself rather than as a separate chip. PRODUCT.md:
+           "the audit chain is the product." */
+        .source-section[data-source] .rec-item > h4::before {
+            font-family: 'Roboto Mono', 'SF Mono', Consolas, monospace;
+            font-weight: 600;
+            font-size: 0.75em;
+            letter-spacing: 0.5px;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            margin-right: 8px;
+            vertical-align: 1px;
+        }
+        .source-section[data-source="Metric Backed"] .rec-item > h4::before {
+            content: "METRIC \00b7";
+            color: var(--success);
+        }
+        .source-section[data-source="ML Backed"] .rec-item > h4::before {
+            content: "ML \00b7";
+            color: var(--info);
+        }
+        .source-section[data-source="Cost Hub"] .rec-item > h4::before {
+            content: "COST HUB \00b7";
+            color: var(--warning);
+        }
+        .source-section[data-source="Audit Based"] .rec-item > h4::before {
+            content: "AUDIT \00b7";
+            color: var(--text-secondary);
+        }
+        /* The source-section wrapper itself is structural only; no margin
+           collapse on the inner rec-item list. */
+        .source-section { display: contents; }
         
         .rec-item p {
             margin-bottom: 12px;
@@ -1681,6 +1737,78 @@ class HTMLReportGenerator:
             border-radius: 2px;
         }
         
+        /* Sticky savings-sorted jump-nav rail. Inline on narrow screens,
+           pinned to the left margin on wide ones. Hidden in print (tabs
+           become the navigation via @media print). */
+        .jump-nav {
+            display: none;
+            background: var(--surface);
+            border: 1px solid var(--divider);
+            border-radius: 8px;
+            padding: 16px;
+            margin-bottom: 16px;
+            font-size: 0.875rem;
+        }
+        @media (min-width: 1400px) {
+            .jump-nav {
+                display: block;
+                position: fixed;
+                top: 100px;
+                left: max(16px, calc(50% - 720px - 240px));
+                width: 220px;
+                max-height: calc(100vh - 140px);
+                overflow-y: auto;
+                z-index: 40;
+                margin-bottom: 0;
+            }
+        }
+        .jump-nav__heading {
+            text-transform: uppercase;
+            font-size: 0.75rem;
+            font-weight: 600;
+            letter-spacing: 0.5px;
+            color: var(--text-secondary);
+            margin: 0 0 8px 0;
+            padding-bottom: 8px;
+            border-bottom: 1px solid var(--divider);
+        }
+        .jump-nav__list {
+            list-style: none;
+            padding: 0;
+            margin: 0;
+        }
+        .jump-nav__list li {
+            margin: 0;
+        }
+        .jump-nav__list a {
+            display: flex;
+            justify-content: space-between;
+            align-items: baseline;
+            gap: 12px;
+            padding: 6px 8px;
+            text-decoration: none;
+            color: var(--text-primary);
+            border-radius: 4px;
+            border: 1px solid transparent;
+        }
+        .jump-nav__list a:hover {
+            background: var(--background);
+            border-color: var(--divider);
+        }
+        .jump-nav__list a:focus-visible {
+            outline: 2px solid var(--primary);
+            outline-offset: 2px;
+        }
+        .jump-nav__label {
+            font-weight: 500;
+        }
+        .jump-nav__amount {
+            color: var(--text-secondary);
+            font-variant-numeric: tabular-nums;
+            font-size: 0.8125rem;
+            white-space: nowrap;
+        }
+
         /* Responsive Design */
         @media (max-width: 960px) {
             .container { padding: 16px; }
@@ -1878,6 +2006,8 @@ class HTMLReportGenerator:
             body { background: white; color: black; font-family: Georgia, 'Times New Roman', serif; }
             .container { box-shadow: none; }
             .tab-buttons { display: none; }
+            .priority-filter { display: none; }
+            .jump-nav { display: none; }
             .theme-toggle { display: none; }
             .export-btn { display: none; }
             .back-to-top { display: none; }
@@ -1921,63 +2051,83 @@ class HTMLReportGenerator:
         return header + pricing_note
 
     def _get_summary(self) -> str:
-        """Get summary section"""
-        # Use canonical totals from ScanResultBuilder — same source as the executive summary tab.
-        summary = self.scan_results.get("summary", {})
-        total_recommendations = summary.get("total_recommendations", 0)
-        total_savings = summary.get("total_monthly_savings", 0)
-        total_services_scanned = len(self.scan_results.get("services", {}))
+        """Render the Audit Trail executive summary.
 
-        # Per-service savings sum used by reconciliation footnote — the adversarial reader
-        # mentally adds the per-tab totals; if the headline differs, surface the dedup math
-        # rather than letting the discrepancy register as inattention. Mirrors the visible
-        # display logic in _get_service_content so the numbers line up with each tab.
+        One sentence carries the headline (defensible monthly savings, annual
+        figure, top two services by savings with their share of total, risk
+        signal count). The reconciliation footnote stays below, surfacing the
+        dedup math when the per-service sum diverges from the headline. No
+        four-card grid: the cards were template furniture, the sentence is
+        the audit voice.
+        """
+        summary = self.scan_results.get("summary", {})
+        total_savings = float(summary.get("total_monthly_savings", 0) or 0)
+
+        # Per-service savings sum used by reconciliation footnote — the
+        # adversarial reader mentally adds the per-tab totals; if the headline
+        # differs, surface the dedup math rather than letting the discrepancy
+        # register as inattention. Mirrors _get_service_content so the numbers
+        # line up with each tab.
+        services = self.scan_results.get("services", {})
+        per_service_savings: List[Tuple[str, float]] = []
         raw_per_service_sum = 0.0
-        for service_key, service_data in self.scan_results["services"].items():
+        for service_key, service_data in services.items():
             calculated = self._calculate_service_savings(service_key, service_data)
             canonical = service_data.get("total_monthly_savings", 0) or 0
-            shown = calculated if calculated > 0 else canonical
-            raw_per_service_sum += float(shown)
+            shown = float(calculated if calculated > 0 else canonical)
+            raw_per_service_sum += shown
+            if shown > 0:
+                per_service_savings.append((service_data.get("service_name", service_key), shown))
+
+        per_service_savings.sort(key=lambda p: -p[1])
+        top_two = per_service_savings[:2]
+        top_share = sum(s for _, s in top_two) / total_savings if total_savings > 0 else 0.0
 
         risk_counts = self._count_priorities_by_severity()
+        high_count = risk_counts["high"]
+        anomaly_count = risk_counts["anomalies"]
 
-        html = f"""<div class="summary">
-            <h2>Executive Summary</h2>
-            <div class="summary-grid">
-                <div class="summary-card" role="status" aria-label="Total Recommendations: {total_recommendations}">
-                    <h3>Total Recommendations</h3>
-                    <div class="value">{total_recommendations}</div>
-                </div>
-                <div class="summary-card" role="status" aria-label="Defensible Monthly Savings: ${total_savings:.2f}">
-                    <h3>Defensible Monthly Savings</h3>
-                    <div class="value">${total_savings:.2f}</div>
-                </div>
-                <div class="summary-card" role="status" aria-label="Services Scanned: {total_services_scanned}">
-                    <h3>Services Scanned</h3>
-                    <div class="value">{total_services_scanned}</div>
-                </div>
-                <div class="summary-card" role="status" aria-label="Potential Annual Savings: ${total_savings * 12:.2f}">
-                    <h3>Potential Annual Savings</h3>
-                    <div class="value">${total_savings * 12:.2f}</div>
-                </div>
-            </div>"""
+        # Compose the sentence.
+        sentence_parts: List[str] = [
+            f'This account can defensibly save <strong>${total_savings:,.2f}/month</strong>'
+            f' (<strong>${total_savings * 12:,.0f}/year</strong>).'
+        ]
+        if len(top_two) >= 2 and top_share > 0:
+            sentence_parts.append(
+                f'<strong>{html.escape(top_two[0][0])}</strong> (${top_two[0][1]:,.0f}) and '
+                f'<strong>{html.escape(top_two[1][0])}</strong> (${top_two[1][1]:,.0f}) '
+                f'hold <strong>{top_share * 100:.0f}%</strong> of that.'
+            )
+        elif len(top_two) == 1:
+            sentence_parts.append(
+                f'<strong>{html.escape(top_two[0][0])}</strong> (${top_two[0][1]:,.0f}) '
+                f'is the largest opportunity.'
+            )
 
-        # Top-line risks row — gives the architect / leader persona 10-second confidence.
-        html += (
-            '<div class="risks-row" role="group" aria-label="Top-line risks">'
-            f'<span class="risk-pill risk-high"><strong>{risk_counts["high"]}</strong> HIGH</span>'
-            f'<span class="risk-pill risk-medium"><strong>{risk_counts["medium"]}</strong> MEDIUM</span>'
-            f'<span class="risk-pill risk-low"><strong>{risk_counts["low"]}</strong> LOW</span>'
-            f'<span class="risk-pill risk-info"><strong>{risk_counts["anomalies"]}</strong> active anomalies</span>'
-            f'<span class="risk-pill risk-info"><strong>{risk_counts["billing_alarms"]}</strong> billing alarms</span>'
-            "</div>"
+        if high_count > 0:
+            severity_word = "risk is" if high_count == 1 else "risks are"
+            sentence_parts.append(
+                f'<strong>{high_count}</strong> HIGH-severity {severity_word} open.'
+            )
+        elif anomaly_count > 0:
+            anomaly_word = "anomaly is" if anomaly_count == 1 else "anomalies are"
+            sentence_parts.append(
+                f'<strong>{anomaly_count}</strong> active cost {anomaly_word} flagged.'
+            )
+
+        sentence = " ".join(sentence_parts)
+
+        out = (
+            '<section class="summary" aria-labelledby="summary-heading">'
+            '<h2 id="summary-heading" class="visually-hidden">Executive Summary</h2>'
+            f'<p class="summary-headline">{sentence}</p>'
         )
 
-        # Reconciliation footnote — only render if the per-service sum diverges from the
+        # Reconciliation footnote: only when per-service sum diverges from the
         # headline by more than $1 (avoid noise from rounding).
-        dedup_delta = raw_per_service_sum - float(total_savings)
+        dedup_delta = raw_per_service_sum - total_savings
         if dedup_delta > 1.0:
-            html += (
+            out += (
                 '<p class="reconciliation-note">'
                 f"Per-tab sum: <strong>${raw_per_service_sum:,.2f}</strong> "
                 f"&minus; deduplication adjustment <strong>${dedup_delta:,.2f}</strong> "
@@ -1988,10 +2138,17 @@ class HTMLReportGenerator:
 
         graviton_count = self._count_graviton_exclusions()
         if graviton_count > 0:
-            html += f'<div class="info-note"><p><svg class="icon icon-sm"><use href="#icon-clipboard"/></svg> Note: {graviton_count} Graviton migration recommendations excluded from per-service detail. These require architecture-level review and are available via AWS Compute Optimizer.</p></div>'
+            out += (
+                '<div class="info-note"><p>'
+                '<svg class="icon icon-sm"><use href="#icon-clipboard"/></svg> '
+                f'Note: {graviton_count} Graviton migration recommendations excluded from '
+                'per-service detail. These require architecture-level review and are available '
+                'via AWS Compute Optimizer.'
+                '</p></div>'
+            )
 
-        html += "</div>"
-        return html
+        out += "</section>"
+        return out
 
     def _count_priorities_by_severity(self) -> Dict[str, int]:
         """Aggregate HIGH/MEDIUM/LOW counts + anomaly + billing-alarm risk signals.
@@ -2153,7 +2310,25 @@ class HTMLReportGenerator:
             "</div>"
         )
 
-        return f'<div class="tabs">{tab_buttons}{filter_strip}{tab_contents}</div>'
+        # Sticky savings-sorted jump-nav rail. Hidden on screens narrower than
+        # the wide breakpoint and in print (tabs become the navigation there).
+        # Anchor click activates the target tab via jumpToPanel and scrolls.
+        rail_items = "".join(
+            f'<li><a href="#panel-{html.escape(key)}" '
+            f'onclick="jumpToPanel(\'{html.escape(key)}\'); event.preventDefault();">'
+            f'<span class="jump-nav__label">{html.escape(label)}</span>'
+            f'<span class="jump-nav__amount">{_format_savings_chip(savings) or "&mdash;"}</span>'
+            "</a></li>"
+            for savings, key, label, _rec_count, _emit in tab_entries
+        )
+        jump_nav = (
+            '<aside class="jump-nav" aria-label="Service savings jump nav">'
+            '<h3 class="jump-nav__heading">By savings</h3>'
+            f'<ol class="jump-nav__list">{rail_items}</ol>'
+            '</aside>'
+        )
+
+        return jump_nav + f'<div class="tabs">{tab_buttons}{filter_strip}{tab_contents}</div>'
 
     def _extract_snapshots_data(self, services: Dict[str, Any]) -> Dict[str, Any]:
         """Extract all snapshot-related recommendations from services"""
@@ -2425,33 +2600,17 @@ class HTMLReportGenerator:
             </div>
             """
 
-        # Key metrics
-        total_savings = summary.get("total_monthly_savings", 0)
-        services_scanned = summary.get("total_services_scanned", 0)
-
+        # Stat-cards retired: the top-of-page summary sentence (_get_summary)
+        # already carries Total Monthly Savings, top-services share, and risks.
+        # Repeating them as cards here was the triple-stacked-summary pattern
+        # PRODUCT.md asks us to leave behind. The tab opens directly into the
+        # charts + legend so the FinOps audit drops straight into evidence.
         content = (
-            """
-        <div class="service-header">
-            <h2 class="service-title"><svg class="icon icon-sm"><use href="#icon-chart"/></svg> Executive Summary</h2>
-            <div class="service-stats">
-                <div class="stat-card"><div class="stat-label">Total Monthly Savings</div>
-                    <div class="value savings">$"""
-            + f"{total_savings:.2f}"
-            + """</div>
-                </div>
-                <div class="stat-card"><div class="stat-label">Total Recommendations</div>
-                    <div class="value">"""
-            + str(total_recommendations)
-            + """</div>
-                </div>
-                <div class="stat-card"><div class="stat-label">Services Scanned</div>
-                    <div class="value">"""
-            + str(services_scanned)
-            + """</div>
-                </div>
-            </div>
-        </div>
-        """
+            '<div class="service-header">'
+            '<h2 class="service-title">'
+            '<svg class="icon icon-sm"><use href="#icon-chart"/></svg> Executive Summary'
+            '</h2>'
+            '</div>'
         )
 
         graviton_count = self._count_graviton_exclusions()
@@ -2952,7 +3111,7 @@ class HTMLReportGenerator:
             should_skip_source_loop,
             should_use_handler,
             should_fallback_to_per_rec,
-            source_type_badge,
+            source_type_label,
         )
 
         if service_key == "file_systems":
@@ -2989,12 +3148,22 @@ class HTMLReportGenerator:
                     if not handler_output:
                         # Handler filtered out all recs (e.g., all findings are "Optimized")
                         continue
-                    badge = source_type_badge(service_key, source_name)
+                    label = source_type_label(service_key, source_name)
+                    # Wrap the handler output in a source-section. CSS renders a
+                    # typographic prefix on every nested rec-item h4 via the
+                    # data-source attribute. The chip-style badge retires; the
+                    # audit chain now lives in the rec-item title's typesetting.
+                    open_wrap = (
+                        f'<section class="source-section" data-source="{html.escape(label)}">'
+                        if label
+                        else ""
+                    )
+                    close_wrap = "</section>" if label else ""
+                    content += open_wrap
                     if not should_skip_section_header(service_key):
-                        content += f"<h4>{source_name.replace('_', ' ').title()}: {total_count} items{badge}</h4>"
-                    elif badge:
-                        content += f'<div class="source-badge">{badge}</div>'
+                        content += f"<h4>{source_name.replace('_', ' ').title()}: {total_count} items</h4>"
                     content += handler_output
+                    content += close_wrap
                     continue
 
                 if should_fallback_to_per_rec(service_key):
@@ -3266,6 +3435,15 @@ class HTMLReportGenerator:
                 currentFilter = null;
                 updateFilterIndicators();
             }}
+        }}
+
+        // Jump-nav rail handler: activates the target tab (via showTab) and
+        // smooth-scrolls the panel into view. Used by the sticky savings rail
+        // and by any anchor-style link into a service panel.
+        function jumpToPanel(tabId) {{
+            showTab(tabId, {{ type: 'click' }});
+            const panel = document.getElementById('panel-' + tabId);
+            if (panel) panel.scrollIntoView({{ behavior: 'smooth', block: 'start' }});
         }}
 
         // WAI-ARIA tab keyboard pattern: roving tabindex + Left/Right/Home/End.
