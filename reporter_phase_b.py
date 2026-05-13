@@ -285,6 +285,13 @@ def _render_ebs_enhanced_checks(recommendations: List[Rec], source_name: str, se
         # Unattached is rendered by _render_ebs_unattached against its own source.
         if "unattached" in category.lower():
             continue
+        # Snapshot findings are consolidated into the dedicated Snapshots tab
+        # (see HTMLReportGenerator._extract_snapshots_data /
+        # _get_snapshots_content). Skipping them here prevents the same
+        # SnapshotId from appearing once per CheckCategory in EBS and again in
+        # Snapshots, which previously inflated the visual savings rollup.
+        if "snapshot" in category.lower():
+            continue
         if category not in grouped_checks:
             grouped_checks[category] = []
         grouped_checks[category].append(rec)

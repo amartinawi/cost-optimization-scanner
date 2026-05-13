@@ -40,6 +40,23 @@ from typing import Any, Callable, Dict, List, Tuple
 
 logger = logging.getLogger(__name__)
 
+
+def _format_savings_chip(amount: float) -> str:
+    """Compact dollar format for tab chips. '$267', '$1.2k', '$14.3k'.
+
+    Negative or zero values return the empty string so callers can decide to
+    omit the chip entirely. Anything under $1 collapses to '<$1' (we still
+    want to differentiate 'a recommendation exists' from 'no savings').
+    """
+    if amount <= 0:
+        return ""
+    if amount < 1:
+        return "&lt;$1"
+    if amount < 1000:
+        return f"${amount:.0f}"
+    return f"${amount / 1000:.1f}k"
+
+
 _SAVINGS_KEYWORDS: Dict[str, List[Tuple[str, float]]] = {
     "ec2": [
         ("previous generation", 50),
@@ -1827,26 +1844,33 @@ class HTMLReportGenerator:
             outline-offset: 2px;
         }
 
-        /* Tab Count Badges */
-        .tab-count {
+        /* Tab Chips — count or savings */
+        .tab-count,
+        .tab-savings {
             display: inline-flex;
             align-items: center;
             justify-content: center;
             min-width: 18px;
             height: 18px;
-            padding: 0 5px;
+            padding: 0 7px;
             margin-left: 6px;
-            font-size: 0.65rem;
+            font-size: 0.7rem;
             font-weight: 600;
             border-radius: 9px;
-            background: var(--bg-secondary, #f5f5f5);
+            background: var(--background);
             color: var(--text-secondary);
             line-height: 1;
             vertical-align: middle;
+            font-variant-numeric: tabular-nums;
         }
-        [data-theme="dark"] .tab-count {
-            background: rgba(255,255,255,0.12);
-            color: rgba(255,255,255,0.7);
+        .tab-button.active .tab-savings {
+            background: var(--badge-success-bg);
+            color: var(--badge-success-fg);
+        }
+        [data-theme="dark"] .tab-count,
+        [data-theme="dark"] .tab-savings {
+            background: rgba(255,255,255,0.08);
+            color: rgba(255,255,255,0.75);
         }
 
         /* Print Styles */
@@ -2001,98 +2025,122 @@ class HTMLReportGenerator:
         return counts
 
     def _get_tabs(self) -> str:
-        """Get tabs section"""
+        """Get tabs section.
+
+        Tab order is **savings-descending** so the architect skim lands on the
+        services that hold the most money first. Each tab chip shows the
+        savings figure (compact dollar format) rather than a raw recommendation
+        count: 'RDS  $267' beats 'RDS  8' when the question is 'where is the
+        money'. Recommendation count remains in the panel header.
+        """
         services = self.scan_results["services"]
 
         # Extract snapshots and AMIs from EBS enhanced checks
         snapshots_data = self._extract_snapshots_data(services)
         amis_data = self._extract_amis_data(services)
 
-        # Tab buttons
-        tab_buttons = '<div class="tab-buttons" role="tablist">'
+        # Build a flat list of (savings, key, label, rec_count, content_emitter) tuples.
+        # All service tabs plus the synthetic Snapshots / AMIs aggregations. Sort
+        # by savings descending so high-impact services lead the strip.
+        tab_entries: List[Tuple[float, str, str, int, Callable[[], str]]] = []
 
-        tab_buttons += '<button class="tab-button active" role="tab" aria-selected="true" aria-controls="panel-executive-summary" id="tab-executive-summary" onclick="showTab(\'executive-summary\', event)"><svg class="icon icon-sm"><use href="#icon-chart"/></svg> Executive Summary</button>'
-
-        # Add main service tabs with Snapshots and AMIs
-        for i, (service_key, service_data) in enumerate(services.items()):
-            # Use filtered data for accurate counts (removes MigrateToGraviton etc.)
+        for service_key, service_data in services.items():
             filtered = self._filter_recommendations(service_data)
             rec_count = filtered.get("total_recommendations", 0)
             if rec_count == 0:
                 continue
+            savings = float(filtered.get("total_monthly_savings", 0) or 0)
+            label = str(service_data["service_name"])
+            if service_key == "ami" and amis_data["count"] > 0:
+                # AMI tab is rendered via the dedicated AMIs panel.
+                tab_entries.append((
+                    savings,
+                    service_key,
+                    label,
+                    rec_count,
+                    lambda d=amis_data: self._get_amis_content(d),
+                ))
+            else:
+                tab_entries.append((
+                    savings,
+                    service_key,
+                    label,
+                    rec_count,
+                    lambda k=service_key, d=service_data: self._get_service_content(k, d),
+                ))
 
-            tab_buttons += f'<button class="tab-button" role="tab" aria-selected="false" aria-controls="panel-{html.escape(service_key)}" id="tab-{html.escape(service_key)}" onclick="showTab(\'{html.escape(service_key)}\', event)">{html.escape(str(service_data["service_name"]))}<span class="tab-count">{rec_count}</span></button>'
+        # Synthetic Snapshots tab.
+        if snapshots_data["count"] > 0:
+            snap_savings = float(snapshots_data.get("total_savings", 0) or 0)
+            tab_entries.append((
+                snap_savings,
+                "snapshots",
+                "Snapshots",
+                snapshots_data["count"],
+                lambda d=snapshots_data: self._get_snapshots_content(d),
+            ))
 
-            # Add Snapshots tab right after EBS (if snapshots exist)
-            if service_key == "ebs" and snapshots_data["count"] > 0:
-                snap_count = snapshots_data["count"]
-                tab_buttons += f'<button class="tab-button" role="tab" aria-selected="false" aria-controls="panel-snapshots" id="tab-snapshots" onclick="showTab(\'snapshots\', event)">Snapshots<span class="tab-count">{snap_count}</span></button>'
-
-        # Add standalone Snapshots tab if no EBS tab but snapshots exist
-        if snapshots_data["count"] > 0 and not any(
-            s.get("total_recommendations", 0) > 0 for k, s in services.items() if k == "ebs"
-        ):
-            snap_count = snapshots_data["count"]
-            tab_buttons += f'<button class="tab-button" role="tab" aria-selected="false" aria-controls="panel-snapshots" id="tab-snapshots" onclick="showTab(\'snapshots\', event)">Snapshots<span class="tab-count">{snap_count}</span></button>'
-
-        # Add standalone AMIs tab if no AMI service but AMIs exist
-        if amis_data["count"] > 0 and not any(
+        # Synthetic AMIs tab only if there's no underlying AMI service section.
+        ami_already_present = any(
             s.get("total_recommendations", 0) > 0 for k, s in services.items() if k == "ami"
-        ):
-            ami_count = amis_data["count"]
-            tab_buttons += f'<button class="tab-button" role="tab" aria-selected="false" aria-controls="panel-amis" id="tab-amis" onclick="showTab(\'amis\', event)">AMIs<span class="tab-count">{ami_count}</span></button>'
+        )
+        if amis_data["count"] > 0 and not ami_already_present:
+            ami_savings = sum(
+                float(r.get("EstimatedMonthlySavings", 0) or 0)
+                for r in amis_data.get("recommendations", [])
+            )
+            tab_entries.append((
+                ami_savings,
+                "amis",
+                "AMIs",
+                amis_data["count"],
+                lambda d=amis_data: self._get_amis_content(d),
+            ))
+
+        # Descending sort: highest savings first. Ties broken by recommendation
+        # count desc then label asc so the order is deterministic.
+        tab_entries.sort(key=lambda e: (-e[0], -e[3], e[2]))
+
+        # Tab buttons
+        tab_buttons = '<div class="tab-buttons" role="tablist">'
+        tab_buttons += (
+            '<button class="tab-button active" role="tab" aria-selected="true" '
+            'aria-controls="panel-executive-summary" id="tab-executive-summary" '
+            'onclick="showTab(\'executive-summary\', event)">'
+            '<svg class="icon icon-sm"><use href="#icon-chart"/></svg> Executive Summary'
+            "</button>"
+        )
+
+        for savings, key, label, _rec_count, _emit in tab_entries:
+            chip = (
+                f'<span class="tab-savings" aria-label="{savings:,.2f} dollars per month estimated savings">'
+                f"{_format_savings_chip(savings)}</span>"
+                if savings > 0
+                else ""
+            )
+            tab_buttons += (
+                f'<button class="tab-button" role="tab" aria-selected="false" '
+                f'aria-controls="panel-{html.escape(key)}" id="tab-{html.escape(key)}" '
+                f'onclick="showTab(\'{html.escape(key)}\', event)">'
+                f'{html.escape(label)}{chip}</button>'
+            )
 
         tab_buttons += "</div>"
 
-        # Tab contents
-        tab_contents = ""
+        # Tab contents — same order as buttons.
+        tab_contents = (
+            '<div id="panel-executive-summary" class="tab-content active" '
+            'role="tabpanel" aria-labelledby="tab-executive-summary">'
+            + self._get_executive_summary_content()
+            + "</div>"
+        )
 
-        # Add Executive Summary tab content first (always active). Panel id is the
-        # `panel-` prefixed form so it matches `aria-controls` from the tab button.
-        tab_contents += '<div id="panel-executive-summary" class="tab-content active" role="tabpanel" aria-labelledby="tab-executive-summary">'
-        tab_contents += self._get_executive_summary_content()
-        tab_contents += "</div>"
-
-        # Add main service tabs with Snapshots and AMIs
-        for service_key, service_data in services.items():
-            # Skip tabs with no recommendations
-            if service_data.get("total_recommendations", 0) == 0:
-                continue
-
-            # No longer active since Executive Summary is active
+        for _savings, key, _label, _rec_count, emit in tab_entries:
             tab_contents += (
-                f'<div id="panel-{html.escape(service_key)}" class="tab-content" role="tabpanel" aria-labelledby="tab-{html.escape(service_key)}">'
+                f'<div id="panel-{html.escape(key)}" class="tab-content" '
+                f'role="tabpanel" aria-labelledby="tab-{html.escape(key)}">'
+                f"{emit()}</div>"
             )
-            if service_key == "ami" and amis_data["count"] > 0:
-                tab_contents += self._get_amis_content(amis_data)
-            else:
-                tab_contents += self._get_service_content(service_key, service_data)
-
-            tab_contents += "</div>"
-
-            # Add Snapshots tab content right after EBS
-            if service_key == "ebs" and snapshots_data["count"] > 0:
-                tab_contents += (
-                    '<div id="panel-snapshots" class="tab-content" role="tabpanel" aria-labelledby="tab-snapshots">'
-                )
-                tab_contents += self._get_snapshots_content(snapshots_data)
-                tab_contents += "</div>"
-
-        # Add standalone Snapshots tab if no EBS tab but snapshots exist
-        if snapshots_data["count"] > 0 and not any(
-            s.get("total_recommendations", 0) > 0 for k, s in services.items() if k == "ebs"
-        ):
-            tab_contents += '<div id="panel-snapshots" class="tab-content" role="tabpanel" aria-labelledby="tab-snapshots">'
-            tab_contents += self._get_snapshots_content(snapshots_data)
-            tab_contents += "</div>"
-
-        # Add standalone AMIs tab if no AMI service but AMIs exist
-        if amis_data["count"] > 0 and not any(
-            s.get("total_recommendations", 0) > 0 for k, s in services.items() if k == "ami"
-        ):
-            tab_contents += '<div id="panel-amis" class="tab-content" role="tabpanel" aria-labelledby="tab-amis">'
-            tab_contents += self._get_amis_content(amis_data)
-            tab_contents += "</div>"
 
         # Priority filter strip — dims non-matching .rec-item across all tabs.
         filter_strip = (
