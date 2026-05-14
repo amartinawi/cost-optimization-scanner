@@ -442,23 +442,8 @@ def get_enhanced_container_checks(ctx: ScanContext) -> dict[str, Any]:
                                         )
                                     elif max_cpu > 80 or max_memory > 80:
                                         pass
-                            else:
-                                checks["ecs_rightsizing"].append(
-                                    {
-                                        "ClusterName": cluster_name,
-                                        "ServiceName": service_name,
-                                        "Recommendation": (
-                                            "Metrics not available; enable Container Insights "
-                                            "to produce metric-backed optimization findings"
-                                        ),
-                                        "EstimatedSavings": "Enable Container Insights first for accurate analysis",
-                                        "CheckCategory": "ECS Container Insights Required",
-                                        "ActionRequired": (
-                                            f"aws ecs put-cluster-settings --cluster {cluster_name} "
-                                            "--settings name=containerInsights,value=enabled"
-                                        ),
-                                    }
-                                )
+                            # No metrics available branch removed: "Enable Container Insights
+                            # first" is a monitoring-enablement nudge, not a cost saving.
 
                         except Exception as e:
                             print(f"Warning: Could not check Container Insights for ECS cluster {cluster_name}: {e}")
@@ -572,38 +557,10 @@ def get_enhanced_container_checks(ctx: ScanContext) -> dict[str, Any]:
                                     "AvgMemory": f"{avg_memory:.1f}%",
                                 }
                             )
-                        elif max_cpu > 85 or max_memory > 85:
-                            checks["eks_rightsizing"].append(
-                                {
-                                    "ClusterName": cluster_name,
-                                    "Recommendation": (
-                                        f"Measured high peak usage over 7 days "
-                                        f"(CPU: {max_cpu:.1f}%, Memory: {max_memory:.1f}%) "
-                                        "- consider larger instances or auto-scaling"
-                                    ),
-                                    "EstimatedSavings": "Performance improvement, potential cost increase",
-                                    "CheckCategory": "EKS Performance Optimization - Metric-Backed",
-                                    "MetricsPeriod": "7 days",
-                                    "MaxCPU": f"{max_cpu:.1f}%",
-                                    "MaxMemory": f"{max_memory:.1f}%",
-                                }
-                            )
-                    elif not container_insights_enabled:
-                        checks["eks_rightsizing"].append(
-                            {
-                                "ClusterName": cluster_name,
-                                "Recommendation": (
-                                    "Metrics not available; enable Container Insights "
-                                    "to produce metric-backed optimization findings"
-                                ),
-                                "EstimatedSavings": "Enable Container Insights first for accurate analysis",
-                                "CheckCategory": "EKS Container Insights Required",
-                                "ActionRequired": (
-                                    f"aws eks create-addon --cluster-name {cluster_name} "
-                                    "--addon-name amazon-cloudwatch-observability"
-                                ),
-                            }
-                        )
+                        # EKS Performance Optimization (peak usage scale-up suggestion):
+                        # removed — explicitly "potential cost increase", not a saving.
+                    # No-metrics fallback removed: "Enable Container Insights" is monitoring
+                    # enablement, not a cost saving.
 
                     for nodegroup_name in nodegroup_names:
                         try:

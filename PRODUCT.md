@@ -16,7 +16,7 @@ The same artifact must work at all three depths in a single read. There is no se
 
 ## Product Purpose
 
-The scanner inspects 37 AWS service categories with 260+ checks, backs every recommendation with CloudWatch metrics and live AWS Pricing API data, and writes a single HTML report plus a JSON snapshot. The HTML report is the canonical user-facing surface of the entire project; CLI flags and JSON output exist to feed it.
+The scanner inspects 34 AWS service categories with 200+ cost-optimization checks, backs every recommendation with CloudWatch metrics and live AWS Pricing API data, and writes a single HTML report plus a JSON snapshot. **Scope is strictly cost.** Every emitted finding must produce a concrete account-specific $ saving — health monitoring, security advice, version-freshness nudges, and operational best-practice without realized savings are excluded by design (see `CHANGELOG.md` [3.4.0] for the cost-only scope refinement). The HTML report is the canonical user-facing surface of the entire project; CLI flags and JSON output exist to feed it.
 
 The report succeeds when, in one read, a practitioner can:
 

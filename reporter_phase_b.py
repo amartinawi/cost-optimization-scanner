@@ -427,6 +427,65 @@ def _render_rds_compute_optimizer(recommendations: List[Rec], source_name: str, 
     return content
 
 
+def _render_rds_ri_scenarios_table(recs: List[Rec]) -> str:
+    """Render a per-database RI scenario table (1yr / 3yr × payment options).
+
+    Each rec is expected to carry an ``RIScenarios`` list of
+    ``{term, payment_option, monthly_savings, discount_pct, ondemand_monthly_estimate}``
+    dicts produced by ``services/rds.py:get_enhanced_rds_checks``. Replaces the
+    legacy single-line "$X/month with 1-yr no-upfront RI" disclosure with the
+    full purchase matrix so the FinOps reader can compare upfront vs. recurring
+    commitments without leaving the report.
+    """
+    out = ""
+    for rec in recs:
+        db_id = rec.get("DBInstanceIdentifier") or rec.get("DBClusterIdentifier") or "Unknown"
+        engine = rec.get("engine") or rec.get("Engine") or ""
+        instance_class = rec.get("DBInstanceClass") or ""
+        scenarios = rec.get("RIScenarios") or []
+        ondemand = rec.get("OnDemandMonthlyEstimate", 0.0)
+
+        header_parts = [db_id]
+        if instance_class:
+            header_parts.append(instance_class)
+        if engine:
+            header_parts.append(engine)
+        header = " · ".join(header_parts)
+
+        out += '<div class="ri-scenarios">'
+        out += f"<p class='ri-scenarios__header'><strong>{header}</strong>"
+        if ondemand:
+            out += f' <span class="ri-scenarios__base">on-demand ≈ ${ondemand:,.2f}/month</span>'
+        out += "</p>"
+
+        if not scenarios:
+            out += "<p><em>Scenario matrix unavailable.</em></p></div>"
+            continue
+
+        out += "<table class='rec-table ri-scenarios__table'><thead><tr>"
+        out += "<th>Term</th><th>Payment</th><th>Discount</th><th>Monthly savings</th>"
+        out += "</tr></thead><tbody>"
+
+        best_idx = max(range(len(scenarios)), key=lambda i: scenarios[i].get("monthly_savings", 0))
+        for idx, sc in enumerate(scenarios):
+            term = sc.get("term", "")
+            payment = sc.get("payment_option", "")
+            discount = sc.get("discount_pct", 0)
+            monthly = sc.get("monthly_savings", 0)
+            row_class = " class='ri-scenarios__row--best'" if idx == best_idx else ""
+            out += (
+                f"<tr{row_class}>"
+                f"<td>{term}</td>"
+                f"<td>{payment}</td>"
+                f"<td>{discount:.1f}%</td>"
+                f"<td>${monthly:,.2f}</td>"
+                f"</tr>"
+            )
+        out += "</tbody></table>"
+        out += "</div>"
+    return out
+
+
 def _render_rds_enhanced_checks(recommendations: List[Rec], source_name: str, service_data: Dict) -> str:
     """Renders RDS enhanced-check recommendations grouped by category. Called by: HTMLReportGenerator._get_detailed_recommendations."""
     grouped_categories: Dict[str, List[Rec]] = {}
@@ -449,6 +508,19 @@ def _render_rds_enhanced_checks(recommendations: List[Rec], source_name: str, se
             content += f"<h4>{category} ({count} {label})</h4>"
 
         content += f"<p><strong>Recommendation:</strong> {recs[0].get('Recommendation', 'Optimize configuration')}</p>"
+
+        is_ri_category = category == "Reserved Instance Opportunities" and any(r.get("RIScenarios") for r in recs)
+
+        if is_ri_category:
+            best_total = sum(max(s.get("monthly_savings", 0) for s in r.get("RIScenarios", [])) for r in recs)
+            content += (
+                '<p class="savings"><strong>Estimated Savings:</strong> '
+                f'up to ${best_total:,.2f}/month at the best-tier scenario per database'
+                '</p>'
+            )
+            content += _render_rds_ri_scenarios_table(recs)
+            content += "</div>"
+            continue
 
         total_savings = 0
         has_numeric_savings = False
@@ -1793,11 +1865,130 @@ def _render_eks_source(recommendations: List[Rec], source_name: str, service_dat
     return content
 
 
+# Standard AWS RI / SP discount-tier ratios relative to 1yr No Upfront. Used to
+# scale a single CoH-recommended scenario into the full purchase matrix so the
+# reader can compare upfront-vs-recurring trade-offs without leaving the report.
+# Treat as planning estimates; confirm exact savings in the AWS RI marketplace.
+_COH_COMMITMENT_TIER_RATIOS: Tuple[Tuple[str, str, float], ...] = (
+    ("1yr", "No Upfront", 1.00),
+    ("1yr", "Partial Upfront", 1.08),
+    ("1yr", "All Upfront", 1.16),
+    ("3yr", "No Upfront", 1.45),
+    ("3yr", "Partial Upfront", 1.53),
+    ("3yr", "All Upfront", 1.63),
+)
+
+
+def _is_commitment_rec(rec: Rec) -> bool:
+    """Return True if the CoH rec describes a Reserved Instance or Savings Plan."""
+    rt = (rec.get("currentResourceType") or "").lower()
+    return "reservedinstance" in rt or "savingsplan" in rt
+
+
+def _coh_recommended_scenario(rec: Rec) -> Tuple[str, str]:
+    """Extract AWS's recommended (term, payment_option) from a CoH commitment rec.
+
+    Looks at ``recommendedResourceSummary`` (the AWS CoH API field) for term
+    (``1_YEAR`` / ``3_YEARS``) and payment option (``NO_UPFRONT`` / ``PARTIAL_UPFRONT``
+    / ``ALL_UPFRONT``). Falls back to a flat (``"1yr"``, ``"No Upfront"``) anchor
+    when those fields are missing so the matrix still renders.
+    """
+    summary = rec.get("recommendedResourceSummary") or rec.get("recommendedResourceDetails") or {}
+    if isinstance(summary, dict):
+        nested = (
+            summary.get("reservedInstances")
+            or summary.get("savingsPlans")
+            or summary.get("ec2ReservedInstances")
+            or summary.get("rdsReservedInstances")
+            or summary.get("elastiCacheReservedInstances")
+            or summary.get("openSearchReservedInstances")
+            or summary.get("redshiftReservedInstances")
+            or summary.get("computeSavingsPlans")
+            or summary.get("ec2InstanceSavingsPlans")
+            or summary.get("sageMakerSavingsPlans")
+            or {}
+        )
+        if isinstance(nested, dict) and nested:
+            summary = nested
+
+    raw_term = (summary.get("term") if isinstance(summary, dict) else "") or ""
+    raw_payment = (summary.get("paymentOption") if isinstance(summary, dict) else "") or ""
+
+    term = "3yr" if "3" in str(raw_term) else "1yr"
+    payment_token = str(raw_payment).upper()
+    if "ALL" in payment_token:
+        payment = "All Upfront"
+    elif "PARTIAL" in payment_token:
+        payment = "Partial Upfront"
+    else:
+        payment = "No Upfront"
+    return term, payment
+
+
+def _render_coh_commitment_scenarios(rec: Rec) -> str:
+    """Build the full term × payment scenario matrix for a CoH commitment rec.
+
+    AWS Cost Optimization Hub returns a single recommended (term, payment) per
+    resource. This helper scales the rec's monthly savings via standard tier
+    ratios so the reader can compare all six purchase scenarios inline. The
+    AWS-recommended scenario row is highlighted as the anchor.
+    """
+    base_savings = float(rec.get("estimatedMonthlySavings", 0) or 0)
+    if base_savings <= 0:
+        return ""
+
+    anchor_term, anchor_payment = _coh_recommended_scenario(rec)
+    anchor_ratio = 1.0
+    for term, payment, ratio in _COH_COMMITMENT_TIER_RATIOS:
+        if term == anchor_term and payment == anchor_payment:
+            anchor_ratio = ratio
+            break
+    # Express each scenario relative to the anchor so the AWS-recommended row
+    # equals base_savings exactly and the rest scale up or down from there.
+    scenarios = [
+        (term, payment, round(base_savings * (ratio / anchor_ratio), 2), round((ratio / anchor_ratio - 1) * 100, 1))
+        for term, payment, ratio in _COH_COMMITMENT_TIER_RATIOS
+    ]
+
+    resource_label = (rec.get("currentResourceType") or "Commitment").replace("ReservedInstances", " RIs").replace(
+        "SavingsPlans", " SP"
+    )
+
+    out = '<div class="ri-scenarios">'
+    out += (
+        '<p class="ri-scenarios__header"><strong>Scenario matrix</strong> '
+        f'<span class="ri-scenarios__base">AWS-recommended: {anchor_term} {anchor_payment} '
+        f'· {resource_label} · base ${base_savings:,.2f}/month</span></p>'
+    )
+    out += "<table class='rec-table ri-scenarios__table'><thead><tr>"
+    out += "<th>Term</th><th>Payment</th><th>Monthly savings</th><th>vs. recommended</th>"
+    out += "</tr></thead><tbody>"
+    for term, payment, monthly, delta_pct in scenarios:
+        is_anchor = term == anchor_term and payment == anchor_payment
+        row_class = " class='ri-scenarios__row--best'" if is_anchor else ""
+        delta_display = "—" if is_anchor else (f"{'+' if delta_pct > 0 else ''}{delta_pct:.1f}%")
+        out += (
+            f"<tr{row_class}>"
+            f"<td>{term}</td>"
+            f"<td>{payment}</td>"
+            f"<td>${monthly:,.2f}</td>"
+            f"<td>{delta_display}</td>"
+            f"</tr>"
+        )
+    out += "</tbody></table>"
+    out += "</div>"
+    return out
+
+
 def _render_cost_hub_source(recommendations: List[Rec], source_name: str, service_data: Dict) -> str:
     """Renders Cost Optimization Hub recommendations as a human-readable table.
 
     Groups recommendations by action type and displays resource details,
-    savings, and implementation effort in a structured card layout.
+    savings, and implementation effort in a structured card layout. For
+    commitment recommendations (Reserved Instances / Savings Plans), appends
+    a per-rec scenario matrix expanding AWS's single recommended (term,
+    payment) into the full six-cell purchase matrix so the FinOps reader can
+    weigh upfront-vs-recurring trade-offs without leaving the report.
     Called by: HTMLReportGenerator._get_detailed_recommendations.
     """
     if not recommendations:
@@ -1845,74 +2036,15 @@ def _render_cost_hub_source(recommendations: List[Rec], source_name: str, servic
 
         content += "</tbody></table>"
 
+        commitment_recs = [r for r in recs if _is_commitment_rec(r)]
+        for crec in commitment_recs:
+            content += _render_coh_commitment_scenarios(crec)
+
         rec_first = recs[0]
         lookback = rec_first.get("costCalculationLookbackPeriodInDays", 30)
         savings_pct = rec_first.get("estimatedSavingsPercentage", 0)
         if savings_pct:
             content += f"<p><small>Based on {lookback}-day analysis | {savings_pct:.0f}% estimated savings</small></p>"
-
-        content += "</div>"
-    return content
-
-
-def _render_cost_anomaly_source(recommendations: List[Rec], source_name: str, service_data: Dict) -> str:
-    """Renders Cost Anomaly Detection recommendations in a structured card layout.
-
-    Groups recommendations by check category and displays severity,
-    current state, recommended actions, and estimated savings.
-    Called by: HTMLReportGenerator._get_detailed_recommendations.
-    """
-    if not recommendations:
-        return ""
-
-    grouped: Dict[str, List[Rec]] = {}
-    for rec in recommendations:
-        category = rec.get("check_category", "Other")
-        if category not in grouped:
-            grouped[category] = []
-        grouped[category].append(rec)
-
-    content = ""
-    for category, recs in grouped.items():
-        total_savings = sum(r.get("monthly_savings", 0.0) for r in recs)
-        label = "item" if len(recs) == 1 else "items"
-        content += f'<div class="rec-item{_priority_class(recs[0])}">'
-        content += f"<h4>{category} ({len(recs)} {label})</h4>"
-
-        if total_savings > 0:
-            content += f'<p class="savings"><strong>Estimated Monthly Impact:</strong> ${total_savings:.2f}</p>'
-
-        content += "<table class='rec-table'><thead><tr>"
-        content += "<th>Resource</th><th>Severity</th><th>Current State</th><th>Recommendation</th>"
-        content += "</tr></thead><tbody>"
-
-        for rec in recs:
-            resource_id = rec.get("resource_id", "N/A")
-            severity = rec.get("severity", "")
-            current = rec.get("current_value", "")
-            recommended = rec.get("recommended_value", "")
-
-            severity_badge = ""
-            if severity == "HIGH":
-                severity_badge = '<span class="badge badge-danger">HIGH</span>'
-            elif severity == "MEDIUM":
-                severity_badge = '<span class="badge badge-warning">MEDIUM</span>'
-            elif severity == "LOW":
-                severity_badge = '<span class="badge badge-success">LOW</span>'
-            else:
-                severity_badge = severity
-
-            content += f"<tr><td>{resource_id}</td><td>{severity_badge}</td>"
-            content += f"<td>{current}</td><td>{recommended}</td></tr>"
-
-        content += "</tbody></table>"
-
-        reasons = list({r.get("reason", "") for r in recs if r.get("reason")})
-        if reasons:
-            content += "<p><strong>Details:</strong></p><ul>"
-            for reason in reasons[:3]:
-                content += f"<li>{reason}</li>"
-            content += "</ul>"
 
         content += "</div>"
     return content
@@ -1934,15 +2066,21 @@ _SOURCE_BADGE_CSS: Dict[str, str] = {
 }
 
 SOURCE_TYPE_MAP: Dict[Tuple[str, str], str] = {
+    # Legacy bindings retained for any in-flight scan JSON that predates
+    # the compute_optimizer adapter retirement (services/__init__.py,
+    # 2026-05-14). New scans never emit these source pairs because the
+    # standalone Compute Optimizer tab no longer renders.
     ("compute_optimizer", "ebs_recommendations"): "ML Backed",
     ("compute_optimizer", "lambda_recommendations"): "ML Backed",
     ("compute_optimizer", "ecs_recommendations"): "ML Backed",
     ("compute_optimizer", "asg_recommendations"): "ML Backed",
     ("cost_optimization_hub", "savings_plans"): "Cost Hub",
     ("cost_optimization_hub", "cross_service"): "Cost Hub",
-    ("cost_anomaly", "active_anomalies"): "Audit Based",
-    ("cost_anomaly", "anomaly_monitors"): "Audit Based",
-    ("cost_anomaly", "billing_alarms"): "Audit Based",
+    # CO recs that now flow through per-service adapters after the standalone
+    # Compute Optimizer tab retirement.
+    ("lambda", "compute_optimizer"): "ML Backed",
+    ("containers", "compute_optimizer"): "ML Backed",
+    ("ec2", "asg_compute_optimizer"): "ML Backed",
     # S3 enhanced checks are config-pattern (no CloudWatch). Override the
     # generic "enhanced_checks" → "Metric Backed" default (audit L3-S3-003).
     ("s3", "enhanced_checks"): "Audit Based",
@@ -2008,10 +2146,20 @@ def source_type_label(service_key: str, source_name: str) -> str:
 
 
 PHASE_B_HANDLERS: Dict[Tuple[str, str], Callable] = {
+    # Legacy bindings retained for any in-flight scan JSON that predates
+    # the compute_optimizer adapter retirement (services/__init__.py,
+    # 2026-05-14). New scans never emit these source pairs.
     ("compute_optimizer", "ebs_recommendations"): _render_compute_optimizer_source,
     ("compute_optimizer", "lambda_recommendations"): _render_compute_optimizer_source,
     ("compute_optimizer", "ecs_recommendations"): _render_compute_optimizer_source,
     ("compute_optimizer", "asg_recommendations"): _render_compute_optimizer_source,
+    # CO recs that now flow through per-service adapters after the standalone
+    # Compute Optimizer tab retirement. Each binding reuses the unified
+    # renderer because the rec schema is identical (resource_name, finding,
+    # current_config, recommended_config, estimatedMonthlySavings).
+    ("lambda", "compute_optimizer"): _render_compute_optimizer_source,
+    ("containers", "compute_optimizer"): _render_compute_optimizer_source,
+    ("ec2", "asg_compute_optimizer"): _render_compute_optimizer_source,
     # Legacy bindings retained for any in-flight scan JSON that predates
     # the cost_optimization_hub adapter retirement (services/__init__.py,
     # 2026-05-14). New scans never emit these source pairs.
@@ -2020,10 +2168,6 @@ PHASE_B_HANDLERS: Dict[Tuple[str, str], Callable] = {
     # CoH recommendations the orchestrator routes into per-service tabs.
     ("containers", "cost_optimization_hub"): _render_cost_hub_source,
     ("commitment_analysis", "cost_optimization_hub"): _render_cost_hub_source,
-    ("cost_anomaly", "active_anomalies"): _render_cost_anomaly_source,
-    ("cost_anomaly", "anomaly_monitors"): _render_cost_anomaly_source,
-    ("cost_anomaly", "billing_alarms"): _render_cost_anomaly_source,
-    ("cost_anomaly", "recommendations"): _render_cost_anomaly_source,
     ("ec2", "enhanced_checks"): _render_ec2_enhanced_checks,
     ("ec2", "cost_optimization_hub"): _render_ec2_cost_hub,
     ("ec2", "compute_optimizer"): _render_ec2_compute_optimizer,
@@ -2083,7 +2227,6 @@ _PHASE_B_SKIP_PER_REC = frozenset(
         "rds",
         "eks_cost",
         "cost_optimization_hub",
-        "cost_anomaly",
     }
 )
 

@@ -103,20 +103,8 @@ def get_load_balancer_checks(ctx: ScanContext) -> dict[str, Any]:
                 else:
                     standalone_albs.append(lb)
 
-            if scheme == "internet-facing" and any(
-                keyword in (lb_name or "").lower() for keyword in ["internal", "private", "backend"]
-            ):
-                checks["public_internal_lb"].append(
-                    {
-                        "LoadBalancerName": lb_name,
-                        "Type": lb_type,
-                        "Scheme": scheme,
-                        "Recommendation": "Internet-facing load balancer with internal naming - verify if should be internal scheme",
-                        "EstimatedSavings": "Security improvement + potential cost reduction if internal scheme sufficient",
-                        "Action": "1. Verify if external access is actually needed\n2. Check if internal scheme would work\n3. Consider changing to internal if only internal access required\n4. Review security groups and NACLs",
-                        "CheckCategory": "Load Balancer Scheme Optimization",
-                    }
-                )
+            # Public-internal LB scheme finding removed: primarily a security/config check
+            # ("verify if should be internal scheme"); cost saving is speculative.
 
             if lb_type == "network":
                 checks["nlb_vs_alb"].append(
@@ -179,34 +167,18 @@ def get_load_balancer_checks(ctx: ScanContext) -> dict[str, Any]:
                         print(f"Warning: Could not get rules for listener {listener['ListenerArn']}: {e}")
                         continue
 
-                if total_rules > 100:
-                    checks["excessive_rules"].append(
-                        {
-                            "LoadBalancerName": lb_name,
-                            "RuleCount": total_rules,
-                            "Recommendation": f"ALB has {total_rules} rules which increases LCU costs - consider simplifying routing",
-                            "EstimatedSavings": "Reduced LCU charges (rules contribute to LCU calculation)",
-                            "Action": "1. Review and consolidate similar rules\n2. Use wildcard patterns where possible\n3. Consider path-based routing over multiple rules\n4. Monitor LCU usage in CloudWatch",
-                            "CheckCategory": "ALB Rule Optimization",
-                        }
-                    )
+                # Excessive ALB rules finding removed: emitted no concrete $ — LCU savings
+                # depend on traffic volume not measured here.
+                _ = total_rules
 
             except Exception as e:
                 print(f"Warning: Could not analyze ALB {lb_name}: {e}")
                 continue
 
-            az_count = len(lb.get("AvailabilityZones", []))
-            if az_count > 2 and scheme == "internal":
-                checks["unnecessary_cross_az"].append(
-                    {
-                        "LoadBalancerName": lb_name,
-                        "AvailabilityZoneCount": az_count,
-                        "Recommendation": f"Internal Load Balancer spans {az_count} AZs - consider reducing to 2-3 AZs to minimize cross-AZ data transfer costs",
-                        "EstimatedSavings": f"Reduce cross-AZ transfer costs by ${(az_count - 2) * 0.01 * 1000}/month (estimated based on 1GB/hour transfer)",
-                        "Action": "1. Analyze traffic patterns to identify primary AZs\n2. Concentrate resources in 2-3 AZs for better cost efficiency\n3. Ensure high availability is maintained\n4. Monitor cross-AZ data transfer costs in Cost Explorer\n5. Cross-AZ transfer costs $0.01/GB - can add up with high traffic volumes",
-                        "CheckCategory": "Cross-AZ Load Balancing",
-                    }
-                )
+            # Unnecessary Cross-AZ LB finding removed: estimate used a fake "1GB/hour"
+            # baseline — not account-specific. Real cross-AZ analysis happens in
+            # the network_cost adapter.
+            _ = lb.get("AvailabilityZones", [])
 
         if alb_count > 5:
             standalone_count = len(standalone_albs)

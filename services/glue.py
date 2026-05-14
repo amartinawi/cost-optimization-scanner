@@ -71,16 +71,9 @@ def get_enhanced_glue_checks(ctx: ScanContext) -> dict[str, Any]:
                 crawler_name = crawler.get("Name")
                 schedule = crawler.get("Schedule", {}).get("ScheduleExpression")
 
-                if schedule and "cron" in schedule.lower():
-                    checks["crawler_optimization"].append(
-                        {
-                            "CrawlerName": crawler_name,
-                            "Schedule": schedule,
-                            "Recommendation": "Review crawler frequency - run on-demand if possible",
-                            "EstimatedSavings": "Variable based on frequency",
-                            "CheckCategory": "Glue Crawler Optimization",
-                        }
-                    )
+                # Crawler optimization finding removed: "Variable based on frequency" with
+                # no concrete per-crawler quantification.
+                _ = (crawler_name, schedule)
     except Exception as e:
         ctx.warn(f"Could not analyze Glue resources: {e}", "glue")
 

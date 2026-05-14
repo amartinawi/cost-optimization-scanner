@@ -119,16 +119,9 @@ def get_enhanced_dms_checks(ctx: ScanContext) -> dict[str, Any]:
             for page in serverless_paginator.paginate():
                 serverless_configs = page.get("ReplicationConfigs", [])
 
-                for config in serverless_configs:
-                    config_id = config.get("ReplicationConfigIdentifier")
-                    checks["serverless_migration"].append(
-                        {
-                            "ConfigId": config_id,
-                            "Recommendation": "Monitor DMS Serverless usage patterns for cost optimization",
-                            "EstimatedSavings": "Variable based on usage",
-                            "CheckCategory": "Serverless Optimization",
-                        }
-                    )
+                # DMS Serverless monitor finding removed: "Variable based on usage" with
+                # no per-config quantification — monitoring nudge, not a saving.
+                _ = serverless_configs
         except Exception:
             pass
 

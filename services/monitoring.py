@@ -95,17 +95,8 @@ def get_cloudwatch_checks(ctx: ScanContext) -> dict[str, Any]:
                     }
                 )
 
-            if stored_bytes > 10 * 1024**3:
-                checks["excessive_logging"].append(
-                    {
-                        "LogGroupName": log_group_name,
-                        "StoredGB": round(stored_bytes / (1024**3), 2),
-                        "RetentionDays": retention_days,
-                        "Recommendation": "Large log group - review log level and retention",
-                        "EstimatedSavings": "Reduce log level or retention period",
-                        "CheckCategory": "Excessive Log Storage",
-                    }
-                )
+            # Excessive log storage finding removed: emitted no concrete $ — "review log
+            # level and retention" without quantifying storage savings.
 
         try:
             cloudwatch = ctx.client("cloudwatch")
@@ -118,24 +109,9 @@ def get_cloudwatch_checks(ctx: ScanContext) -> dict[str, Any]:
                     state_reason = alarm.get("StateReason", "")
                     alarm_config_updated = alarm.get("AlarmConfigurationUpdatedTimestamp")
 
-                    if "Insufficient Data" in state_reason and alarm_config_updated:
-                        if isinstance(alarm_config_updated, str):
-                            continue
-
-                        age_days = (datetime.now(UTC) - alarm_config_updated).days
-                        if age_days > 7:
-                            checks["unused_alarms"].append(
-                                {
-                                    "AlarmName": alarm_name,
-                                    "StateReason": state_reason,
-                                    "AgeDays": age_days,
-                                    "Recommendation": (
-                                        f"Alarm has insufficient data for {age_days} days"
-                                        " - review metric availability or delete"
-                                    ),
-                                    "CheckCategory": "Unused CloudWatch Alarms",
-                                }
-                            )
+                    # Unused CloudWatch Alarms finding removed: health/operational signal
+                    # with no EstimatedSavings field — not a cost recommendation.
+                    _ = (state_reason, alarm_config_updated, alarm_name)
 
         except Exception as e:
             print(f"Warning: Could not analyze CloudWatch alarms: {e}")
@@ -204,18 +180,9 @@ def get_cloudtrail_checks(ctx: ScanContext) -> dict[str, Any]:
 
             trail_names.add(trail_name)
 
-            # First CloudTrail trail in each region is free; only flag additional trails
-            if is_multi_region and trail_index > 0:
-                checks["multi_region_trails"].append(
-                    {
-                        "TrailName": trail_name,
-                        "TrailARN": trail_arn,
-                        "S3Bucket": s3_bucket,
-                        "Recommendation": "Multi-region trail - verify if all regions needed",
-                        "EstimatedSavings": "$0.00/month — single-region trail costs ~90% less",
-                        "CheckCategory": "Multi-Region CloudTrail",
-                    }
-                )
+            # Multi-region CloudTrail finding removed: emitted $0/month with a generic
+            # "~90% less" percentage — no concrete per-account savings.
+            _ = (is_multi_region, trail_arn, s3_bucket)
 
             try:
                 selectors_response = cloudtrail.get_event_selectors(TrailName=trail_name)
@@ -228,27 +195,10 @@ def get_cloudtrail_checks(ctx: ScanContext) -> dict[str, Any]:
                         resource_type = resource.get("Type")
                         values = resource.get("Values", [])
 
-                        if resource_type == "AWS::S3::Object" and "arn:aws:s3:::*/*" in values:
-                            checks["data_events_all_s3"].append(
-                                {
-                                    "TrailName": trail_name,
-                                    "ResourceType": resource_type,
-                                    "Recommendation": "Data events enabled for all S3 buckets - very expensive",
-                                    "EstimatedSavings": "$0.00/month — limit to specific buckets for 80-95% savings",
-                                    "CheckCategory": "S3 Data Events All Buckets",
-                                }
-                            )
-
-                        if resource_type == "AWS::Lambda::Function" and "arn:aws:lambda:*" in str(values):
-                            checks["data_events_all_lambda"].append(
-                                {
-                                    "TrailName": trail_name,
-                                    "ResourceType": resource_type,
-                                    "Recommendation": "Data events enabled for all Lambda functions - expensive",
-                                    "EstimatedSavings": "$0.00/month — limit to specific functions for significant savings",
-                                    "CheckCategory": "Lambda Data Events All Functions",
-                                }
-                            )
+                        # S3 and Lambda data-events findings removed: each emitted $0/month
+                        # with percentage-range savings ("80-95%" / "significant") — no
+                        # concrete per-account quantification.
+                        _ = (resource_type, values)
 
             except ClientError as e:
                 if e.response["Error"]["Code"] != "TrailNotFoundException":
@@ -260,16 +210,9 @@ def get_cloudtrail_checks(ctx: ScanContext) -> dict[str, Any]:
                 insights_response = cloudtrail.get_insight_selectors(TrailName=trail_name)
                 insight_selectors = insights_response.get("InsightSelectors", [])
 
-                if insight_selectors:
-                    checks["unused_insights"].append(
-                        {
-                            "TrailName": trail_name,
-                            "InsightTypes": [s.get("InsightType") for s in insight_selectors],
-                            "Recommendation": "CloudTrail Insights enabled - verify usage and value",
-                            "EstimatedSavings": "$0.35 per 100,000 events if unused",
-                            "CheckCategory": "CloudTrail Insights",
-                        }
-                    )
+                # CloudTrail Insights finding removed: emitted a generic per-event AWS
+                # rate ($0.35/100K) without per-account event-volume math.
+                _ = insight_selectors
 
             except ClientError as e:
                 if e.response["Error"]["Code"] != "TrailNotFoundException":
@@ -277,18 +220,8 @@ def get_cloudtrail_checks(ctx: ScanContext) -> dict[str, Any]:
             except Exception as e:
                 print(f"Warning: Could not check insights for {trail_name}: {e}")
 
-        if len(trail_names) > 2:
-            checks["duplicate_trails"].append(
-                {
-                    "TrailCount": len(trail_names),
-                    "TrailNames": list(trail_names),
-                    "Recommendation": (
-                        f"{len(trail_names)} trails detected - review event selectors to avoid duplication"
-                    ),
-                    "EstimatedSavings": "$0.00/month — consolidate overlapping trails to reduce costs",
-                    "CheckCategory": "Multiple CloudTrail Trails",
-                }
-            )
+        # Multiple CloudTrail Trails finding removed: emitted $0/month with a generic
+        # "consolidate overlapping trails" suggestion — no concrete savings.
 
     except Exception as e:
         print(f"Warning: Could not perform CloudTrail checks: {e}")

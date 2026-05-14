@@ -1,6 +1,6 @@
 # Service Adapters
 
-36 ServiceModule adapter files in `services/adapters/`. Each implements `scan(ctx) -> ServiceFindings`. AWS Cost Optimization Hub is **not** a dedicated adapter (retired from `ALL_MODULES` on 2026-05-14); its recommendations are fetched once by `ScanOrchestrator._prefetch_advisor_data` and consumed per-service via `ctx.cost_hub_splits[<service_key>]`.
+34 ServiceModule adapter files in `services/adapters/`. Each implements `scan(ctx) -> ServiceFindings`. Two former adapters were retired from `ALL_MODULES` on 2026-05-14 and their findings now flow per-service: AWS Cost Optimization Hub recommendations are fetched once by `ScanOrchestrator._prefetch_advisor_data` and consumed via `ctx.cost_hub_splits[<service_key>]`; AWS Compute Optimizer recommendations are pulled inline by EC2 / EBS / RDS / Lambda / Containers adapters via the `services.advisor.get_<resource>_compute_optimizer_recommendations` helpers.
 
 ## Pricing Models
 

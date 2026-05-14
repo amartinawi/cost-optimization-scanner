@@ -145,3 +145,162 @@ def get_rds_compute_optimizer_recommendations(
         if "OptInRequiredException" in str(e) or "not registered" in str(e):
             recommendations.append(_compute_optimizer_opt_in_rec("RDS", "rightsizing"))
     return recommendations
+
+
+def get_lambda_compute_optimizer_recommendations(
+    ctx: ScanContext,
+) -> list[dict[str, Any]]:
+    """Get Lambda function recommendations from Compute Optimizer.
+
+    Returns normalized recommendation dicts ready for inline rendering in
+    the Lambda tab. Returns the opt-in placeholder when CO is not enabled.
+    """
+    compute_optimizer = ctx.client("compute-optimizer")
+    if not compute_optimizer:
+        return []
+    raw: list[dict[str, Any]] = []
+    try:
+        response = compute_optimizer.get_lambda_function_recommendations()
+        raw.extend(response.get("lambdaFunctionRecommendations", []))
+        while response.get("nextToken"):
+            response = compute_optimizer.get_lambda_function_recommendations(nextToken=response["nextToken"])
+            raw.extend(response.get("lambdaFunctionRecommendations", []))
+    except Exception as e:
+        logger.warning("Lambda Compute Optimizer not available: %s", e)
+        if "OptInRequiredException" in str(e) or "not registered" in str(e):
+            return [_compute_optimizer_opt_in_rec("Lambda", "memory-rightsizing")]
+        return []
+    return [_normalize_lambda_co_rec(r, ctx.pricing_multiplier) for r in raw]
+
+
+def get_ecs_compute_optimizer_recommendations(
+    ctx: ScanContext,
+) -> list[dict[str, Any]]:
+    """Get ECS service recommendations from Compute Optimizer.
+
+    Returns normalized recommendation dicts ready for inline rendering in
+    the Containers tab. Returns the opt-in placeholder when CO is not enabled.
+    """
+    compute_optimizer = ctx.client("compute-optimizer")
+    if not compute_optimizer:
+        return []
+    raw: list[dict[str, Any]] = []
+    try:
+        response = compute_optimizer.get_ecs_service_recommendations()
+        raw.extend(response.get("ecsServiceRecommendations", []))
+        while response.get("nextToken"):
+            response = compute_optimizer.get_ecs_service_recommendations(nextToken=response["nextToken"])
+            raw.extend(response.get("ecsServiceRecommendations", []))
+    except Exception as e:
+        logger.warning("ECS Compute Optimizer not available: %s", e)
+        if "OptInRequiredException" in str(e) or "not registered" in str(e):
+            return [_compute_optimizer_opt_in_rec("ECS", "task-rightsizing")]
+        return []
+    return [_normalize_ecs_co_rec(r, ctx.pricing_multiplier) for r in raw]
+
+
+def get_asg_compute_optimizer_recommendations(
+    ctx: ScanContext,
+) -> list[dict[str, Any]]:
+    """Get Auto Scaling Group recommendations from Compute Optimizer.
+
+    Returns normalized recommendation dicts ready for inline rendering in
+    the EC2 tab. Returns the opt-in placeholder when CO is not enabled.
+    """
+    compute_optimizer = ctx.client("compute-optimizer")
+    if not compute_optimizer:
+        return []
+    raw: list[dict[str, Any]] = []
+    try:
+        response = compute_optimizer.get_auto_scaling_group_recommendations()
+        raw.extend(response.get("autoScalingGroupRecommendations", []))
+        while response.get("nextToken"):
+            response = compute_optimizer.get_auto_scaling_group_recommendations(nextToken=response["nextToken"])
+            raw.extend(response.get("autoScalingGroupRecommendations", []))
+    except Exception as e:
+        logger.warning("ASG Compute Optimizer not available: %s", e)
+        if "OptInRequiredException" in str(e) or "not registered" in str(e):
+            return [_compute_optimizer_opt_in_rec("Auto Scaling Group", "instance-rightsizing")]
+        return []
+    return [_normalize_asg_co_rec(r, ctx.pricing_multiplier) for r in raw]
+
+
+def _normalize_lambda_co_rec(raw: dict[str, Any], pricing_multiplier: float) -> dict[str, Any]:
+    """Normalize a raw Lambda Compute Optimizer recommendation."""
+    savings = 0.0
+    for opt in raw.get("memorySizeRecommendationOptions", []):
+        if "savingsOpportunity" in opt:
+            savings = opt["savingsOpportunity"].get("estimatedMonthlySavings", {}).get("value", 0.0)
+            break
+
+    arn = raw.get("functionArn", "")
+    fn_part = arn.split(":function:")[-1] if ":function:" in arn else arn
+    fn_name = fn_part.split(":")[0] or arn
+
+    recommended_memory = 0
+    options = raw.get("memorySizeRecommendationOptions", [])
+    if options:
+        recommended_memory = options[0].get("memorySize", 0)
+
+    return {
+        "resource_id": fn_name,
+        "resource_name": fn_name,
+        "resource_type": "Lambda Function",
+        "finding": raw.get("finding", ""),
+        "current_config": {
+            "memorySize": raw.get("currentMemorySize", 0),
+            "runtime": raw.get("currentExecutionType", ""),
+        },
+        "recommended_config": {"memorySize": recommended_memory},
+        "estimatedMonthlySavings": round(savings * pricing_multiplier, 2),
+        "lookback_period_days": raw.get("lookBackPeriodInDays", 14),
+    }
+
+
+def _normalize_ecs_co_rec(raw: dict[str, Any], pricing_multiplier: float) -> dict[str, Any]:
+    """Normalize a raw ECS Compute Optimizer recommendation."""
+    savings = 0.0
+    service_options = raw.get("serviceRecommendationOptions", [])
+    if service_options:
+        savings = service_options[0].get("savingsOpportunity", {}).get("estimatedMonthlySavings", {}).get("value", 0.0)
+
+    svc_id = raw.get("serviceArn", "").split(":service/")[-1] or raw.get("serviceArn", "")
+    svc_name = svc_id.split("/")[-1] if "/" in svc_id else svc_id
+    return {
+        "resource_id": svc_id,
+        "resource_name": svc_name,
+        "resource_type": "ECS Service",
+        "finding": raw.get("finding", ""),
+        "current_config": raw.get("currentServiceConfiguration", {}),
+        "recommended_config": service_options[0].get("containerRecommendations", []) if service_options else [],
+        "estimatedMonthlySavings": round(savings * pricing_multiplier, 2),
+        "lookback_period_days": raw.get("lookBackPeriodInDays", 14),
+    }
+
+
+def _normalize_asg_co_rec(raw: dict[str, Any], pricing_multiplier: float) -> dict[str, Any]:
+    """Normalize a raw ASG Compute Optimizer recommendation."""
+    savings = 0.0
+    options = raw.get("instanceRecommendationOptions", [])
+    if options:
+        savings = options[0].get("savingsOpportunity", {}).get("estimatedMonthlySavings", {}).get("value", 0.0)
+
+    asg_arn = raw.get("autoScalingGroupArn", "")
+    asg_name = raw.get("autoScalingGroupName", "") or (
+        asg_arn.split("autoScalingGroupName/")[-1] if "autoScalingGroupName/" in asg_arn else asg_arn
+    )
+    return {
+        "resource_id": asg_name,
+        "resource_name": asg_name,
+        "resource_type": "Auto Scaling Group",
+        "finding": raw.get("finding", ""),
+        "current_config": {
+            "instanceType": raw.get("currentConfiguration", {}).get("instanceType", ""),
+            "desiredCapacity": raw.get("currentConfiguration", {}).get("desiredCapacity", 0),
+        },
+        "recommended_config": {"instanceType": options[0].get("configuration", {}).get("instanceType", "")}
+        if options
+        else {},
+        "estimatedMonthlySavings": round(savings * pricing_multiplier, 2),
+        "lookback_period_days": raw.get("lookBackPeriodInDays", 14),
+    }

@@ -314,19 +314,8 @@ class EksCostModule(BaseServiceModule):
 
                 resource_id = f"{cluster_name}/{ng_name}"
 
-                if ng_status not in ("ACTIVE", "UPDATING"):
-                    recs.append(
-                        {
-                            "resource_id": resource_id,
-                            "check_type": "node_group",
-                            "check_category": "Node Group Optimization",
-                            "current_value": f"Node group status: {ng_status}",
-                            "recommended_value": "Review and delete inactive node group",
-                            "monthly_savings": 0.0,
-                            "severity": "LOW",
-                            "reason": f"Node group '{ng_name}' in cluster '{cluster_name}' is in {ng_status} state",
-                        }
-                    )
+                # Inactive node group state finding removed: $0/month, health/operational
+                # signal — not a cost recommendation.
 
                 has_prev_gen = any(any(it.startswith(prefix) for prefix in PREV_GEN_PREFIXES) for it in instance_types)
                 if has_prev_gen:
@@ -347,20 +336,8 @@ class EksCostModule(BaseServiceModule):
                         }
                     )
 
-                if max_size > 0 and desired > 0 and desired < max_size * 0.5:
-                    recs.append(
-                        {
-                            "resource_id": resource_id,
-                            "check_type": "node_group",
-                            "check_category": "Node Group Optimization",
-                            "current_value": f"desiredSize={desired}, maxSize={max_size} (under-utilized)",
-                            "recommended_value": "Reduce maxSize to match actual workload or enable cluster autoscaler",
-                            "monthly_savings": 0.0,
-                            "severity": "LOW",
-                            "reason": f"Node group '{ng_name}' desired size ({desired}) is less than "
-                            f"50% of max ({max_size}); consider right-sizing or enabling autoscaling",
-                        }
-                    )
+                # Under-utilized scaling config finding removed: $0/month, "consider
+                # right-sizing or enabling autoscaling" without quantified cost delta.
 
                 recs.append(
                     {
@@ -439,20 +416,9 @@ class EksCostModule(BaseServiceModule):
                     f"Graviton profiles and pod consolidation could save ~20%",
                 }
             )
-        else:
-            recs.append(
-                {
-                    "resource_id": f"{cluster_name}/fargate",
-                    "check_type": "fargate_analysis",
-                    "check_category": "Fargate Cost Analysis",
-                    "current_value": "No Fargate profiles configured",
-                    "recommended_value": "Consider Fargate for serverless pod execution (no node management)",
-                    "monthly_savings": 0.0,
-                    "severity": "LOW",
-                    "reason": f"Cluster '{cluster_name}' runs only managed node groups; "
-                    f"Fargate eliminates node management overhead for suitable workloads",
-                }
-            )
+        # "No Fargate profiles configured" finding removed: $0/month, best-practice
+        # migration nudge ("Fargate eliminates node management overhead") — not a
+        # cost saving for this cluster.
 
         return recs, len(profile_names)
 
@@ -491,34 +457,11 @@ class EksCostModule(BaseServiceModule):
                 addon_arn = addon.get("addonArn", "")
                 addon_version = addon.get("addonVersion", "Unknown")
 
-                if "aws-marketplace" in addon_arn:
-                    recs.append(
-                        {
-                            "resource_id": f"{cluster_name}/{addon_name}",
-                            "check_type": "addon_cost",
-                            "check_category": "Add-on Costs",
-                            "current_value": f"Marketplace add-on: {addon_name} v{addon_version}",
-                            "recommended_value": "Review marketplace add-on pricing and consider open-source alternatives",
-                            "monthly_savings": 0.0,
-                            "severity": "LOW",
-                            "reason": f"Add-on '{addon_name}' is from AWS Marketplace; "
-                            f"verify subscription costs and evaluate free alternatives",
-                        }
-                    )
-
-                if addon_status not in ("ACTIVE", "UPDATING"):
-                    recs.append(
-                        {
-                            "resource_id": f"{cluster_name}/{addon_name}",
-                            "check_type": "addon_cost",
-                            "check_category": "Add-on Costs",
-                            "current_value": f"Add-on status: {addon_status}",
-                            "recommended_value": "Investigate and resolve add-on issue or remove if unused",
-                            "monthly_savings": 0.0,
-                            "severity": "LOW",
-                            "reason": f"Add-on '{addon_name}' in cluster '{cluster_name}' is in {addon_status} state",
-                        }
-                    )
+                # Marketplace add-on $0 advisory removed: no per-account cost stated;
+                # MCP review confirms add-on cost varies per subscription so a generic
+                # "review pricing" finding has no concrete saving.
+                # Add-on DEGRADED state removed: health/operational signal, $0/month.
+                _ = (addon_arn, addon_status, addon_version)
 
             except Exception as e:
                 print(f"Warning: EKS describe_addon({cluster_name}/{addon_name}) failed: {e}")

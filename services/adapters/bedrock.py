@@ -275,26 +275,11 @@ def _check_idle_agents(ctx: Any, pricing_multiplier: float) -> list[dict[str, An
         except Exception:
             return recs
 
-    for agent in agents:
-        agent_id = agent.get("agentId", "unknown")
-        agent_name = agent.get("agentName", agent_id)
-        status = agent.get("agentStatus", "Unknown")
-        estimated_monthly = 5.0 * pricing_multiplier
-        if estimated_monthly > 1.0:
-            recs.append(
-                {
-                    "agent_id": agent_id,
-                    "agent_name": agent_name,
-                    "status": status,
-                    "check_category": "Agent",
-                    "current_value": f"Agent '{agent_name}' ({status})",
-                    "recommended_value": "Review Agent invocation volume and delete if unused",
-                    "monthly_savings": round(estimated_monthly, 2),
-                    "reason": f"Agent '{agent_name}' has no invocations detected — "
-                    f"estimated ${estimated_monthly:.2f}/mo in underlying model costs",
-                }
-            )
-
+    # Bedrock Agent idle finding removed: agents themselves accrue no AWS charge
+    # (MCP confirmed) — the $5/month was a hardcoded placeholder, not a real cost.
+    # Real Bedrock spend is via Provisioned Throughput and per-token invocations,
+    # both of which are checked elsewhere in this adapter.
+    _ = (agents, pricing_multiplier)
     return recs
 
 

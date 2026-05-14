@@ -6,6 +6,7 @@ from typing import Any
 
 from core.contracts import ServiceFindings, SourceBlock
 from services._base import BaseServiceModule
+from services.advisor import get_lambda_compute_optimizer_recommendations
 from services.lambda_svc import LAMBDA_OPTIMIZATION_DESCRIPTIONS, get_enhanced_lambda_checks
 
 
@@ -18,7 +19,7 @@ class LambdaModule(BaseServiceModule):
 
     def required_clients(self) -> tuple[str, ...]:
         """Returns boto3 client names required for Lambda scanning."""
-        return ("lambda",)
+        return ("lambda", "compute-optimizer")
 
     def scan(self, ctx: Any) -> ServiceFindings:
         """Scan Lambda functions for cost optimization opportunities.
@@ -35,6 +36,7 @@ class LambdaModule(BaseServiceModule):
         print("\U0001f50d [services/adapters/lambda.py] Lambda module active")
 
         cost_hub_recs = ctx.cost_hub_splits.get("lambda", [])
+        co_recs = get_lambda_compute_optimizer_recommendations(ctx)
         enhanced_result = get_enhanced_lambda_checks(ctx)
         enhanced_recs = enhanced_result.get("recommendations", [])
 
@@ -67,9 +69,12 @@ class LambdaModule(BaseServiceModule):
                 formula_savings += mem_gb * (LAMBDA_PRICE_PER_GB_SEC_X86 - LAMBDA_PRICE_PER_GB_SEC_ARM) * 730 * 3600
 
         formula_savings *= ctx.pricing_multiplier
-        savings = hub_savings + formula_savings
+        co_savings = sum(rec.get("estimatedMonthlySavings", 0.0) for rec in co_recs)
+        savings = hub_savings + formula_savings + co_savings
 
-        # Deduplicate: if a function appears in both Cost Hub and enhanced checks, keep Cost Hub version
+        # Deduplicate: if a function appears in Cost Hub and enhanced checks, keep Cost Hub version.
+        # Compute Optimizer recs surface independently — they carry memorySize rightsizing
+        # the enhanced/Cost-Hub checks do not.
         seen_functions: set[str] = set()
         for rec in cost_hub_recs:
             fn = rec.get("resourceArn", "").split(":")[-1] if "resourceArn" in rec else rec.get("FunctionName", "")
@@ -84,7 +89,7 @@ class LambdaModule(BaseServiceModule):
 
         enhanced_recs = deduped_enhanced
 
-        total_recs = len(cost_hub_recs) + len(enhanced_recs)
+        total_recs = len(cost_hub_recs) + len(co_recs) + len(enhanced_recs)
 
         return ServiceFindings(
             service_name="Lambda",
@@ -92,6 +97,7 @@ class LambdaModule(BaseServiceModule):
             total_monthly_savings=savings,
             sources={
                 "cost_optimization_hub": SourceBlock(count=len(cost_hub_recs), recommendations=tuple(cost_hub_recs)),
+                "compute_optimizer": SourceBlock(count=len(co_recs), recommendations=tuple(co_recs)),
                 "enhanced_checks": SourceBlock(count=len(enhanced_recs), recommendations=tuple(enhanced_recs)),
             },
             optimization_descriptions=LAMBDA_OPTIMIZATION_DESCRIPTIONS,

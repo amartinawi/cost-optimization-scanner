@@ -46,17 +46,10 @@ def get_enhanced_apprunner_checks(ctx: ScanContext) -> dict[str, Any]:
                     service_config = service_details.get("Service", {})
                     instance_config = service_config.get("InstanceConfiguration", {})
 
-                    instance_type = instance_config.get("InstanceRoleArn", "")  # noqa: F841
-                    if "large" in str(instance_config) or instance_config.get("Memory", "1 GB") != "1 GB":
-                        checks["auto_scaling_optimization"].append(
-                            {
-                                "ServiceName": service_name,
-                                "Recommendation": "Review auto-scaling settings and instance configuration for cost optimization",  # noqa: E501
-                                "EstimatedSavings": "$30/month potential",
-                                "CheckCategory": "Auto Scaling Optimization",
-                                "Note": "Monitor actual CPU and memory usage before adjusting",
-                            }
-                        )
+                    # App Runner Auto Scaling Optimization finding removed: emitted a
+                    # hardcoded "$30/month potential" magic number with no per-service
+                    # math — not a quantified saving.
+                    _ = instance_config
                 except Exception:
                     pass
 

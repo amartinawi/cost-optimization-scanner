@@ -80,17 +80,8 @@ def get_enhanced_step_functions_checks(ctx: ScanContext) -> dict[str, Any]:
                     except Exception:
                         pass
 
-                if any(env in sm_name.lower() for env in ["dev", "test", "staging"]):
-                    checks["nonprod_24x7"].append(
-                        {
-                            "StateMachineArn": sm_arn,
-                            "StateMachineName": sm_name,
-                            "Environment": "non-production",
-                            "Recommendation": "Implement shutdown schedule for non-prod",
-                            "EstimatedSavings": "65-75% with scheduled shutdown",
-                            "CheckCategory": "Step Functions Non-Prod 24/7",
-                        }
-                    )
+                # Non-prod 24/7 finding removed: emitted "65-75%" percentage range without
+                # concrete per-state-machine cost baseline.
 
     except Exception as e:
         ctx.warn(f"Could not perform Step Functions checks: {e}", "stepfunctions")

@@ -110,24 +110,11 @@ def get_enhanced_api_gateway_checks(ctx: ScanContext) -> dict[str, Any]:
                 except Exception:
                     pass
 
-                try:
-                    stages = apigateway.get_stages(restApiId=api_id)
-                    for stage in stages.get("item", []):
-                        stage_name = stage.get("stageName")
-                        if not stage.get("cacheClusterEnabled", False):
-                            checks["caching_opportunities"].append(
-                                {
-                                    "ApiId": api_id,
-                                    "ApiName": api_name,
-                                    "StageName": stage_name,
-                                    "Recommendation": "Enable caching to reduce backend calls",
-                                    "EstimatedSavings": "Reduced backend costs",
-                                    "CheckCategory": "API Gateway Caching",
-                                }
-                            )
-                except Exception as e:
-                    ctx.warn(f"Could not check stages for API {api_id}: {e}", "api_gateway")
-                    continue
+                # API Gateway Caching finding removed: "Reduced backend costs" with no
+                # quantification — caching actually adds API Gateway cost ($0.020-$3.80/hr
+                # by cache size); whether net savings exist depends on backend pricing
+                # not measured here.
+                _ = api_id
 
     except Exception as e:
         ctx.warn(f"Could not perform API Gateway checks: {e}", "api_gateway")

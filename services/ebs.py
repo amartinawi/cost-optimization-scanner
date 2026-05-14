@@ -406,21 +406,9 @@ def compute_ebs_checks(
                 iops = volume.get("Iops", 0)
                 size = volume.get("Size", 0)
 
-                # Flag high-IOPS volumes that might be underutilized
-                if volume_type in ["io1", "io2"] and iops > 1000:
-                    checks["underutilized_volumes"].append(
-                        {
-                            "VolumeId": volume["VolumeId"],
-                            "VolumeType": volume_type,
-                            "Size": size,
-                            "IOPS": iops,
-                            "Recommendation": (
-                                f"High-IOPS volume ({iops} IOPS) - verify utilization with CloudWatch metrics"
-                            ),
-                            "EstimatedSavings": "$0.00/month - enable CloudWatch monitoring to validate IOPS usage",
-                            "CheckCategory": "Underutilized Volumes",
-                        }
-                    )
+                # Underutilized high-IOPS volumes flag removed: $0/month, "enable CloudWatch
+                # monitoring to validate" is a monitoring-enablement nudge.
+                _ = (volume_type, iops, size)
 
         # Check for snapshot lifecycle opportunities
         paginator = ec2.get_paginator("describe_snapshots")
@@ -429,18 +417,9 @@ def compute_ebs_checks(
             for _snapshot in page["Snapshots"]:
                 snapshot_count += 1
 
-        # If many snapshots, suggest lifecycle management
-        if snapshot_count > 50:
-            checks["snapshot_lifecycle"].append(
-                {
-                    "SnapshotCount": snapshot_count,
-                    "Recommendation": (
-                        f"Account has {snapshot_count} snapshots - consider implementing automated lifecycle management"
-                    ),
-                    "EstimatedSavings": "$0.00/month - quantify after enabling Data Lifecycle Manager",
-                    "CheckCategory": "Snapshot Lifecycle",
-                }
-            )
+        # Snapshot Lifecycle finding removed: $0/month, "quantify after enabling DLM"
+        # is a feature-enablement nudge — actual savings come from snapshot deletion
+        # which is surfaced via the dedicated Snapshots tab.
 
         # Check for over-provisioned IOPS (heuristic estimates - recommend CloudWatch validation)
         volume_paginator = ec2.get_paginator("describe_volumes")

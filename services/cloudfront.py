@@ -82,22 +82,8 @@ def get_enhanced_cloudfront_checks(ctx: ScanContext) -> dict[str, Any]:
                     except Exception:
                         pass
 
-                if not enabled:
-                    checks["low_traffic_distributions"].append(
-                        {
-                            "DistributionId": dist_id,
-                            "DomainName": domain_name,
-                            "Status": status,
-                            "PriceClass": price_class,
-                            "Enabled": enabled,
-                            "Recommendation": (
-                                "Disabled distribution - consider deletion to"
-                                " eliminate allocation overhead and configuration drift"
-                            ),
-                            "EstimatedSavings": "$0/month (no data transfer cost when disabled)",
-                            "CheckCategory": "CloudFront Unused Distribution",
-                        }
-                    )
+                # Disabled CloudFront distribution housekeeping finding removed: explicitly
+                # $0/month — disabled distributions incur no data-transfer cost.
 
                 try:
                     dist_config = cloudfront.get_distribution_config(Id=dist_id)
@@ -143,24 +129,9 @@ def get_enhanced_cloudfront_checks(ctx: ScanContext) -> dict[str, Any]:
                     except Exception:
                         pass
 
-                    if should_check_origin_shield:
-                        for origin in origins:
-                            origin_shield = origin.get("OriginShield", {})
-                            if origin_shield.get("Enabled", False):
-                                checks["origin_shield_unnecessary"].append(
-                                    {
-                                        "DistributionId": dist_id,
-                                        "DomainName": domain_name,
-                                        "Status": status,
-                                        "PriceClass": price_class,
-                                        "OriginShieldRegion": origin_shield.get("OriginShieldRegion", "Unknown"),
-                                        "Recommendation": (
-                                            "Origin Shield adds costs - review necessity for traffic patterns"
-                                        ),
-                                        "EstimatedSavings": "Variable based on cache hit improvement vs additional costs",
-                                        "CheckCategory": "CloudFront Origin Shield Review",
-                                    }
-                                )
+                    # Origin Shield review finding removed: "Variable based on cache hit
+                    # improvement vs additional costs" — net effect can go either way.
+                    _ = (should_check_origin_shield, origins)
                 except Exception as e:
                     ctx.warn(f"Error analyzing CloudFront distribution {dist_id}: {e}", "cloudfront")
 

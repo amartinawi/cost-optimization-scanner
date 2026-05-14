@@ -229,21 +229,10 @@ def _check_clone_sprawl(
     except Exception:
         return recs
 
-    if snapshot_count > 5:
-        recs.append(
-            {
-                "cluster_id": cluster_id,
-                "engine": engine,
-                "engine_version": engine_version,
-                "check_type": "clone_sprawl",
-                "current_value": f"{snapshot_count} manual snapshots",
-                "recommended_value": "Reduce to 5 or fewer manual snapshots",
-                "monthly_savings": 0.0,
-                "reason": f"Cluster has {snapshot_count} manual snapshots; consider cleanup to "
-                f"reduce storage costs and operational clutter",
-            }
-        )
-
+    # Clone sprawl finding removed: $0/month and "reduce storage costs and operational
+    # clutter" without quantification. Snapshot-specific cost savings live in the
+    # Snapshots tab where age + size produce a real number.
+    _ = (snapshot_count, cluster_id, engine, engine_version)
     return recs
 
 
@@ -289,20 +278,9 @@ def _check_global_db(
         if lag is not None and lag > 100:
             high_lag_replicas.append(replica_id)
 
-    if high_lag_replicas:
-        recs.append(
-            {
-                "cluster_id": cluster_id,
-                "engine": engine,
-                "engine_version": engine_version,
-                "check_type": "global_db_replica_lag",
-                "current_value": f"{len(high_lag_replicas)} replicas with >100ms lag",
-                "recommended_value": "Investigate network or workload imbalance on lagging replicas",
-                "monthly_savings": 0.0,
-                "reason": f"Global DB replicas with high lag: {', '.join(high_lag_replicas[:5])}",
-            }
-        )
-
+    # Global DB replica lag finding removed: $0/month, replication-lag monitoring is
+    # an operational health signal, not a cost recommendation.
+    _ = (high_lag_replicas, cluster_id, engine, engine_version)
     return recs
 
 
@@ -316,21 +294,9 @@ def _check_backtrack(cluster: dict[str, Any]) -> list[dict[str, Any]]:
     engine = cluster.get("Engine", "")
     engine_version = cluster.get("EngineVersion", "")
 
-    hours = backtrack_window / 3600.0
-    if hours > 48:
-        recs.append(
-            {
-                "cluster_id": cluster_id,
-                "engine": engine,
-                "engine_version": engine_version,
-                "check_type": "backtrack_window",
-                "current_value": f"Backtrack window: {hours:.0f} hours",
-                "recommended_value": "Reduce backtrack window to 48 hours or less",
-                "monthly_savings": 0.0,
-                "reason": f"Large backtrack window ({hours:.0f}h) increases change record "
-                f"storage costs; consider reducing to 48h or less",
-            }
-        )
+    # Backtrack window finding removed: $0/month — change-record storage cost exists
+    # but is not quantified per-cluster (depends on write volume).
+    _ = (backtrack_window, cluster_id, engine, engine_version)
 
     return recs
 

@@ -76,18 +76,9 @@ def get_enhanced_msk_checks(ctx: ScanContext) -> dict[str, Any]:
             for page in paginator_v2.paginate():
                 serverless_clusters = page.get("ClusterInfoList", [])
 
-                for cluster in serverless_clusters:
-                    if cluster.get("ClusterType") == "SERVERLESS":
-                        cluster_name = cluster.get("ClusterName")
-                        checks["serverless_migration"].append(
-                            {
-                                "ClusterName": cluster_name,
-                                "ClusterType": "Serverless",
-                                "Recommendation": "Monitor serverless usage patterns for cost optimization",
-                                "EstimatedSavings": "Variable based on usage",
-                                "CheckCategory": "Serverless Optimization",
-                            }
-                        )
+                # MSK Serverless monitor finding removed: "Variable based on usage" with
+                # no concrete per-cluster quantification.
+                _ = serverless_clusters
         except Exception:
             pass
 

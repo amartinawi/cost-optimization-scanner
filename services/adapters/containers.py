@@ -6,6 +6,7 @@ from typing import Any
 
 from core.contracts import ServiceFindings, SourceBlock
 from services._base import BaseServiceModule
+from services.advisor import get_ecs_compute_optimizer_recommendations
 from services.containers import get_container_services_analysis, get_enhanced_container_checks
 
 
@@ -18,7 +19,7 @@ class ContainersModule(BaseServiceModule):
 
     def required_clients(self) -> tuple[str, ...]:
         """Returns boto3 client names required for container infrastructure scanning."""
-        return ("ecs", "eks", "ecr")
+        return ("ecs", "eks", "ecr", "compute-optimizer")
 
     def scan(self, ctx: Any) -> ServiceFindings:
         """Scan container infrastructure (ECS, EKS, ECR) for cost optimization.
@@ -102,7 +103,13 @@ class ContainersModule(BaseServiceModule):
         for rec in cost_hub_recs:
             savings += float(rec.get("estimatedMonthlySavings", 0) or 0)
 
-        total_recs = len(enhanced_recs) + len(cost_hub_recs)
+        # Compute Optimizer ECS service recs (Fargate task-size rightsizing). Migrated
+        # in from the retired standalone Compute Optimizer adapter (2026-05-14) so
+        # ECS optimization signals all live in one tab.
+        co_recs = get_ecs_compute_optimizer_recommendations(ctx)
+        savings += sum(float(r.get("estimatedMonthlySavings", 0.0) or 0.0) for r in co_recs)
+
+        total_recs = len(enhanced_recs) + len(cost_hub_recs) + len(co_recs)
 
         return ServiceFindings(
             service_name="Containers",
@@ -113,6 +120,7 @@ class ContainersModule(BaseServiceModule):
                 "cost_optimization_hub": SourceBlock(
                     count=len(cost_hub_recs), recommendations=tuple(cost_hub_recs)
                 ),
+                "compute_optimizer": SourceBlock(count=len(co_recs), recommendations=tuple(co_recs)),
             },
             extras={
                 "service_counts": {

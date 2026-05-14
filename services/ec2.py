@@ -249,20 +249,8 @@ def get_enhanced_ec2_checks(
                                 # fast_mode intentionally skips CloudWatch — don't emit a noisy
                                 # "enable monitoring" rec for every running instance.
                                 pass
-                            else:
-                                checks["rightsizing_opportunities"].append(
-                                    {
-                                        "InstanceId": instance_id,
-                                        "InstanceType": instance_type,
-                                        "Recommendation": (
-                                            "Enable detailed CloudWatch monitoring"
-                                            " to analyze utilization for"
-                                            " rightsizing opportunities"
-                                        ),
-                                        "EstimatedSavings": "$0.00/month - enable CloudWatch monitoring to quantify",
-                                        "CheckCategory": "Monitoring Required",
-                                    }
-                                )
+                            # else: no CloudWatch metrics — emit no finding (cost-only scope:
+                            # "enable monitoring" nudges produce no quantified savings).
 
                         try:
                             if autoscaling is None:
@@ -275,33 +263,9 @@ def get_enhanced_ec2_checks(
                                         instance_name = tag["Value"]
                                         break
 
-                                if any(
-                                    keyword in instance_name.lower()
-                                    for keyword in [
-                                        "web",
-                                        "app",
-                                        "api",
-                                        "service",
-                                        "worker",
-                                    ]
-                                ):
-                                    checks["auto_scaling_missing"].append(
-                                        {
-                                            "InstanceId": instance_id,
-                                            "InstanceType": instance_type,
-                                            "InstanceName": instance_name,
-                                            "Recommendation": (
-                                                "Consider adding to Auto Scaling"
-                                                " Group for high availability and"
-                                                " cost optimization"
-                                            ),
-                                            "EstimatedSavings": (
-                                                "$0.00/month - improves availability;"
-                                                " quantify after ASG sizing"
-                                            ),
-                                            "CheckCategory": ("Auto Scaling Missing"),
-                                        }
-                                    )
+                                # Auto Scaling Missing finding removed: $0/month, primarily a resilience
+                                # nudge ("improves availability") not a quantified cost recommendation.
+                                pass
                         except ClientError as ec:
                             code = ec.response.get("Error", {}).get("Code", "")
                             if code in ("UnauthorizedOperation", "AccessDenied"):
@@ -460,34 +424,12 @@ def get_enhanced_ec2_checks(
                                     " optimal instance type"
                                 )
 
-                                checks["burstable_credits"].append(
-                                    {
-                                        "InstanceId": instance_id,
-                                        "InstanceType": instance_type,
-                                        "Recommendation": recommendation,
-                                        "CheckCategory": ("Burstable Instance Optimization"),
-                                        "EstimatedSavings": "$0.00/month - enable CloudWatch monitoring to quantify",
-                                        "ActionRequired": (
-                                            "Enable detailed CloudWatch monitoring if not already enabled"
-                                        ),
-                                    }
-                                )
+                                # Burstable Instance Optimization without metrics: removed
+                                # ($0/month, "enable monitoring" nudge — no quantified savings).
+                                pass
 
-                    elif state == "stopped":
-                        checks["stopped_instances"].append(
-                            {
-                                "InstanceId": instance_id,
-                                "InstanceType": instance_type,
-                                "State": state,
-                                "Recommendation": (
-                                    "Stopped instance already saves compute"
-                                    " costs. Terminate to also eliminate EBS"
-                                    " storage costs"
-                                ),
-                                "CheckCategory": "Stopped Instances",
-                                "EstimatedSavings": "$0.00/month - EBS storage saving depends on attached volumes",
-                            }
-                        )
+                    # Stopped Instances finding removed: $0/month, already-stopped instances
+                    # incur no compute cost; attached-EBS savings are surfaced by the EBS adapter.
 
     except Exception as e:
         ctx.warn(f"Could not perform enhanced EC2 checks: {e}", service="ec2")
@@ -542,75 +484,9 @@ def get_auto_scaling_checks(ctx: ScanContext) -> dict[str, Any]:
             tags = {tag["Key"]: tag["Value"] for tag in asg.get("Tags", [])}
             environment = tags.get("Environment", "").lower()
 
-            if min_size == desired_capacity == max_size and min_size > 0:
-                is_eks_nodegroup = _is_eks_nodegroup_asg(asg_name, tags)
-
-                if is_eks_nodegroup:
-                    checks["static_asgs"].append(
-                        {
-                            "AutoScalingGroupName": asg_name,
-                            "MinSize": min_size,
-                            "MaxSize": max_size,
-                            "DesiredCapacity": desired_capacity,
-                            "Recommendation": (
-                                "EKS node group with static sizing - consider"
-                                " enabling Cluster Autoscaler or Karpenter for"
-                                " dynamic scaling"
-                            ),
-                            "EstimatedSavings": (
-                                "$0.00/month - quantify via per-node price ×"
-                                " expected scale-down hours"
-                            ),
-                            "Action": (
-                                "1. Install Cluster Autoscaler or Karpenter\n"
-                                "2. Configure node group for scaling"
-                                " (increase max_size)\n"
-                                "3. Set appropriate scaling policies\n"
-                                "4. Monitor workload patterns for"
-                                " optimization"
-                            ),
-                            "CheckCategory": "EKS Static Node Groups",
-                        }
-                    )
-                else:
-                    checks["static_asgs"].append(
-                        {
-                            "AutoScalingGroupName": asg_name,
-                            "MinSize": min_size,
-                            "MaxSize": max_size,
-                            "DesiredCapacity": desired_capacity,
-                            "Recommendation": (
-                                "ASG not configured for scaling - consider fixed EC2 instances or enable scaling"
-                            ),
-                            "EstimatedSavings": (
-                                "$0.00/month - quantify after switch to Reserved"
-                                " Instances or dynamic scaling"
-                            ),
-                            "Action": (
-                                "1. Evaluate if scaling is needed\n"
-                                "2. If no scaling needed: replace with fixed"
-                                " EC2 instances + Reserved Instances\n"
-                                "3. If scaling needed: configure min/max"
-                                " capacity and scaling policies"
-                            ),
-                            "CheckCategory": "Static Auto Scaling Groups",
-                        }
-                    )
-
-            if environment in ["dev", "test", "development", "staging"] and min_size > 0:
-                checks["nonprod_24x7_asgs"].append(
-                    {
-                        "AutoScalingGroupName": asg_name,
-                        "Environment": environment,
-                        "MinSize": min_size,
-                        "Recommendation": ("Non-prod ASG running 24/7 - implement shutdown schedule"),
-                        "EstimatedSavings": (
-                            "$0.00/month - quantify via per-instance price ×"
-                            " (730 - shutdown_hours_per_month)"
-                        ),
-                        "CheckCategory": "Non-Prod 24/7 ASGs",
-                    }
-                )
+            # Static ASGs / EKS static node groups: removed (each emitted $0/month with
+            # "quantify after sizing" — best-practice nudges, not cost-quantified findings).
+            # Non-Prod 24/7 ASGs: removed (also $0/month).
 
             launch_template = asg.get("LaunchTemplate")
             _launch_config = asg.get("LaunchConfigurationName")
@@ -648,17 +524,9 @@ def get_auto_scaling_checks(ctx: ScanContext) -> dict[str, Any]:
                 scale_out_policies = [p for p in policies if p.get("ScalingAdjustment", 0) > 0]
                 scale_in_policies = [p for p in policies if p.get("ScalingAdjustment", 0) < 0]
 
-                if scale_out_policies and not scale_in_policies:
-                    checks["missing_scale_in_policies"].append(
-                        {
-                            "AutoScalingGroupName": asg_name,
-                            "ScaleOutPolicies": len(scale_out_policies),
-                            "ScaleInPolicies": len(scale_in_policies),
-                            "Recommendation": ("ASG has scale-out but no scale-in policies"),
-                            "EstimatedSavings": "$0.00/month - prevents future cost spikes",
-                            "CheckCategory": "Missing Scale-In Policies",
-                        }
-                    )
+                # Missing Scale-In Policies finding removed: $0/month, "prevents future cost
+                # spikes" is risk-mitigation, not realized savings.
+                _ = scale_in_policies
 
             except Exception as e:
                 ctx.warn(f"Could not get Auto Scaling policies for {asg_name}: {e}", service="ec2")
@@ -737,27 +605,8 @@ def get_advanced_ec2_checks(
                             }
                         )
 
-                    if any(
-                        keyword in name.lower()
-                        for keyword in [
-                            "monitor",
-                            "nagios",
-                            "zabbix",
-                            "prometheus",
-                        ]
-                    ):
-                        checks["monitoring_only_instances"].append(
-                            {
-                                "InstanceId": instance_id,
-                                "InstanceType": instance_type,
-                                "Name": name,
-                                "Recommendation": (
-                                    "Consider CloudWatch, managed monitoring, or containerized solution"
-                                ),
-                                "EstimatedSavings": "$0.00/month - quantify after replacement design",
-                                "CheckCategory": ("Monitoring-Only Instances"),
-                            }
-                        )
+                    # Monitoring-only instances finding removed: $0/month, "quantify after
+                    # replacement design" is a migration nudge, not a quantified saving.
 
                     if fast_mode:
                         # Skip the per-instance describe_volumes enrichment;

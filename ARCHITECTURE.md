@@ -21,8 +21,8 @@ a service registry, and isolated adapter modules.
                         |
          +----------------+----------------+
          |                |                |
-   ALL_MODULES[0]   ALL_MODULES[1]  ... ALL_MODULES[35]
-   (36 adapters in services/adapters/*.py)
+   ALL_MODULES[0]   ALL_MODULES[1]  ... ALL_MODULES[33]
+   (34 adapters in services/adapters/*.py)
          |                |                |
          +----------------+----------------+
                         |
@@ -653,7 +653,7 @@ cost-optimization-scanner/
     session.py                    (50)   AwsSessionFactory
     filtering.py                  (60)   resolve_cli_keys
   services/
-    __init__.py                   (63)   ALL_MODULES registry (36 adapters)
+    __init__.py                   (63)   ALL_MODULES registry (34 adapters)
     _base.py                      (32)   BaseServiceModule
     _savings.py                   (16)   parse_dollar_savings
     advisor.py                    (153)  Cost Hub + Compute Optimizer

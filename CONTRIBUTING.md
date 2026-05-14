@@ -1,6 +1,20 @@
 # Contributing to AWS Cost Optimization Scanner
 
-We welcome contributions. This guide covers the v3.x modular architecture with 36 ServiceModule adapters (AWS Cost Optimization Hub findings are routed per-service via `ctx.cost_hub_splits` rather than living in a dedicated adapter).
+We welcome contributions. This guide covers the v3.x modular architecture with 34 ServiceModule adapters. Two adapters were retired on 2026-05-14: AWS Cost Optimization Hub findings now route per-service via `ctx.cost_hub_splits`, and AWS Compute Optimizer findings route per-service via the `services.advisor.get_<resource>_compute_optimizer_recommendations` helpers consumed inline by the EC2, EBS, RDS, Lambda, and Containers adapters.
+
+## Scope Rule: Cost Only
+
+This scanner is strictly cost-optimization. **Every new check must produce a concrete account-specific $ saving.** If a recommendation cannot quote a per-resource dollar amount via `PricingEngine`, `parse_dollar_savings`, or an arithmetic formula, it does not belong in this codebase. Things that are explicitly out of scope:
+
+- Health / state monitoring (DEGRADED add-ons, inactive node groups, replication lag, alarm coverage)
+- Version-upgrade nudges (Old Redis, Old Elasticsearch, Aurora Serverless v2 migration without a per-cluster cost delta)
+- Security / compliance (encryption, IAM, public access, internal-scheme audits)
+- Resilience / DR (backup retention adds, multi-AZ adds, cross-region copy "verify if needed")
+- Best-practice nudges (Fargate adoption, Graviton without instance pricing, container insights enablement)
+- "$0/month — quantify after X" placeholder findings
+- Percentage-range estimates without a per-account baseline ("65-75% savings", "80-95% reduction")
+
+See `CHANGELOG.md` [3.4.0] for the 40+ findings purged during the cost-only scope refinement.
 
 ## Getting Started
 
@@ -56,7 +70,7 @@ services/
   _base.py                      BaseServiceModule default implementations
   _savings.py                   parse_dollar_savings helper
   advisor.py                    Cost Hub + Compute Optimizer utilities
-  adapters/                     36 ServiceModule adapter files
+  adapters/                     34 ServiceModule adapter files
 html_report_generator.py        HTML report generation
 reporter_phase_a.py             Descriptor-driven grouped rendering
 reporter_phase_b.py             Function registry for source handlers

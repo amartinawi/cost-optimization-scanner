@@ -5,6 +5,10 @@
 > **Reporting** — each with explicit pass/fail criteria, evidence requirements,
 > and a fixed output schema. Run all three layers per service.
 
+## Scope Rule: Cost Only (added 2026-05-14)
+
+This scanner is strictly cost-optimization. **Every check must produce a concrete account-specific $ saving** via live `PricingEngine` lookups, per-resource math, or `parse_dollar_savings`. During audit, classify each rec generator as **KEEP** (real $) or **REMOVE** (one of: health/state monitoring, version-upgrade nudge, security/compliance, resilience/DR, best-practice without quantified savings, `$0/month — quantify after X` placeholder, percentage-range estimate without per-account baseline). Add a new L1 finding for every REMOVE candidate. See `CHANGELOG.md` [3.4.0] for the precedent purge.
+
 ---
 
 ## How to use

@@ -137,14 +137,6 @@ _SERVICE_STATS_CONFIG: Dict[str, Dict[str, Any]] = {
             ("ECS Services", "ecs_services"),
         ],
     },
-    "cost_anomaly": {
-        "multi_source_cards": [
-            ("Active Anomalies", "extras", "active_anomaly_count"),
-            ("30-Day Impact", "extras", "total_anomaly_impact_30d"),
-            ("Anomaly Monitors", "extras", "monitor_count"),
-            ("Billing Alarms", "extras", "billing_alarm_count"),
-        ],
-    },
     "eks_cost": {
         "multi_source_cards": [
             ("EKS Clusters", "extras", "cluster_count"),
@@ -189,14 +181,6 @@ _SERVICE_STATS_CONFIG: Dict[str, Dict[str, Any]] = {
             ("SP Coverage", "extras", "sp_coverage_rate"),
             ("RI Utilization", "extras", "ri_utilization_rate"),
             ("RI Coverage", "extras", "ri_coverage_rate"),
-        ],
-    },
-    "compute_optimizer": {
-        "multi_source_cards": [
-            ("EBS Findings", "extras", "ebs_count"),
-            ("Lambda Findings", "extras", "lambda_count"),
-            ("ECS Findings", "extras", "ecs_count"),
-            ("ASG Findings", "extras", "asg_count"),
         ],
     },
     "cost_optimization_hub": {
@@ -1332,7 +1316,41 @@ class HTMLReportGenerator:
         [data-theme="dark"] .rec-table tr:hover td {
             background: rgba(255, 255, 255, 0.06);
         }
-        
+
+        /* Reservation scenario matrix — replaces the legacy single-line
+         * "1-yr no-upfront RI" disclosure with the full purchase matrix so
+         * the FinOps reader sees every term × payment-option scenario without
+         * leaving the report. The best-scenario row is highlighted so the
+         * eye lands on the maximum-savings purchase first. */
+        .ri-scenarios {
+            margin: 10px 0 16px 0;
+            padding: 10px 12px 4px 12px;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            background: var(--bg-secondary);
+        }
+        .ri-scenarios__header {
+            margin: 0 0 6px 0;
+            font-size: 0.85rem;
+            color: var(--text-primary);
+        }
+        .ri-scenarios__base {
+            color: var(--text-secondary);
+            font-weight: 400;
+            font-size: 0.78rem;
+            margin-left: 8px;
+        }
+        .ri-scenarios__table {
+            margin-bottom: 4px;
+        }
+        .ri-scenarios__row--best td {
+            background: rgba(46, 125, 50, 0.10);
+            font-weight: 600;
+        }
+        [data-theme="dark"] .ri-scenarios__row--best td {
+            background: rgba(102, 187, 106, 0.16);
+        }
+
         /* Material Chips/Badges */
         .badge {
             display: inline-flex;
@@ -2242,7 +2260,6 @@ class HTMLReportGenerator:
 
         risk_counts = self._count_priorities_by_severity()
         high_count = risk_counts["high"]
-        anomaly_count = risk_counts["anomalies"]
 
         # Top services value: "Cost Optimization Hub, RDS (83%)" or single name.
         if len(top_two) >= 2 and top_share > 0:
@@ -2259,16 +2276,10 @@ class HTMLReportGenerator:
         else:
             top_services_value = '<span class="summary-fact__qual">no defensible savings located</span>'
 
-        # Open risks value: prefer HIGH severity, fall back to active anomalies.
+        # Open risks value: HIGH-severity recommendations across all services.
         if high_count > 0:
             risks_value = (
                 f'<span class="risk-tag risk-tag--high"><strong>{high_count}</strong> HIGH</span>'
-            )
-        elif anomaly_count > 0:
-            anomaly_noun = "anomaly" if anomaly_count == 1 else "anomalies"
-            risks_value = (
-                f'<span class="risk-tag risk-tag--info"><strong>{anomaly_count}</strong> '
-                f'active cost {anomaly_noun}</span>'
             )
         else:
             risks_value = '<span class="summary-fact__qual">none open</span>'
@@ -2325,13 +2336,13 @@ class HTMLReportGenerator:
         return out
 
     def _count_priorities_by_severity(self) -> Dict[str, int]:
-        """Aggregate HIGH/MEDIUM/LOW counts + anomaly + billing-alarm risk signals.
+        """Aggregate HIGH/MEDIUM/LOW priority counts across all recommendations.
 
-        Returns a dict with keys ``high``, ``medium``, ``low``, ``anomalies``,
-        ``billing_alarms``. Walks every service's filtered recommendations once.
+        Returns a dict with keys ``high``, ``medium``, ``low``. Walks every
+        service's filtered recommendations once.
         """
-        counts = {"high": 0, "medium": 0, "low": 0, "anomalies": 0, "billing_alarms": 0}
-        for service_key, service_data in self.scan_results.get("services", {}).items():
+        counts = {"high": 0, "medium": 0, "low": 0}
+        for _service_key, service_data in self.scan_results.get("services", {}).items():
             filtered = self._filter_recommendations(service_data)
             for source_data in filtered.get("sources", {}).values():
                 if isinstance(source_data, dict):
@@ -2350,9 +2361,6 @@ class HTMLReportGenerator:
                         counts["medium"] += 1
                     elif priority in ("low", "info", "informational"):
                         counts["low"] += 1
-            if service_key == "cost_anomaly":
-                counts["anomalies"] = service_data.get("active_anomalies_count", 0) or 0
-                counts["billing_alarms"] = service_data.get("billing_alarms_count", 0) or 0
         return counts
 
     def _get_tabs(self) -> str:

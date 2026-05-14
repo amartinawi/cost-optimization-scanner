@@ -1,4 +1,4 @@
-"""Service adapter registry — imports and instantiates all 37 ServiceModule adapters."""
+"""Service adapter registry — imports and instantiates all 34 ServiceModule adapters."""
 
 from __future__ import annotations
 
@@ -13,9 +13,7 @@ from services.adapters.batch import BatchModule
 from services.adapters.bedrock import BedrockModule
 from services.adapters.cloudfront import CloudfrontModule
 from services.adapters.commitment_analysis import CommitmentAnalysisModule
-from services.adapters.compute_optimizer import ComputeOptimizerModule
 from services.adapters.containers import ContainersModule
-from services.adapters.cost_anomaly import CostAnomalyModule
 from services.adapters.dms import DmsModule
 from services.adapters.dynamodb import DynamoDbModule
 from services.adapters.ebs import EbsModule
@@ -70,16 +68,18 @@ ALL_MODULES: list[Any] = [
     GlueModule(),
     AthenaModule(),
     BatchModule(),
-    ComputeOptimizerModule(),
     # CostOptimizationHubModule retired from ALL_MODULES (2026-05-14): its
     # findings are distributed into per-service tabs via ScanOrchestrator
     # ._prefetch_advisor_data + ctx.cost_hub_splits. The aggregate tab
     # duplicated information that already lived under EC2, RDS, EBS, etc.
+    # ComputeOptimizerModule retired from ALL_MODULES (2026-05-14): its
+    # EC2 / EBS / RDS recommendations were already inline in those tabs;
+    # Lambda / ECS / ASG recommendations now flow through the corresponding
+    # adapters via services.advisor.get_<resource>_compute_optimizer_recommendations.
     AuroraModule(),
     CommitmentAnalysisModule(),
     BedrockModule(),
     SageMakerModule(),
     NetworkCostModule(),
-    CostAnomalyModule(),
     EksCostModule(),
 ]

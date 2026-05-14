@@ -102,30 +102,9 @@ def get_enhanced_opensearch_checks(ctx: ScanContext) -> dict[str, Any]:
                         }
                     )
 
-                if "OpenSearch" in engine_version:
-                    version = engine_version.replace("OpenSearch_", "")
-                    major_version = float(version.split(".")[0]) if version else 0
-                    if major_version < 2:
-                        checks["old_versions"].append(
-                            {
-                                "DomainName": domain_name,
-                                "EngineVersion": engine_version,
-                                "Recommendation": "Upgrade to OpenSearch 2.x",
-                                "CheckCategory": "Old OpenSearch Version",
-                            }
-                        )
-                elif "Elasticsearch" in engine_version:
-                    version = engine_version.replace("Elasticsearch_", "")
-                    major_version = float(version.split(".")[0]) if version else 0
-                    if major_version < 7:
-                        checks["old_versions"].append(
-                            {
-                                "DomainName": domain_name,
-                                "EngineVersion": engine_version,
-                                "Recommendation": "Upgrade to Elasticsearch 7.x or migrate to OpenSearch",
-                                "CheckCategory": "Old Elasticsearch Version",
-                            }
-                        )
+                # Old OpenSearch / Elasticsearch version findings removed: version
+                # upgrades emit freshness / EOL nudges with no concrete cost delta
+                # (per-hour engine cost is identical across versions).
 
                 if storage_type == "gp2":
                     checks["storage_optimization"].append(

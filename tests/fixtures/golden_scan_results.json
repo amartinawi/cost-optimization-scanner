@@ -576,16 +576,6 @@
         }
       }
     },
-    "compute_optimizer": {
-      "service_name": "Compute Optimizer",
-      "total_recommendations": 0,
-      "total_monthly_savings": 0.0,
-      "sources": {},
-      "extras": {
-        "opt_in_required": false,
-        "resource_counts": {}
-      }
-    },
     "cost_optimization_hub": {
       "service_name": "Cost Optimization Hub",
       "total_recommendations": 0,
@@ -622,7 +612,7 @@
     "bedrock": {
       "service_name": "Bedrock",
       "total_recommendations": 5,
-      "total_monthly_savings": 1674.00,
+      "total_monthly_savings": 1674.0,
       "sources": {
         "idle_provisioned_throughput": {
           "count": 2,
@@ -634,8 +624,8 @@
               "check_category": "PT Analysis",
               "current_value": "PT 'my-haiku-pt' with 1 unit(s), 0 invocations in 30 days",
               "recommended_value": "Delete idle Provisioned Throughput",
-              "monthly_savings": 584.00,
-              "reason": "Provisioned Throughput 'my-haiku-pt' has zero invocations in 30 days — wasting $584.00/mo"
+              "monthly_savings": 584.0,
+              "reason": "Provisioned Throughput 'my-haiku-pt' has zero invocations in 30 days \u2014 wasting $584.00/mo"
             },
             {
               "provisioned_model_id": "my-titan-pt",
@@ -644,8 +634,8 @@
               "check_category": "PT Analysis",
               "current_value": "PT 'my-titan-pt' with 1 unit(s), 0 invocations in 30 days",
               "recommended_value": "Delete idle Provisioned Throughput",
-              "monthly_savings": 219.00,
-              "reason": "Provisioned Throughput 'my-titan-pt' has zero invocations in 30 days — wasting $219.00/mo"
+              "monthly_savings": 219.0,
+              "reason": "Provisioned Throughput 'my-titan-pt' has zero invocations in 30 days \u2014 wasting $219.00/mo"
             }
           ]
         },
@@ -659,8 +649,8 @@
               "check_category": "PT Analysis",
               "current_value": "PT commitment $2920.00/mo, estimated on-demand $2200.00/mo",
               "recommended_value": "Switch to on-demand pricing",
-              "monthly_savings": 720.00,
-              "reason": "On-demand estimated at $2200.00/mo vs PT cost $2920.00/mo — save $720.00/mo by switching"
+              "monthly_savings": 720.0,
+              "reason": "On-demand estimated at $2200.00/mo vs PT cost $2920.00/mo \u2014 save $720.00/mo by switching"
             }
           ]
         },
@@ -674,8 +664,8 @@
               "check_category": "Knowledge Base",
               "current_value": "KB 'product-docs-kb' active, ~$146.00/mo OCU cost",
               "recommended_value": "Review Knowledge Base usage and delete if unused",
-              "monthly_savings": 146.00,
-              "reason": "Knowledge Base 'product-docs-kb' may have idle OCU hours — estimated $146.00/mo if fully idle"
+              "monthly_savings": 146.0,
+              "reason": "Knowledge Base 'product-docs-kb' may have idle OCU hours \u2014 estimated $146.00/mo if fully idle"
             }
           ]
         },
@@ -689,8 +679,8 @@
               "check_category": "Agent",
               "current_value": "Agent 'customer-support-agent' (PREPARED)",
               "recommended_value": "Review Agent invocation volume and delete if unused",
-              "monthly_savings": 5.00,
-              "reason": "Agent 'customer-support-agent' has no invocations detected — estimated $5.00/mo in underlying model costs"
+              "monthly_savings": 5.0,
+              "reason": "Agent 'customer-support-agent' has no invocations detected \u2014 estimated $5.00/mo in underlying model costs"
             }
           ]
         }
@@ -720,7 +710,7 @@
     "sagemaker": {
       "service_name": "SageMaker",
       "total_recommendations": 6,
-      "total_monthly_savings": 4231.20,
+      "total_monthly_savings": 4231.2,
       "sources": {
         "idle_endpoints": {
           "count": 2,
@@ -731,7 +721,7 @@
               "check_category": "Idle Endpoints",
               "current_value": "Endpoint 'fraud-detection-prod' (ml.m5.xlarge) has 0 invocations in 7 days",
               "recommended_value": "Delete endpoint or reduce instance count",
-              "monthly_savings": 576.40,
+              "monthly_savings": 576.4,
               "reason": "SageMaker endpoint 'fraud-detection-prod' is active but received zero invocations in the last 7 days"
             },
             {
@@ -740,7 +730,7 @@
               "check_category": "Idle Endpoints",
               "current_value": "Endpoint 'image-classifier-v2' (ml.c5.2xlarge) has 0 invocations in 7 days",
               "recommended_value": "Delete endpoint or reduce instance count",
-              "monthly_savings": 1452.80,
+              "monthly_savings": 1452.8,
               "reason": "SageMaker endpoint 'image-classifier-v2' is active but received zero invocations in the last 7 days"
             }
           ]
@@ -754,7 +744,7 @@
               "check_category": "Idle Notebooks",
               "current_value": "Notebook 'eda-notebook-dev' (ml.t3.medium) is running",
               "recommended_value": "Stop or delete idle notebook instance",
-              "monthly_savings": 76.50,
+              "monthly_savings": 76.5,
               "reason": "SageMaker notebook 'eda-notebook-dev' (ml.t3.medium) is running; consider stopping if not actively in use"
             },
             {
@@ -763,7 +753,7 @@
               "check_category": "Idle Notebooks",
               "current_value": "Notebook 'training-analysis' (ml.m5.large) is running",
               "recommended_value": "Stop or delete idle notebook instance",
-              "monthly_savings": 153.00,
+              "monthly_savings": 153.0,
               "reason": "SageMaker notebook 'training-analysis' (ml.m5.large) is running; consider stopping if not actively in use"
             }
           ]
@@ -778,7 +768,7 @@
               "check_category": "Spot Training",
               "current_value": "Training job 'bert-finetune-2026-04-15' ran 48.5h on-demand (ml.p3.2xlarge)",
               "recommended_value": "Enable Managed Spot Training for similar future jobs",
-              "monthly_savings": 856.50,
+              "monthly_savings": 856.5,
               "reason": "Training job 'bert-finetune-2026-04-15' ran 48.5h on-demand; Spot Training could save ~70% ($856.50 per equivalent run)"
             }
           ]
@@ -793,7 +783,7 @@
               "check_category": "Consolidation",
               "current_value": "3 endpoints using ml.m5.xlarge",
               "recommended_value": "Consolidate into fewer multi-model endpoints",
-              "monthly_savings": 1116.00,
+              "monthly_savings": 1116.0,
               "reason": "3 SageMaker endpoints use ml.m5.xlarge; consolidating onto multi-model endpoints could save ~30%"
             }
           ]
@@ -824,7 +814,7 @@
     "network_cost": {
       "service_name": "Network Transfer Costs",
       "total_recommendations": 4,
-      "total_monthly_savings": 509.20,
+      "total_monthly_savings": 509.2,
       "sources": {
         "cross_region_transfer": {
           "count": 1,
@@ -835,7 +825,7 @@
               "check_category": "Cross-Region Transfer",
               "current_value": "$850.00/mo cross-region transfer spend",
               "recommended_value": "Consolidate workloads to fewer regions or use VPC endpoints",
-              "monthly_savings": 255.00,
+              "monthly_savings": 255.0,
               "severity": "HIGH",
               "reason": "Cross-region data transfer costs $850.00/mo; architectural changes (regional consolidation, caching, endpoint placement) could reduce by up to 30%"
             }
@@ -850,7 +840,7 @@
               "check_category": "Cross-AZ Transfer",
               "current_value": "$360.00/mo cross-AZ transfer spend",
               "recommended_value": "Co-locate communicating services in the same AZ",
-              "monthly_savings": 180.00,
+              "monthly_savings": 180.0,
               "severity": "MEDIUM",
               "reason": "Cross-AZ transfer costs $360.00/mo; co-locating services in the same AZ could save ~50%"
             }
@@ -865,7 +855,7 @@
               "check_category": "Internet Egress",
               "current_value": "$125.00/mo direct internet egress",
               "recommended_value": "Route traffic through CloudFront for egress optimization",
-              "monthly_savings": 50.00,
+              "monthly_savings": 50.0,
               "severity": "MEDIUM",
               "reason": "Direct internet egress costs $125.00/mo; CloudFront could reduce costs by ~40% with better performance"
             }
@@ -880,23 +870,17 @@
               "check_category": "TGW vs Peering",
               "current_value": "TGW + 3 peering connections, $1210.00/mo transfer",
               "recommended_value": "Optimize TGW route tables to minimize cross-hub traffic",
-              "monthly_savings": 24.20,
+              "monthly_savings": 24.2,
               "severity": "MEDIUM",
               "reason": "Mixed TGW/peering topology with $1210.00/mo transfer. Optimizing TGW routes could save ~20% on processing costs."
             }
           ]
         }
       },
-      "total_data_transfer_spend_30d": 1210.00,
-      "cross_region_spend_30d": 850.00,
+      "total_data_transfer_spend_30d": 1210.0,
+      "cross_region_spend_30d": 850.0,
       "peering_count": 3,
       "tgw_count": 1
-    },
-    "cost_anomaly": {
-      "service_name": "Cost Anomaly Detection",
-      "total_recommendations": 0,
-      "total_monthly_savings": 0.0,
-      "sources": {}
     },
     "eks_cost": {
       "service_name": "EKS Cost Visibility",
@@ -908,7 +892,7 @@
   "summary": {
     "total_services_scanned": 7,
     "total_recommendations": 29,
-    "total_monthly_savings": 7151.10
+    "total_monthly_savings": 7151.1
   },
   "trend_analysis": null
 }

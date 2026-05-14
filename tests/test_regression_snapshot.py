@@ -37,8 +37,8 @@ class TestGoldenJsonParity:
         required = {"account_id", "region", "profile", "scan_time", "services", "summary"}
         assert required.issubset(golden_json.keys()), f"Missing top-level keys: {required - set(golden_json.keys())}"
 
-    def test_golden_json_has_37_services(self, golden_json: dict) -> None:
-        """All 37 expected service keys are present."""
+    def test_golden_json_has_35_services(self, golden_json: dict) -> None:
+        """All 35 expected service keys are present."""
         expected_services = {
             "ec2",
             "ami",
@@ -68,14 +68,12 @@ class TestGoldenJsonParity:
             "glue",
             "athena",
             "batch",
-            "compute_optimizer",
             "cost_optimization_hub",
             "aurora",
             "commitment_analysis",
             "bedrock",
             "sagemaker",
             "network_cost",
-            "cost_anomaly",
             "eks_cost",
         }
         actual = set(golden_json["services"].keys())

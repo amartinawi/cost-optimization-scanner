@@ -56,13 +56,14 @@ EXPECTED_SERVICE_KEYS = {
     "athena",
     "batch",
     "bedrock",
-    "compute_optimizer",
     # cost_optimization_hub retired from ALL_MODULES (2026-05-14):
-    # findings are now distributed into per-service tabs via
+    # findings distributed into per-service tabs via
     # ScanOrchestrator._prefetch_advisor_data + ctx.cost_hub_splits.
+    # compute_optimizer adapter retired from ALL_MODULES (2026-05-14):
+    # EC2 / EBS / RDS findings already inline; Lambda / ECS / ASG findings
+    # now flow through their respective adapters.
     "aurora",
     "commitment_analysis",
-    "cost_anomaly",
     "eks_cost",
 }
 

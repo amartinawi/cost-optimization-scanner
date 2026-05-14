@@ -81,20 +81,9 @@ def get_route53_checks(ctx: ScanContext) -> dict[str, Any]:
                     if record.get("GeoLocation") is not None:
                         geolocation_records += 1
 
-                total_complex = weighted_records + latency_records + geolocation_records
-                if total_complex > 0 and record_count < 10:
-                    checks["complex_routing_simple_use"].append(
-                        {
-                            "HostedZoneId": zone_id,
-                            "ZoneName": zone_name,
-                            "WeightedRecords": weighted_records,
-                            "LatencyRecords": latency_records,
-                            "GeolocationRecords": geolocation_records,
-                            "Recommendation": "Complex routing policies for simple zone - verify necessity",
-                            "EstimatedSavings": "Simple routing reduces query costs",
-                            "CheckCategory": "Unnecessary Complex Routing",
-                        }
-                    )
+                # Complex routing simple use finding removed: emitted vague "simple routing
+                # reduces query costs" with no $ tied (Route 53 query cost is very low).
+                _ = (weighted_records, latency_records, geolocation_records, record_count)
 
             except Exception as e:
                 ctx.warn(f"Could not analyze records for zone {zone_name}: {e}", "route53")
@@ -110,16 +99,10 @@ def get_route53_checks(ctx: ScanContext) -> dict[str, Any]:
                 hc_config = health_check.get("HealthCheckConfig", {})
                 hc_type = hc_config.get("Type")
 
-                if hc_type in ["HTTP", "HTTPS", "TCP"]:
-                    checks["unnecessary_health_checks"].append(
-                        {
-                            "HealthCheckId": hc_id,
-                            "Type": hc_type,
-                            "Recommendation": "Health check without routing dependency - verify necessity",
-                            "EstimatedSavings": "$0.50/month per health check if removed",
-                            "CheckCategory": "Unnecessary Health Checks",
-                        }
-                    )
+                # Unnecessary Health Checks finding removed: $0.50/check is a generic AWS
+                # rate quoted regardless of routing-dependency analysis — not a per-account
+                # quantified saving.
+                _ = (hc_id, hc_type)
 
         except Exception as e:
             ctx.warn(f"Could not analyze Route 53 health checks: {e}", "route53")

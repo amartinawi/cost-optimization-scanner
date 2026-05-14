@@ -5,6 +5,47 @@ All notable changes to the AWS Cost Optimization Scanner project will be documen
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.4.0] - 2026-05-14
+
+### Removed (Cost-Only Scope Refinement)
+- **40+ non-cost-saving findings purged across 24 service modules**. The scanner is now strictly a cost-optimization tool — every emitted recommendation must produce a concrete account-specific $ saving. Removed: health / state checks (DEGRADED add-ons, inactive node groups, replication lag monitors), best-practice nudges (Fargate adoption, Aurora Serverless v2 migration, "consider Graviton" without instance pricing), version-upgrade prompts (Old Redis / Elasticsearch / OpenSearch versions), monitoring-enablement directives (Container Insights, CloudWatch detailed monitoring, DLM), $0/month findings with "quantify after X" tails, and percentage-range estimates with no per-account baseline. Specifically:
+  - `services/ec2.py`: Monitoring Required, Auto Scaling Missing, Burstable Instance Optimization (no metrics), Stopped Instances housekeeping, Static ASGs (EKS + non-EKS), Non-Prod 24/7 ASGs, Missing Scale-In Policies, Monitoring-Only Instances.
+  - `services/rds.py`: io1/io2/gp3 IOPS review, Stopped-database housekeeping, Burstable Instance Rightsizing (no metrics), Aurora Serverless v2 migration nudge (instance + cluster), Aurora I/O-Optimized "review".
+  - `services/elasticache.py`: Old Engine Version (Redis < 7 upgrade nudge).
+  - `services/containers.py`: ECS Container Insights Required, EKS Performance Optimization (scale-up = cost increase), EKS Container Insights Required.
+  - `services/adapters/eks.py`: Node group DEGRADED state, under-utilized scaling config, "No Fargate profiles configured" best-practice nudge, marketplace add-on $0 review, Add-on DEGRADED state.
+  - `services/adapters/aurora.py`: Clone sprawl, Global DB replica lag, Backtrack window.
+  - `services/adapters/bedrock.py`: Idle Bedrock agent (AWS docs confirm agents themselves accrue no charge — hardcoded $5/month placeholder removed).
+  - `services/monitoring.py`: Excessive log storage, Unused CloudWatch Alarms, Multi-Region CloudTrail, S3/Lambda Data Events trail flags, CloudTrail Insights, Multiple CloudTrail Trails.
+  - `services/load_balancer.py`: Public Internal LB (security), Excessive ALB rules (no per-rule $), Unnecessary Cross-AZ LB (fake 1GB/hour baseline).
+  - `services/route53.py`: Complex Routing Simple Use, Unnecessary Health Checks (generic $0.50/check, not per-account).
+  - `services/step_functions.py`: Non-Prod 24/7 (percentage range).
+  - `services/ebs.py`: Underutilized high-IOPS volumes flag (no-metrics fallback), Snapshot Lifecycle (DLM enablement).
+  - `services/athena.py`: Query Results lifecycle nudge, Workgroup Optimization (scan limit).
+  - `services/api_gateway.py`: API Gateway Caching (caching itself adds cost).
+  - `services/cloudfront.py`: Disabled distribution housekeeping ($0 explicit), Origin Shield Review (net effect can go either way).
+  - `services/dms.py`: DMS Serverless monitor nudge ("Variable based on usage").
+  - `services/glue.py`: Crawler Optimization ("Variable based on frequency").
+  - `services/msk.py`: MSK Serverless monitor nudge ("Variable based on usage").
+  - `services/lambda_svc.py`: Lambda Low Invocation (no idle cost on Lambda — savings ~$0), Lambda VPC Configuration (mixed perf+cost), Lambda Reserved Concurrency (reserved concurrency itself is free).
+  - `services/backup.py`: Cross-Region Backup Copies (resilience trade-off), Ephemeral Resource Backups (unquantified), Multiple Backup Plans (AWS Backup plans are free per AWS docs — only jobs cost money).
+  - `services/apprunner.py`: Auto Scaling Optimization (hardcoded "$30/month potential" magic number).
+  - `services/opensearch.py`: Old OpenSearch Version, Old Elasticsearch Version (engine cost identical across versions).
+
+  Findings that survived this purge all carry one of: (1) a live `PricingEngine`-derived $ amount, (2) a per-resource `parse_dollar_savings`-extracted value, (3) a concrete formula like `(current - recommended) × per-unit-price × 730`. AWS Knowledge MCP was consulted to confirm the cost reality of five borderline cases (Bedrock agents, AWS Backup plans, VPC gateway endpoints, Lightsail bundle transfer allowance, ALB LCU pricing) before removal.
+
+### Added
+- **RDS Reserved Instance scenario matrix on every database**. The Reserved Instance Opportunities rec category in the RDS tab no longer disclose a single hard-coded `"1-yr no-upfront RI"` scenario; each candidate database now carries an `RIScenarios` list covering the full 6-cell purchase matrix (1yr / 3yr × No Upfront / Partial Upfront / All Upfront) computed via the new `RDS_RI_DISCOUNT_MATRIX` constants in `services/rds.py` against the live PricingEngine-derived on-demand baseline. The renderer (`_render_rds_ri_scenarios_table` in `reporter_phase_b.py`) emits a compact per-database table with the maximum-savings row highlighted, alongside the on-demand monthly baseline so the FinOps reader can audit the discount math.
+- **Cost Optimization Hub commitment scenario matrix**. CoH-routed reservation / Savings Plan recommendations consumed by the Commitment Analysis tab via `ctx.cost_hub_splits["commitment_analysis"]` are now scaled from AWS's single recommended (term, payment_option) into the full 6-cell matrix using standard tier ratios (`_COH_COMMITMENT_TIER_RATIOS` in `reporter_phase_b.py`). Each commitment rec renders an inline scenarios table below the existing CoH summary table; the AWS-recommended scenario row is highlighted as the anchor and the others are shown as percent-delta relative to it.
+
+### Changed
+- **Compute Optimizer findings distributed into per-service tabs** (mirrors the earlier Cost Optimization Hub retirement). The standalone "Compute Optimizer" tab no longer renders. EC2 / EBS / RDS recommendations were already inline in their tabs via `services.advisor.get_<resource>_compute_optimizer_recommendations`; Lambda / ECS / ASG recommendations now flow through the corresponding per-service adapters: Lambda CO recs render inside the Lambda tab as a `compute_optimizer` source, ECS CO recs render inside the Containers tab as a `compute_optimizer` source, and ASG CO recs render inside the EC2 tab as an `asg_compute_optimizer` source. Adds `get_lambda_compute_optimizer_recommendations`, `get_ecs_compute_optimizer_recommendations`, `get_asg_compute_optimizer_recommendations` plus their normalization helpers to `services/advisor.py`. New `SOURCE_TYPE_MAP` + `PHASE_B_HANDLERS` bindings reuse the existing `_render_compute_optimizer_source` renderer because the rec schema is identical across all four resource types. Cleans up: the per-service-with-no-savings "Optimization Recommendations: 18 items / Monthly Savings: $0.00" surface that the standalone tab produced when the underlying CO recs had empty `savingsOpportunity` blocks.
+
+### Removed
+- **Cost Anomaly Detection adapter retired** from `services/__init__.py:ALL_MODULES`. The "Cost Anomaly Detection" tab no longer renders; the standalone scan path (Cost Explorer `get_anomalies` / `get_anomaly_monitors` / `get_anomaly_subscriptions` + CloudWatch `describe_alarms`) is removed entirely. The HIGH-severity risk signal in the executive summary now reads purely from priority-tagged recommendations across all surviving services rather than falling back to active-anomaly count. Deleted: `services/adapters/cost_anomaly.py`, `_render_cost_anomaly_source` in `reporter_phase_b.py`, `cost_anomaly` tab spec in `html_report_generator.py`, four `SOURCE_TYPE_MAP` + four `PHASE_B_HANDLERS` entries, golden fixture key.
+- **Compute Optimizer adapter retired** from `services/__init__.py:ALL_MODULES`. Deleted: `services/adapters/compute_optimizer.py`, `compute_optimizer` tab spec in `html_report_generator.py`, golden fixture key. The legacy `(compute_optimizer, *)` `SOURCE_TYPE_MAP` and `PHASE_B_HANDLERS` entries are retained for any in-flight scan JSON that predates the retirement; new scans never emit them.
+- Service count: 36 → 34 after both removals.
+
 ## [3.3.0] - 2026-05-14
 
 ### Added

@@ -121,34 +121,9 @@ def get_enhanced_lambda_checks(ctx: ScanContext) -> dict[str, Any]:
                         }
                     )
 
-                try:
-                    end_time = datetime.now(UTC)
-                    start_time = end_time - timedelta(days=30)
-                    metrics = cloudwatch.get_metric_statistics(
-                        Namespace="AWS/Lambda",
-                        MetricName="Invocations",
-                        Dimensions=[{"Name": "FunctionName", "Value": function_name}],
-                        StartTime=start_time,
-                        EndTime=end_time,
-                        Period=INVOCATION_METRIC_PERIOD_30D,
-                        Statistics=["Sum"],
-                    )
-                    invocations = metrics["Datapoints"][0]["Sum"] if metrics["Datapoints"] else 0
-                    if invocations < LOW_INVOCATION_30DAY_THRESHOLD:
-                        checks["low_invocation"].append(
-                            {
-                                "FunctionName": function_name,
-                                "MemorySize": memory_size,
-                                "Runtime": runtime,
-                                "Invocations30Days": int(invocations),
-                                "Recommendation": "Low usage - consider consolidation or deletion",
-                                "EstimatedSavings": "Eliminate unused costs",
-                                "CheckCategory": "Lambda Low Invocation",
-                            }
-                        )
-                except Exception as e:
-                    print(f"Warning: Could not get metrics for function {function_name}: {e}")
-                    continue
+                # Lambda Low Invocation finding removed: Lambda has no idle cost — only
+                # invocations cost money — so "low invocation" functions already incur
+                # ~$0 and there is nothing to save by deleting them.
 
                 try:
                     provisioned = lambda_client.list_provisioned_concurrency_configs(FunctionName=function_name)
@@ -169,31 +144,11 @@ def get_enhanced_lambda_checks(ctx: ScanContext) -> dict[str, Any]:
                     print(f"Warning: Could not check provisioned concurrency for {function_name}: {e}")
                     continue
 
-                if vpc_config and vpc_config.get("SubnetIds"):
-                    checks["vpc_without_need"].append(
-                        {
-                            "FunctionName": function_name,
-                            "MemorySize": memory_size,
-                            "Runtime": runtime,
-                            "VpcId": vpc_config.get("VpcId", "N/A"),
-                            "Recommendation": "VPC adds ENI costs and cold start latency - remove if not needed",
-                            "EstimatedSavings": "Reduce ENI costs and improve performance",
-                            "CheckCategory": "Lambda VPC Configuration",
-                        }
-                    )
-
-                if reserved_concurrency and reserved_concurrency > HIGH_RESERVED_CONCURRENCY_THRESHOLD:
-                    checks["high_reserved_concurrency"].append(
-                        {
-                            "FunctionName": function_name,
-                            "MemorySize": memory_size,
-                            "Runtime": runtime,
-                            "ReservedConcurrency": reserved_concurrency,
-                            "Recommendation": f"{reserved_concurrency} reserved concurrency may be excessive",
-                            "EstimatedSavings": "Review actual concurrency needs",
-                            "CheckCategory": "Lambda Reserved Concurrency",
-                        }
-                    )
+                # Lambda VPC configuration finding removed: mixed cost/performance ("improve
+                # performance"); ENI savings exist but are not quantified per-function.
+                # Lambda Reserved Concurrency finding removed: "Review actual concurrency
+                # needs" — reserved concurrency itself has no cost (unlike provisioned).
+                _ = (vpc_config, reserved_concurrency)
 
                 if "x86_64" in architectures and runtime in ARM_SUPPORTED_RUNTIMES:
                     try:

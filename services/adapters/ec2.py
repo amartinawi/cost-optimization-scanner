@@ -8,7 +8,10 @@ from typing import Any
 from core.contracts import ServiceFindings, SourceBlock
 from services._base import BaseServiceModule
 from services._savings import compute_optimizer_savings, parse_dollar_savings
-from services.advisor import get_ec2_compute_optimizer_recommendations
+from services.advisor import (
+    get_asg_compute_optimizer_recommendations,
+    get_ec2_compute_optimizer_recommendations,
+)
 from services.ec2 import get_advanced_ec2_checks, get_ec2_instance_count, get_enhanced_ec2_checks
 
 logger = logging.getLogger(__name__)
@@ -45,6 +48,7 @@ class EC2Module(BaseServiceModule):
 
         cost_hub_recs = ctx.cost_hub_splits.get("ec2", [])
         co_recs = get_ec2_compute_optimizer_recommendations(ctx)
+        asg_co_recs = get_asg_compute_optimizer_recommendations(ctx)
         enhanced_result = get_enhanced_ec2_checks(ctx, ctx.pricing_multiplier, ctx.fast_mode)
         enhanced_recs = enhanced_result.get("recommendations", [])
         advanced_result = get_advanced_ec2_checks(ctx, ctx.pricing_multiplier, ctx.fast_mode)
@@ -53,12 +57,19 @@ class EC2Module(BaseServiceModule):
         savings = 0.0
         savings += sum(rec.get("estimatedMonthlySavings", 0) for rec in cost_hub_recs)
         savings += sum(compute_optimizer_savings(rec) for rec in co_recs)
+        savings += sum(float(rec.get("estimatedMonthlySavings", 0.0) or 0.0) for rec in asg_co_recs)
         for rec in enhanced_recs:
             savings += parse_dollar_savings(rec.get("EstimatedSavings", ""))
         for rec in advanced_recs:
             savings += parse_dollar_savings(rec.get("EstimatedSavings", ""))
 
-        total_recs = len(cost_hub_recs) + len(co_recs) + len(enhanced_recs) + len(advanced_recs)
+        total_recs = (
+            len(cost_hub_recs)
+            + len(co_recs)
+            + len(asg_co_recs)
+            + len(enhanced_recs)
+            + len(advanced_recs)
+        )
 
         return ServiceFindings(
             service_name="EC2",
@@ -67,6 +78,7 @@ class EC2Module(BaseServiceModule):
             sources={
                 "cost_optimization_hub": SourceBlock(count=len(cost_hub_recs), recommendations=tuple(cost_hub_recs)),
                 "compute_optimizer": SourceBlock(count=len(co_recs), recommendations=tuple(co_recs)),
+                "asg_compute_optimizer": SourceBlock(count=len(asg_co_recs), recommendations=tuple(asg_co_recs)),
                 "enhanced_checks": SourceBlock(count=len(enhanced_recs), recommendations=tuple(enhanced_recs)),
                 "advanced_ec2_checks": SourceBlock(count=len(advanced_recs), recommendations=tuple(advanced_recs)),
             },

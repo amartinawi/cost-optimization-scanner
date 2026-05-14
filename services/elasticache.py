@@ -101,17 +101,8 @@ def get_enhanced_elasticache_checks(ctx: ScanContext) -> dict[str, Any]:
                         }
                     )
 
-                if engine.lower() == "redis":
-                    major_version = int(engine_version.split(".")[0]) if engine_version else 0
-                    if major_version < 7:
-                        checks["old_engine_versions"].append(
-                            {
-                                "ClusterId": cluster_id,
-                                "EngineVersion": engine_version,
-                                "Recommendation": "Upgrade engine version",
-                                "CheckCategory": "Old Engine Version",
-                            }
-                        )
+                # "Old Engine Version" finding removed: pure version-freshness nudge
+                # with no cost saving tied (Redis 7 upgrade is free; engine cost is identical).
 
                 if num_nodes >= 2:
                     checks["reserved_nodes"].append(

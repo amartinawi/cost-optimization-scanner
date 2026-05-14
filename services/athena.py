@@ -38,27 +38,11 @@ def get_enhanced_athena_checks(ctx: ScanContext) -> dict[str, Any]:
                 result_config = config.get("ResultConfiguration", {})
                 output_location = result_config.get("OutputLocation", "")
 
-                if output_location:
-                    checks["query_results"].append(
-                        {
-                            "WorkGroupName": wg_name,
-                            "OutputLocation": output_location,
-                            "Recommendation": "Set lifecycle policy on query results bucket",
-                            "EstimatedSavings": "Reduce S3 storage costs",
-                            "CheckCategory": "Athena Query Results",
-                        }
-                    )
-
-                bytes_scanned_cutoff = config.get("BytesScannedCutoffPerQuery")
-                if not bytes_scanned_cutoff:
-                    checks["workgroup_optimization"].append(
-                        {
-                            "WorkGroupName": wg_name,
-                            "Recommendation": "Set per-query data scan limit to control costs",
-                            "EstimatedSavings": "Prevent runaway query costs",
-                            "CheckCategory": "Athena Workgroup Optimization",
-                        }
-                    )
+                # Athena Query Results (lifecycle on output bucket) and Workgroup
+                # Optimization (scan-limit) findings removed: each emitted vague
+                # "Reduce S3 storage costs" / "Prevent runaway query costs" without
+                # concrete per-workgroup quantification.
+                _ = (output_location, config)
             except Exception:
                 continue
     except Exception as e:

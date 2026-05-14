@@ -23,9 +23,21 @@ logger = logging.getLogger(__name__)
 #   - Non-prod schedule: nights + weekends shutdown ≈ 12h/day weekdays only,
 #     yielding ≈ 65% reduction relative to 24/7.
 #   - Reserved Instance: 1-yr no-upfront on AWS is ≈ 40% off on-demand.
+#   - The RI scenario matrix below (1yr / 3yr × No Upfront / Partial Upfront /
+#     All Upfront) reflects AWS public guidance averages. Discount tiers vary
+#     by engine + instance family; treat these as planning estimates and
+#     confirm exact savings in the AWS RI marketplace before purchase.
 RDS_MULTI_AZ_REDUCTION: float = 0.50
 RDS_NON_PROD_SCHEDULE_REDUCTION: float = 0.65
 RDS_RESERVED_INSTANCE_REDUCTION: float = 0.40
+RDS_RI_DISCOUNT_MATRIX: tuple[tuple[str, str, float], ...] = (
+    ("1yr", "No Upfront", 0.38),
+    ("1yr", "Partial Upfront", 0.41),
+    ("1yr", "All Upfront", 0.44),
+    ("3yr", "No Upfront", 0.55),
+    ("3yr", "Partial Upfront", 0.58),
+    ("3yr", "All Upfront", 0.62),
+)
 
 
 def _rds_monthly_price(ctx: ScanContext, engine: str, instance_class: str, *, multi_az: bool) -> float:
@@ -352,25 +364,8 @@ def get_enhanced_rds_checks(
                             "storageFinding": (f"{storage_type} ({allocated_storage}GB) → gp3 recommended"),
                         }
                     )
-                elif storage_type in ["io1", "io2", "gp3"]:
-                    checks["storage_optimization"].append(
-                        {
-                            "DBInstanceIdentifier": db_instance_id,
-                            "resourceArn": (f"arn:aws:rds:{region}:{account_id}:db:{db_instance_id}"),
-                            "engine": engine,
-                            "engineVersion": instance.get("EngineVersion", ""),
-                            "CurrentStorageType": storage_type,
-                            "AllocatedStorage": allocated_storage,
-                            "Recommendation": (
-                                f"Review {storage_type} IOPS/throughput configuration for potential optimization"
-                            ),
-                            "EstimatedSavings": ("Requires workload analysis for IOPS/throughput tuning"),
-                            "CheckCategory": "RDS Storage Optimization",
-                            "storageFinding": (
-                                f"{storage_type} ({allocated_storage}GB) - review IOPS/throughput settings"
-                            ),
-                        }
-                    )
+                # io1/io2/gp3 "review IOPS/throughput" finding removed: requires workload
+                # analysis to quantify — emitted no concrete savings.
 
                 if any(env in db_instance_id.lower() for env in ["dev", "test", "staging", "qa"]):
                     env_name = next(
@@ -401,37 +396,10 @@ def get_enhanced_rds_checks(
                             }
                         )
 
-                if db_instance_status == "stopped":
-                    checks["idle_databases"].append(
-                        {
-                            "DBInstanceIdentifier": db_instance_id,
-                            "resourceArn": (f"arn:aws:rds:{region}:{account_id}:db:{db_instance_id}"),
-                            "engine": engine,
-                            "DBInstanceStatus": db_instance_status,
-                            "Recommendation": (
-                                "Consider deleting stopped database if no longer needed (storage costs still apply)"
-                            ),
-                            "EstimatedSavings": ("Storage costs continue while stopped"),
-                            "CheckCategory": "Idle Database Detection",
-                            "instanceFinding": (f"Database in {db_instance_status} state"),
-                        }
-                    )
-
-                if db_instance_class.startswith("db.t"):
-                    checks["instance_rightsizing"].append(
-                        {
-                            "DBInstanceIdentifier": db_instance_id,
-                            "resourceArn": (f"arn:aws:rds:{region}:{account_id}:db:{db_instance_id}"),
-                            "engine": engine,
-                            "DBInstanceClass": db_instance_class,
-                            "Recommendation": (
-                                "Review burstable instance usage - consider fixed instance if consistently high CPU"
-                            ),
-                            "EstimatedSavings": ("Requires CloudWatch analysis for accurate sizing"),
-                            "CheckCategory": "Instance Rightsizing",
-                            "instanceFinding": (f"Burstable instance ({db_instance_class}) - review usage patterns"),
-                        }
-                    )
+                # Stopped-database housekeeping finding removed: "storage costs continue
+                # while stopped" is informational, not a quantified saving.
+                # Burstable instance review removed: "Requires CloudWatch analysis" is
+                # a monitoring nudge, not a cost recommendation.
 
                 if db_instance_status == "available":
                     is_likely_prod = not any(env in db_instance_id.lower() for env in ["dev", "test", "staging", "qa"])
@@ -439,7 +407,17 @@ def get_enhanced_rds_checks(
                     ri_base_price = _rds_monthly_price(
                         ctx, engine or "", db_instance_class or "", multi_az=multi_az
                     )
-                    ri_savings = ri_base_price * RDS_RESERVED_INSTANCE_REDUCTION
+                    ri_scenarios = [
+                        {
+                            "term": term,
+                            "payment_option": payment,
+                            "monthly_savings": round(ri_base_price * pct, 2),
+                            "discount_pct": round(pct * 100, 1),
+                            "ondemand_monthly_estimate": round(ri_base_price, 2),
+                        }
+                        for term, payment, pct in RDS_RI_DISCOUNT_MATRIX
+                    ]
+                    best_scenario = max(ri_scenarios, key=lambda s: s["monthly_savings"])
                     checks["reserved_instances"].append(
                         {
                             "DBInstanceIdentifier": db_instance_id,
@@ -448,37 +426,18 @@ def get_enhanced_rds_checks(
                             "DBInstanceClass": db_instance_class,
                             "Recommendation": (f"Consider Reserved Instances for {ri_text}"),
                             "EstimatedSavings": (
-                                f"${ri_savings:.2f}/month with 1-yr no-upfront RI"
+                                f"up to ${best_scenario['monthly_savings']:.2f}/month "
+                                f"({best_scenario['term']} {best_scenario['payment_option']})"
                             ),
                             "CheckCategory": ("Reserved Instance Opportunities"),
                             "instanceFinding": (f"Instance ({db_instance_class}) - RI candidate"),
+                            "RIScenarios": ri_scenarios,
+                            "OnDemandMonthlyEstimate": round(ri_base_price, 2),
                         }
                     )
 
-                if "aurora" in engine and db_instance_class in [
-                    "db.t3.small",
-                    "db.t3.medium",
-                    "db.t4g.small",
-                    "db.t4g.medium",
-                ]:
-                    checks["aurora_serverless_candidates"].append(
-                        {
-                            "DBInstanceIdentifier": db_instance_id,
-                            "resourceArn": (f"arn:aws:rds:{region}:{account_id}:db:{db_instance_id}"),
-                            "engine": engine,
-                            "engineVersion": instance.get("EngineVersion", ""),
-                            "DBInstanceClass": db_instance_class,
-                            "Recommendation": ("Consider migrating to Aurora Serverless v2 for variable workloads"),
-                            "EstimatedSavings": (
-                                "$0.00/month - quantify after measuring idle hours"
-                                " (Aurora Serverless v2 charges per ACU-hour)"
-                            ),
-                            "CheckCategory": ("Aurora Serverless v2 Migration"),
-                            "instanceFinding": (
-                                f"Small Aurora instance ({db_instance_class}) - good candidate for Serverless v2"
-                            ),
-                        }
-                    )
+                # Aurora Serverless v2 migration nudge removed: $0/month with "quantify
+                # after measuring idle hours" — no concrete savings.
 
         try:
             paginator = rds.get_paginator("describe_db_snapshots")
@@ -521,44 +480,10 @@ def get_enhanced_rds_checks(
                     engine = cluster.get("Engine", "")
 
                     if "aurora" in engine.lower():
-                        if cluster.get("ServerlessV2ScalingConfiguration") is None:
-                            checks["aurora_serverless_v2"].append(
-                                {
-                                    "DBClusterIdentifier": cluster_id,
-                                    "resourceArn": (f"arn:aws:rds:{region}:{account_id}:cluster:{cluster_id}"),
-                                    "Engine": engine,
-                                    "Recommendation": ("Consider Aurora Serverless v2 for variable workloads"),
-                                    "EstimatedSavings": (
-                                        "$0.00/month - quantify after measuring"
-                                        " idle hours (Aurora Serverless v2 is"
-                                        " ACU-hour billed)"
-                                    ),
-                                    "CheckCategory": ("Aurora Serverless v2 Migration"),
-                                }
-                            )
-
-                        storage_type = cluster.get("StorageType", "aurora")
-                        if storage_type == "aurora":
-                            checks["storage_optimization"].append(
-                                {
-                                    "DBClusterIdentifier": cluster_id,
-                                    "resourceArn": (f"arn:aws:rds:{region}:{account_id}:cluster:{cluster_id}"),
-                                    "Engine": engine,
-                                    "StorageType": storage_type,
-                                    "Recommendation": (
-                                        "Review Aurora storage usage and"
-                                        " consider Aurora I/O-Optimized"
-                                        " if high I/O costs"
-                                    ),
-                                    "EstimatedSavings": (
-                                        "$0.00/month - quantify after reviewing"
-                                        " I/O usage; Aurora I/O-Optimized has"
-                                        " higher storage but zero I/O charges"
-                                    ),
-                                    "CheckCategory": ("Aurora Storage Optimization"),
-                                    "instanceFinding": ("Aurora cluster - review I/O patterns"),
-                                }
-                            )
+                        # Aurora Serverless v2 migration nudge and Aurora I/O-Optimized
+                        # "review" finding both removed: each emitted $0/month with
+                        # "quantify after measuring" — no concrete savings.
+                        pass
 
             try:
                 paginator = rds.get_paginator("describe_db_cluster_snapshots")

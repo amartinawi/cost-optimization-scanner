@@ -87,20 +87,10 @@ def get_backup_checks(ctx: ScanContext) -> dict[str, Any]:
                         )
 
                     copy_actions = rule.get("CopyActions", [])
-                    if copy_actions:
-                        for copy_action in copy_actions:
-                            dest_vault_arn = copy_action.get("DestinationBackupVaultArn", "")
-                            if dest_vault_arn and ctx.region not in dest_vault_arn:
-                                checks["unnecessary_cross_region"].append(
-                                    {
-                                        "BackupPlanName": plan_name,
-                                        "RuleName": rule_name,
-                                        "DestinationVault": dest_vault_arn,
-                                        "Recommendation": "Cross-region backup copy - verify business need",
-                                        "EstimatedSavings": "Remove if not required for DR",
-                                        "CheckCategory": "Cross-Region Backup Copies",
-                                    }
-                                )
+                    # Cross-region backup copies finding removed: "Remove if not required
+                    # for DR" is a resilience-vs-cost trade-off check, not a cost saving
+                    # per se — and the actual storage delta is not quantified.
+                    _ = copy_actions
 
                 paginator = backup.get_paginator("list_backup_selections")
                 selections: list[dict[str, Any]] = []
@@ -116,18 +106,9 @@ def get_backup_checks(ctx: ScanContext) -> dict[str, Any]:
                         selection_details = selection_response.get("BackupSelection", {})
                         resources = selection_details.get("Resources", [])
 
-                        for resource_arn in resources:
-                            if any(env in resource_arn.lower() for env in ["dev", "test", "staging"]):
-                                checks["ephemeral_backups"].append(
-                                    {
-                                        "BackupPlanName": plan_name,
-                                        "SelectionName": selection_name,
-                                        "ResourceArn": resource_arn,
-                                        "Recommendation": "Backing up dev/test resources - often unnecessary",
-                                        "EstimatedSavings": "Remove ephemeral resource backups",
-                                        "CheckCategory": "Ephemeral Resource Backups",
-                                    }
-                                )
+                        # Ephemeral resource backups finding removed: "Remove ephemeral
+                        # resource backups" emitted no concrete $ — storage delta unquantified.
+                        _ = resources
 
                     except Exception as e:
                         ctx.warn(f"Could not analyze backup selection {selection_name}: {e}", "backup")
@@ -135,16 +116,9 @@ def get_backup_checks(ctx: ScanContext) -> dict[str, Any]:
             except Exception as e:
                 ctx.warn(f"Could not analyze backup plan {plan_name}: {e}", "backup")
 
-        if len(backup_plans) > 3:
-            checks["multiple_backup_plans"].append(
-                {
-                    "BackupPlanCount": len(backup_plans),
-                    "PlanNames": [p.get("BackupPlanName") for p in backup_plans],
-                    "Recommendation": "Multiple backup plans - check for overlapping coverage",
-                    "EstimatedSavings": "Consolidate plans to avoid duplicate backups",
-                    "CheckCategory": "Multiple Backup Plans",
-                }
-            )
+        # Multiple Backup Plans finding removed: AWS Backup plans themselves are free
+        # (MCP confirmed); only backup jobs incur cost. "Multiple plans - check for
+        # overlap" emitted no concrete $ and is operational hygiene, not a cost saving.
 
     except Exception as e:
         ctx.warn(f"Could not perform AWS Backup checks: {e}", "backup")
