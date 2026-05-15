@@ -225,8 +225,15 @@ def get_asg_compute_optimizer_recommendations(
     return [_normalize_asg_co_rec(r, ctx.pricing_multiplier) for r in raw]
 
 
-def _normalize_lambda_co_rec(raw: dict[str, Any], pricing_multiplier: float) -> dict[str, Any]:
-    """Normalize a raw Lambda Compute Optimizer recommendation."""
+def _normalize_lambda_co_rec(raw: dict[str, Any], pricing_multiplier: float = 1.0) -> dict[str, Any]:
+    """Normalize a raw Lambda Compute Optimizer recommendation.
+
+    AWS Compute Optimizer returns estimated savings already priced in the
+    resource's home region. ``pricing_multiplier`` is accepted for caller
+    back-compat but NOT applied to the savings value — doing so would
+    double-count the regional adjustment.
+    """
+    _ = pricing_multiplier  # See docstring; intentionally unused.
     savings = 0.0
     for opt in raw.get("memorySizeRecommendationOptions", []):
         if "savingsOpportunity" in opt:
@@ -252,13 +259,18 @@ def _normalize_lambda_co_rec(raw: dict[str, Any], pricing_multiplier: float) -> 
             "runtime": raw.get("currentExecutionType", ""),
         },
         "recommended_config": {"memorySize": recommended_memory},
-        "estimatedMonthlySavings": round(savings * pricing_multiplier, 2),
+        "estimatedMonthlySavings": round(savings, 2),
         "lookback_period_days": raw.get("lookBackPeriodInDays", 14),
     }
 
 
-def _normalize_ecs_co_rec(raw: dict[str, Any], pricing_multiplier: float) -> dict[str, Any]:
-    """Normalize a raw ECS Compute Optimizer recommendation."""
+def _normalize_ecs_co_rec(raw: dict[str, Any], pricing_multiplier: float = 1.0) -> dict[str, Any]:
+    """Normalize a raw ECS Compute Optimizer recommendation.
+
+    AWS CO savings are region-priced upstream; ``pricing_multiplier`` is
+    accepted for back-compat but not applied (see ``_normalize_lambda_co_rec``).
+    """
+    _ = pricing_multiplier
     savings = 0.0
     service_options = raw.get("serviceRecommendationOptions", [])
     if service_options:
@@ -273,13 +285,18 @@ def _normalize_ecs_co_rec(raw: dict[str, Any], pricing_multiplier: float) -> dic
         "finding": raw.get("finding", ""),
         "current_config": raw.get("currentServiceConfiguration", {}),
         "recommended_config": service_options[0].get("containerRecommendations", []) if service_options else [],
-        "estimatedMonthlySavings": round(savings * pricing_multiplier, 2),
+        "estimatedMonthlySavings": round(savings, 2),
         "lookback_period_days": raw.get("lookBackPeriodInDays", 14),
     }
 
 
-def _normalize_asg_co_rec(raw: dict[str, Any], pricing_multiplier: float) -> dict[str, Any]:
-    """Normalize a raw ASG Compute Optimizer recommendation."""
+def _normalize_asg_co_rec(raw: dict[str, Any], pricing_multiplier: float = 1.0) -> dict[str, Any]:
+    """Normalize a raw ASG Compute Optimizer recommendation.
+
+    AWS CO savings are region-priced upstream; ``pricing_multiplier`` is
+    accepted for back-compat but not applied (see ``_normalize_lambda_co_rec``).
+    """
+    _ = pricing_multiplier
     savings = 0.0
     options = raw.get("instanceRecommendationOptions", [])
     if options:
@@ -301,6 +318,6 @@ def _normalize_asg_co_rec(raw: dict[str, Any], pricing_multiplier: float) -> dic
         "recommended_config": {"instanceType": options[0].get("configuration", {}).get("instanceType", "")}
         if options
         else {},
-        "estimatedMonthlySavings": round(savings * pricing_multiplier, 2),
+        "estimatedMonthlySavings": round(savings, 2),
         "lookback_period_days": raw.get("lookBackPeriodInDays", 14),
     }
