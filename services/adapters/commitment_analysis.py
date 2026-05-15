@@ -20,8 +20,27 @@ from __future__ import annotations
 from datetime import UTC, date, datetime, timedelta, timezone
 from typing import Any
 
+from botocore.exceptions import ClientError  # type: ignore[import-untyped]
+
 from core.contracts import GroupingSpec, ServiceFindings, SourceBlock, StatCardSpec
 from services._base import BaseServiceModule
+
+
+def _route_ce_error(ctx: Any, action: str, exc: Exception) -> None:
+    """Classify Cost Explorer errors into ctx.permission_issue vs ctx.warn.
+
+    CE returns AccessDeniedException when the caller lacks ce:Get* perms.
+    Routing to permission_issue surfaces it in the JSON output's
+    permission_issues array (vs a generic warning that hides IAM gaps).
+    """
+    if isinstance(exc, ClientError):
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code in {"AccessDenied", "AccessDeniedException", "UnauthorizedOperation"}:
+            ctx.permission_issue(
+                f"{action} blocked: {code}", "commitment_analysis", action=action
+            )
+            return
+    ctx.warn(f"{action} failed: {exc}", "commitment_analysis")
 
 
 def _time_period() -> dict[str, str]:
@@ -89,12 +108,12 @@ class CommitmentAnalysisModule(BaseServiceModule):
 
         tp = _time_period()
 
-        sp_util_recs, sp_util_rate = self._check_sp_utilization(ce, tp)
-        sp_cov_recs, sp_cov_rate = self._check_sp_coverage(ce, tp)
-        ri_util_recs, ri_util_rate = self._check_ri_utilization(ce, tp)
-        ri_cov_recs, ri_cov_rate = self._check_ri_coverage(ce, tp)
-        expiry_recs = self._check_expiring(ce, tp)
-        purchase_recs = self._check_purchase_recommendations(ce)
+        sp_util_recs, sp_util_rate = self._check_sp_utilization(ctx, ce, tp)
+        sp_cov_recs, sp_cov_rate = self._check_sp_coverage(ctx, ce, tp)
+        ri_util_recs, ri_util_rate = self._check_ri_utilization(ctx, ce, tp)
+        ri_cov_recs, ri_cov_rate = self._check_ri_coverage(ctx, ce, tp)
+        expiry_recs = self._check_expiring(ctx, ce, tp)
+        purchase_recs = self._check_purchase_recommendations(ctx, ce)
 
         all_recs = sp_util_recs + sp_cov_recs + ri_util_recs + ri_cov_recs + expiry_recs + purchase_recs
         total_savings = sum(r.get("monthly_savings", 0.0) for r in all_recs)
@@ -156,7 +175,7 @@ class CommitmentAnalysisModule(BaseServiceModule):
             },
         )
 
-    def _check_sp_utilization(self, ce: Any, tp: dict[str, str]) -> tuple[list[dict[str, Any]], float]:
+    def _check_sp_utilization(self, ctx: Any, ce: Any, tp: dict[str, str]) -> tuple[list[dict[str, Any]], float]:
         """Check Savings Plans utilization rate and flag under-utilized plans.
 
         Args:
@@ -174,7 +193,7 @@ class CommitmentAnalysisModule(BaseServiceModule):
             util = resp.get("SavingsPlansUtilizations", {})
             overall_rate = self._parse_pct(util.get("Total", {}).get("UtilizationPercentage", "0"))
         except Exception as e:
-            print(f"Warning: SP utilization check failed: {e}")
+            _route_ce_error(ctx, "ce:GetSavingsPlansUtilization", e)
             return recs, overall_rate
 
         try:
@@ -205,11 +224,11 @@ class CommitmentAnalysisModule(BaseServiceModule):
                     break
                 params["NextToken"] = next_token
         except Exception as e:
-            print(f"Warning: SP utilization details failed: {e}")
+            _route_ce_error(ctx, "ce:GetSavingsPlansUtilizationDetails", e)
 
         return recs, overall_rate
 
-    def _check_sp_coverage(self, ce: Any, tp: dict[str, str]) -> tuple[list[dict[str, Any]], float]:
+    def _check_sp_coverage(self, ctx: Any, ce: Any, tp: dict[str, str]) -> tuple[list[dict[str, Any]], float]:
         """Check Savings Plans coverage by service and flag coverage gaps.
 
         Args:
@@ -263,11 +282,11 @@ class CommitmentAnalysisModule(BaseServiceModule):
             if total_spend > 0:
                 overall_rate = total_covered / total_spend
         except Exception as e:
-            print(f"Warning: SP coverage check failed: {e}")
+            _route_ce_error(ctx, "ce:GetSavingsPlansCoverage", e)
 
         return recs, overall_rate
 
-    def _check_ri_utilization(self, ce: Any, tp: dict[str, str]) -> tuple[list[dict[str, Any]], float]:
+    def _check_ri_utilization(self, ctx: Any, ce: Any, tp: dict[str, str]) -> tuple[list[dict[str, Any]], float]:
         """Check Reserved Instance utilization rate by service.
 
         Args:
@@ -320,11 +339,11 @@ class CommitmentAnalysisModule(BaseServiceModule):
             total = resp.get("Total", {})
             overall_rate = self._parse_pct(total.get("UtilizationPercentage", "0"))
         except Exception as e:
-            print(f"Warning: RI utilization check failed: {e}")
+            _route_ce_error(ctx, "ce:GetReservationUtilization", e)
 
         return recs, overall_rate
 
-    def _check_ri_coverage(self, ce: Any, tp: dict[str, str]) -> tuple[list[dict[str, Any]], float]:
+    def _check_ri_coverage(self, ctx: Any, ce: Any, tp: dict[str, str]) -> tuple[list[dict[str, Any]], float]:
         """Check Reserved Instance coverage by service.
 
         Args:
@@ -375,11 +394,11 @@ class CommitmentAnalysisModule(BaseServiceModule):
             total = resp.get("Total", {})
             overall_rate = self._parse_pct(total.get("CoveragePercentage", "0"))
         except Exception as e:
-            print(f"Warning: RI coverage check failed: {e}")
+            _route_ce_error(ctx, "ce:GetReservationCoverage", e)
 
         return recs, overall_rate
 
-    def _check_expiring(self, ce: Any, tp: dict[str, str]) -> list[dict[str, Any]]:
+    def _check_expiring(self, ctx: Any, ce: Any, tp: dict[str, str]) -> list[dict[str, Any]]:
         """Check for expiring Savings Plans using utilization details.
 
         Uses ``get_savings_plans_utilization_details`` which includes
@@ -430,11 +449,11 @@ class CommitmentAnalysisModule(BaseServiceModule):
                     break
                 params["NextToken"] = next_token
         except Exception as e:
-            print(f"Warning: Expiring commitments check failed: {e}")
+            _route_ce_error(ctx, "ce:GetSavingsPlansUtilizationDetails", e)
 
         return recs
 
-    def _check_purchase_recommendations(self, ce: Any) -> list[dict[str, Any]]:
+    def _check_purchase_recommendations(self, ctx: Any, ce: Any) -> list[dict[str, Any]]:
         """Fetch Savings Plans and RI purchase recommendations from Cost Explorer.
 
         Args:
@@ -445,8 +464,8 @@ class CommitmentAnalysisModule(BaseServiceModule):
         """
         recs: list[dict[str, Any]] = []
 
-        recs.extend(self._fetch_sp_recommendations(ce))
-        recs.extend(self._fetch_ri_recommendations(ce))
+        recs.extend(self._fetch_sp_recommendations(ctx, ce))
+        recs.extend(self._fetch_ri_recommendations(ctx, ce))
 
         return recs
 
@@ -465,7 +484,7 @@ class CommitmentAnalysisModule(BaseServiceModule):
     _SP_TYPES: tuple[str, ...] = ("COMPUTE_SP",)
     _RI_SERVICES: tuple[str, ...] = ("Amazon EC2",)
 
-    def _fetch_sp_recommendations(self, ce: Any) -> list[dict[str, Any]]:
+    def _fetch_sp_recommendations(self, ctx: Any, ce: Any) -> list[dict[str, Any]]:
         """Fetch Compute Savings Plans purchase recommendations across the
         full (term, payment) matrix.
 
@@ -494,7 +513,11 @@ class CommitmentAnalysisModule(BaseServiceModule):
                             LookbackPeriodInDays="THIRTY_DAYS",
                         )
                     except Exception as e:
-                        print(f"Warning: SP purchase recommendation failed for {sp_type} {scenario}: {e}")
+                        _route_ce_error(
+                            ctx,
+                            f"ce:GetSavingsPlansPurchaseRecommendation[{sp_type}/{scenario}]",
+                            e,
+                        )
                         continue
 
                     for rec in resp.get("SavingsPlansPurchaseRecommendation", []):
@@ -562,7 +585,7 @@ class CommitmentAnalysisModule(BaseServiceModule):
 
         return recs
 
-    def _fetch_ri_recommendations(self, ce: Any) -> list[dict[str, Any]]:
+    def _fetch_ri_recommendations(self, ctx: Any, ce: Any) -> list[dict[str, Any]]:
         """Fetch Reserved Instance purchase recommendations across the
         full (term, payment) matrix per service.
 
@@ -590,7 +613,11 @@ class CommitmentAnalysisModule(BaseServiceModule):
                             PaymentOption=payment_api,
                         )
                     except Exception as e:
-                        print(f"Warning: RI purchase recommendation failed for {service} {scenario}: {e}")
+                        _route_ce_error(
+                            ctx,
+                            f"ce:GetReservationPurchaseRecommendation[{service}/{scenario}]",
+                            e,
+                        )
                         continue
 
                     for rec in resp.get("Recommendations", []):
