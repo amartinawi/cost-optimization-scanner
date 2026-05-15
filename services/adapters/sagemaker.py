@@ -15,7 +15,6 @@ from typing import Any
 from core.contracts import GroupingSpec, ServiceFindings, SourceBlock, StatCardSpec
 from services._base import BaseServiceModule
 
-SAGEMAKER_INSTANCE_MULTIPLIER: float = 1.15
 SPOT_SAVINGS_RATE: float = 0.70
 HOURS_PER_MONTH: int = 730
 IDLE_ENDPOINT_DAYS: int = 7
@@ -34,19 +33,34 @@ def _empty_findings(**extras: Any) -> ServiceFindings:
 
 
 def _get_instance_monthly(ctx: Any, instance_type: str) -> float:
+    """Return SageMaker instance monthly price.
+
+    PricingEngine.get_sagemaker_instance_monthly() queries the
+    ``AmazonSageMaker`` service code, so the value already reflects the
+    SageMaker-vs-EC2 managed-ML premium AWS applies — no additional
+    multiplier needed. Returns 0.0 when Pricing API is unavailable so the
+    caller can skip the rec rather than fabricate a fallback constant.
+    """
     try:
         price = ctx.pricing_engine.get_sagemaker_instance_monthly(instance_type)
         if price and price > 0:
-            return price * SAGEMAKER_INSTANCE_MULTIPLIER
+            return float(price)
     except Exception:
         pass
     return 0.0
 
 
+_CW_PERIOD_1D: int = 86400  # AWS CloudWatch max Period for ≤15-day queries.
+
+
 def _get_cloudwatch_invocations_sum(cw: Any, endpoint_name: str, days: int = IDLE_ENDPOINT_DAYS) -> float | None:
+    """Total endpoint invocations over the lookback window.
+
+    Uses Period=86400 (the CW maximum); aggregates per-day Sum datapoints.
+    Larger Period values silently fail at the GetMetricStatistics API.
+    """
     now = datetime.now(timezone.utc)
     start = now - timedelta(days=days)
-    period = days * 86400
     try:
         resp = cw.get_metric_statistics(
             Namespace="AWS/SageMaker",
@@ -54,7 +68,7 @@ def _get_cloudwatch_invocations_sum(cw: Any, endpoint_name: str, days: int = IDL
             Dimensions=[{"Name": "EndpointName", "Value": endpoint_name}],
             StartTime=start,
             EndTime=now,
-            Period=period,
+            Period=_CW_PERIOD_1D,
             Statistics=["Sum"],
         )
         dps = resp.get("Datapoints", [])
@@ -135,11 +149,10 @@ def _check_idle_endpoints(
                     if variants:
                         instance_type = variants[0].get("InstanceType", "unknown")
 
+            # PricingEngine returns region-correct prices already; do not
+            # re-multiply by pricing_multiplier (would double-count).
+            _ = pricing_multiplier
             instance_monthly = _get_instance_monthly(ctx, instance_type)
-            if instance_monthly == 0.0:
-                monthly_savings = 0.0
-            else:
-                monthly_savings = instance_monthly * pricing_multiplier
 
             recs.append(
                 {
@@ -148,7 +161,7 @@ def _check_idle_endpoints(
                     "check_category": "Idle Endpoints",
                     "current_value": f"Endpoint '{name}' ({instance_type}) has 0 invocations in {IDLE_ENDPOINT_DAYS} days",
                     "recommended_value": "Delete endpoint or reduce instance count",
-                    "monthly_savings": round(monthly_savings, 2),
+                    "monthly_savings": round(instance_monthly, 2),
                     "reason": f"SageMaker endpoint '{name}' is active but received zero invocations "
                     f"in the last {IDLE_ENDPOINT_DAYS} days",
                 }
@@ -178,16 +191,13 @@ def _check_idle_notebooks(
     except Exception:
         return recs, 0
 
+    _ = pricing_multiplier  # PricingEngine values are already region-correct.
     for nb in notebooks:
         try:
             name = nb.get("NotebookInstanceName", "")
             instance_type = nb.get("InstanceType", "unknown")
 
             instance_monthly = _get_instance_monthly(ctx, instance_type)
-            if instance_monthly == 0.0:
-                monthly_savings = 0.0
-            else:
-                monthly_savings = instance_monthly * pricing_multiplier
 
             recs.append(
                 {
@@ -196,7 +206,7 @@ def _check_idle_notebooks(
                     "check_category": "Idle Notebooks",
                     "current_value": f"Notebook '{name}' ({instance_type}) is running",
                     "recommended_value": "Stop or delete idle notebook instance",
-                    "monthly_savings": round(monthly_savings, 2),
+                    "monthly_savings": round(instance_monthly, 2),
                     "reason": f"SageMaker notebook '{name}' ({instance_type}) is running; "
                     f"consider stopping if not actively in use",
                 }
@@ -265,7 +275,10 @@ def _check_spot_training(
             hourly_rate = instance_monthly / HOURS_PER_MONTH
             training_hours = training_time / 3600.0
             on_demand_cost = hourly_rate * training_hours
-            savings = on_demand_cost * SPOT_SAVINGS_RATE * pricing_multiplier
+            # `hourly_rate` derives from PricingEngine (region-correct);
+            # do NOT apply pricing_multiplier here.
+            _ = pricing_multiplier
+            savings = on_demand_cost * SPOT_SAVINGS_RATE
 
             if savings < 0.50:
                 continue
@@ -331,7 +344,9 @@ def _check_multi_model_consolidation(
             continue
 
         endpoint_names = [g["name"] for g in group]
-        savings = (len(group) - 1) * instance_monthly * CONSOLIDATION_SAVINGS_RATE * pricing_multiplier
+        # PricingEngine returns region-correct value; do not re-multiply.
+        _ = pricing_multiplier
+        savings = (len(group) - 1) * instance_monthly * CONSOLIDATION_SAVINGS_RATE
 
         recs.append(
             {

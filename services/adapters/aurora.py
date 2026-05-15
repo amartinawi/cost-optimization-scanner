@@ -24,6 +24,13 @@ HOURS_PER_MONTH: int = 730
 
 
 def _get_acu_hourly(ctx: Any) -> float:
+    """Return the per-ACU hourly price already region-correct.
+
+    Live PricingEngine returns a region-priced value (no multiplier needed).
+    Fallback applies ctx.pricing_multiplier internally so the caller can
+    treat the return value uniformly without per-source casing. Callers
+    MUST NOT re-multiply by ctx.pricing_multiplier downstream.
+    """
     try:
         price = ctx.pricing_engine.get_aurora_acu_hourly()
         if price and price > 0:
@@ -49,12 +56,20 @@ def _describe_aurora_clusters(rds: Any) -> list[dict[str, Any]]:
     return clusters
 
 
+_CW_PERIOD_1D: int = 86400  # AWS CloudWatch max Period for ≤15-day queries.
+
+
 def _get_cloudwatch_avg(
     cw: Any, namespace: str, metric: str, dimensions: list[dict[str, str]], days: int = 14
 ) -> float | None:
+    """Average of a CW metric over the lookback window.
+
+    Uses Period=86400 (1 day) — the CloudWatch maximum — and averages
+    the per-day datapoints. Larger Period values are silently rejected
+    by the GetMetricStatistics API.
+    """
     now = datetime.now(timezone.utc)
     start = now - timedelta(days=days)
-    period = days * 86400
     try:
         resp = cw.get_metric_statistics(
             Namespace=namespace,
@@ -62,7 +77,7 @@ def _get_cloudwatch_avg(
             Dimensions=dimensions,
             StartTime=start,
             EndTime=now,
-            Period=period,
+            Period=_CW_PERIOD_1D,
             Statistics=["Average"],
         )
         dps = resp.get("Datapoints", [])
@@ -76,9 +91,13 @@ def _get_cloudwatch_avg(
 def _get_cloudwatch_sum(
     cw: Any, namespace: str, metric: str, dimensions: list[dict[str, str]], days: int = 14
 ) -> float | None:
+    """Sum of a CW metric over the lookback window.
+
+    Uses Period=86400 (1 day) — the CloudWatch maximum — and sums the
+    per-day datapoints to produce a total over the requested window.
+    """
     now = datetime.now(timezone.utc)
     start = now - timedelta(days=days)
-    period = days * 86400
     try:
         resp = cw.get_metric_statistics(
             Namespace=namespace,
@@ -86,7 +105,7 @@ def _get_cloudwatch_sum(
             Dimensions=dimensions,
             StartTime=start,
             EndTime=now,
-            Period=period,
+            Period=_CW_PERIOD_1D,
             Statistics=["Sum"],
         )
         dps = resp.get("Datapoints", [])
@@ -126,7 +145,11 @@ def _check_serverless_v2(
 
     waste_ratio = max(0.0, 1.0 - (avg_util / 100.0)) if max_acu > 0 else 0.0
     wasted_acu = max_acu * waste_ratio
-    monthly_savings = wasted_acu * acu_hourly * HOURS_PER_MONTH * pricing_multiplier
+    # `acu_hourly` from `_get_acu_hourly` is already region-correct (live
+    # path returns AWS Pricing API value; fallback path applies the
+    # multiplier internally). MUST NOT re-multiply by pricing_multiplier.
+    _ = pricing_multiplier  # explicit: not applied here, see helper docstring.
+    monthly_savings = wasted_acu * acu_hourly * HOURS_PER_MONTH
 
     if monthly_savings > 1.0:
         recs.append(

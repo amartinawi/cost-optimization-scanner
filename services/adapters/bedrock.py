@@ -27,6 +27,7 @@ KB_OCU_HOURLY: float = 0.20
 HOURS_PER_MONTH: int = 730
 CW_NAMESPACE: str = "AWS/Bedrock"
 CW_LOOKBACK_DAYS: int = 30
+CW_PERIOD_1D: int = 86400  # AWS CloudWatch max Period for ≤15-day queries.
 
 
 def _empty_findings() -> ServiceFindings:
@@ -56,9 +57,13 @@ def _list_provisioned_throughputs(bedrock: Any) -> list[dict[str, Any]]:
 
 
 def _get_pt_invocation_sum(cw: Any, model_id: str) -> float | None:
+    """Total invocations of a PT'd model over the lookback window.
+
+    Uses Period=86400 (the CW max for queries ≤15 days); aggregates the
+    per-day Sum datapoints. Larger Period values silently fail.
+    """
     now = datetime.now(timezone.utc)
     start = now - timedelta(days=CW_LOOKBACK_DAYS)
-    period = CW_LOOKBACK_DAYS * 86400
     try:
         resp = cw.get_metric_statistics(
             Namespace=CW_NAMESPACE,
@@ -66,7 +71,7 @@ def _get_pt_invocation_sum(cw: Any, model_id: str) -> float | None:
             Dimensions=[{"Name": "ModelId", "Value": model_id}],
             StartTime=start,
             EndTime=now,
-            Period=period,
+            Period=CW_PERIOD_1D,
             Statistics=["Sum"],
         )
         dps = resp.get("Datapoints", [])
@@ -78,9 +83,12 @@ def _get_pt_invocation_sum(cw: Any, model_id: str) -> float | None:
 
 
 def _get_pt_token_counts(cw: Any, model_id: str) -> tuple[float | None, float | None]:
+    """Total InputTokenCount / OutputTokenCount over the lookback window.
+
+    Same Period=86400 constraint as ``_get_pt_invocation_sum``.
+    """
     now = datetime.now(timezone.utc)
     start = now - timedelta(days=CW_LOOKBACK_DAYS)
-    period = CW_LOOKBACK_DAYS * 86400
     input_total: float | None = None
     output_total: float | None = None
     try:
@@ -90,7 +98,7 @@ def _get_pt_token_counts(cw: Any, model_id: str) -> tuple[float | None, float | 
             Dimensions=[{"Name": "ModelId", "Value": model_id}],
             StartTime=start,
             EndTime=now,
-            Period=period,
+            Period=CW_PERIOD_1D,
             Statistics=["Sum"],
         )
         dps_in = resp_in.get("Datapoints", [])
@@ -105,7 +113,7 @@ def _get_pt_token_counts(cw: Any, model_id: str) -> tuple[float | None, float | 
             Dimensions=[{"Name": "ModelId", "Value": model_id}],
             StartTime=start,
             EndTime=now,
-            Period=period,
+            Period=CW_PERIOD_1D,
             Statistics=["Sum"],
         )
         dps_out = resp_out.get("Datapoints", [])
@@ -207,6 +215,16 @@ def _check_pt_breakeven(
 
 
 def _check_idle_knowledge_bases(ctx: Any, pricing_multiplier: float) -> list[dict[str, Any]]:
+    """Surface Knowledge Bases for review.
+
+    Bedrock KB OCU pricing scales with actual query / ingestion activity,
+    not constant 730 hr/month. Without CW utilization data the adapter
+    cannot quantify savings, so each rec emits monthly_savings = 0.0 plus
+    a pricing_warning indicating what data is needed. This is honest:
+    previously every KB reported $146/mo idle which was fictitious for
+    actively-used KBs.
+    """
+    _ = pricing_multiplier  # No quantified savings emitted; multiplier unused.
     recs: list[dict[str, Any]] = []
     agent_client = None
     try:
@@ -233,21 +251,20 @@ def _check_idle_knowledge_bases(ctx: Any, pricing_multiplier: float) -> list[dic
         kb_id = kb.get("knowledgeBaseId", "unknown")
         kb_name = kb.get("name", kb_id)
         status = kb.get("status", "Unknown")
-        monthly_cost = KB_OCU_HOURLY * HOURS_PER_MONTH * pricing_multiplier
-        if monthly_cost > 1.0:
-            recs.append(
-                {
-                    "knowledge_base_id": kb_id,
-                    "knowledge_base_name": kb_name,
-                    "status": status,
-                    "check_category": "Knowledge Base",
-                    "current_value": f"KB '{kb_name}' active, ~${monthly_cost:.2f}/mo OCU cost",
-                    "recommended_value": "Review Knowledge Base usage and delete if unused",
-                    "monthly_savings": round(monthly_cost, 2),
-                    "reason": f"Knowledge Base '{kb_name}' may have idle OCU hours — "
-                    f"estimated ${monthly_cost:.2f}/mo if fully idle",
-                }
-            )
+        recs.append(
+            {
+                "knowledge_base_id": kb_id,
+                "knowledge_base_name": kb_name,
+                "status": status,
+                "check_category": "Knowledge Base",
+                "current_value": f"KB '{kb_name}' active",
+                "recommended_value": "Review query volume and delete if unused",
+                "monthly_savings": 0.0,
+                "pricing_warning": "requires KB query/ingest CW metrics for quantified savings",
+                "reason": f"Knowledge Base '{kb_name}' detected; verify utilization via "
+                f"CloudWatch query metrics before deleting",
+            }
+        )
 
     return recs
 
@@ -307,7 +324,7 @@ class BedrockModule(BaseServiceModule):
     reads_fast_mode: bool = True
 
     def required_clients(self) -> tuple[str, ...]:
-        return ("bedrock", "cloudwatch")
+        return ("bedrock", "bedrock-agent", "cloudwatch")
 
     def scan(self, ctx: Any) -> ServiceFindings:
         print("\U0001f50d [services/adapters/bedrock.py] Bedrock module active")
