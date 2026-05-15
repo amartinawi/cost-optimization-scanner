@@ -280,7 +280,12 @@ def get_efs_optimization_descriptions() -> dict[str, dict[str, str]]:
 def get_fsx_file_system_count(ctx: ScanContext) -> dict[str, Any]:
     try:
         fsx = ctx.client("fsx")
-        fs_response = fsx.describe_file_systems()
+        # Paginate to avoid silently dropping pages beyond the default ceiling.
+        fs_paginator = fsx.get_paginator("describe_file_systems")
+        _file_systems_pages: list[dict[str, Any]] = []
+        for _page in fs_paginator.paginate():
+            _file_systems_pages.append({"FileSystems": _page.get("FileSystems", [])})
+        fs_response = {"FileSystems": [fs for p in _file_systems_pages for fs in p["FileSystems"]]}
 
         cache_response = fsx.describe_file_caches()
 
@@ -376,7 +381,12 @@ def get_fsx_optimization_analysis(ctx: ScanContext, pricing_multiplier: float) -
     recommendations: list[dict[str, Any]] = []
     try:
         fsx = ctx.client("fsx")
-        fs_response = fsx.describe_file_systems()
+        # Paginate to avoid silently dropping pages beyond the default ceiling.
+        fs_paginator = fsx.get_paginator("describe_file_systems")
+        _file_systems_pages: list[dict[str, Any]] = []
+        for _page in fs_paginator.paginate():
+            _file_systems_pages.append({"FileSystems": _page.get("FileSystems", [])})
+        fs_response = {"FileSystems": [fs for p in _file_systems_pages for fs in p["FileSystems"]]}
 
         for fs in fs_response["FileSystems"]:
             fs_id = fs["FileSystemId"]

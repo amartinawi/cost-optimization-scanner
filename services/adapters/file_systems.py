@@ -15,6 +15,25 @@ from services.efs_fsx import (
     get_fsx_optimization_analysis,
 )
 
+# Per-opportunity savings factors (AWS-documented midpoints).
+# Lifecycle Standard→IA: $0.30→$0.025 ≈ 92% delta; conservative midpoint 0.50
+# applied to file systems WITH IA policy already enabled (the lifecycle delta
+# benefits files that age into IA). For NO-IA file systems the absolute
+# saving is larger but actual savings depend on access patterns.
+FS_SAVINGS_FACTORS: dict[str, float] = {
+    "lifecycle": 0.50,
+    "archive": 0.85,        # Standard→Archive delta ≈ 97%, midpoint 0.85
+    "one_zone": 0.47,       # AWS-documented 47% Regional→One Zone
+    "idle_efs": 1.00,
+    "throughput": 0.30,     # 20-50% Elastic Throughput midpoint
+    "fsx_rightsize": 0.30,
+    "fsx_intelligent_tiering": 0.40,
+    "fsx_dedup": 0.50,      # 30-80% Windows dedup midpoint
+    "fsx_single_az": 0.50,
+    "fsx_backup_retention": 0.30,
+    "default": 0.30,
+}
+
 
 class FileSystemsModule(BaseServiceModule):
     """ServiceModule adapter for file systems (EFS, FSx). Composite savings strategy."""
@@ -62,19 +81,32 @@ class FileSystemsModule(BaseServiceModule):
         enhanced_recs = enhanced_result.get("recommendations", [])
 
         savings = 0.0
+
+        # EFS lifecycle savings (file systems WITHOUT lifecycle policy).
+        # `EstimatedMonthlyCost` from the shim was computed with the shim's
+        # _estimate_efs_cost helper which already applies pricing_multiplier;
+        # do NOT re-multiply here.
         for rec in efs_recs:
             cost = rec.get("EstimatedMonthlyCost", 0)
             if ctx.pricing_engine is not None and cost == 0:
                 size_gb = rec.get("SizeGB", rec.get("StorageCapacity", 0))
                 if size_gb > 0:
+                    # PricingEngine returns region-correct $/GB; no multiplier.
                     price = ctx.pricing_engine.get_efs_monthly_price_per_gb()
                     cost = size_gb * price
-            savings += cost * 0.40
+            # Lifecycle saves the access-pattern-tiered delta; conservative
+            # midpoint factor applied per L2.3.x.
+            savings += cost * FS_SAVINGS_FACTORS["lifecycle"]
+
+        # FSx: `cost` from the shim's _estimate_fsx_cost is ALREADY multiplied
+        # by pricing_multiplier internally (services/efs_fsx.py:116). The
+        # previous adapter then multiplied again — double-application bug.
         for rec in fsx_recs:
             cost = rec.get("EstimatedMonthlyCost", 0)
-            if ctx.pricing_multiplier:
-                cost *= ctx.pricing_multiplier
-            savings += cost * 0.40
+            savings += cost * FS_SAVINGS_FACTORS["fsx_rightsize"]
+
+        # Enhanced checks now read a numeric field set by the shim if present;
+        # fall back to 0 if the rec is informational-only.
         for rec in enhanced_recs:
             savings += rec.get("EstimatedMonthlySavings", rec.get("monthly_savings", 0))
 
