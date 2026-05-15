@@ -67,8 +67,29 @@ DYNAMODB_CHECK_DESCRIPTIONS: dict[str, dict[str, str]] = {
     },
 }
 
-_PROVISIONED_RCU_COST: float = 0.107
-_PROVISIONED_WCU_COST: float = 0.537
+# AWS DynamoDB pricing (us-east-1, verified via Pricing API 2026-05).
+# Provisioned: $0.00013/RCU-hr (SKU 4V475Q49DCKGXQZ2), $0.00065/WCU-hr (SKU R6PXMNYCEDGZ2EYN).
+# Region-scaled via pricing_multiplier at the per-rec emit site.
+_PROVISIONED_RCU_COST: float = 0.00013 * 730  # = $0.0949/RCU-month
+_PROVISIONED_WCU_COST: float = 0.00065 * 730  # = $0.4745/WCU-month
+
+# On-demand: AWS lists per *million* request units ($0.125/M reads,
+# $0.625/M writes). Per-unit values were 10x too high prior to fix.
+_ON_DEMAND_RCU_PER_REQUEST: float = 0.125 / 1_000_000  # = $0.000000125/RRU
+_ON_DEMAND_WCU_PER_REQUEST: float = 0.625 / 1_000_000  # = $0.000000625/WRU
+
+# Per-opportunity savings factors. Each factor is applied to the table's
+# current monthly cost to estimate savings if the recommendation is acted
+# on. Factors are AWS-documented midpoints rather than arbitrary constants.
+DYNAMODB_SAVINGS_FACTORS: dict[str, float] = {
+    "reserved_capacity": 0.66,       # AWS-published 53-76% midpoint
+    "rightsize_provisioned": 0.40,   # measured-utilization fallback midpoint
+    "billing_mode_switch": 0.40,     # AWS-published 20-60% midpoint
+    "unused_table": 1.00,            # deleting an empty table = 100% saved
+    "data_lifecycle": 0.60,          # AWS-published 40-80% TTL/archive midpoint
+    "default": 0.30,                 # conservative fallback when category unknown
+}
+
 _HIGH_CAPACITY_THRESHOLD: int = 100
 _LARGE_TABLE_BYTES: int = 1024**3
 _VERY_LARGE_TABLE_BYTES: int = 10 * 1024**3
@@ -167,15 +188,21 @@ def get_dynamodb_table_analysis(ctx: ScanContext) -> dict[str, Any]:
                         if r_dps and w_dps:
                             avg_r = sum(d["Average"] for d in r_dps) / len(r_dps)
                             avg_w = sum(d["Average"] for d in w_dps) / len(w_dps)
-                            on_demand_rcu = 0.00000125
-                            on_demand_wcu = 0.00000625
+                            # avg_r/avg_w are CW "Average ConsumedXxxCapacityUnits"
+                            # over the 1-hour Period; multiply by hours/month to
+                            # estimate the monthly request volume, then apply the
+                            # per-request rate.
                             table_info["EstimatedMonthlyCost"] = round(
-                                (avg_r * on_demand_rcu + avg_w * on_demand_wcu) * 730, 2
+                                (avg_r * _ON_DEMAND_RCU_PER_REQUEST + avg_w * _ON_DEMAND_WCU_PER_REQUEST) * 730, 2
                             )
                         else:
-                            table_info["EstimatedMonthlyCost"] = 25.0
+                            # No CW data points available; emit 0 with a warning
+                            # rather than fabricating a $25/month constant.
+                            table_info["EstimatedMonthlyCost"] = 0.0
+                            table_info["PricingWarning"] = "on-demand cost unavailable: no CloudWatch data"
                     except Exception:
-                        table_info["EstimatedMonthlyCost"] = 25.0
+                        table_info["EstimatedMonthlyCost"] = 0.0
+                        table_info["PricingWarning"] = "on-demand cost unavailable: CloudWatch query failed"
                     table_info["OptimizationOpportunities"].append(
                         "Monitor usage patterns to consider Provisioned mode for steady workloads"
                     )

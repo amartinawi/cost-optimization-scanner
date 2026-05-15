@@ -731,7 +731,14 @@ def _render_s3_enhanced_checks(recommendations: List[Rec], source_name: str, ser
 
 
 def _render_dynamodb_enhanced_checks(recommendations: List[Rec], source_name: str, service_data: Dict) -> str:
-    """Renders DynamoDB recommendations grouped by billing optimisation. Called by: HTMLReportGenerator._get_detailed_recommendations."""
+    """Renders DynamoDB recommendations grouped by billing optimisation. Called by: HTMLReportGenerator._get_detailed_recommendations.
+
+    Dispatches on ``CheckCategory`` (canonical, set by the shim) with a
+    fallback to ``OptimizationOpportunities`` substring search for older
+    table-analysis recs that pre-date the structured category field. The
+    substring fallback is case-insensitive so it matches both legacy
+    "switch to..." and "Switch to..." emission shapes.
+    """
     grouped_dynamo = {
         "Provisioned to On-Demand": [],
         "On-Demand to Provisioned": [],
@@ -740,18 +747,33 @@ def _render_dynamodb_enhanced_checks(recommendations: List[Rec], source_name: st
         "Other Optimizations": [],
     }
 
+    # Canonical CheckCategory -> group mapping. Shim-emitted categories take
+    # precedence over substring matching on the opportunities list.
+    category_to_group = {
+        "DynamoDB Reserved Capacity": "Reserved Capacity",
+        "DynamoDB Over-Provisioned Capacity": "Provisioned to On-Demand",
+        "DynamoDB Billing Mode - Metric-Backed": "On-Demand to Provisioned",
+        "DynamoDB Monitoring Required": "Other Optimizations",
+        "DynamoDB CloudWatch Required": "Other Optimizations",
+        "DynamoDB Data Lifecycle": "Other Optimizations",
+        "Unused DynamoDB Tables": "Other Optimizations",
+    }
+
     for rec in recommendations:
         billing_mode = rec.get("BillingMode", "Unknown")
         opportunities = rec.get("OptimizationOpportunities", [])
         check_category = rec.get("CheckCategory", "")
+        opp_str = str(opportunities).lower()
 
-        if "Switch to On-Demand" in str(opportunities) or "On-Demand" in check_category:
+        if check_category in category_to_group:
+            grouped_dynamo[category_to_group[check_category]].append(rec)
+        elif "switch to on-demand" in opp_str or "consider on-demand" in opp_str:
             grouped_dynamo["Provisioned to On-Demand"].append(rec)
-        elif "Switch to Provisioned" in str(opportunities) or "Provisioned" in check_category:
+        elif "switch to provisioned" in opp_str or "consider provisioned" in opp_str:
             grouped_dynamo["On-Demand to Provisioned"].append(rec)
-        elif "Enable Auto Scaling" in str(opportunities) or "Auto Scaling" in check_category:
+        elif "enable auto scaling" in opp_str or "auto scaling" in opp_str:
             grouped_dynamo["Enable Auto Scaling"].append(rec)
-        elif "Reserved Capacity" in str(opportunities) or "Reserved" in check_category:
+        elif "reserved capacity" in opp_str:
             grouped_dynamo["Reserved Capacity"].append(rec)
         elif opportunities:
             grouped_dynamo["Other Optimizations"].append(rec)
