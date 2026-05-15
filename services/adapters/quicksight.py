@@ -36,16 +36,27 @@ class QuicksightModule(BaseServiceModule):
         result = get_enhanced_quicksight_checks(ctx)
         recs = result.get("recommendations", [])
 
-        QUICKSIGHT_SPICE_PER_GB = {"ENTERPRISE": 0.38, "STANDARD": 0.25}
+        # AWS QuickSight SPICE storage is $0.38/GB-month for BOTH Standard
+        # and Enterprise editions (verified via the QuickSight pricing page
+        # 2026-05). Previous code used $0.25 for Standard — wrong by 34%.
+        # Region-scaled via ctx.pricing_multiplier per L2.3.2.
+        SPICE_PRICE_PER_GB: float = 0.38
         savings = 0.0
         for rec in recs:
-            edition = rec.get("Edition", "ENTERPRISE")
-            spice_price = QUICKSIGHT_SPICE_PER_GB.get(edition, 0.38) * ctx.pricing_multiplier
+            spice_price = SPICE_PRICE_PER_GB * ctx.pricing_multiplier
             unused_gb = rec.get("UnusedSpiceCapacityGB", 0)
             if unused_gb > 0:
-                savings += unused_gb * spice_price
+                rec_savings = unused_gb * spice_price
+                rec["EstimatedMonthlySavings"] = round(rec_savings, 2)
+                savings += rec_savings
             else:
-                savings += 30.0 * ctx.pricing_multiplier
+                # No unused-capacity figure on the rec; skip rather than
+                # fabricate $30 fallback constant.
+                rec.setdefault("EstimatedMonthlySavings", 0.0)
+                rec.setdefault(
+                    "PricingWarning",
+                    "requires UnusedSpiceCapacityGB on rec for quantified savings",
+                )
 
         sources = {"enhanced_checks": SourceBlock(count=len(recs), recommendations=tuple(recs))}
 

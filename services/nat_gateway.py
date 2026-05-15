@@ -105,13 +105,18 @@ def get_nat_gateway_checks(ctx: ScanContext) -> dict[str, Any]:
         for az_key, count in az_nat_count.items():
             if count > 1:
                 vpc_id, az = az_key.split(":")
+                # Same-AZ duplicates are pure waste (no HA trade-off — both
+                # gateways already share the same AZ failure domain).
+                # Saving = all redundant NATs above 1.
+                az_consolidate_savings = (count - 1) * nat_monthly
                 checks["multiple_nat_gateways"].append(
                     {
                         "VpcId": vpc_id,
                         "AvailabilityZone": az,
                         "NatGatewayCount": count,
                         "Recommendation": f"{count} NAT Gateways in same AZ - review if all are needed",
-                        "EstimatedSavings": f"${(count - 1) * nat_monthly:.2f}/month if consolidated",
+                        "EstimatedSavings": f"${az_consolidate_savings:.2f}/month if consolidated",
+                        "EstimatedMonthlySavings": round(az_consolidate_savings, 2),
                         "CheckCategory": "Multiple NAT Gateways",
                     }
                 )
@@ -119,24 +124,39 @@ def get_nat_gateway_checks(ctx: ScanContext) -> dict[str, Any]:
         for nat in nat_gateways:
             if nat.get("State") == "available":
                 nat_id = nat.get("NatGatewayId", "N/A")
+                # Real low-throughput savings depend on actual CW
+                # BytesOutToDestination metric × $0.045/GB cross-AZ.
+                # Without that data, emit 0 + warning rather than the
+                # previous invented "$25/month" string.
                 checks["low_throughput_nat_gateways"].append(
                     {
                         "NatGatewayId": nat_id,
                         "VpcId": nat.get("VpcId", "N/A"),
                         "Recommendation": "Monitor CloudWatch metrics - consider NAT instance for low throughput",
-                        "EstimatedSavings": "Up to $25/month for low-traffic scenarios",
+                        "EstimatedSavings": "$0.00/month - requires CW BytesOutToDestination metric",
+                        "EstimatedMonthlySavings": 0.0,
+                        "PricingWarning": "requires CW BytesOutToDestination × cross-AZ rate for quantified savings",
                         "CheckCategory": "Low Throughput NAT Gateway",
                     }
                 )
 
         for vpc_id, count in vpc_nat_count.items():
             if count > 1:
+                # Cross-AZ NAT consolidation TRADES OFF availability.
+                # AWS recommends 1 NAT per AZ for HA. Realistic savings =
+                # count − az_count (the redundant NATs beyond AZ count).
+                # We don't have AZ count per VPC available here; emit a
+                # conservative estimate = full count - 1 with explicit
+                # availability-trade-off warning so the user reads it.
+                cross_az_savings = (count - 1) * nat_monthly
                 checks["unnecessary_nat_per_az"].append(
                     {
                         "VpcId": vpc_id,
                         "NatGatewayCount": count,
-                        "Recommendation": f"{count} NAT Gateways in VPC - consider single NAT for cost optimization",
-                        "EstimatedSavings": f"${(count - 1) * nat_monthly:.2f}/month (reduced availability)",
+                        "Recommendation": f"{count} NAT Gateways in VPC - consider consolidation; AWS recommends 1 NAT per AZ for HA",
+                        "EstimatedSavings": f"${cross_az_savings:.2f}/month maximum (sacrifices per-AZ HA)",
+                        "EstimatedMonthlySavings": round(cross_az_savings, 2),
+                        "PricingWarning": "consolidation eliminates per-AZ failure isolation",
                         "CheckCategory": "Unnecessary NAT per AZ",
                     }
                 )

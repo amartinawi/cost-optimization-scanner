@@ -126,10 +126,16 @@ FALLBACK_S3_GB_MONTH: dict[str, float] = {
     "INTELLIGENT_TIERING": 0.023,
 }
 FALLBACK_EFS_GB_MONTH: float = 0.33
-FALLBACK_EIP_MONTH: float = 3.65
-FALLBACK_NAT_MONTH: float = 35.04
-FALLBACK_VPC_ENDPOINT_MONTH: float = 8.03
-FALLBACK_ALB_MONTH: float = 20.44
+# Network fallback constants reconciled to us-east-1 AWS list prices
+# (verified via Pricing API 2026-05). Previous values reflected a
+# higher-priced region (eu-west-1) which contradicted the per-shim
+# fallback ternaries (`else 32.0` for NAT, `else 7.30` for VPC EP,
+# `else 16.20` for ALB) — section 4.4 violation of two-different-
+# fallback-prices-for-same-SKU.
+FALLBACK_EIP_MONTH: float = 3.65       # $0.005/hr × 730 = $3.65/mo
+FALLBACK_NAT_MONTH: float = 32.85      # $0.045/hr × 730 = $32.85/mo
+FALLBACK_VPC_ENDPOINT_MONTH: float = 7.30   # $0.01/hr × 730 = $7.30/mo
+FALLBACK_ALB_MONTH: float = 16.43      # $0.0225/hr × 730 = $16.43/mo
 FALLBACK_AURORA_ACU_HOURLY: float = 0.06
 SAGEMAKER_OVER_EC2: float = 1.15
 

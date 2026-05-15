@@ -73,8 +73,9 @@ def get_enhanced_quicksight_checks(ctx: ScanContext) -> dict[str, Any]:
                                 " GB) - consider reducing"
                             ),
                             "EstimatedSavings": (
-                                f"~${(total_capacity - used_capacity) * 0.25:.0f}"
-                                "/month (estimate - verify SPICE pricing)"
+                                # AWS lists SPICE at $0.38/GB-mo for BOTH Standard
+                                # and Enterprise editions.
+                                f"~${(total_capacity - used_capacity) * 0.38:.0f}/month"
                             ),
                             "CheckCategory": "SPICE Optimization",
                         }

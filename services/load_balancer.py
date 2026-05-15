@@ -51,9 +51,14 @@ def _is_kubernetes_managed_alb(elbv2: Any, lb_name: str, lb_arn: str) -> bool:
 
 
 def get_load_balancer_checks(ctx: ScanContext) -> dict[str, Any]:
-    alb_monthly = ctx.pricing_engine.get_alb_monthly_price() if ctx.pricing_engine is not None else 16.20
-    nlb_monthly = alb_monthly * 1.4
     """Category 4: Load Balancers optimization checks"""
+    # ALB base hourly is $0.0225 (us-east-1). NLB base hourly is also $0.0225
+    # — the price differences live in LCU vs NLCU consumption rates, not the
+    # base. The previous 1.4× ratio was invented; for the NLB→ALB savings
+    # rec we can only honestly emit 0 + warning until per-LB CW metrics
+    # (LCU/NLCU consumption) are wired through.
+    alb_monthly = ctx.pricing_engine.get_alb_monthly_price() if ctx.pricing_engine is not None else 16.20
+    nlb_monthly = alb_monthly  # Same base; LCU/NLCU diff requires traffic data.
     checks: dict[str, list[dict[str, Any]]] = {
         "zero_traffic_albs": [],
         "single_service_albs": [],
@@ -107,12 +112,17 @@ def get_load_balancer_checks(ctx: ScanContext) -> dict[str, Any]:
             # ("verify if should be internal scheme"); cost saving is speculative.
 
             if lb_type == "network":
+                # Base hourly is identical between ALB and NLB; cost delta
+                # depends on LCU vs NLCU consumption (traffic-driven). The
+                # rec is informational until those metrics are wired.
                 checks["nlb_vs_alb"].append(
                     {
                         "LoadBalancerName": lb_name,
                         "Type": lb_type,
-                        "Recommendation": "Review if ALB can handle your traffic patterns (HTTP/HTTPS only) - ALB is typically cheaper",
-                        "EstimatedSavings": f"Estimated ${nlb_monthly - alb_monthly:.2f}/month savings (NLB: ${nlb_monthly:.2f} vs ALB: ${alb_monthly:.2f})",
+                        "Recommendation": "Review if ALB can handle your traffic patterns (HTTP/HTTPS only) - LCU/NLCU consumption drives the actual cost delta",
+                        "EstimatedSavings": "$0.00/month - requires CW LCU/NLCU consumption metrics",
+                        "EstimatedMonthlySavings": 0.0,
+                        "PricingWarning": "ALB/NLB base hourly is identical; LCU vs NLCU traffic data needed",
                         "Action": "1. Verify if you need Layer 4 load balancing\n2. Check if traffic is HTTP/HTTPS only\n3. Consider ALB if Layer 7 features sufficient\n4. Keep NLB if you need TCP/UDP or extreme performance",
                         "CheckCategory": "NLB vs ALB Cost Optimization",
                     }
