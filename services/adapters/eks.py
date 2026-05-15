@@ -24,7 +24,9 @@ FARGATE_MEM_GB_HOURLY: float = 0.004445
 HOURS_PER_MONTH: int = 730
 
 PREV_GEN_PREFIXES: tuple[str, ...] = ("m3.", "m4.", "c3.", "c4.", "r3.", "r4.", "t2.")
-GRAVITON_SAVINGS_FACTOR: float = 0.30
+# AWS Graviton EC2 list-price delta vs x86 (m5→m6g, c5→c6g, etc.) ≈ 20%.
+# Previously used 0.30 which exceeds the AWS-published price delta.
+GRAVITON_SAVINGS_FACTOR: float = 0.20
 SPOT_SAVINGS_FACTOR: float = 0.70
 
 
@@ -276,7 +278,7 @@ class EksCostModule(BaseServiceModule):
         self,
         eks: Any,
         cluster_name: str,
-        multiplier: float,
+        multiplier: float,  # noqa: ARG002 - reserved for future EC2 price math
     ) -> tuple[list[dict[str, Any]], int]:
         """Analyze node groups for instance type and scaling optimization.
 
@@ -319,26 +321,42 @@ class EksCostModule(BaseServiceModule):
 
                 has_prev_gen = any(any(it.startswith(prefix) for prefix in PREV_GEN_PREFIXES) for it in instance_types)
                 if has_prev_gen:
+                    # Graviton savings derive from the EC2 instance price ×
+                    # desired node count × 20% list-price delta — NOT from
+                    # the EKS control-plane fee. The previous formula
+                    # ($0.10/hr × 730 × 2 × 0.30 = $43.80 flat) had no
+                    # relation to the actual node-group cost. Without
+                    # EC2 instance-price + count data wired through, we
+                    # cannot quantify honestly — emit 0 + PricingWarning
+                    # so the rec still surfaces for review.
                     recs.append(
                         {
                             "resource_id": resource_id,
                             "check_type": "node_group",
                             "check_category": "Node Group Optimization",
                             "current_value": f"Previous-gen instance types: {instance_types}",
-                            "recommended_value": "Migrate to Graviton (ARM) instances for ~30% cost savings",
-                            "monthly_savings": round(
-                                EKS_CONTROL_PLANE_HOURLY * HOURS_PER_MONTH * 2 * GRAVITON_SAVINGS_FACTOR * multiplier,
-                                2,
+                            "recommended_value": f"Migrate to Graviton (ARM) instances for ~{int(GRAVITON_SAVINGS_FACTOR * 100)}% cost savings",
+                            "monthly_savings": 0.0,
+                            "pricing_warning": (
+                                "requires EC2 instance price × desired node count "
+                                "for quantified savings"
                             ),
                             "severity": "MEDIUM",
                             "reason": f"Node group '{ng_name}' uses previous-generation instance types; "
-                            f"Graviton migration offers ~30% cost reduction with better performance",
+                            f"Graviton list-price delta is ~{int(GRAVITON_SAVINGS_FACTOR * 100)}%",
                         }
                     )
 
                 # Under-utilized scaling config finding removed: $0/month, "consider
                 # right-sizing or enabling autoscaling" without quantified cost delta.
 
+                # Spot savings = (EC2 instance hourly × node count × 730 × 0.70).
+                # Same constraint as the Graviton path: without the EC2
+                # instance price + desired-node-count multiplication, we
+                # cannot quantify honestly. Emit 0 + PricingWarning rather
+                # than the previous control-plane-cost-based formula
+                # which under-reports by 20-680x depending on real
+                # node group size.
                 recs.append(
                     {
                         "resource_id": resource_id,
@@ -346,9 +364,10 @@ class EksCostModule(BaseServiceModule):
                         "check_category": "Node Group Optimization",
                         "current_value": f"On-Demand node group with types: {instance_types}",
                         "recommended_value": "Use Spot instances for non-critical workloads (60-90% savings)",
-                        "monthly_savings": round(
-                            EKS_CONTROL_PLANE_HOURLY * HOURS_PER_MONTH * SPOT_SAVINGS_FACTOR * multiplier,
-                            2,
+                        "monthly_savings": 0.0,
+                        "pricing_warning": (
+                            "requires EC2 instance price × desired node count "
+                            "for quantified savings"
                         ),
                         "severity": "LOW",
                         "reason": f"Node group '{ng_name}' uses On-Demand instances; "

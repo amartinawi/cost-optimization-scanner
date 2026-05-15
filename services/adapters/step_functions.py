@@ -8,8 +8,6 @@ from core.contracts import ServiceFindings, SourceBlock
 from services._base import BaseServiceModule
 from services.step_functions import STEP_FUNCTIONS_OPTIMIZATION_DESCRIPTIONS, get_enhanced_step_functions_checks
 
-STEP_FUNCTIONS_IDLE_MONTHLY_FALLBACK: float = 150.0
-
 
 class StepFunctionsModule(BaseServiceModule):
     """ServiceModule adapter for Step Functions. CloudWatch state-transition savings strategy."""
@@ -18,10 +16,12 @@ class StepFunctionsModule(BaseServiceModule):
     cli_aliases: tuple[str, ...] = ("step_functions",)
     display_name: str = "Step Functions"
     reads_fast_mode: bool = True
+    # Adapter consults CloudWatch for ExecutionsStarted metric per state machine.
+    requires_cloudwatch: bool = True
 
     def required_clients(self) -> tuple[str, ...]:
         """Returns boto3 client names required for Step Functions scanning."""
-        return ("states",)
+        return ("states", "cloudwatch")
 
     def scan(self, ctx: Any) -> ServiceFindings:
         """Scan Step Functions state machines for cost optimization opportunities.
@@ -78,16 +78,23 @@ class StepFunctionsModule(BaseServiceModule):
                 if monthly_executions > 0:
                     monthly_transitions = monthly_executions * AVG_STATES_PER_EXECUTION
                     if eligible_for_migration:
+                        # Standard→Express savings approximated as 60% of
+                        # Standard transition cost. Express has a different
+                        # pricing model ($1/M requests + GB-s duration), but
+                        # the 60% midpoint is a documented upper-bound for
+                        # short workflows. NOTE: real savings can be 95%+ for
+                        # short executions or negative for long ones; this
+                        # rec is conservative.
                         savings += (
                             (monthly_transitions / 1000)
                             * STEP_FUNCTIONS_PER_1K_TRANSITIONS
                             * 0.60
                             * ctx.pricing_multiplier
                         )
-                else:
-                    savings += STEP_FUNCTIONS_IDLE_MONTHLY_FALLBACK * ctx.pricing_multiplier
-            else:
-                savings += STEP_FUNCTIONS_IDLE_MONTHLY_FALLBACK * ctx.pricing_multiplier
+                # Idle state machines incur NO AWS charges (Step Functions
+                # bills only per state transition for Standard, per
+                # request+duration for Express). Previous $150 fabricated
+                # fallback removed — emitting 0 is the only honest value.
 
         return ServiceFindings(
             service_name="Step Functions",
