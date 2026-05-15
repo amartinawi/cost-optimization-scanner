@@ -15,7 +15,9 @@ class ElasticacheModule(BaseServiceModule):
     key: str = "elasticache"
     cli_aliases: tuple[str, ...] = ("elasticache",)
     display_name: str = "ElastiCache"
-    reads_fast_mode: bool = True
+    # Shim hits cloudwatch.get_metric_statistics for CPU-utilization
+    # analysis of underutilized clusters.
+    requires_cloudwatch: bool = True
 
     def required_clients(self) -> tuple[str, ...]:
         """Returns boto3 client names required for ElastiCache scanning."""
@@ -56,8 +58,10 @@ class ElasticacheModule(BaseServiceModule):
             num_nodes = rec.get("NumNodes", 1)
 
             if ctx.pricing_engine is not None and node_type:
+                # PricingEngine returns region-correct $/month already;
+                # do NOT re-multiply by ctx.pricing_multiplier (L2.3.1).
                 monthly = ctx.pricing_engine.get_instance_monthly_price("AmazonElastiCache", node_type)
-                savings += monthly * num_nodes * ri_rate * ctx.pricing_multiplier
+                savings += monthly * num_nodes * ri_rate
             else:
                 if "Reserved" in est:
                     savings += 60 * ctx.pricing_multiplier

@@ -40,12 +40,15 @@ class DmsModule(BaseServiceModule):
         for rec in recs:
             instance_class = rec.get("InstanceClass", "")
             if ctx.pricing_engine is not None and instance_class:
+                # PricingEngine returns region-correct $/month; do NOT
+                # re-multiply by ctx.pricing_multiplier (L2.3.1).
                 monthly = ctx.pricing_engine.get_instance_monthly_price(
                     "AWSDatabaseMigrationSvc", instance_class.replace("dms.", "")
                 )
-                savings += monthly * 0.35 * ctx.pricing_multiplier
-            else:
-                savings += 50 * ctx.pricing_multiplier
+                if monthly > 0:
+                    savings += monthly * 0.35
+                # else: pricing API miss; skip rather than fabricate $50 fallback.
+            # else: instance_class unknown; skip rather than fabricate $50 fallback.
 
         multi_az_recs: list[dict[str, Any]] = []
         for rec in recs:
@@ -58,17 +61,36 @@ class DmsModule(BaseServiceModule):
                     kw in name.lower() or kw in tag_values for kw in ("dev", "test", "staging", "sandbox", "nonprod")
                 )
                 if is_non_prod:
+                    # Multi-AZ DMS doubles the instance hourly rate. Switching
+                    # to Single-AZ saves 50% of the actual instance cost — use
+                    # the live price for this class rather than a flat $50.
+                    az_savings = 0.0
+                    az_warning = None
+                    if ctx.pricing_engine and instance_class != "unknown":
+                        monthly = ctx.pricing_engine.get_instance_monthly_price(
+                            "AWSDatabaseMigrationSvc", instance_class.replace("dms.", "")
+                        )
+                        if monthly > 0:
+                            az_savings = monthly * 0.5
+                    if az_savings == 0.0:
+                        az_warning = "instance class pricing unavailable"
                     multi_az_recs.append(
                         {
                             "Resource": name,
                             "InstanceClass": instance_class,
                             "MultiAZ": True,
                             "Recommendation": "Switch Multi-AZ DMS instance to Single-AZ for dev/test",
-                            "EstimatedSavings": "~50% of instance cost (Multi-AZ doubles the price)",
+                            "EstimatedSavings": (
+                                f"${az_savings:.2f}/month (50% of instance cost)"
+                                if az_savings > 0
+                                else "~50% of instance cost (Multi-AZ doubles the price)"
+                            ),
+                            "EstimatedMonthlySavings": round(az_savings, 2),
+                            **({"PricingWarning": az_warning} if az_warning else {}),
                             "CheckCategory": "DMS Multi-AZ in Non-Prod",
                         }
                     )
-        savings += len(multi_az_recs) * 50 * ctx.pricing_multiplier
+                    savings += az_savings
 
         checks = result.get("checks", {})
         sources = {k: SourceBlock(count=len(v), recommendations=tuple(v)) for k, v in checks.items()}

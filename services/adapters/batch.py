@@ -46,7 +46,8 @@ class BatchModule(BaseServiceModule):
             if "Fargate Spot" in category:
                 rate = 0.70
             elif "Graviton" in category:
-                rate = 0.10
+                # AWS Graviton list-price delta x86→arm is ~20%.
+                rate = 0.20
             elif "Spot" in category:
                 rate = 0.70
             else:
@@ -54,11 +55,15 @@ class BatchModule(BaseServiceModule):
 
             instance_types = rec.get("InstanceTypes", [])
             if ctx.pricing_engine is not None and instance_types:
+                # get_ec2_hourly_price returns region-correct $/hr; do NOT
+                # re-multiply by ctx.pricing_multiplier (L2.3.1).
                 hourly = ctx.pricing_engine.get_ec2_hourly_price(instance_types[0])
                 monthly = hourly * 730
-                savings += monthly * rate * multiplier
-            else:
-                savings += BATCH_COMPUTE_FALLBACK_MONTHLY * rate * multiplier
+                savings += monthly * rate
+            # else: instance_types unknown; skip rather than fabricate
+            # $150 fallback (was over/under-stated 1.5-36x depending on
+            # actual instance type).
+        _ = multiplier  # documented; live path is region-correct already.
 
         sources = {"enhanced_checks": SourceBlock(count=len(recs), recommendations=tuple(recs))}
 

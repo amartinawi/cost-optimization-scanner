@@ -8,6 +8,12 @@ from core.contracts import ServiceFindings, SourceBlock
 from services._base import BaseServiceModule
 from services.opensearch import OPENSEARCH_OPTIMIZATION_DESCRIPTIONS, get_enhanced_opensearch_checks
 
+# OpenSearch-managed gp3 EBS storage rate ($/GB-month, us-east-1 baseline).
+# Region-scaled via pricing_multiplier at the per-rec emit site.
+GP3_PRICE_PER_GB_MONTH: float = 0.11
+# Conservative midpoint of cold-tier / UltraWarm storage savings vs gp3.
+STORAGE_SAVINGS_FACTOR: float = 0.20
+
 
 class OpensearchModule(BaseServiceModule):
     """ServiceModule adapter for OpenSearch. Keyword-rate savings strategy."""
@@ -15,7 +21,6 @@ class OpensearchModule(BaseServiceModule):
     key: str = "opensearch"
     cli_aliases: tuple[str, ...] = ("opensearch",)
     display_name: str = "OpenSearch"
-    reads_fast_mode: bool = True
 
     def required_clients(self) -> tuple[str, ...]:
         """Returns boto3 client names required for OpenSearch scanning."""
@@ -37,8 +42,6 @@ class OpensearchModule(BaseServiceModule):
         result = get_enhanced_opensearch_checks(ctx)
         recs = result.get("recommendations", [])
 
-        GP3_PRICE_PER_GB_MONTH = 0.11
-
         savings = 0.0
         for rec in recs:
             est = rec.get("EstimatedSavings", "")
@@ -55,8 +58,10 @@ class OpensearchModule(BaseServiceModule):
             instance_count = rec.get("InstanceCount", 1)
 
             if ctx.pricing_engine is not None and instance_type:
+                # PricingEngine returns region-correct $/month; do NOT
+                # re-multiply by ctx.pricing_multiplier (L2.3.1).
                 monthly = ctx.pricing_engine.get_instance_monthly_price("AmazonES", instance_type)
-                savings += monthly * instance_count * ri_rate * ctx.pricing_multiplier
+                savings += monthly * instance_count * ri_rate
             else:
                 if "Reserved" in est:
                     savings += 300 * ctx.pricing_multiplier
@@ -67,8 +72,11 @@ class OpensearchModule(BaseServiceModule):
 
             ebs_volume_size = rec.get("EBSVolumeSize", 0)
             if ebs_volume_size > 0:
-                storage_monthly = ebs_volume_size * GP3_PRICE_PER_GB_MONTH
-                savings += storage_monthly * ri_rate * ctx.pricing_multiplier
+                # gp3 rate is module-const → apply pricing_multiplier (L2.3.2).
+                # Storage savings are NOT a function of instance ri_rate
+                # (reserved capacity doesn't discount storage).
+                storage_monthly = ebs_volume_size * GP3_PRICE_PER_GB_MONTH * ctx.pricing_multiplier
+                savings += storage_monthly * STORAGE_SAVINGS_FACTOR
 
         return ServiceFindings(
             service_name="OpenSearch",

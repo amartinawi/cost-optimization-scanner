@@ -43,16 +43,18 @@ class MskModule(BaseServiceModule):
                 instance_type = rec.get("InstanceType")
                 num_brokers = rec.get("NumberOfBrokerNodes", 3)
                 if instance_type:
+                    # Broker price from PricingEngine is region-correct
+                    # already; storage rate is a module-const so it needs
+                    # the multiplier applied independently.
                     hourly = ctx.pricing_engine.get_msk_broker_hourly_price(instance_type)
-                    monthly_cluster = hourly * 730 * num_brokers
+                    broker_monthly = hourly * 730 * num_brokers
                     volume_size = rec.get("BrokerStorageGB", 100)
-                    storage_monthly = volume_size * 0.10 * num_brokers
-                    monthly_cluster += storage_monthly
-                    savings += monthly_cluster * 0.30 * ctx.pricing_multiplier
-                else:
-                    savings += 150.0 * ctx.pricing_multiplier
-        else:
-            savings = 150.0 * len(recs) * ctx.pricing_multiplier
+                    storage_monthly = (
+                        volume_size * 0.10 * num_brokers * ctx.pricing_multiplier
+                    )
+                    savings += (broker_monthly + storage_monthly) * 0.30
+                # else: instance_type unknown; skip rather than fabricate $150.
+        # else: pricing engine unavailable; cannot quantify — emit 0 (no recs).
 
         sources = {"enhanced_checks": SourceBlock(count=len(recs), recommendations=tuple(recs))}
 
