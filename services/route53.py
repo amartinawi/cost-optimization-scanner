@@ -12,6 +12,34 @@ from core.scan_context import ScanContext
 
 print("🔍 [services/route53.py] Route53 module active")
 
+# Route 53 hosted zone pricing (us-east-1 / global):
+#   First 25 hosted zones:  $0.50/zone/month
+#   Each additional zone:   $0.10/zone/month
+# Source: https://aws.amazon.com/route53/pricing/
+ROUTE53_HOSTED_ZONE_TIER_1: float = 0.50
+ROUTE53_HOSTED_ZONE_TIER_2: float = 0.10
+ROUTE53_HOSTED_ZONE_TIER_1_LIMIT: int = 25
+
+
+def _route53_zone_monthly_cost(extra_zones: int, *, base_zones_in_account: int = 0) -> float:
+    """Return monthly cost for `extra_zones` removable zones, given that
+    `base_zones_in_account` zones already exist (so we know which tier
+    each removable zone sits in).
+
+    The first `ROUTE53_HOSTED_ZONE_TIER_1_LIMIT` zones cost $0.50/month,
+    the rest cost $0.10/month. Removing zones saves the most-expensive
+    tier first.
+    """
+    if extra_zones <= 0:
+        return 0.0
+    # Zones currently above the tier-1 limit are the cheapest to remove.
+    above_tier_1 = max(0, base_zones_in_account - ROUTE53_HOSTED_ZONE_TIER_1_LIMIT)
+    cheap_removable = min(extra_zones, above_tier_1) * ROUTE53_HOSTED_ZONE_TIER_2
+    remaining = extra_zones - min(extra_zones, above_tier_1)
+    expensive_removable = remaining * ROUTE53_HOSTED_ZONE_TIER_1
+    return cheap_removable + expensive_removable
+
+
 ROUTE53_OPTIMIZATION_DESCRIPTIONS: dict[str, dict[str, str]] = {
     "unused_hosted_zones": {
         "title": "Remove Unused Hosted Zones",
@@ -26,8 +54,15 @@ ROUTE53_OPTIMIZATION_DESCRIPTIONS: dict[str, dict[str, str]] = {
 }
 
 
-def get_route53_checks(ctx: ScanContext) -> dict[str, Any]:
-    """Route 53 optimization checks"""
+def get_route53_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> dict[str, Any]:
+    """Route 53 optimization checks.
+
+    Args:
+        ctx: Scan context with route53 client.
+        pricing_multiplier: Regional pricing multiplier applied to per-rec
+            $ values. Route 53 is a global service so multiplier is usually
+            1.0 but kept for consistency with sibling adapters.
+    """
     checks: dict[str, list[dict[str, Any]]] = {
         "unused_hosted_zones": [],
         "unnecessary_health_checks": [],
@@ -51,6 +86,10 @@ def get_route53_checks(ctx: ScanContext) -> dict[str, Any]:
             record_count = zone.get("ResourceRecordSetCount", 0)
 
             if record_count <= 2:
+                # Tier-1 zone removal (most accounts have <25 zones — apply tier-1 rate).
+                zone_savings = _route53_zone_monthly_cost(
+                    1, base_zones_in_account=len(hosted_zones)
+                ) * pricing_multiplier
                 checks["unused_hosted_zones"].append(
                     {
                         "HostedZoneId": zone_id,
@@ -58,7 +97,8 @@ def get_route53_checks(ctx: ScanContext) -> dict[str, Any]:
                         "RecordCount": record_count,
                         "IsPrivate": is_private,
                         "Recommendation": "Hosted zone has minimal records - verify if still needed",
-                        "EstimatedSavings": "$0.50/month per zone if deleted",
+                        "EstimatedSavings": f"${zone_savings:.2f}/month per zone if deleted",
+                        "EstimatedMonthlySavings": round(zone_savings, 2),
                         "CheckCategory": "Unused Hosted Zones",
                     }
                 )
@@ -120,13 +160,18 @@ def get_route53_checks(ctx: ScanContext) -> dict[str, Any]:
 
         for zone_name, zone_ids in zone_names.items():
             if len(zone_ids) > 1:
+                removable = len(zone_ids) - 1
+                consolidate_savings = _route53_zone_monthly_cost(
+                    removable, base_zones_in_account=len(hosted_zones)
+                ) * pricing_multiplier
                 checks["duplicate_private_zones"].append(
                     {
                         "ZoneName": zone_name,
                         "ZoneCount": len(zone_ids),
                         "ZoneIds": zone_ids,
                         "Recommendation": "Multiple private zones with same name - check VPC associations",
-                        "EstimatedSavings": f"${(len(zone_ids) - 1) * 0.50:.2f}/month if consolidated",
+                        "EstimatedSavings": f"${consolidate_savings:.2f}/month if consolidated",
+                        "EstimatedMonthlySavings": round(consolidate_savings, 2),
                         "CheckCategory": "Duplicate Private Zones",
                     }
                 )

@@ -16,6 +16,39 @@ from core.scan_context import ScanContext
 
 print("🔍 [services/monitoring.py] Monitoring module active")
 
+# CloudWatch Logs storage list price (us-east-1): $0.03/GB-month
+# Source: AWS Pricing API SKU JRHJQ2UMPUB5K73A (verified 2026-05).
+# Region-scaled via `pricing_multiplier` at the per-rec emit site.
+CW_LOGS_GB_MONTH: float = 0.03
+
+# CloudWatch custom metrics tiered pricing (us-east-1):
+#   First 10,000 metrics:  $0.30/metric/month
+#   Next 240,000:          $0.10/metric/month
+#   Above 250,000:         $0.05/metric/month
+# Source: https://aws.amazon.com/cloudwatch/pricing/ (verified 2026-05).
+CW_CUSTOM_METRIC_TIER_1: float = 0.30
+CW_CUSTOM_METRIC_TIER_2: float = 0.10
+CW_CUSTOM_METRIC_TIER_3: float = 0.05
+CW_CUSTOM_METRIC_TIER_1_LIMIT: int = 10_000
+CW_CUSTOM_METRIC_TIER_2_LIMIT: int = 250_000
+
+
+def _cw_custom_metrics_monthly_cost(count: int) -> float:
+    """Return CloudWatch custom metrics monthly cost for `count` metrics
+    applying AWS-published tiered pricing breakpoints. Region-scaled by
+    the caller via `pricing_multiplier`.
+    """
+    if count <= 0:
+        return 0.0
+    tier_1 = min(count, CW_CUSTOM_METRIC_TIER_1_LIMIT) * CW_CUSTOM_METRIC_TIER_1
+    tier_2 = max(
+        0,
+        min(count, CW_CUSTOM_METRIC_TIER_2_LIMIT) - CW_CUSTOM_METRIC_TIER_1_LIMIT,
+    ) * CW_CUSTOM_METRIC_TIER_2
+    tier_3 = max(0, count - CW_CUSTOM_METRIC_TIER_2_LIMIT) * CW_CUSTOM_METRIC_TIER_3
+    return tier_1 + tier_2 + tier_3
+
+
 MONITORING_OPTIMIZATION_DESCRIPTIONS: dict[str, dict[str, str]] = {
     "never_expiring_logs": {
         "title": "Set Log Retention Policies",
@@ -55,8 +88,14 @@ MONITORING_OPTIMIZATION_DESCRIPTIONS: dict[str, dict[str, str]] = {
 }
 
 
-def get_cloudwatch_checks(ctx: ScanContext) -> dict[str, Any]:
-    """Category 9: CloudWatch optimization checks"""
+def get_cloudwatch_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> dict[str, Any]:
+    """Category 9: CloudWatch optimization checks.
+
+    Args:
+        ctx: Scan context with cloudwatch + logs clients.
+        pricing_multiplier: Regional pricing multiplier applied to per-rec
+            $ values. us-east-1 ≈ 1.0; eu-west-1 ≈ 1.08; etc.
+    """
     checks: dict[str, list[dict[str, Any]]] = {
         "never_expiring_logs": [],
         "excessive_logging": [],
@@ -84,13 +123,16 @@ def get_cloudwatch_checks(ctx: ScanContext) -> dict[str, Any]:
             stored_bytes = log_group.get("storedBytes", 0)
 
             if retention_days is None:
+                stored_gb = stored_bytes / (1024**3)
+                monthly_savings = stored_gb * CW_LOGS_GB_MONTH * pricing_multiplier
                 checks["never_expiring_logs"].append(
                     {
                         "LogGroupName": log_group_name,
                         "StoredBytes": stored_bytes,
-                        "StoredGB": round(stored_bytes / (1024**3), 2),
+                        "StoredGB": round(stored_gb, 2),
                         "Recommendation": "Set retention policy to prevent unlimited log growth",
-                        "EstimatedSavings": f"${stored_bytes * 0.57 / (1024**3):.2f}/month with 30-day retention",
+                        "EstimatedSavings": f"${monthly_savings:.2f}/month if 30-day retention enforced",
+                        "EstimatedMonthlySavings": round(monthly_savings, 2),
                         "CheckCategory": "Never-Expiring Log Groups",
                     }
                 )
@@ -131,12 +173,17 @@ def get_cloudwatch_checks(ctx: ScanContext) -> dict[str, Any]:
 
             for namespace, count in namespace_counts.items():
                 if count > 100:
+                    # Tiered AWS pricing — savings = current_cost - cost(50%-reduced count).
+                    current_cost = _cw_custom_metrics_monthly_cost(count)
+                    reduced_cost = _cw_custom_metrics_monthly_cost(count // 2)
+                    monthly_savings = (current_cost - reduced_cost) * pricing_multiplier
                     checks["unused_custom_metrics"].append(
                         {
                             "Namespace": namespace,
                             "MetricCount": count,
                             "Recommendation": f"High number of custom metrics ({count}) - review necessity",
-                            "EstimatedSavings": f"${count * 0.30:.2f}/month if reduced by 50%",
+                            "EstimatedSavings": f"${monthly_savings:.2f}/month if reduced by 50%",
+                            "EstimatedMonthlySavings": round(monthly_savings, 2),
                             "CheckCategory": "Excessive Custom Metrics",
                         }
                     )

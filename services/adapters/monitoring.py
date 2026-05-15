@@ -17,7 +17,9 @@ class MonitoringModule(BaseServiceModule):
     key: str = "monitoring"
     cli_aliases: tuple[str, ...] = ("monitoring",)
     display_name: str = "Monitoring & Logging"
-    reads_fast_mode: bool = True
+    # Shim hits cloudwatch.describe_alarms + list_metrics for custom-metrics
+    # tier pricing; flag must reflect that.
+    requires_cloudwatch: bool = True
 
     def required_clients(self) -> tuple[str, ...]:
         """Returns boto3 client names required for monitoring and logging scanning."""
@@ -38,10 +40,11 @@ class MonitoringModule(BaseServiceModule):
         """
         print("\U0001f50d [services/adapters/monitoring.py] Monitoring module active")
 
-        cw_result = get_cloudwatch_checks(ctx)
+        multiplier = ctx.pricing_multiplier
+        cw_result = get_cloudwatch_checks(ctx, multiplier)
         ct_result = get_cloudtrail_checks(ctx)
         backup_result = get_backup_checks(ctx)
-        r53_result = get_route53_checks(ctx)
+        r53_result = get_route53_checks(ctx, multiplier)
 
         cw_recs = cw_result.get("recommendations", [])
         ct_recs = ct_result.get("recommendations", [])
@@ -50,15 +53,18 @@ class MonitoringModule(BaseServiceModule):
 
         all_recs = cw_recs + ct_recs + backup_recs + r53_recs
 
+        # Prefer the numeric `EstimatedMonthlySavings` field when present
+        # (shim now emits it on quantified recs); fall back to string parse
+        # for sub-shims that haven't been migrated yet.
+        from services._savings import parse_dollar_savings
+
         savings = 0.0
         for rec in all_recs:
-            savings_str = rec.get("EstimatedSavings", "")
-            if "$" in savings_str and "/month" in savings_str:
-                try:
-                    savings_val = float(savings_str.replace("$", "").split("/")[0])
-                    savings += savings_val
-                except (ValueError, AttributeError):
-                    pass
+            numeric = rec.get("EstimatedMonthlySavings")
+            if isinstance(numeric, (int, float)) and numeric > 0:
+                savings += float(numeric)
+                continue
+            savings += parse_dollar_savings(rec.get("EstimatedSavings", ""))
 
         total_recs = len(all_recs)
 
