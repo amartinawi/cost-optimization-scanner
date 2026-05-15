@@ -8,7 +8,9 @@ from core.contracts import ServiceFindings, SourceBlock
 from services._base import BaseServiceModule
 from services.athena import ATHENA_OPTIMIZATION_DESCRIPTIONS, get_enhanced_athena_checks
 
-ATHENA_SCAN_FALLBACK_MONTHLY: float = 50.0
+# Athena per-TB scan rate (us-east-1, verified $5/TB AWS list).
+# When CW ProcessedBytes is unavailable we emit 0 + PricingWarning
+# rather than the previous $50 fabricated fallback.
 
 
 class AthenaModule(BaseServiceModule):
@@ -18,10 +20,11 @@ class AthenaModule(BaseServiceModule):
     cli_aliases: tuple[str, ...] = ("athena",)
     display_name: str = "Athena"
     reads_fast_mode: bool = True
+    requires_cloudwatch: bool = True  # adapter consults CW ProcessedBytes metric.
 
     def required_clients(self) -> tuple[str, ...]:
         """Returns boto3 client names required for Athena scanning."""
-        return ("athena",)
+        return ("athena", "cloudwatch")
 
     def scan(self, ctx: Any) -> ServiceFindings:
         print("\U0001f50d [services/adapters/athena.py] Athena module active")
@@ -59,13 +62,21 @@ class AthenaModule(BaseServiceModule):
                         monthly_tb = 0
 
                 if monthly_tb > 0:
-                    # 75% savings factor based on AWS benchmarks showing 70-91% compression for columnar formats
-                    savings += monthly_tb * ATHENA_PRICE_PER_TB * ctx.pricing_multiplier * 0.75
+                    # 75% savings factor based on AWS benchmarks showing
+                    # 70-91% compression for columnar formats (Parquet/ORC).
+                    rec_savings = monthly_tb * ATHENA_PRICE_PER_TB * ctx.pricing_multiplier * 0.75
+                    rec["EstimatedMonthlySavings"] = round(rec_savings, 2)
+                    savings += rec_savings
                 else:
-                    # Fallback $50 estimate when CloudWatch data unavailable
-                    savings += ATHENA_SCAN_FALLBACK_MONTHLY * ctx.pricing_multiplier
+                    # CW returned no data; emit 0 + warning rather than
+                    # fabricate $50 fallback constant.
+                    rec["EstimatedMonthlySavings"] = 0.0
+                    rec["PricingWarning"] = "CW ProcessedBytes metric returned no data"
             else:
-                savings += ATHENA_SCAN_FALLBACK_MONTHLY * ctx.pricing_multiplier
+                # fast_mode: skip CW lookup. Emit 0 + warning so a full
+                # scan re-runs the metric query.
+                rec["EstimatedMonthlySavings"] = 0.0
+                rec["PricingWarning"] = "fast mode skipped CW; re-run without --fast"
 
         sources = {"enhanced_checks": SourceBlock(count=len(recs), recommendations=tuple(recs))}
 

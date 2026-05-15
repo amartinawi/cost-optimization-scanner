@@ -15,6 +15,10 @@ class ApiGatewayModule(BaseServiceModule):
     key: str = "api_gateway"
     cli_aliases: tuple[str, ...] = ("api_gateway",)
     display_name: str = "API Gateway"
+    # Shim correctly honors ctx.fast_mode at services/api_gateway.py:73.
+    reads_fast_mode: bool = True
+    # Shim queries CW `Count` metric per API.
+    requires_cloudwatch: bool = True
 
     def required_clients(self) -> tuple[str, ...]:
         """Returns boto3 client names required for API Gateway scanning."""

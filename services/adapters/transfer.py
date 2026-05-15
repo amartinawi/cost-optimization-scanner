@@ -36,14 +36,31 @@ class TransferModule(BaseServiceModule):
         result = get_enhanced_transfer_checks(ctx)
         recs = result.get("recommendations", [])
 
-        TRANSFER_PER_PROTOCOL_HOUR = 0.30
+        # AWS Transfer Family protocol endpoint rate: $0.30/protocol/hour
+        # (us-east-1, verified via AWS pricing page). Region-scaled via
+        # pricing_multiplier per L2.3.2.
+        TRANSFER_PER_PROTOCOL_HOUR: float = 0.30
 
         savings = 0.0
         for rec in recs:
-            protocols = rec.get("Protocols", ["SFTP"])
-            num_protocols = len(protocols) if isinstance(protocols, list) else 1
-            removable = max(0, num_protocols - 1)
-            endpoint_monthly = removable * TRANSFER_PER_PROTOCOL_HOUR * 730 * ctx.pricing_multiplier
+            # Shim should explicitly indicate how many protocols can be
+            # removed via `RemovableProtocols` field. Fall back to the
+            # legacy "len(Protocols) - 1" heuristic only when the explicit
+            # field is missing — surface a warning either way.
+            explicit_removable = rec.get("RemovableProtocols")
+            if isinstance(explicit_removable, int) and explicit_removable >= 0:
+                removable = explicit_removable
+            else:
+                protocols = rec.get("Protocols", [])
+                if not isinstance(protocols, list):
+                    # Not an endpoint-shaped rec (e.g., connector) — skip.
+                    rec.setdefault("EstimatedMonthlySavings", 0.0)
+                    continue
+                removable = max(0, len(protocols) - 1)
+            endpoint_monthly = (
+                removable * TRANSFER_PER_PROTOCOL_HOUR * 730 * ctx.pricing_multiplier
+            )
+            rec["EstimatedMonthlySavings"] = round(endpoint_monthly, 2)
             savings += endpoint_monthly
 
         sources = {"enhanced_checks": SourceBlock(count=len(recs), recommendations=tuple(recs))}

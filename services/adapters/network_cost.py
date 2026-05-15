@@ -315,7 +315,12 @@ class NetworkCostModule(BaseServiceModule):
 
         if egress_spend > 0:
             monthly_est = egress_spend
-            potential_savings = monthly_est * CLOUDFRONT_SAVINGS_FACTOR * multiplier
+            # `egress_spend` comes from Cost Explorer which already returns
+            # real region-priced dollars. Do NOT apply pricing_multiplier
+            # (L2.3.1). Cross-region and cross-AZ paths correctly omit
+            # multiplier; egress now matches for consistency.
+            _ = multiplier
+            potential_savings = monthly_est * CLOUDFRONT_SAVINGS_FACTOR
 
             recs.append(
                 {

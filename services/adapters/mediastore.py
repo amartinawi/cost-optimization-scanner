@@ -40,13 +40,19 @@ class MediastoreModule(BaseServiceModule):
         for rec in recs:
             estimated_gb = rec.get("EstimatedStorageGB", 0)
             if ctx.pricing_engine:
+                # PricingEngine returns region-correct $/GB; no multiplier.
                 price_per_gb = ctx.pricing_engine.get_s3_monthly_price_per_gb("STANDARD")
             else:
+                # Module-const fallback path → apply multiplier (L2.3.2).
                 price_per_gb = 0.023 * ctx.pricing_multiplier
             if estimated_gb > 0:
-                savings += estimated_gb * price_per_gb
+                rec_savings = estimated_gb * price_per_gb
+                rec["EstimatedMonthlySavings"] = round(rec_savings, 2)
+                savings += rec_savings
             else:
-                savings += 20.0 * ctx.pricing_multiplier
+                # No storage figure; emit 0 + warning rather than fabricate $20.
+                rec["EstimatedMonthlySavings"] = 0.0
+                rec["PricingWarning"] = "requires EstimatedStorageGB for quantified savings"
 
         sources = {"enhanced_checks": SourceBlock(count=len(recs), recommendations=tuple(recs))}
 
