@@ -6,7 +6,11 @@ from typing import Any
 
 from core.contracts import ServiceFindings, SourceBlock
 from services._base import BaseServiceModule
-from services.lightsail import LIGHTSAIL_OPTIMIZATION_DESCRIPTIONS, get_enhanced_lightsail_checks
+from services.lightsail import (
+    LIGHTSAIL_OPTIMIZATION_DESCRIPTIONS,
+    get_enhanced_lightsail_checks,
+    get_lightsail_bundle_cost,
+)
 
 
 class LightsailModule(BaseServiceModule):
@@ -35,14 +39,19 @@ class LightsailModule(BaseServiceModule):
         print("\U0001f50d [services/adapters/lightsail.py] Lightsail module active")
         result = get_enhanced_lightsail_checks(ctx)
         recs = result.get("recommendations", [])
+        # AWS Lightsail Pricing API uses `bundle` / `bundleGroup` filters,
+        # NOT `instanceType` (verified via get_pricing_service_attributes).
+        # The previous get_instance_monthly_price() path was structurally
+        # dead (returned 0 every time). Use the shim's bundle dict helper
+        # instead — it carries the AWS-list bundle prices and is the
+        # authoritative source for Lightsail in this codebase.
         savings = 0.0
         for rec in recs:
             bundle_name = rec.get("BundleId", "")
-            if ctx.pricing_engine and bundle_name:
-                monthly = ctx.pricing_engine.get_instance_monthly_price("AmazonLightsail", bundle_name)
-                savings += monthly if monthly > 0 else 12.0 * ctx.pricing_multiplier
-            else:
-                savings += 12.0 * ctx.pricing_multiplier
+            if bundle_name:
+                monthly = get_lightsail_bundle_cost(bundle_name) * ctx.pricing_multiplier
+                savings += monthly
+            # else: bundle unknown; skip rather than fabricate $12 fallback.
 
         checks = result.get("checks", {})
         sources = {k: SourceBlock(count=len(v), recommendations=tuple(v)) for k, v in checks.items()}

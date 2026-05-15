@@ -22,6 +22,22 @@ WORKSPACE_BUNDLE_MAP: dict[str, str] = {
     "GRAPHICSPRO": "5",
 }
 
+# AWS WorkSpaces AlwaysOn monthly prices (us-east-1, Windows w/ Plus bundle).
+# Source: https://aws.amazon.com/workspaces-family/workspaces/pricing/
+# Region-scaled via pricing_multiplier at the per-rec emit site.
+# Used as the authoritative price source because AWS WorkSpaces Pricing API
+# uses `bundle` filter (not `instanceType`), which the generic PricingEngine
+# instance lookup cannot reach.
+WORKSPACE_BUNDLE_MONTHLY: dict[str, float] = {
+    "VALUE": 25.0,
+    "STANDARD": 35.0,
+    "PERFORMANCE": 60.0,
+    "POWER": 80.0,
+    "POWERPRO": 124.0,
+    "GRAPHICS": 350.0,
+    "GRAPHICSPRO": 735.0,
+}
+
 WORKSPACE_BUNDLE_RANK: dict[str, int] = {
     "VALUE": 0,
     "STANDARD": 1,
@@ -46,15 +62,17 @@ WORKSPACES_OPTIMIZATION_DESCRIPTIONS: dict[str, dict[str, str]] = {
 }
 
 
-def _get_bundle_price(ctx: ScanContext, bundle_id: str) -> float:
-    """Look up monthly price for a WorkSpaces bundle via PricingEngine."""
-    if not ctx.pricing_engine:
-        return 35.0 * ctx.pricing_multiplier
-    try:
-        price = ctx.pricing_engine.get_instance_monthly_price("AmazonWorkSpaces", bundle_id)
-        return price if price > 0 else 35.0 * ctx.pricing_multiplier
-    except Exception:
-        return 35.0 * ctx.pricing_multiplier
+def _get_bundle_price_by_compute_type(ctx: ScanContext, compute_type: str) -> float:
+    """Return monthly $ price for a WorkSpaces bundle by compute-type name.
+
+    Resolves directly via WORKSPACE_BUNDLE_MONTHLY (AWS-list prices). The
+    generic PricingEngine instance lookup is bypassed because AWS WorkSpaces
+    Pricing API uses a `bundle` attribute, not `instanceType`, so the
+    previous get_instance_monthly_price("AmazonWorkSpaces", bundle_id)
+    call structurally returned 0. Region-scaled by ctx.pricing_multiplier.
+    """
+    base = WORKSPACE_BUNDLE_MONTHLY.get(compute_type.upper(), 0.0)
+    return base * ctx.pricing_multiplier
 
 
 def get_enhanced_workspaces_checks(ctx: ScanContext) -> dict[str, Any]:
@@ -117,10 +135,11 @@ def get_enhanced_workspaces_checks(ctx: ScanContext) -> dict[str, Any]:
                         target_type = "PERFORMANCE" if current_rank > 2 else None
 
                     if target_type and target_type != compute_type:
-                        current_bundle = WORKSPACE_BUNDLE_MAP.get(compute_type, "2")
-                        target_bundle = WORKSPACE_BUNDLE_MAP.get(target_type, "2")
-                        current_price = _get_bundle_price(ctx, current_bundle)
-                        target_price = _get_bundle_price(ctx, target_bundle)
+                        # Resolve prices by compute_type name directly; the
+                        # numeric bundle IDs (1/2/3/etc.) are kept in
+                        # WORKSPACE_BUNDLE_MAP only for legacy adapter use.
+                        current_price = _get_bundle_price_by_compute_type(ctx, compute_type)
+                        target_price = _get_bundle_price_by_compute_type(ctx, target_type)
                         savings = max(current_price - target_price, 0.0)
 
                         if savings > 0:
