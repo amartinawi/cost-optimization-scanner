@@ -25,7 +25,12 @@ def compute_ami_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> dic
     checks: dict[str, list[dict[str, Any]]] = {"unused_amis": [], "old_amis": []}
 
     try:
-        amis_response = ec2.describe_images(Owners=["self"])
+        # Paginate to avoid silently dropping pages beyond the default ceiling.
+        amis_paginator = ec2.get_paginator("describe_images")
+        amis_list: list[dict[str, Any]] = []
+        for page in amis_paginator.paginate(Owners=["self"]):
+            amis_list.extend(page.get("Images", []))
+        amis_response = {"Images": amis_list}
 
         running_amis: set[str] = set()
         paginator = ec2.get_paginator("describe_instances")
@@ -103,11 +108,24 @@ def compute_ami_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> dic
                             total_snapshot_size_gb += block_device["Ebs"].get("VolumeSize", 8)
 
                 if total_snapshot_size_gb == 0:
-                    total_snapshot_size_gb = 8
+                    # No snapshot-size data; skip the cost emission rather
+                    # than invent an 8 GB fallback.
+                    continue
 
-                # NOTE: Uses full EBS volume size, not incremental snapshot size.
-                # Actual incremental snapshots are typically 10-30% of full volume size.
-                monthly_snapshot_cost = total_snapshot_size_gb * 0.05 * pricing_multiplier
+                # AWS EBS snapshots are incremental — only changed blocks
+                # are billed. Block-device VolumeSize is an UPPER BOUND on
+                # the snapshot's billed bytes; actual ranges 10-30%. We
+                # emit the MAX with explicit qualifier in the display
+                # string. PricingEngine returns region-correct $/GB-month;
+                # NO additional pricing_multiplier (L2.3.1).
+                if ctx.pricing_engine is not None:
+                    try:
+                        snapshot_rate = ctx.pricing_engine.get_ebs_snapshot_price_per_gb()
+                    except Exception:
+                        snapshot_rate = 0.05 * pricing_multiplier
+                else:
+                    snapshot_rate = 0.05 * pricing_multiplier
+                monthly_snapshot_cost = total_snapshot_size_gb * snapshot_rate
 
                 checks["old_amis"].append(
                     {

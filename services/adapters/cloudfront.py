@@ -36,29 +36,36 @@ class CloudfrontModule(BaseServiceModule):
         try:
             result = get_enhanced_cloudfront_checks(ctx)
         except Exception as e:
-            print(f"Warning: [cloudfront] enhanced checks failed: {e}")
+            ctx.warn(f"enhanced checks failed: {e}", "cloudfront")
             result = {}
         recs = result.get("recommendations", [])
 
+        # CloudFront data-transfer-out pricing is tiered + regional ($0.085/GB
+        # US/EU first 10TB, $0.080 next 40TB; $0.120 Asia tier-1; etc.). The
+        # previous adapter used a flat $0.10/GB AND a fictional 0.5 KB/request
+        # size assumption that produced numbers detached from reality.
+        # Without per-rec PriceClass + measured bytes via the CloudFront
+        # CW `BytesDownloaded` metric we cannot quantify honestly. Emit
+        # 0 + PricingWarning so the recs surface for human review.
         savings = 0.0
-        price_per_gb = 0.10
         for rec in recs:
             weekly_requests_str = rec.get("WeeklyRequests", "")
             try:
                 weekly_requests = float(weekly_requests_str)
             except (ValueError, TypeError):
                 weekly_requests = 0.0
+            if rec.get("CheckCategory") == "CloudFront Unused Distribution":
+                # Unused distribution: $0 saving until traffic resumes.
+                rec["EstimatedMonthlySavings"] = 0.0
+                continue
+            rec["EstimatedMonthlySavings"] = 0.0
+            rec["PricingWarning"] = (
+                "requires CW BytesDownloaded metric and distribution PriceClass "
+                "for quantified savings"
+            )
+            _ = weekly_requests  # documented; not used in current honest path.
 
-            if weekly_requests > 0:
-                est_gb = weekly_requests * 0.0005 / 4.33
-                savings += est_gb * price_per_gb
-            elif rec.get("CheckCategory") == "CloudFront Unused Distribution":
-                savings += 0.0
-            else:
-                savings += 10.0
-
-        multiplier = getattr(ctx, "pricing_multiplier", 1.0)
-        savings = round(savings * multiplier, 2)
+        savings = round(savings, 2)
 
         return ServiceFindings(
             service_name="CloudFront",

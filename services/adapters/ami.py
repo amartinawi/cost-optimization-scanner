@@ -23,38 +23,73 @@ class AmiModule(BaseServiceModule):
     def scan(self, ctx: Any) -> ServiceFindings:
         """Scan AMI resources for cost optimization opportunities.
 
-        Consults the ami service module for old/unused AMI detection.
-        Savings calculated from per-recommendation EstimatedMonthlySavings.
+        Emits two distinct sources:
+
+          - ``old_amis``    — AMIs older than the snapshot-retention
+                              threshold; carry quantified savings derived
+                              from EBS snapshot storage rate.
+          - ``unused_amis`` — AMIs not referenced by any running instance,
+                              launch template, or ASG. No cost data yet;
+                              emit 0 + PricingWarning until snapshot-size
+                              data is wired through.
 
         Args:
             ctx: ScanContext with region, clients, and pricing data.
-
-        Returns:
-            ServiceFindings with an "old_amis" SourceBlock entry.
         """
         print("\U0001f50d [services/adapters/ami.py] AMI module active")
         result = compute_ami_checks(ctx, ctx.pricing_multiplier)
-        recs = result.get("recommendations", [])
-        savings = sum(rec.get("EstimatedMonthlySavings", 0) for rec in recs)
+        old_recs = result.get("old_amis", [])
+        unused_recs = result.get("unused_amis", [])
+
+        savings = 0.0
+        for rec in old_recs:
+            savings += float(rec.get("EstimatedMonthlySavings", 0) or 0)
+        # `unused_amis` no longer contribute fictional dollars; they emit 0
+        # + PricingWarning so total_recommendations and total_monthly_savings
+        # diverge cleanly only on visibility-only recs (intentional).
+        for rec in unused_recs:
+            if "EstimatedMonthlySavings" not in rec:
+                rec["EstimatedMonthlySavings"] = 0.0
+                rec["PricingWarning"] = (
+                    "requires associated snapshot size for quantified savings"
+                )
+
+        total_recs = len(old_recs) + len(unused_recs)
 
         return ServiceFindings(
             service_name="AMI",
-            total_recommendations=len(recs),
+            total_recommendations=total_recs,
             total_monthly_savings=savings,
-            sources={"old_amis": SourceBlock(count=len(recs), recommendations=tuple(recs))},
+            sources={
+                "old_amis": SourceBlock(count=len(old_recs), recommendations=tuple(old_recs)),
+                "unused_amis": SourceBlock(count=len(unused_recs), recommendations=tuple(unused_recs)),
+            },
             total_count=result.get("total_count", 0),
             optimization_descriptions={
                 "old_amis": {
                     "title": "Delete Old and Unused AMIs",
                     "description": (
-                        "Old and unused AMIs retain associated EBS snapshots that incur"
-                        " ongoing storage costs. Deregister unused AMIs and delete orphaned snapshots."
+                        "Old AMIs retain associated EBS snapshots that incur"
+                        " ongoing storage costs. Deregister and delete orphaned snapshots."
                     ),
                     "action": (
-                        "1. Identify AMIs not associated with any running instance\n"
-                        "2. Deregister unused AMIs via AWS Console or CLI\n"
+                        "1. Identify AMIs older than 90 days\n"
+                        "2. Deregister via AWS Console or CLI\n"
                         "3. Delete orphaned snapshots left behind\n"
-                        "4. Estimated savings: snapshot storage cost per GB-month"
+                        "4. Savings = snapshot storage cost per GB-month"
+                    ),
+                },
+                "unused_amis": {
+                    "title": "Review Unused AMIs",
+                    "description": (
+                        "AMIs not referenced by any running instance, launch"
+                        " template, or ASG. Snapshot-storage savings depend on"
+                        " the underlying block-device snapshot size."
+                    ),
+                    "action": (
+                        "1. Verify the AMI is truly orphaned\n"
+                        "2. Capture snapshot size via describe_snapshots\n"
+                        "3. Deregister and delete snapshots"
                     ),
                 },
             },
