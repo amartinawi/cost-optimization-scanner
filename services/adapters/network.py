@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Any
+import logging
+from typing import Any, Callable
 
 from core.contracts import ServiceFindings, SourceBlock
 from services._base import BaseServiceModule
@@ -12,6 +13,52 @@ from services.elastic_ip import get_elastic_ip_checks
 from services.load_balancer import get_load_balancer_checks
 from services.nat_gateway import get_nat_gateway_checks
 from services.vpc_endpoints import get_vpc_endpoints_checks
+
+logger = logging.getLogger(__name__)
+
+# Severity thresholds for `_derive_severity`. Values are conservative
+# midpoints chosen to align with the audit doc's qualitative buckets:
+# idle resources costing ≥$30/month (e.g. a full NAT gateway, multiple
+# EIPs) → HIGH; mid-range optimizations → MEDIUM; sub-$10 → LOW.
+_SEVERITY_HIGH_USD: float = 30.0
+_SEVERITY_MEDIUM_USD: float = 10.0
+
+
+def _derive_severity(rec: dict[str, Any]) -> str:
+    """Return a severity tag for a network recommendation based on parsed savings.
+
+    Honors any explicit `severity` already set by the sub-shim; only fills it
+    in when missing. Magnitude-based fallback keeps the rule simple and
+    defensible (audit L3-002).
+    """
+    existing = rec.get("severity") or rec.get("Severity") or rec.get("priority") or rec.get("Priority")
+    if existing:
+        return str(existing).upper()
+    monthly = parse_dollar_savings(rec.get("EstimatedSavings", ""))
+    if monthly >= _SEVERITY_HIGH_USD:
+        return "HIGH"
+    if monthly >= _SEVERITY_MEDIUM_USD:
+        return "MEDIUM"
+    return "LOW"
+
+
+def _annotate_severity(recs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Add a `severity` key to each rec in-place using `_derive_severity`."""
+    for rec in recs:
+        rec["severity"] = _derive_severity(rec)
+    return recs
+
+
+def _safe_collect(label: str, fn: Callable[..., dict[str, Any]], ctx: Any) -> list[dict[str, Any]]:
+    """Run a sub-shim and return its recommendations, swallowing failures.
+
+    One failing sub-shim must not blank the whole network tab (audit L1-005).
+    """
+    try:
+        return list(fn(ctx).get("recommendations", []))
+    except Exception as e:
+        logger.warning(f"[network] {label} sub-check failed: {e}")
+        return []
 
 
 def _sum_savings(recs: list[dict[str, Any]]) -> float:
@@ -35,7 +82,9 @@ class NetworkModule(BaseServiceModule):
 
         Each sub-area produces its own SourceBlock so the report can show
         per-domain savings rather than a single rolled-up "enhanced_checks"
-        bucket.
+        bucket. Each sub-call is isolated so a single failure does not blank
+        the whole tab. Recommendations missing an explicit `severity` are
+        tagged HIGH/MEDIUM/LOW from their parsed dollar savings.
 
         Args:
             ctx: ScanContext with region, clients, and pricing data.
@@ -45,11 +94,11 @@ class NetworkModule(BaseServiceModule):
             `load_balancers`, and `auto_scaling_groups` SourceBlocks.
         """
 
-        eip_recs = list(get_elastic_ip_checks(ctx).get("recommendations", []))
-        nat_recs = list(get_nat_gateway_checks(ctx).get("recommendations", []))
-        vpc_recs = list(get_vpc_endpoints_checks(ctx).get("recommendations", []))
-        lb_recs = list(get_load_balancer_checks(ctx).get("recommendations", []))
-        asg_recs = list(get_auto_scaling_checks(ctx).get("recommendations", []))
+        eip_recs = _annotate_severity(_safe_collect("elastic_ip", get_elastic_ip_checks, ctx))
+        nat_recs = _annotate_severity(_safe_collect("nat_gateway", get_nat_gateway_checks, ctx))
+        vpc_recs = _annotate_severity(_safe_collect("vpc_endpoints", get_vpc_endpoints_checks, ctx))
+        lb_recs = _annotate_severity(_safe_collect("load_balancer", get_load_balancer_checks, ctx))
+        asg_recs = _annotate_severity(_safe_collect("auto_scaling", get_auto_scaling_checks, ctx))
 
         all_recs = eip_recs + nat_recs + vpc_recs + lb_recs + asg_recs
         total_savings = _sum_savings(all_recs)
