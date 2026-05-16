@@ -87,6 +87,81 @@ S3_STORAGE_COSTS: dict[str, float] = {
 
 S3_INTELLIGENT_TIERING_MONITORING_FEE: float = 0.0025
 
+# Per-opportunity savings factors applied to a bucket's current monthly storage
+# cost. Replaces the legacy blanket × 0.40 multiplier flagged in audit
+# L2-S3-001. Values are conservative midpoints grounded in AWS S3 docs:
+#
+# - lifecycle_missing: Standard → IA after 30 days saves
+#   (0.023 − 0.0125)/0.023 ≈ 45.6% on the transitioned slice. Assuming ~65% of
+#   bucket data is IA-eligible (industry-typical for general-purpose buckets)
+#   the conservative bucket-level reduction is ~0.30.
+# - intelligent_tiering: AWS documents 20-40% savings for variable access
+#   patterns; conservative midpoint 0.20.
+# - both_missing: combined effect dominated by lifecycle; capped at 0.40 to
+#   avoid double-counting overlapping savings.
+# - static_website: storage-class change does not apply; CloudFront data
+#   transfer savings are usage-dependent — emit as $0.00/month informational.
+S3_SAVINGS_FACTORS: dict[str, float] = {
+    "lifecycle_missing": 0.30,
+    "intelligent_tiering": 0.20,
+    "both_missing": 0.40,
+    "static_website": 0.0,
+    "other": 0.0,
+}
+
+# Bucket-error classifier — used by all bucket-level S3 calls to route
+# AccessDenied / AllAccessDisabled / 403 through ctx.permission_issue and
+# everything else through logger.debug. Replaces 18 bare `print()` sites
+# flagged in audit L1-S3-001 / L1-S3-002.
+_S3_ACCESS_DENIED_CODES: frozenset[str] = frozenset({
+    "AccessDenied",
+    "AllAccessDisabled",
+    "AuthorizationError",
+    "Forbidden",
+    "MethodNotAllowed",
+})
+
+
+def _is_access_denied(exc: BaseException) -> bool:
+    """Return True if the exception represents an IAM permission denial."""
+    if isinstance(exc, ClientError):
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code in _S3_ACCESS_DENIED_CODES:
+            return True
+    msg = str(exc)
+    return "AccessDenied" in msg or "AllAccessDisabled" in msg or "Forbidden" in msg
+
+
+def _route_bucket_error(
+    ctx: ScanContext,
+    bucket_name: str,
+    exc: BaseException,
+    *,
+    action: str,
+    expected_codes: tuple[str, ...] = (),
+) -> None:
+    """Route a bucket-level S3 error to permission_issue, expected-miss skip, or logger.
+
+    Args:
+        ctx: Scan context.
+        bucket_name: Bucket the error pertains to.
+        exc: The caught exception.
+        action: The S3 IAM action that failed (e.g. ``"s3:GetBucketLifecycleConfiguration"``).
+        expected_codes: Substrings that indicate an expected miss (e.g.
+            ``"NoSuchLifecycleConfiguration"``); these are swallowed silently.
+    """
+    msg = str(exc)
+    if any(code in msg for code in expected_codes):
+        return
+    if _is_access_denied(exc):
+        ctx.permission_issue(
+            f"{action} denied on bucket {bucket_name}",
+            service="s3",
+            action=action,
+        )
+        return
+    logger.debug("S3 %s error on bucket %s: %s", action, bucket_name, exc)
+
 S3_REGIONAL_MULTIPLIERS: dict[str, dict[str, float]] = {
     "us-east-1": {
         "STANDARD": 1.0,
@@ -534,26 +609,65 @@ def _calculate_s3_storage_cost(
     region: str,
     ctx: ScanContext | None = None,
 ) -> float:
+    """Return monthly storage cost for ``size_gb`` in ``storage_class`` and ``region``.
+
+    Uses ``PricingEngine`` (live) when available; falls back to module-const
+    rates × regional multiplier. ``_SC_MAP`` normalizes storage-class names so
+    that lookups against both ``S3_STORAGE_COSTS`` and
+    ``S3_REGIONAL_MULTIPLIERS`` share a single namespace (audit L2-S3-004).
+    """
     try:
+        engine_key = _SC_MAP.get(storage_class, storage_class)
         if ctx and ctx.pricing_engine:
-            engine_key = _SC_MAP.get(storage_class, storage_class)
             price = ctx.pricing_engine.get_s3_monthly_price_per_gb(engine_key)
             return round(size_gb * price, 2)
         base_cost = S3_STORAGE_COSTS.get(storage_class, S3_STORAGE_COSTS["STANDARD"])
-        regional_multiplier = S3_REGIONAL_MULTIPLIERS.get(region, {}).get(storage_class, 1.0)
+        # Regional multipliers index by the same engine_key so the
+        # GLACIER_FLEXIBLE_RETRIEVAL vs GLACIER spelling drift no longer hides
+        # the multiplier in regions that use the legacy key.
+        regional_multiplier = (
+            S3_REGIONAL_MULTIPLIERS.get(region, {}).get(engine_key)
+            or S3_REGIONAL_MULTIPLIERS.get(region, {}).get(storage_class, 1.0)
+        )
         return round(size_gb * base_cost * regional_multiplier, 2)
-    except Exception:
-        return round(size_gb * 0.023, 2)
+    except Exception as e:
+        logger.debug("S3 storage cost calc failed for %s/%s: %s", region, storage_class, e)
+        return round(size_gb * S3_STORAGE_COSTS["STANDARD"], 2)
 
 
 def _is_static_website_bucket(bucket_name: str, s3_client: Any) -> bool:
+    """Return True if ``bucket_name`` is configured for static-website hosting.
+
+    Result is intended to be cached on ``bucket_info`` by the caller so it is
+    not re-queried for every code path that needs it (audit L2-S3-007).
+    """
     try:
         s3_client.get_bucket_website(Bucket=bucket_name)
         return True
     except Exception as e:
         if "NoSuchWebsiteConfiguration" not in str(e):
-            print(f"⚠️ Error checking website config for bucket {bucket_name}: {str(e)}")
+            logger.debug("S3 GetBucketWebsite error on %s: %s", bucket_name, e)
         return False
+
+
+def _classify_opportunities(bucket_info: dict[str, Any]) -> str:
+    """Return the ``S3_SAVINGS_FACTORS`` key matching this bucket's gaps.
+
+    Resolves the per-opportunity savings model that replaces the legacy
+    blanket × 0.40 factor (audit L2-S3-001).
+    """
+    has_lifecycle = bucket_info.get("HasLifecyclePolicy", False)
+    has_tiering = bucket_info.get("HasIntelligentTiering", False)
+    is_static = bucket_info.get("IsStaticWebsite", False)
+    if is_static:
+        return "static_website"
+    if not has_lifecycle and not has_tiering:
+        return "both_missing"
+    if not has_lifecycle:
+        return "lifecycle_missing"
+    if not has_tiering:
+        return "intelligent_tiering"
+    return "other"
 
 
 def _estimate_s3_bucket_cost(
@@ -618,11 +732,13 @@ def _estimate_s3_bucket_cost(
                         regional_cost = base_cost * regional_multiplier
                     storage_cost = class_size_gb * regional_cost
 
-                    if cost_key == "INTELLIGENT_TIERING":
-                        estimated_objects = class_size_gb * 1000
-                        monitoring_fee = (estimated_objects / 1000) * S3_INTELLIGENT_TIERING_MONITORING_FEE
-                        storage_cost += monitoring_fee
-
+                    # Intelligent-Tiering monitoring fee depends on real object
+                    # count ($0.0025 per 1000 objects/month). The legacy heuristic
+                    # of class_size_gb × 1000 (audit L2-S3-005) silently invents
+                    # a number; without a CloudWatch NumberOfObjects metric we
+                    # omit the fee rather than guess. Buckets with many small
+                    # objects will be slightly under-estimated; large-object
+                    # buckets will be on the nose.
                     total_cost += storage_cost
 
             except Exception as e:
@@ -644,7 +760,10 @@ def _estimate_s3_bucket_cost(
         return round(total_cost, 2)
 
     except Exception as e:
-        print(f"⚠️ Error calculating S3 storage cost: {str(e)}")
+        if _is_endpoint_unreachable(e):
+            _mark_region_dead(ctx, bucket_region, f"S3 cost-estimate outer for {bucket_name}")
+        else:
+            logger.debug("S3 storage cost calc outer error for %s: %s", bucket_name, e)
         if ctx.pricing_engine:
             return round(size_gb * ctx.pricing_engine.get_s3_monthly_price_per_gb("STANDARD"), 2)
         base_cost = S3_STORAGE_COSTS["STANDARD"]
@@ -658,15 +777,26 @@ def get_s3_bucket_analysis(
     fast_mode: bool,
     pricing_multiplier: float,
 ) -> dict[str, Any]:
-    print("🔍 [services/s3.py] S3 module active")
+    """Scan every accessible S3 bucket and emit per-bucket recommendations.
+
+    Each bucket's ``SavingsDelta`` is derived from a per-opportunity factor
+    (``S3_SAVINGS_FACTORS``) applied to the bucket's estimated monthly storage
+    cost — see ``_classify_opportunities``. Replaces the legacy blanket
+    ``× 0.40`` multiplier flagged in audit L2-S3-001.
+
+    Note: ``pricing_multiplier`` is accepted for ABI compatibility with the
+    adapter signature. Per-storage-class costs come from ``PricingEngine``
+    (region-correct) when available, falling back to module constants × the
+    regional multiplier dict.
+    """
+    del pricing_multiplier  # PricingEngine path is authoritative; constant retained for signature stability.
+    logger.debug("S3 bucket analysis starting (fast_mode=%s)", fast_mode)
     s3 = ctx.client("s3")
 
     try:
         response = s3.list_buckets()
         buckets = response.get("Buckets", [])
-
-        mode_label = "(fast mode)" if fast_mode else "(full analysis)"
-        print(f"📊 Analyzing {len(buckets)} S3 buckets{mode_label}...")
+        logger.debug("Analyzing %d S3 buckets (%s)", len(buckets), "fast" if fast_mode else "full")
 
         analysis: dict[str, Any] = {
             "total_buckets": len(buckets),
@@ -692,14 +822,11 @@ def get_s3_bucket_analysis(
                 bucket_s3_client = ctx.client("s3", region=bucket_region)
 
             except Exception as e:
-                print(f"⚠️ Error getting bucket location for {bucket_name}: {str(e)}")
-                bucket_s3_client = ctx.client("s3")
+                _route_bucket_error(
+                    ctx, bucket_name, e, action="s3:GetBucketLocation"
+                )
                 bucket_region = ctx.region
-                if bucket_region != ctx.region:
-                    bucket_s3_client = ctx.client("s3", region=bucket_region)
-                else:
-                    bucket_s3_client = ctx.client("s3")
-
+                bucket_s3_client = ctx.client("s3")
                 analysis.setdefault("permission_issues", []).append(
                     {"bucket": bucket_name, "issue": "location_access", "error": str(e)}
                 )
@@ -710,31 +837,42 @@ def get_s3_bucket_analysis(
                 "Region": bucket_region,
                 "HasLifecyclePolicy": False,
                 "HasIntelligentTiering": False,
+                "IsStaticWebsite": False,
                 "EstimatedMonthlyCost": 0,
                 "SizeBytes": 0,
                 "SizeGB": 0,
                 "OptimizationOpportunities": [],
             }
 
+            # Resolve IsStaticWebsite exactly once per bucket and cache the
+            # result on bucket_info; downstream code paths and the enhanced
+            # checks no longer need to re-query (audit L2-S3-007).
+            bucket_info["IsStaticWebsite"] = _is_static_website_bucket(
+                bucket_name, bucket_s3_client
+            )
+
             if fast_mode:
                 try:
-                    bucket_s3_client = ctx.client("s3", region=bucket_region)
-                    objects_response = bucket_s3_client.list_objects_v2(Bucket=bucket_name, MaxKeys=100)
+                    objects_response = bucket_s3_client.list_objects_v2(
+                        Bucket=bucket_name, MaxKeys=100
+                    )
                     object_count = objects_response.get("KeyCount", 0)
 
                     if object_count > 0:
-                        total_size = sum(obj.get("Size", 0) for obj in objects_response.get("Contents", []))
+                        total_size = sum(
+                            obj.get("Size", 0) for obj in objects_response.get("Contents", [])
+                        )
                         bucket_info["SizeGB"] = total_size / (1024**3)
-
                         bucket_info["FastModeWarning"] = (
                             "Fast mode: Size based on sample only - may be significantly understated"
                         )
-                        print(f"⚠️ Fast mode: {bucket_name} size is sample-based estimate only")
                         bucket_info["EstimatedMonthlyCost"] = _calculate_s3_storage_cost(
                             bucket_info["SizeGB"], "STANDARD", bucket_region, ctx=ctx
                         )
                 except Exception as e:
-                    print(f"⚠️ Error analyzing bucket {bucket_name}: {str(e)}")
+                    _route_bucket_error(
+                        ctx, bucket_name, e, action="s3:ListBucket"
+                    )
             else:
                 try:
                     bucket_cloudwatch_client = _bucket_cloudwatch_client(ctx, bucket_region)
@@ -813,22 +951,26 @@ def get_s3_bucket_analysis(
                 bucket_s3_client.get_bucket_lifecycle_configuration(Bucket=bucket_name)
                 bucket_info["HasLifecyclePolicy"] = True
             except Exception as e:
-                if "NoSuchLifecycleConfiguration" not in str(e):
-                    print(f"⚠️ Error checking lifecycle for bucket {bucket_name}: {str(e)}")
+                _route_bucket_error(
+                    ctx,
+                    bucket_name,
+                    e,
+                    action="s3:GetLifecycleConfiguration",
+                    expected_codes=("NoSuchLifecycleConfiguration",),
+                )
                 bucket_info["OptimizationOpportunities"].append(
                     "Configure lifecycle policies for automatic storage class transitions"
                 )
                 analysis["buckets_without_lifecycle"].append(bucket_name)
 
             try:
-                tiering_response = bucket_s3_client.list_bucket_intelligent_tiering_configurations(Bucket=bucket_name)
+                tiering_response = bucket_s3_client.list_bucket_intelligent_tiering_configurations(
+                    Bucket=bucket_name
+                )
                 if tiering_response.get("IntelligentTieringConfigurationList"):
                     bucket_info["HasIntelligentTiering"] = True
                 else:
-                    is_static_site = _is_static_website_bucket(bucket_name, bucket_s3_client)
-                    bucket_info["IsStaticWebsite"] = is_static_site
-
-                    if is_static_site:
+                    if bucket_info["IsStaticWebsite"]:
                         bucket_info["OptimizationOpportunities"].append(
                             "Static website: Consider CloudFront CDN for reduced data transfer costs"
                         )
@@ -838,11 +980,10 @@ def get_s3_bucket_analysis(
                         )
                     analysis["buckets_without_intelligent_tiering"].append(bucket_name)
             except Exception as e:
-                print(f"⚠️ Error checking intelligent tiering for bucket {bucket_name}: {str(e)}")
-                is_static_site = _is_static_website_bucket(bucket_name, bucket_s3_client)
-                bucket_info["IsStaticWebsite"] = is_static_site
-
-                if is_static_site:
+                _route_bucket_error(
+                    ctx, bucket_name, e, action="s3:GetIntelligentTieringConfiguration"
+                )
+                if bucket_info["IsStaticWebsite"]:
                     bucket_info["OptimizationOpportunities"].append(
                         "Static website: Consider CloudFront CDN for reduced data transfer costs"
                     )
@@ -853,30 +994,55 @@ def get_s3_bucket_analysis(
                 analysis["buckets_without_intelligent_tiering"].append(bucket_name)
 
             if not bucket_info["HasLifecyclePolicy"] and not bucket_info["HasIntelligentTiering"]:
-                bucket_info["OptimizationOpportunities"].append("High priority: No cost optimization configured")
+                bucket_info["OptimizationOpportunities"].append(
+                    "High priority: No cost optimization configured"
+                )
 
-            if bucket_info["OptimizationOpportunities"]:
-                bucket_info["SavingsDelta"] = round(bucket_info["EstimatedMonthlyCost"] * 0.40, 2)
+            # Per-opportunity savings: classify the bucket's gap and apply the
+            # matching factor from S3_SAVINGS_FACTORS. Replaces blanket × 0.40.
+            opportunity_key = _classify_opportunities(bucket_info)
+            factor = S3_SAVINGS_FACTORS.get(opportunity_key, 0.0)
+            cost = bucket_info.get("EstimatedMonthlyCost", 0) or 0
+            if bucket_info["OptimizationOpportunities"] and factor > 0:
+                savings = round(cost * factor, 2)
+                bucket_info["SavingsDelta"] = savings
+                bucket_info["EstimatedSavings"] = f"${savings:.2f}/month"
             else:
-                bucket_info["SavingsDelta"] = 0
+                bucket_info["SavingsDelta"] = 0.0
+                if opportunity_key == "static_website":
+                    bucket_info["EstimatedSavings"] = (
+                        "$0.00/month - data transfer dependent (CloudFront CDN)"
+                    )
+                else:
+                    bucket_info["EstimatedSavings"] = "$0.00/month"
+            bucket_info["OpportunityClass"] = opportunity_key
 
             bucket_metrics.append(bucket_info)
             analysis["optimization_opportunities"].append(bucket_info)
 
-            if len(bucket_metrics) % 20 == 0:
-                print(f"   📈 Processed {len(bucket_metrics)}/{len(buckets)} buckets...")
+            if len(bucket_metrics) % 50 == 0:
+                logger.debug("Processed %d/%d S3 buckets", len(bucket_metrics), len(buckets))
 
-        print(f"✅ Completed S3 analysis for {len(buckets)} buckets")
+        logger.debug("Completed S3 bucket analysis for %d buckets", len(buckets))
 
-        analysis["top_cost_buckets"] = sorted(bucket_metrics, key=lambda x: x["EstimatedMonthlyCost"], reverse=True)[
-            :10
-        ]
-        analysis["top_size_buckets"] = sorted(bucket_metrics, key=lambda x: x["SizeGB"], reverse=True)[:10]
+        analysis["top_cost_buckets"] = sorted(
+            bucket_metrics, key=lambda x: x["EstimatedMonthlyCost"], reverse=True
+        )[:10]
+        analysis["top_size_buckets"] = sorted(
+            bucket_metrics, key=lambda x: x["SizeGB"], reverse=True
+        )[:10]
 
         return analysis
 
     except Exception as e:
-        print(f"Warning: Could not analyze S3 buckets: {e}")
+        if _is_access_denied(e):
+            ctx.permission_issue(
+                f"s3:ListAllMyBuckets denied: {e}",
+                service="s3",
+                action="s3:ListAllMyBuckets",
+            )
+        else:
+            ctx.warn(f"Could not analyze S3 buckets: {e}", service="s3")
         return {
             "total_buckets": 0,
             "buckets_without_lifecycle": [],
@@ -892,6 +1058,19 @@ def get_enhanced_s3_checks(
     ctx: ScanContext,
     pricing_multiplier: float,
 ) -> dict[str, Any]:
+    """Config-pattern checks layered on top of ``get_s3_bucket_analysis``.
+
+    Every emitted record carries a parseable ``EstimatedSavings`` string. The
+    dedicated source for bucket-level dollar savings is
+    ``get_s3_bucket_analysis``; checks here are visibility-only (informational
+    ``$0.00/month - <reason>``). The adapter dedups overlapping categories so
+    ``total_recommendations`` and ``total_monthly_savings`` stay honest.
+
+    Routes ``AccessDenied`` / ``AllAccessDisabled`` / ``403`` from every
+    bucket-level call through ``ctx.permission_issue`` (audit L1-S3-002).
+    Replaces 15 ``print()`` sites with logger / ctx routing (audit L1-S3-001).
+    """
+    del pricing_multiplier  # Reserved for future per-operation cost models.
     s3 = ctx.client("s3")
     checks: dict[str, Any] = {
         "lifecycle_missing": [],
@@ -905,6 +1084,14 @@ def get_enhanced_s3_checks(
         "request_heavy_buckets": [],
         "static_website_optimization": [],
     }
+    # Per-bucket cache of _is_static_website_bucket so it's queried at most
+    # once per bucket inside this function (audit L2-S3-007).
+    static_cache: dict[str, bool] = {}
+
+    def _static(name: str, client: Any) -> bool:
+        if name not in static_cache:
+            static_cache[name] = _is_static_website_bucket(name, client)
+        return static_cache[name]
 
     try:
         response = s3.list_buckets()
@@ -915,17 +1102,14 @@ def get_enhanced_s3_checks(
 
             try:
                 location_response = s3.get_bucket_location(Bucket=bucket_name)
-                bucket_region = location_response.get("LocationConstraint")
-                if bucket_region is None:
-                    bucket_region = "us-east-1"
-
-                if bucket_region != ctx.region:
-                    bucket_s3_client = ctx.client("s3", region=bucket_region)
-                else:
-                    bucket_s3_client = ctx.client("s3")
-
+                bucket_region = location_response.get("LocationConstraint") or "us-east-1"
+                bucket_s3_client = (
+                    ctx.client("s3", region=bucket_region)
+                    if bucket_region != ctx.region
+                    else ctx.client("s3")
+                )
             except Exception as e:
-                print(f"Warning: Could not get location for bucket {bucket_name}: {e}")
+                _route_bucket_error(ctx, bucket_name, e, action="s3:GetBucketLocation")
                 bucket_s3_client = ctx.client("s3")
 
             try:
@@ -937,18 +1121,22 @@ def get_enhanced_s3_checks(
                             "BucketName": bucket_name,
                             "IncompleteUploads": len(uploads),
                             "CheckCategory": "Incomplete Multipart Uploads",
-                            "Recommendation": ("Configure lifecycle rule to abort incomplete uploads after 7 days"),
+                            "Recommendation": (
+                                "Configure lifecycle rule to abort incomplete uploads after 7 days"
+                            ),
+                            "EstimatedSavings": (
+                                "$0.00/month - quantify via S3 Storage Lens (incomplete-upload bytes)"
+                            ),
                         }
                     )
             except Exception as e:
-                print(f"Warning: Could not check multipart uploads for bucket {bucket_name}: {e}")
+                _route_bucket_error(ctx, bucket_name, e, action="s3:ListBucketMultipartUploads")
 
             try:
                 bucket_s3_client.get_bucket_lifecycle_configuration(Bucket=bucket_name)
             except Exception as e:
                 if "NoSuchLifecycleConfiguration" in str(e):
-                    is_static_site = _is_static_website_bucket(bucket_name, bucket_s3_client)
-
+                    is_static_site = _static(bucket_name, bucket_s3_client)
                     if is_static_site:
                         recommendation = (
                             "Static website detected: Configure lifecycle policies"
@@ -958,10 +1146,9 @@ def get_enhanced_s3_checks(
                         category = "Static Website Optimization"
                     else:
                         recommendation = (
-                            "Configure lifecycle policies for automatic tiering to reduce storage costs by 40-95%"
+                            "Configure lifecycle policies for automatic tiering to reduce storage costs"
                         )
                         category = "Storage Class Optimization"
-
                     checks["lifecycle_missing"].append(
                         {
                             "BucketName": bucket_name,
@@ -970,7 +1157,17 @@ def get_enhanced_s3_checks(
                             "Recommendation": recommendation,
                             "SizeGB": 0,
                             "EstimatedMonthlyCost": 0,
+                            # Dollar savings live in s3_bucket_analysis; this
+                            # entry is the visibility flag only — adapter dedups
+                            # against the dedicated source.
+                            "EstimatedSavings": (
+                                "$0.00/month - covered by S3 Bucket Analysis source"
+                            ),
                         }
+                    )
+                else:
+                    _route_bucket_error(
+                        ctx, bucket_name, e, action="s3:GetLifecycleConfiguration"
                     )
 
             try:
@@ -980,12 +1177,17 @@ def get_enhanced_s3_checks(
                         {
                             "BucketName": bucket_name,
                             "VersioningStatus": "Enabled",
-                            "Recommendation": ("Monitor versioning growth and configure lifecycle for old versions"),
+                            "Recommendation": (
+                                "Monitor versioning growth and configure lifecycle for old versions"
+                            ),
                             "CheckCategory": "Versioning Optimization",
+                            "EstimatedSavings": (
+                                "$0.00/month - quantify via S3 Storage Lens (noncurrent-version bytes)"
+                            ),
                         }
                     )
             except Exception as e:
-                print(f"Warning: Could not check versioning for bucket {bucket_name}: {e}")
+                _route_bucket_error(ctx, bucket_name, e, action="s3:GetBucketVersioning")
 
             try:
                 replication_response = bucket_s3_client.get_bucket_replication(Bucket=bucket_name)
@@ -994,13 +1196,23 @@ def get_enhanced_s3_checks(
                         {
                             "BucketName": bucket_name,
                             "HasReplication": True,
-                            "Recommendation": ("Review cross-region replication necessity and destination usage"),
+                            "Recommendation": (
+                                "Review cross-region replication necessity and destination usage"
+                            ),
                             "CheckCategory": "Replication Optimization",
+                            "EstimatedSavings": (
+                                "$0.00/month - depends on replicated-bytes volume and destination region"
+                            ),
                         }
                     )
             except Exception as e:
-                if "ReplicationConfigurationNotFoundError" not in str(e):
-                    print(f"Warning: Could not check replication for bucket {bucket_name}: {e}")
+                _route_bucket_error(
+                    ctx,
+                    bucket_name,
+                    e,
+                    action="s3:GetReplicationConfiguration",
+                    expected_codes=("ReplicationConfigurationNotFoundError",),
+                )
 
             try:
                 logging_response = bucket_s3_client.get_bucket_logging(Bucket=bucket_name)
@@ -1009,12 +1221,15 @@ def get_enhanced_s3_checks(
                         {
                             "BucketName": bucket_name,
                             "LoggingEnabled": True,
-                            "Recommendation": ("Review if server access logs are still needed"),
+                            "Recommendation": "Review if server access logs are still needed",
                             "CheckCategory": "Logging Optimization",
+                            "EstimatedSavings": (
+                                "$0.00/month - depends on log-volume retention policy"
+                            ),
                         }
                     )
             except Exception as e:
-                print(f"Warning: Could not check logging for bucket {bucket_name}: {e}")
+                _route_bucket_error(ctx, bucket_name, e, action="s3:GetBucketLogging")
 
             try:
                 objects_response = bucket_s3_client.list_objects_v2(Bucket=bucket_name, MaxKeys=1)
@@ -1025,14 +1240,19 @@ def get_enhanced_s3_checks(
                             {
                                 "BucketName": bucket_name,
                                 "AgeDays": bucket_age,
-                                "Recommendation": (f"Empty bucket older than {bucket_age} days - consider deletion"),
+                                "Recommendation": (
+                                    f"Empty bucket older than {bucket_age} days - consider deletion"
+                                ),
                                 "CheckCategory": "Unused Resources",
+                                "EstimatedSavings": (
+                                    "$0.00/month - empty bucket incurs no storage cost"
+                                ),
                             }
                         )
             except Exception as e:
-                print(f"Warning: Could not check bucket {bucket_name} for emptiness: {e}")
+                _route_bucket_error(ctx, bucket_name, e, action="s3:ListBucket")
 
-            if _is_static_website_bucket(bucket_name, bucket_s3_client):
+            if _static(bucket_name, bucket_s3_client):
                 checks["static_website_optimization"].append(
                     {
                         "BucketName": bucket_name,
@@ -1042,17 +1262,32 @@ def get_enhanced_s3_checks(
                             " for reduced data transfer costs and improved performance"
                         ),
                         "CheckCategory": "Static Website Optimization",
-                        "EstimatedSavings": ("Variable based on traffic - typically 20-60% on data transfer costs"),
+                        "EstimatedSavings": (
+                            "$0.00/month - data transfer dependent (CloudFront CDN)"
+                        ),
                     }
                 )
 
     except Exception as e:
-        print(f"Warning: Could not perform enhanced S3 checks: {e}")
+        if _is_access_denied(e):
+            ctx.permission_issue(
+                f"s3:ListAllMyBuckets denied: {e}",
+                service="s3",
+                action="s3:ListAllMyBuckets",
+            )
+        else:
+            ctx.warn(f"Could not perform enhanced S3 checks: {e}", service="s3")
 
     recommendations: list[dict[str, Any]] = []
     for category, items in checks.items():
         for item in items:
-            item["CheckCategory"] = item.get("CheckCategory", category.replace("_", " ").title())
+            item["CheckCategory"] = item.get(
+                "CheckCategory", category.replace("_", " ").title()
+            )
+            # Defensive: any path that forgot to set EstimatedSavings gets
+            # an honest informational default so the adapter parses $0
+            # consistently (audit L2-S3-002).
+            item.setdefault("EstimatedSavings", "$0.00/month")
             recommendations.append(item)
 
     return {"recommendations": recommendations, **checks}
