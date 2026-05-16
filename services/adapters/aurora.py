@@ -230,108 +230,11 @@ def _check_io_tier(
     return recs
 
 
-def _check_clone_sprawl(
-    cluster: dict[str, Any],
-    rds: Any,
-) -> list[dict[str, Any]]:
-    recs: list[dict[str, Any]] = []
-    cluster_id = cluster["DBClusterIdentifier"]
-    engine = cluster.get("Engine", "")
-    engine_version = cluster.get("EngineVersion", "")
-
-    snapshot_count = 0
-    try:
-        params: dict[str, Any] = {
-            "SnapshotType": "manual",
-            "DBClusterIdentifier": cluster_id,
-        }
-        while True:
-            resp = rds.describe_db_cluster_snapshots(**params)
-            snapshot_count += len(resp.get("DBClusterSnapshots", []))
-            marker = resp.get("Marker")
-            if not marker:
-                break
-            params["Marker"] = marker
-    except Exception:
-        return recs
-
-    # Clone sprawl finding removed: $0/month and "reduce storage costs and operational
-    # clutter" without quantification. Snapshot-specific cost savings live in the
-    # Snapshots tab where age + size produce a real number.
-    _ = (snapshot_count, cluster_id, engine, engine_version)
-    return recs
-
-
-def _check_global_db(
-    cluster: dict[str, Any],
-    rds: Any,
-    cw: Any,
-    fast_mode: bool,
-) -> list[dict[str, Any]]:
-    recs: list[dict[str, Any]] = []
-    if fast_mode:
-        return recs
-
-    global_cluster_id = cluster.get("GlobalClusterIdentifier")
-    if not global_cluster_id:
-        return recs
-
-    cluster_id = cluster["DBClusterIdentifier"]
-    engine = cluster.get("Engine", "")
-    engine_version = cluster.get("EngineVersion", "")
-
-    replicas: list[dict[str, Any]] = []
-    try:
-        resp = rds.describe_global_clusters(GlobalClusterIdentifier=global_cluster_id)
-        for gc in resp.get("GlobalClusters", []):
-            for member in gc.get("Members", []):
-                if member.get("DBClusterArn") and not member.get("IsWriter", False):
-                    replicas.append(member)
-    except Exception:
-        return recs
-
-    if not replicas:
-        return recs
-
-    high_lag_replicas: list[str] = []
-    for replica in replicas:
-        arn = replica.get("DBClusterArn", "")
-        replica_id = arn.split(":cluster:")[-1] if ":cluster:" in arn else ""
-        if not replica_id:
-            continue
-        dims = [{"Name": "DBClusterIdentifier", "Value": replica_id}]
-        lag = _get_cloudwatch_avg(cw, "AWS/RDS", "AuroraReplicaLag", dims)
-        if lag is not None and lag > 100:
-            high_lag_replicas.append(replica_id)
-
-    # Global DB replica lag finding removed: $0/month, replication-lag monitoring is
-    # an operational health signal, not a cost recommendation.
-    _ = (high_lag_replicas, cluster_id, engine, engine_version)
-    return recs
-
-
-def _check_backtrack(cluster: dict[str, Any]) -> list[dict[str, Any]]:
-    recs: list[dict[str, Any]] = []
-    backtrack_window = cluster.get("BacktrackWindow", 0)
-    if backtrack_window <= 0:
-        return recs
-
-    cluster_id = cluster["DBClusterIdentifier"]
-    engine = cluster.get("Engine", "")
-    engine_version = cluster.get("EngineVersion", "")
-
-    # Backtrack window finding removed: $0/month — change-record storage cost exists
-    # but is not quantified per-cluster (depends on write volume).
-    _ = (backtrack_window, cluster_id, engine, engine_version)
-
-    return recs
-
-
 class AuroraModule(BaseServiceModule):
     """ServiceModule adapter for Aurora Serverless v2 cost optimization.
 
-    Analyzes Aurora clusters for ACU waste, I/O tier selection, snapshot
-    sprawl, global DB replica lag, and backtrack window cost risk.
+    Analyzes Aurora clusters for ACU waste and I/O-Optimized vs Standard
+    storage tier selection.
     """
 
     key: str = "aurora"
@@ -374,9 +277,6 @@ class AuroraModule(BaseServiceModule):
 
         serverless_recs: list[dict[str, Any]] = []
         io_recs: list[dict[str, Any]] = []
-        clone_recs: list[dict[str, Any]] = []
-        global_recs: list[dict[str, Any]] = []
-        backtrack_recs: list[dict[str, Any]] = []
 
         serverless_count = 0
         global_count = 0
@@ -390,14 +290,11 @@ class AuroraModule(BaseServiceModule):
 
                 serverless_recs.extend(_check_serverless_v2(cluster, rds, cw, acu_hourly, multiplier, fast_mode))
                 io_recs.extend(_check_io_tier(cluster, cw, multiplier, fast_mode))
-                clone_recs.extend(_check_clone_sprawl(cluster, rds))
-                global_recs.extend(_check_global_db(cluster, rds, cw, fast_mode))
-                backtrack_recs.extend(_check_backtrack(cluster))
             except Exception as e:
                 logger.warning(f"[aurora] cluster check failed: {e}")
                 continue
 
-        all_recs = serverless_recs + io_recs + clone_recs + global_recs + backtrack_recs
+        all_recs = serverless_recs + io_recs
         total_savings = sum(r.get("monthly_savings", 0.0) for r in all_recs)
 
         return ServiceFindings(
@@ -413,18 +310,6 @@ class AuroraModule(BaseServiceModule):
                     count=len(io_recs),
                     recommendations=tuple(io_recs),
                 ),
-                "clone_sprawl": SourceBlock(
-                    count=len(clone_recs),
-                    recommendations=tuple(clone_recs),
-                ),
-                "global_db": SourceBlock(
-                    count=len(global_recs),
-                    recommendations=tuple(global_recs),
-                ),
-                "backtrack": SourceBlock(
-                    count=len(backtrack_recs),
-                    recommendations=tuple(backtrack_recs),
-                ),
             },
             extras={
                 "cluster_count": len(clusters),
@@ -439,18 +324,6 @@ class AuroraModule(BaseServiceModule):
                 "io_tier_analysis": {
                     "title": "I/O Tier Analysis",
                     "description": "Compare Standard vs I/O-Optimized storage tier costs",
-                },
-                "clone_sprawl": {
-                    "title": "Clone/Snapshot Sprawl",
-                    "description": "Clusters with excessive manual snapshots",
-                },
-                "global_db": {
-                    "title": "Global DB Replica Lag",
-                    "description": "Cross-region replicas with high replication lag",
-                },
-                "backtrack": {
-                    "title": "Backtrack Window",
-                    "description": "Large backtrack windows increasing change record storage costs",
                 },
             },
         )
