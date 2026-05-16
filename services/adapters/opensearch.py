@@ -38,7 +38,6 @@ class OpensearchModule(BaseServiceModule):
         Returns:
             ServiceFindings with enhanced_checks SourceBlock.
         """
-        print("\U0001f50d [services/adapters/opensearch.py] OpenSearch module active")
         result = get_enhanced_opensearch_checks(ctx)
         recs = result.get("recommendations", [])
 

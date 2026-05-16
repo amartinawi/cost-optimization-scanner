@@ -33,7 +33,6 @@ class MediastoreModule(BaseServiceModule):
         Returns:
             ServiceFindings with enhanced_checks SourceBlock.
         """
-        print("\U0001f50d [services/adapters/mediastore.py] MediaStore module active")
         result = get_enhanced_mediastore_checks(ctx)
         recs = result.get("recommendations", [])
         savings = 0.0

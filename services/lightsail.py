@@ -10,8 +10,6 @@ from typing import Any
 
 from core.scan_context import ScanContext
 
-print("🔍 [services/lightsail.py] Lightsail module active")
-
 LIGHTSAIL_OPTIMIZATION_DESCRIPTIONS: dict[str, dict[str, str]] = {
     "idle_instances": {
         "title": "Delete Idle Lightsail Instances",

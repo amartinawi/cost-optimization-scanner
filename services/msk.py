@@ -10,8 +10,6 @@ from typing import Any
 
 from core.scan_context import ScanContext
 
-print("\U0001f50d [services/msk.py] MSK module active")
-
 MSK_OPTIMIZATION_DESCRIPTIONS: dict[str, dict[str, str]] = {
     "cluster_rightsizing": {
         "title": "Optimize MSK Cluster Sizing",

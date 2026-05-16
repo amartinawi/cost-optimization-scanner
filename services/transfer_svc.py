@@ -22,7 +22,6 @@ TRANSFER_OPTIMIZATION_DESCRIPTIONS: dict[str, dict[str, str]] = {
 
 def get_enhanced_transfer_checks(ctx: ScanContext) -> dict[str, Any]:
     """Get enhanced Transfer Family cost optimization checks."""
-    print("🔍 [services/transfer_svc.py] Transfer module active")
     checks: dict[str, list[dict[str, Any]]] = {
         "unused_servers": [],
         "protocol_optimization": [],

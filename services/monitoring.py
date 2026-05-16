@@ -7,14 +7,16 @@ This module will later become MonitoringModule (T-322) implementing ServiceModul
 
 from __future__ import annotations
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 from datetime import UTC, datetime
 from typing import Any
 
 from botocore.exceptions import ClientError  # type: ignore[import-untyped]
 
 from core.scan_context import ScanContext
-
-print("🔍 [services/monitoring.py] Monitoring module active")
 
 # CloudWatch Logs storage list price (us-east-1): $0.03/GB-month
 # Source: AWS Pricing API SKU JRHJQ2UMPUB5K73A (verified 2026-05).
@@ -156,7 +158,7 @@ def get_cloudwatch_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> 
                     _ = (state_reason, alarm_config_updated, alarm_name)
 
         except Exception as e:
-            print(f"Warning: Could not analyze CloudWatch alarms: {e}")
+            logger.warning(f"Warning: Could not analyze CloudWatch alarms: {e}")
 
         try:
             cloudwatch = ctx.client("cloudwatch")
@@ -189,10 +191,10 @@ def get_cloudwatch_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> 
                     )
 
         except Exception as e:
-            print(f"Warning: Could not analyze custom metrics: {e}")
+            logger.warning(f"Warning: Could not analyze custom metrics: {e}")
 
     except Exception as e:
-        print(f"Warning: Could not perform CloudWatch checks: {e}")
+        logger.warning(f"Warning: Could not perform CloudWatch checks: {e}")
 
     recommendations: list[dict[str, Any]] = []
     for _category, items in checks.items():
@@ -249,9 +251,9 @@ def get_cloudtrail_checks(ctx: ScanContext) -> dict[str, Any]:
 
             except ClientError as e:
                 if e.response["Error"]["Code"] != "TrailNotFoundException":
-                    print(f"Warning: Could not analyze event selectors for {trail_name}: {e}")
+                    logger.warning(f"Warning: Could not analyze event selectors for {trail_name}: {e}")
             except Exception as e:
-                print(f"Warning: Could not analyze event selectors for {trail_name}: {e}")
+                logger.warning(f"Warning: Could not analyze event selectors for {trail_name}: {e}")
 
             try:
                 insights_response = cloudtrail.get_insight_selectors(TrailName=trail_name)
@@ -263,15 +265,15 @@ def get_cloudtrail_checks(ctx: ScanContext) -> dict[str, Any]:
 
             except ClientError as e:
                 if e.response["Error"]["Code"] != "TrailNotFoundException":
-                    print(f"Warning: Could not check insights for {trail_name}: {e}")
+                    logger.warning(f"Warning: Could not check insights for {trail_name}: {e}")
             except Exception as e:
-                print(f"Warning: Could not check insights for {trail_name}: {e}")
+                logger.warning(f"Warning: Could not check insights for {trail_name}: {e}")
 
         # Multiple CloudTrail Trails finding removed: emitted $0/month with a generic
         # "consolidate overlapping trails" suggestion — no concrete savings.
 
     except Exception as e:
-        print(f"Warning: Could not perform CloudTrail checks: {e}")
+        logger.warning(f"Warning: Could not perform CloudTrail checks: {e}")
 
     recommendations: list[dict[str, Any]] = []
     for _category, items in checks.items():

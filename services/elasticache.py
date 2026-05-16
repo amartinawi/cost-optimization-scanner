@@ -6,12 +6,14 @@ This module will later become ElastiCacheModule (T-321) implementing ServiceModu
 
 from __future__ import annotations
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from core.scan_context import ScanContext
-
-print("🔍 [services/elasticache.py] ElastiCache module active")
 
 LOW_CPU_THRESHOLD: int = 20
 
@@ -155,7 +157,7 @@ def get_enhanced_elasticache_checks(ctx: ScanContext) -> dict[str, Any]:
                                 }
                             )
                 except Exception as e:
-                    print(f"Warning: Could not get metrics for cluster {cluster_id}: {e}")
+                    logger.warning(f"Warning: Could not get metrics for cluster {cluster_id}: {e}")
                     continue
 
     except Exception as e:

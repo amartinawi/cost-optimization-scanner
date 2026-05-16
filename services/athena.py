@@ -10,8 +10,6 @@ from typing import Any
 
 from core.scan_context import ScanContext
 
-print("🔍 [services/athena.py] Athena module active")
-
 ATHENA_OPTIMIZATION_DESCRIPTIONS: dict[str, dict[str, str]] = {
     "query_optimization": {
         "title": "Optimize Athena Query Costs",

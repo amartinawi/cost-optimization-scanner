@@ -11,8 +11,6 @@ from typing import Any
 
 from core.scan_context import ScanContext
 
-print("\U0001f50d [services/efs_fsx.py] EFS/FSx module active")
-
 SMALL_EFS_SIZE_GB: float = 0.1
 LARGE_EFS_SIZE_GB: float = 10.0
 LARGE_FSX_CAPACITY_GB: int = 100

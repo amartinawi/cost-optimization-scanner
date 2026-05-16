@@ -32,7 +32,6 @@ class TransferModule(BaseServiceModule):
         Returns:
             ServiceFindings with enhanced_checks SourceBlock.
         """
-        print("\U0001f50d [services/adapters/transfer.py] Transfer Family module active")
         result = get_enhanced_transfer_checks(ctx)
         recs = result.get("recommendations", [])
 

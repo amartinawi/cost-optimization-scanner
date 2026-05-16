@@ -100,7 +100,6 @@ class CommitmentAnalysisModule(BaseServiceModule):
             ri_utilization, ri_coverage_gaps, expiring_commitments,
             and purchase_recommendations source blocks.
         """
-        print("\U0001f50d [services/adapters/commitment_analysis.py] Commitment Analysis module active")
 
         ce = ctx.client("ce")
         if not ce:

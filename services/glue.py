@@ -10,8 +10,6 @@ from typing import Any
 
 from core.scan_context import ScanContext
 
-print("🔍 [services/glue.py] Glue module active")
-
 GLUE_OPTIMIZATION_DESCRIPTIONS: dict[str, dict[str, str]] = {
     "job_optimization": {
         "title": "Optimize Glue Job Configuration",

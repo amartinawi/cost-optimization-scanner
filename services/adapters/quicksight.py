@@ -32,7 +32,6 @@ class QuicksightModule(BaseServiceModule):
         Returns:
             ServiceFindings with enhanced_checks SourceBlock.
         """
-        print("\U0001f50d [services/adapters/quicksight.py] QuickSight module active")
         result = get_enhanced_quicksight_checks(ctx)
         recs = result.get("recommendations", [])
 

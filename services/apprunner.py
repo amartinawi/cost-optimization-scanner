@@ -10,8 +10,6 @@ from typing import Any
 
 from core.scan_context import ScanContext
 
-print("\U0001f50d [services/apprunner.py] AppRunner module active")
-
 APPRUNNER_OPTIMIZATION_DESCRIPTIONS: dict[str, dict[str, str]] = {
     "auto_scaling_optimization": {
         "title": "Optimize App Runner Auto Scaling",
@@ -23,7 +21,6 @@ APPRUNNER_OPTIMIZATION_DESCRIPTIONS: dict[str, dict[str, str]] = {
 
 def get_enhanced_apprunner_checks(ctx: ScanContext) -> dict[str, Any]:
     """Get enhanced App Runner cost optimization checks"""
-    print("\U0001f50d [services/apprunner.py] AppRunner module active")
     checks: dict[str, list[dict[str, Any]]] = {
         "auto_scaling_optimization": [],
         "instance_rightsizing": [],

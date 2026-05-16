@@ -6,9 +6,12 @@ This module will later become QuickSightModule (T-321) implementing ServiceModul
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from core.scan_context import ScanContext
+
+logger = logging.getLogger(__name__)
 
 QUICKSIGHT_OPTIMIZATION_DESCRIPTIONS: dict[str, dict[str, str]] = {
     "spice_optimization": {
@@ -21,7 +24,6 @@ QUICKSIGHT_OPTIMIZATION_DESCRIPTIONS: dict[str, dict[str, str]] = {
 
 def get_enhanced_quicksight_checks(ctx: ScanContext) -> dict[str, Any]:
     """Get enhanced QuickSight cost optimization checks."""
-    print("🔍 [services/quicksight.py] QuickSight module active")
     checks: dict[str, list[dict[str, Any]]] = {
         "spice_optimization": [],
         "user_optimization": [],
@@ -86,7 +88,7 @@ def get_enhanced_quicksight_checks(ctx: ScanContext) -> dict[str, Any]:
     except Exception as e:
         error_str = str(e)
         if "ResourceNotFoundException" in error_str and "account does not exist" in error_str:
-            print("ℹ️ QuickSight is not enabled in this account - skipping QuickSight analysis")
+            logger.info("QuickSight is not enabled in this account - skipping QuickSight analysis")
         else:
             ctx.warn(f"Could not analyze QuickSight resources: {e}", "quicksight")
 

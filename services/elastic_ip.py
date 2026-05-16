@@ -5,11 +5,13 @@ Extracted from CostOptimizer.get_elastic_ip_checks() as a free function.
 
 from __future__ import annotations
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 from typing import Any
 
 from core.scan_context import ScanContext
-
-print("🔍 [services/elastic_ip.py] Elastic IP module active")
 
 
 def get_elastic_ip_checks(ctx: ScanContext) -> dict[str, Any]:
@@ -119,11 +121,11 @@ def get_elastic_ip_checks(ctx: ScanContext) -> dict[str, Any]:
                                 }
                             )
                     except Exception as e:
-                        print(f"Warning: Could not check instance {instance_id}: {e}")
+                        logger.warning(f"Warning: Could not check instance {instance_id}: {e}")
                         continue
 
     except Exception as e:
-        print(f"Warning: Could not perform Elastic IP checks: {e}")
+        logger.warning(f"Warning: Could not perform Elastic IP checks: {e}")
 
     recommendations: list[dict[str, Any]] = []
     for _category, items in checks.items():

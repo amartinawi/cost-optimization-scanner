@@ -36,7 +36,6 @@ class LightsailModule(BaseServiceModule):
         Returns:
             ServiceFindings with per-check-type SourceBlock entries.
         """
-        print("\U0001f50d [services/adapters/lightsail.py] Lightsail module active")
         result = get_enhanced_lightsail_checks(ctx)
         recs = result.get("recommendations", [])
         # AWS Lightsail Pricing API uses `bundle` / `bundleGroup` filters,

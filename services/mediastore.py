@@ -11,8 +11,6 @@ from typing import Any
 
 from core.scan_context import ScanContext
 
-print("🔍 [services/mediastore.py] MediaStore module active")
-
 MEDIASTORE_OPTIMIZATION_DESCRIPTIONS: dict[str, dict[str, str]] = {
     "unused_containers": {
         "title": "Review Unused MediaStore Containers",

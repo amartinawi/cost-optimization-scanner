@@ -33,7 +33,6 @@ class DmsModule(BaseServiceModule):
         Returns:
             ServiceFindings with per-check-type SourceBlock entries.
         """
-        print("\U0001f50d [services/adapters/dms.py] DMS module active")
         result = get_enhanced_dms_checks(ctx)
         recs = result.get("recommendations", [])
         savings = 0.0

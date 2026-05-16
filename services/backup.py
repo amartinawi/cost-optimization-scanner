@@ -10,8 +10,6 @@ from typing import Any
 
 from core.scan_context import ScanContext
 
-print("🔍 [services/backup.py] Backup module active")
-
 BACKUP_OPTIMIZATION_DESCRIPTIONS: dict[str, dict[str, str]] = {
     "excessive_retention": {
         "title": "Optimize Backup Retention Periods",

@@ -11,8 +11,6 @@ from typing import Any
 
 from core.scan_context import ScanContext
 
-print("🔍 [services/step_functions.py] Step Functions module active")
-
 STEP_FUNCTIONS_OPTIMIZATION_DESCRIPTIONS: dict[str, dict[str, str]] = {
     "standard_vs_express": {
         "title": "Migrate High-Volume Standard Workflows to Express",

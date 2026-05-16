@@ -6,12 +6,14 @@ This module will later become OpenSearchModule (T-321) implementing ServiceModul
 
 from __future__ import annotations
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from core.scan_context import ScanContext
-
-print("\U0001f50d [services/opensearch.py] OpenSearch module active")
 
 LOW_CPU_THRESHOLD: int = 20
 
@@ -162,11 +164,11 @@ def get_enhanced_opensearch_checks(ctx: ScanContext) -> dict[str, Any]:
                                 }
                             )
                 except Exception as e:
-                    print(f"Warning: Could not get metrics for domain {domain_name}: {e}")
+                    logger.warning(f"Warning: Could not get metrics for domain {domain_name}: {e}")
                     continue
 
             except Exception as e:
-                print(f"\u26a0\ufe0f Error analyzing OpenSearch domain {domain_name}: {str(e)}")
+                logger.warning(f"\u26a0\ufe0f Error analyzing OpenSearch domain {domain_name}: {str(e)}")
 
     except Exception as e:
         ctx.warn(f"Could not analyze OpenSearch domains: {e}", "opensearch")

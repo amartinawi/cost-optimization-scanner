@@ -72,7 +72,6 @@ class DynamoDbModule(BaseServiceModule):
         Returns:
             ServiceFindings with "dynamodb_table_analysis" and "enhanced_checks" SourceBlocks.
         """
-        print("\U0001f50d [services/adapters/dynamodb.py] DynamoDB module active")
 
         dynamodb_data = get_dynamodb_table_analysis(ctx)
         enhanced_result = get_enhanced_dynamodb_checks(ctx)

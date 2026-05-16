@@ -32,7 +32,6 @@ class CloudfrontModule(BaseServiceModule):
         Returns:
             ServiceFindings with an "enhanced_checks" SourceBlock entry.
         """
-        print("\U0001f50d [services/adapters/cloudfront.py] CloudFront module active")
         try:
             result = get_enhanced_cloudfront_checks(ctx)
         except Exception as e:

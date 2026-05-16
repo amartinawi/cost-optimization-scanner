@@ -44,7 +44,6 @@ class RedshiftModule(BaseServiceModule):
         Returns:
             ServiceFindings with enhanced_checks SourceBlock.
         """
-        print("\U0001f50d [services/adapters/redshift.py] Redshift module active")
         # TODO: RA3 node types charge managed storage at $0.024/GB/month.
         # Current calculation only covers instance pricing, not RMS storage.
         result = get_enhanced_redshift_checks(ctx)

@@ -6,12 +6,14 @@ Extracted from CostOptimizer.get_load_balancer_checks() as a free function.
 
 from __future__ import annotations
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 from datetime import datetime
 from typing import Any
 
 from core.scan_context import ScanContext
-
-print("🔍 [services/load_balancer.py] Load Balancer module active")
 
 
 def _is_kubernetes_managed_alb(elbv2: Any, lb_name: str, lb_arn: str) -> bool:
@@ -45,7 +47,7 @@ def _is_kubernetes_managed_alb(elbv2: Any, lb_name: str, lb_arn: str) -> bool:
                     return True
 
     except Exception as e:
-        print(f"Warning: Could not get tags for ALB {lb_arn}: {e}")
+        logger.warning(f"Warning: Could not get tags for ALB {lb_arn}: {e}")
 
     return False
 
@@ -86,7 +88,7 @@ def get_load_balancer_checks(ctx: ScanContext) -> dict[str, Any]:
             for page in clb_paginator.paginate():
                 classic_lbs.extend(page.get("LoadBalancerDescriptions", []))
         except Exception as e:
-            print(f"⚠️ Error getting Classic Load Balancers: {str(e)}")
+            logger.warning(f"⚠️ Error getting Classic Load Balancers: {str(e)}")
             classic_lbs = []
 
         alb_count = 0
@@ -174,7 +176,7 @@ def get_load_balancer_checks(ctx: ScanContext) -> dict[str, Any]:
                         rules_response = elbv2.describe_rules(ListenerArn=listener["ListenerArn"])
                         total_rules += len(rules_response.get("Rules", []))
                     except Exception as e:
-                        print(f"Warning: Could not get rules for listener {listener['ListenerArn']}: {e}")
+                        logger.warning(f"Warning: Could not get rules for listener {listener['ListenerArn']}: {e}")
                         continue
 
                 # Excessive ALB rules finding removed: emitted no concrete $ — LCU savings
@@ -182,7 +184,7 @@ def get_load_balancer_checks(ctx: ScanContext) -> dict[str, Any]:
                 _ = total_rules
 
             except Exception as e:
-                print(f"Warning: Could not analyze ALB {lb_name}: {e}")
+                logger.warning(f"Warning: Could not analyze ALB {lb_name}: {e}")
                 continue
 
             # Unnecessary Cross-AZ LB finding removed: estimate used a fake "1GB/hour"
@@ -234,7 +236,7 @@ def get_load_balancer_checks(ctx: ScanContext) -> dict[str, Any]:
                     )
 
     except Exception as e:
-        print(f"Warning: Load Balancer checks failed: {e}")
+        logger.warning(f"Warning: Load Balancer checks failed: {e}")
 
     recommendations: list[dict[str, Any]] = []
     for _category, items in checks.items():

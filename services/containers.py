@@ -13,8 +13,6 @@ from core.scan_context import ScanContext
 
 logger = logging.getLogger(__name__)
 
-print("\U0001f50d [services/containers.py] Containers module active")
-
 HIGH_IMAGE_COUNT_THRESHOLD: int = 10
 
 CONTAINER_OPTIMIZATION_DESCRIPTIONS: dict[str, dict[str, str]] = {
@@ -228,7 +226,7 @@ def get_ecr_analysis(ctx: ScanContext) -> dict[str, Any]:
                 for page in paginator.paginate(repositoryName=repo_name):
                     image_count += len(page.get("imageIds", []))
             except Exception as e:
-                print(f"\u26a0\ufe0f Error getting image count for ECR repo {repo_name}: {str(e)}")
+                logger.warning(f"\u26a0\ufe0f Error getting image count for ECR repo {repo_name}: {str(e)}")
                 image_count = 0
 
             repo_info: dict[str, Any] = {
@@ -446,10 +444,10 @@ def get_enhanced_container_checks(ctx: ScanContext) -> dict[str, Any]:
                             # first" is a monitoring-enablement nudge, not a cost saving.
 
                         except Exception as e:
-                            print(f"Warning: Could not check Container Insights for ECS cluster {cluster_name}: {e}")
+                            logger.warning(f"Warning: Could not check Container Insights for ECS cluster {cluster_name}: {e}")
 
             except Exception as e:
-                print(f"Warning: Could not analyze ECS services for {cluster_name}: {e}")
+                logger.warning(f"Warning: Could not analyze ECS services for {cluster_name}: {e}")
 
         # EKS Checks
         try:
@@ -586,13 +584,13 @@ def get_enhanced_container_checks(ctx: ScanContext) -> dict[str, Any]:
                                 )
 
                         except Exception as e:
-                            print(f"Warning: Could not analyze EKS nodegroup {nodegroup_name}: {e}")
+                            logger.warning(f"Warning: Could not analyze EKS nodegroup {nodegroup_name}: {e}")
 
                 except Exception as e:
-                    print(f"Warning: Could not analyze EKS cluster {cluster_name}: {e}")
+                    logger.warning(f"Warning: Could not analyze EKS cluster {cluster_name}: {e}")
 
         except Exception as e:
-            print(f"Warning: Could not perform EKS checks: {e}")
+            logger.warning(f"Warning: Could not perform EKS checks: {e}")
 
         # ECR Checks
         try:
@@ -621,13 +619,13 @@ def get_enhanced_container_checks(ctx: ScanContext) -> dict[str, Any]:
                         )
 
                 except Exception as e:
-                    print(f"Warning: Could not analyze ECR repository {repo_name}: {e}")
+                    logger.warning(f"Warning: Could not analyze ECR repository {repo_name}: {e}")
 
         except Exception as e:
-            print(f"Warning: Could not perform ECR checks: {e}")
+            logger.warning(f"Warning: Could not perform ECR checks: {e}")
 
     except Exception as e:
-        print(f"Warning: Could not perform enhanced Container checks: {e}")
+        logger.warning(f"Warning: Could not perform enhanced Container checks: {e}")
 
     recommendations: list[dict[str, Any]] = []
     for _category, items in checks.items():

@@ -10,8 +10,6 @@ from typing import Any
 
 from core.scan_context import ScanContext
 
-print("🔍 [services/workspaces.py] WorkSpaces module active")
-
 WORKSPACE_BUNDLE_MAP: dict[str, str] = {
     "VALUE": "1",
     "STANDARD": "2",

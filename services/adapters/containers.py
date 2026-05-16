@@ -59,7 +59,6 @@ class ContainersModule(BaseServiceModule):
             ServiceFindings with enhanced_checks, cost_optimization_hub, and
             compute_optimizer SourceBlocks plus service_counts extras.
         """
-        print("\U0001f50d [services/adapters/containers.py] Containers module active")
 
         try:
             container_data = get_container_services_analysis(ctx)

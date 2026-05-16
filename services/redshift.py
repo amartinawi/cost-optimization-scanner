@@ -11,8 +11,6 @@ from typing import Any
 
 from core.scan_context import ScanContext
 
-print("🔍 [services/redshift.py] Redshift module active")
-
 REDSHIFT_OPTIMIZATION_DESCRIPTIONS: dict[str, dict[str, str]] = {
     "reserved_instances": {
         "title": "Purchase Redshift Reserved Instances",

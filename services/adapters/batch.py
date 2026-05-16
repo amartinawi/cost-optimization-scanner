@@ -36,7 +36,6 @@ class BatchModule(BaseServiceModule):
         Returns:
             ServiceFindings with an "enhanced_checks" SourceBlock entry.
         """
-        print("\U0001f50d [services/adapters/batch.py] Batch module active")
         result = get_enhanced_batch_checks(ctx)
         recs = result.get("recommendations", [])
         savings = 0.0

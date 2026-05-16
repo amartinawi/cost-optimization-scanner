@@ -37,7 +37,6 @@ class NetworkModule(BaseServiceModule):
         Returns:
             ServiceFindings with consolidated enhanced_checks SourceBlock.
         """
-        print("\U0001f50d [services/adapters/network.py] Network module active")
 
         eip_result = get_elastic_ip_checks(ctx)
         nat_result = get_nat_gateway_checks(ctx)

@@ -6,12 +6,14 @@ This module will later become LambdaModule (T-321) implementing ServiceModule.
 
 from __future__ import annotations
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from core.scan_context import ScanContext
-
-print("\U0001f50d [services/lambda_svc.py] Lambda module active")
 
 LAMBDA_OPTIMIZATION_DESCRIPTIONS: dict[str, dict[str, str]] = {
     "excessive_memory": {
@@ -105,7 +107,7 @@ def get_enhanced_lambda_checks(ctx: ScanContext) -> dict[str, Any]:
                     vpc_config = config.get("VpcConfig", {})
                     reserved_concurrency = config.get("ReservedConcurrentExecutions")
                 except Exception as e:
-                    print(f"\u26a0\ufe0f Error getting Lambda function config for {function_name}: {str(e)}")
+                    logger.warning(f"\u26a0\ufe0f Error getting Lambda function config for {function_name}: {str(e)}")
                     vpc_config = {}
                     reserved_concurrency = None
 
@@ -141,7 +143,7 @@ def get_enhanced_lambda_checks(ctx: ScanContext) -> dict[str, Any]:
                                 }
                             )
                 except Exception as e:
-                    print(f"Warning: Could not check provisioned concurrency for {function_name}: {e}")
+                    logger.warning(f"Warning: Could not check provisioned concurrency for {function_name}: {e}")
                     continue
 
                 # Lambda VPC configuration finding removed: mixed cost/performance ("improve

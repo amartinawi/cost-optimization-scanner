@@ -36,7 +36,6 @@ class AmiModule(BaseServiceModule):
         Args:
             ctx: ScanContext with region, clients, and pricing data.
         """
-        print("\U0001f50d [services/adapters/ami.py] AMI module active")
         result = compute_ami_checks(ctx, ctx.pricing_multiplier)
         old_recs = result.get("old_amis", [])
         unused_recs = result.get("unused_amis", [])

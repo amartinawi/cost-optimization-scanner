@@ -11,8 +11,6 @@ from typing import Any
 
 from core.scan_context import ScanContext
 
-print("🔍 [services/dms.py] DMS module active")
-
 DMS_OPTIMIZATION_DESCRIPTIONS: dict[str, dict[str, str]] = {
     "serverless_migration": {
         "title": "DMS Serverless Migration Review",

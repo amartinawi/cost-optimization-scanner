@@ -12,8 +12,6 @@ from typing import Any
 
 from core.scan_context import ScanContext
 
-print("\U0001f50d [services/dynamodb.py] DynamoDB module active")
-
 DYNAMODB_CHECK_DESCRIPTIONS: dict[str, dict[str, str]] = {
     "billing_mode_optimization": {
         "title": "Optimize DynamoDB Billing Mode",

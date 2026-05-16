@@ -6,6 +6,10 @@ This module will later become AmiModule (T-321) implementing ServiceModule.
 
 from __future__ import annotations
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 from datetime import UTC, datetime
 from typing import Any
 
@@ -19,7 +23,6 @@ def compute_ami_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> dic
 
     Returns dict with 'recommendations' (list) and 'total_count' (int).
     """
-    print("🔍 [services/ami.py] AMI module active")
     ec2 = ctx.client("ec2")
     autoscaling = ctx.client("autoscaling")
     checks: dict[str, list[dict[str, Any]]] = {"unused_amis": [], "old_amis": []}
@@ -104,7 +107,7 @@ def compute_ami_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> dic
                             for snapshot in snapshot_response.get("Snapshots", []):
                                 total_snapshot_size_gb += snapshot.get("VolumeSize", 0)
                         except Exception as e:
-                            print(f"⚠️ Error getting snapshot details for {snapshot_id}: {str(e)}")
+                            logger.warning(f"⚠️ Error getting snapshot details for {snapshot_id}: {str(e)}")
                             total_snapshot_size_gb += block_device["Ebs"].get("VolumeSize", 8)
 
                 if total_snapshot_size_gb == 0:
@@ -144,7 +147,7 @@ def compute_ami_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> dic
                     }
                 )
     except Exception as e:
-        print(f"Warning: Could not get AMI checks: {e}")
+        logger.warning(f"Warning: Could not get AMI checks: {e}")
 
     return {
         "recommendations": checks.get("old_amis", []) + checks.get("unused_amis", []),

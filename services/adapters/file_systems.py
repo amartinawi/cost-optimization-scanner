@@ -59,7 +59,6 @@ class FileSystemsModule(BaseServiceModule):
             ServiceFindings with "efs_lifecycle_analysis",
             "fsx_optimization_analysis", and "enhanced_checks" SourceBlock entries.
         """
-        print("\U0001f50d [services/adapters/file_systems.py] File Systems module active")
 
         efs_counts = get_efs_file_system_count(ctx)
         fsx_counts = get_fsx_file_system_count(ctx)

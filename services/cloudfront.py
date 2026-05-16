@@ -11,8 +11,6 @@ from typing import Any
 
 from core.scan_context import ScanContext
 
-print("🔍 [services/cloudfront.py] CloudFront module active")
-
 
 def get_enhanced_cloudfront_checks(ctx: ScanContext) -> dict[str, Any]:
     """Enhanced CloudFront cost optimization checks with traffic-based gating.

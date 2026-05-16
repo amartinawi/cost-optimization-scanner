@@ -10,8 +10,6 @@ from typing import Any
 
 from core.scan_context import ScanContext
 
-print("🔍 [services/route53.py] Route53 module active")
-
 # Route 53 hosted zone pricing (us-east-1 / global):
 #   First 25 hosted zones:  $0.50/zone/month
 #   Each additional zone:   $0.10/zone/month

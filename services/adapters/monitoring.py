@@ -38,7 +38,6 @@ class MonitoringModule(BaseServiceModule):
             ServiceFindings with cloudwatch_checks, cloudtrail_checks,
             backup_checks, and route53_checks SourceBlock entries.
         """
-        print("\U0001f50d [services/adapters/monitoring.py] Monitoring module active")
 
         multiplier = ctx.pricing_multiplier
         cw_result = get_cloudwatch_checks(ctx, multiplier)

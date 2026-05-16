@@ -9,10 +9,13 @@ covered by the pre-fetch.
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from core.contracts import GroupingSpec, ServiceFindings, SourceBlock, StatCardSpec
 from services._base import BaseServiceModule
+
+logger = logging.getLogger(__name__)
 
 
 _ROUTED_RESOURCE_TYPES: frozenset[str] = frozenset(
@@ -74,7 +77,6 @@ class CostOptimizationHubModule(BaseServiceModule):
             ServiceFindings with savings_plans and cross_service SourceBlock
             entries containing only unrouted recommendations.
         """
-        print("\U0001f50d [services/adapters/cost_optimization_hub.py] Cost Optimization Hub module active")
 
         all_recs: list[dict[str, Any]] = self._collect_prefetched(ctx)
         all_recs.extend(self._fetch_supplemental(ctx))
@@ -211,7 +213,7 @@ class CostOptimizationHubModule(BaseServiceModule):
                         recs.append(item)
 
         except Exception as e:
-            print(f"Warning: Cost Optimization Hub supplemental fetch error: {e}")
+            logger.warning(f"Cost Optimization Hub supplemental fetch error: {e}")
 
         return recs
 

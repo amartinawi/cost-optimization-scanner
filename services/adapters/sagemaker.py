@@ -392,7 +392,6 @@ class SageMakerModule(BaseServiceModule):
         return ("sagemaker", "cloudwatch")
 
     def scan(self, ctx: Any) -> ServiceFindings:
-        print(f"\U0001f50d [services/adapters/sagemaker.py] SageMaker module active")
 
         sm = ctx.client("sagemaker")
         if not sm:

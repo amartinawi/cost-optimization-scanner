@@ -37,7 +37,6 @@ class ApiGatewayModule(BaseServiceModule):
         Returns:
             ServiceFindings with an "enhanced_checks" SourceBlock entry.
         """
-        print("\U0001f50d [services/adapters/api_gateway.py] API Gateway module active")
         result = get_enhanced_api_gateway_checks(ctx)
         recs = result.get("recommendations", [])
 

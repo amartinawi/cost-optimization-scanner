@@ -36,7 +36,6 @@ class StepFunctionsModule(BaseServiceModule):
         Returns:
             ServiceFindings with enhanced_checks SourceBlock.
         """
-        print("\U0001f50d [services/adapters/step_functions.py] Step Functions module active")
         result = get_enhanced_step_functions_checks(ctx)
         recs = result.get("recommendations", [])
 

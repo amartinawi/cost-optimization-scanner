@@ -42,7 +42,6 @@ class WorkspacesModule(BaseServiceModule):
         Returns:
             ServiceFindings with enhanced_checks SourceBlock.
         """
-        print("\U0001f50d [services/adapters/workspaces.py] WorkSpaces module active")
         result = get_enhanced_workspaces_checks(ctx)
         recs = result.get("recommendations", [])
         # AWS WorkSpaces Pricing API uses the `bundle` filter (not `instanceType`),

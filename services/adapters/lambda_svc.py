@@ -52,7 +52,6 @@ class LambdaModule(BaseServiceModule):
             ServiceFindings with cost_optimization_hub, compute_optimizer,
             and enhanced_checks sources.
         """
-        print("\U0001f50d [services/adapters/lambda.py] Lambda module active")
 
         cost_hub_recs = ctx.cost_hub_splits.get("lambda", [])
         co_recs = get_lambda_compute_optimizer_recommendations(ctx)

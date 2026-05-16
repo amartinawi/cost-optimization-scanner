@@ -34,7 +34,6 @@ class MskModule(BaseServiceModule):
         """
         # TODO: Serverless migration comparison needs DCU-hour pricing ($0.06/DCU-hour).
         # Current recommendation is directional only, not cost-quantified.
-        print("\U0001f50d [services/adapters/msk.py] MSK module active")
         result = get_enhanced_msk_checks(ctx)
         recs = result.get("recommendations", [])
         savings = 0.0

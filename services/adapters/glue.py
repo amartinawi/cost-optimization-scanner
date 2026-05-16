@@ -33,7 +33,6 @@ class GlueModule(BaseServiceModule):
         Returns:
             ServiceFindings with per-check-type SourceBlock entries.
         """
-        print("\U0001f50d [services/adapters/glue.py] Glue module active")
         result = get_enhanced_glue_checks(ctx)
         recs = result.get("recommendations", [])
 

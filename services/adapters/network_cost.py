@@ -18,11 +18,14 @@ EC2 calls are free (no per-request charge).
 
 from __future__ import annotations
 
+import logging
 from datetime import date, timedelta
 from typing import Any
 
 from core.contracts import GroupingSpec, ServiceFindings, SourceBlock, StatCardSpec
 from services._base import BaseServiceModule
+
+logger = logging.getLogger(__name__)
 
 CROSS_AZ_SAVINGS_FACTOR: float = 0.5
 CLOUDFRONT_SAVINGS_FACTOR: float = 0.40
@@ -95,7 +98,6 @@ class NetworkCostModule(BaseServiceModule):
             ServiceFindings with cross_region_transfer, cross_az_transfer,
             internet_egress, and tgw_vs_peering source blocks.
         """
-        print("\U0001f50d [services/adapters/network_cost.py] Network Cost module active")
 
         ce = ctx.client("ce")
         ec2 = ctx.client("ec2")
@@ -221,7 +223,7 @@ class NetworkCostModule(BaseServiceModule):
                     breakdown["egress"] += cost
 
         except Exception as e:
-            print(f"Warning: Data transfer spend query failed: {e}")
+            logger.warning(f"Data transfer spend query failed: {e}")
 
         return total, breakdown
 
@@ -354,14 +356,14 @@ class NetworkCostModule(BaseServiceModule):
             resp = ec2.describe_vpc_peering_connections(Filters=[{"Name": "status-code", "Values": ["active"]}])
             peering_count = len(resp.get("VpcPeeringConnections", []))
         except Exception as e:
-            print(f"Warning: VPC peering query failed: {e}")
+            logger.warning(f"VPC peering query failed: {e}")
 
         try:
             resp = ec2.describe_transit_gateways()
             tgws = resp.get("TransitGateways", [])
             tgw_count = len(tgws)
         except Exception as e:
-            print(f"Warning: Transit Gateway query failed: {e}")
+            logger.warning(f"Transit Gateway query failed: {e}")
 
         return peering_count, tgw_count
 

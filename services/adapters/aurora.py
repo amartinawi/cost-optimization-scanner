@@ -10,11 +10,14 @@ Analyzes Aurora DB clusters for:
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from core.contracts import GroupingSpec, ServiceFindings, SourceBlock, StatCardSpec
 from services._base import BaseServiceModule
+
+logger = logging.getLogger(__name__)
 
 ACU_HOURLY_FALLBACK: float = 0.06
 IO_COST_PER_MILLION: float = 0.20
@@ -350,7 +353,6 @@ class AuroraModule(BaseServiceModule):
         return ("rds", "cloudwatch")
 
     def scan(self, ctx: Any) -> ServiceFindings:
-        print("\U0001f50d [services/adapters/aurora.py] Aurora module active")
 
         rds = ctx.client("rds")
         cw = ctx.client("cloudwatch")
@@ -392,7 +394,7 @@ class AuroraModule(BaseServiceModule):
                 global_recs.extend(_check_global_db(cluster, rds, cw, fast_mode))
                 backtrack_recs.extend(_check_backtrack(cluster))
             except Exception as e:
-                print(f"Warning: [aurora] cluster check failed: {e}")
+                logger.warning(f"[aurora] cluster check failed: {e}")
                 continue
 
         all_recs = serverless_recs + io_recs + clone_recs + global_recs + backtrack_recs

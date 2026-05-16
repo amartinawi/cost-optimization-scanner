@@ -15,8 +15,6 @@ REST_PER_M = 3.50
 HTTP_PER_M = 1.00
 SAVINGS_PER_M = REST_PER_M - HTTP_PER_M
 
-print("🔍 [services/api_gateway.py] API Gateway module active")
-
 API_GATEWAY_OPTIMIZATION_DESCRIPTIONS: dict[str, dict[str, str]] = {
     "rest_vs_http": {
         "title": "Migrate Simple REST APIs to HTTP API",

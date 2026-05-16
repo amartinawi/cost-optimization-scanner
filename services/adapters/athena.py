@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from core.contracts import ServiceFindings, SourceBlock
 from services._base import BaseServiceModule
 from services.athena import ATHENA_OPTIMIZATION_DESCRIPTIONS, get_enhanced_athena_checks
+
+logger = logging.getLogger(__name__)
 
 # Athena per-TB scan rate (us-east-1, verified $5/TB AWS list).
 # When CW ProcessedBytes is unavailable we emit 0 + PricingWarning
@@ -27,7 +30,6 @@ class AthenaModule(BaseServiceModule):
         return ("athena", "cloudwatch")
 
     def scan(self, ctx: Any) -> ServiceFindings:
-        print("\U0001f50d [services/adapters/athena.py] Athena module active")
         result = get_enhanced_athena_checks(ctx)
         recs = result.get("recommendations", [])
 
@@ -58,7 +60,7 @@ class AthenaModule(BaseServiceModule):
                         total_bytes = sum(dp["Sum"] for dp in resp.get("Datapoints", []))
                         monthly_tb = total_bytes / (1024**4) if total_bytes > 0 else 0
                     except Exception as e:
-                        print(f"Warning: [athena] CloudWatch ProcessedBytes metric check failed: {e}")
+                        logger.warning(f"[athena] CloudWatch ProcessedBytes metric check failed: {e}")
                         monthly_tb = 0
 
                 if monthly_tb > 0:

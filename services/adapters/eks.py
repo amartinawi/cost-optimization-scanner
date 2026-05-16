@@ -13,10 +13,13 @@ AWS API cost: All EKS API calls are free (no per-request charge).
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from core.contracts import GroupingSpec, ServiceFindings, SourceBlock, StatCardSpec
 from services._base import BaseServiceModule
+
+logger = logging.getLogger(__name__)
 
 EKS_CONTROL_PLANE_HOURLY: float = 0.10
 FARGATE_VCPU_HOURLY: float = 0.04048
@@ -74,7 +77,6 @@ class EksCostModule(BaseServiceModule):
             fargate_analysis, addon_costs, and cost_hub_recommendations
             source blocks.
         """
-        print("\U0001f50d [services/adapters/eks.py] EKS Cost Visibility module active")
 
         eks = ctx.client("eks")
         if not eks:
@@ -195,7 +197,7 @@ class EksCostModule(BaseServiceModule):
             for page in paginator.paginate():
                 names.extend(page.get("clusters", []))
         except Exception as e:
-            print(f"Warning: EKS list_clusters failed: {e}")
+            logger.warning(f"EKS list_clusters failed: {e}")
         return names
 
     def _describe_cluster(self, eks: Any, name: str) -> dict[str, Any] | None:
@@ -211,7 +213,7 @@ class EksCostModule(BaseServiceModule):
         try:
             return eks.describe_cluster(name=name)
         except Exception as e:
-            print(f"Warning: EKS describe_cluster({name}) failed: {e}")
+            logger.warning(f"EKS describe_cluster({name}) failed: {e}")
             return None
 
     def _check_cluster_cost(
@@ -301,7 +303,7 @@ class EksCostModule(BaseServiceModule):
             for page in paginator.paginate(clusterName=cluster_name):
                 ng_names.extend(page.get("nodegroups", []))
         except Exception as e:
-            print(f"Warning: EKS list_nodegroups({cluster_name}) failed: {e}")
+            logger.warning(f"EKS list_nodegroups({cluster_name}) failed: {e}")
             return recs, 0
 
         for ng_name in ng_names:
@@ -376,7 +378,7 @@ class EksCostModule(BaseServiceModule):
                 )
 
             except Exception as e:
-                print(f"Warning: EKS describe_nodegroup({cluster_name}/{ng_name}) failed: {e}")
+                logger.warning(f"EKS describe_nodegroup({cluster_name}/{ng_name}) failed: {e}")
 
         return recs, len(ng_names)
 
@@ -407,7 +409,7 @@ class EksCostModule(BaseServiceModule):
             for page in paginator.paginate(clusterName=cluster_name):
                 profile_names.extend(page.get("fargateProfileNames", []))
         except Exception as e:
-            print(f"Warning: EKS list_fargate_profiles({cluster_name}) failed: {e}")
+            logger.warning(f"EKS list_fargate_profiles({cluster_name}) failed: {e}")
             return recs, 0
 
         if profile_names:
@@ -465,7 +467,7 @@ class EksCostModule(BaseServiceModule):
             resp = eks.list_addons(clusterName=cluster_name)
             addon_names = resp.get("addons", [])
         except Exception as e:
-            print(f"Warning: EKS list_addons({cluster_name}) failed: {e}")
+            logger.warning(f"EKS list_addons({cluster_name}) failed: {e}")
             return recs, 0
 
         for addon_name in addon_names:
@@ -483,7 +485,7 @@ class EksCostModule(BaseServiceModule):
                 _ = (addon_arn, addon_status, addon_version)
 
             except Exception as e:
-                print(f"Warning: EKS describe_addon({cluster_name}/{addon_name}) failed: {e}")
+                logger.warning(f"EKS describe_addon({cluster_name}/{addon_name}) failed: {e}")
 
         return recs, len(addon_names)
 

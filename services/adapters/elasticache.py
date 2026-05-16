@@ -36,7 +36,6 @@ class ElasticacheModule(BaseServiceModule):
         Returns:
             ServiceFindings with an "enhanced_checks" SourceBlock entry.
         """
-        print("\U0001f50d [services/adapters/elasticache.py] ElastiCache module active")
         result = get_enhanced_elasticache_checks(ctx)
         recs = result.get("recommendations", [])
 

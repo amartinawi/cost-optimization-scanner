@@ -327,7 +327,6 @@ class BedrockModule(BaseServiceModule):
         return ("bedrock", "bedrock-agent", "cloudwatch")
 
     def scan(self, ctx: Any) -> ServiceFindings:
-        print("\U0001f50d [services/adapters/bedrock.py] Bedrock module active")
 
         bedrock = ctx.client("bedrock")
         cw = ctx.client("cloudwatch")

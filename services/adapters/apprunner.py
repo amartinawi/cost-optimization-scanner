@@ -72,7 +72,6 @@ class AppRunnerModule(BaseServiceModule):
         return DEFAULT_ACTIVE_HOURS_PER_MONTH
 
     def scan(self, ctx: Any) -> ServiceFindings:
-        print("\U0001f50d [services/adapters/apprunner.py] App Runner module active")
         result = get_enhanced_apprunner_checks(ctx)
         recs = result.get("recommendations", [])
 
