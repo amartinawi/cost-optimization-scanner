@@ -223,3 +223,88 @@ def test_backup_filter_pins_engine_for_determinism():
     _engine(client).get_rds_backup_storage_price_per_gb()
     assert _filter_value(client.last_filters, "databaseEngine") == "MySQL"
     assert _filter_value(client.last_filters, "productFamily") == "Storage Snapshot"
+
+
+# --------------------------------------------------------------------------- #
+# Enhanced-checks fakes (shared by slice 3 / slice 4)
+# --------------------------------------------------------------------------- #
+class _FakePaginator:
+    def __init__(self, pages):
+        self._pages = pages
+
+    def paginate(self, **kwargs):
+        return list(self._pages)
+
+
+class _FakeRdsClient:
+    def __init__(self, *, instances=None, snapshots=None, clusters=None, cluster_snapshots=None, tags=None):
+        self._instances = instances or []
+        self._snapshots = snapshots or []
+        self._clusters = clusters or []
+        self._cluster_snapshots = cluster_snapshots or []
+        self._tags = tags or {}
+
+    def get_paginator(self, op):
+        pages = {
+            "describe_db_instances": [{"DBInstances": self._instances}],
+            "describe_db_snapshots": [{"DBSnapshots": self._snapshots}],
+            "describe_db_clusters": [{"DBClusters": self._clusters}],
+            "describe_db_cluster_snapshots": [{"DBClusterSnapshots": self._cluster_snapshots}],
+        }[op]
+        return _FakePaginator(pages)
+
+    def list_tags_for_resource(self, ResourceName):  # noqa: N803
+        return {"TagList": self._tags.get(ResourceName, [])}
+
+
+class _FakeRdsPricingEngine:
+    """Deterministic RDS pricing: Multi-AZ = 2× Single-AZ; storage/backup flat."""
+
+    def get_rds_instance_monthly_price(self, engine, instance_class, *, multi_az=False):
+        return 200.0 if multi_az else 100.0
+
+    def get_rds_monthly_storage_price_per_gb(self, storage_type, *, multi_az=False):
+        return 0.115
+
+    def get_rds_backup_storage_price_per_gb(self):
+        return 0.095
+
+
+class _EnhancedCtx(_FakeCtx):
+    def __init__(self, rds_client, pricing_engine=None):
+        super().__init__(pricing_engine=pricing_engine or _FakeRdsPricingEngine())
+        self._rds_client = rds_client
+
+    def client(self, name, region=None):
+        return self._rds_client if name == "rds" else None
+
+
+def _instance(**over):
+    base = {
+        "DBInstanceIdentifier": "prod-db",
+        "DBInstanceClass": "db.t3.medium",
+        "Engine": "mysql",
+        "DBInstanceStatus": "available",
+        "MultiAZ": False,
+        "BackupRetentionPeriod": 7,
+        "AllocatedStorage": 100,
+        "StorageType": "gp2",
+        "EngineVersion": "8.0",
+    }
+    base.update(over)
+    return base
+
+
+def _recs(ctx):
+    from services.rds import get_enhanced_rds_checks
+
+    return get_enhanced_rds_checks(ctx, 1.0, 90)["recommendations"]
+
+
+# --------------------------------------------------------------------------- #
+# Slice 3 — C1-a: no phantom gp2->gp3 storage savings
+# --------------------------------------------------------------------------- #
+def test_no_gp2_gp3_storage_recommendation():
+    ctx = _EnhancedCtx(_FakeRdsClient(instances=[_instance(StorageType="gp2")]))
+    cats = [r.get("CheckCategory", "") for r in _recs(ctx)]
+    assert not any("Storage" in c for c in cats)

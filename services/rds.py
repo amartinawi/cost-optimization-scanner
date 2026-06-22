@@ -236,7 +236,6 @@ def get_enhanced_rds_checks(
                 multi_az = instance.get("MultiAZ", False)
                 backup_retention = instance.get("BackupRetentionPeriod", 0)
                 allocated_storage = instance.get("AllocatedStorage", 0)
-                storage_type = instance.get("StorageType", "gp2")
 
                 if db_instance_status not in ["available", "stopped"]:
                     continue
@@ -342,30 +341,14 @@ def get_enhanced_rds_checks(
                         }
                     )
 
-                if storage_type == "gp2":
-                    gp2_price = (
-                        ctx.pricing_engine.get_rds_monthly_storage_price_per_gb("gp2", multi_az=multi_az)
-                        if ctx.pricing_engine
-                        else 0.115 * pricing_multiplier
-                    )
-                    monthly_cost = allocated_storage * gp2_price
-                    savings = monthly_cost * 0.20
-                    checks["storage_optimization"].append(
-                        {
-                            "DBInstanceIdentifier": db_instance_id,
-                            "resourceArn": (f"arn:aws:rds:{region}:{account_id}:db:{db_instance_id}"),
-                            "engine": engine,
-                            "engineVersion": instance.get("EngineVersion", ""),
-                            "CurrentStorageType": storage_type,
-                            "AllocatedStorage": allocated_storage,
-                            "Recommendation": ("Migrate from gp2 to gp3 for 20% cost savings"),
-                            "EstimatedSavings": f"${savings:.2f}/month",
-                            "CheckCategory": "RDS Storage Optimization",
-                            "storageFinding": (f"{storage_type} ({allocated_storage}GB) → gp3 recommended"),
-                        }
-                    )
-                # io1/io2/gp3 "review IOPS/throughput" finding removed: requires workload
-                # analysis to quantify — emitted no concrete savings.
+                # gp2 -> gp3 storage-migration finding removed (audit C1): unlike EBS,
+                # RDS gp2 and gp3 *base* storage cost the same per GB ($0.115/GB-Mo,
+                # every engine, verified via the Pricing API). The old flat 20% was
+                # phantom savings. gp3's real benefit is its included 3000 IOPS /
+                # 125 MBps baseline, so any saving requires reading provisioned IOPS
+                # above that baseline — there is no defensible flat per-GB delta.
+                # io1/io2/gp3 "review IOPS/throughput" finding likewise removed:
+                # requires workload analysis to quantify — emitted no concrete savings.
 
                 if any(env in db_instance_id.lower() for env in ["dev", "test", "staging", "qa"]):
                     env_name = next(
