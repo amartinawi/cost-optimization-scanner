@@ -108,15 +108,6 @@ _RDS_ENGINE_LABELS: dict[str, str] = {
     "db2-se": "Db2",
 }
 
-# RDS engines whose Pricing API rows live under licenseModel="License included"
-# rather than the default "No license required". Oracle and SQL Server BYOL paths
-# (which RDS does not bill for license) would need different handling, but RDS
-# only offers LI for SQL Server today and an LI/BYOL split for Oracle.
-_RDS_LICENSE_INCLUDED_ENGINES: frozenset[str] = frozenset({
-    "sqlserver-ee", "sqlserver-se", "sqlserver-ex", "sqlserver-web",
-    "oracle-se2",
-})
-
 # RDS engines whose Multi-AZ deployment is published under the "SQL Server
 # Mirror" deploymentOption rather than plain "Multi-AZ" (verified via the
 # Pricing API: deploymentOption values include "Multi-AZ (SQL Server Mirror)").
@@ -146,6 +137,58 @@ def _rds_multi_az_deployment_option(engine: str, *, multi_az: bool) -> str:
     if not multi_az:
         return "Single-AZ"
     return "Multi-AZ (SQL Server Mirror)" if engine in _RDS_SQLSERVER_ENGINES else "Multi-AZ"
+
+
+# RDS engine name -> AWS Pricing API 'databaseEdition' filter value. SQL Server
+# and Oracle price *per edition* (verified via the Pricing API: db.m5.large
+# SQL Server Web $0.311/hr vs Standard $0.977/hr; Oracle SE2 vs EE differ).
+# The describe-API engine string encodes the edition, so without this filter the
+# lookup matches several editions and MaxResults picks one non-deterministically.
+# Engines without an edition dimension (MySQL/PostgreSQL/MariaDB/Aurora/Db2) are
+# absent and get no databaseEdition filter.
+_RDS_ENGINE_EDITIONS: dict[str, str] = {
+    "sqlserver-ee": "Enterprise",
+    "sqlserver-se": "Standard",
+    "sqlserver-ex": "Express",
+    "sqlserver-web": "Web",
+    "oracle-ee": "Enterprise",
+    "oracle-ee-cdb": "Enterprise",
+    "oracle-se2": "Standard Two",
+    "oracle-se2-cdb": "Standard Two",
+    "oracle-se": "Standard One",
+    "oracle-se1": "Standard One",
+}
+
+# RDS describe-API LicenseModel -> AWS Pricing API 'licenseModel' filter value.
+_RDS_LICENSE_MODEL_LABELS: dict[str, str] = {
+    "license-included": "License included",
+    "bring-your-own-license": "Bring your own license",
+    "general-public-license": "No license required",
+    "postgresql-license": "No license required",
+}
+
+
+def _normalize_rds_license_model(rds_license_model: str | None, engine: str) -> str:
+    """Resolve the Pricing API 'licenseModel' value for an RDS instance.
+
+    Prefers the instance's actual ``LicenseModel`` (from ``describe_db_instances``)
+    because it is the only reliable signal — Oracle SE2 License-Included
+    ($0.438/hr) vs BYOL ($0.171/hr) is a 2.6x swing on the same class, and Oracle
+    has NO "No license required" row at all (so the old engine-static default
+    silently missed and fell back). When the instance value is absent, fall back
+    to an engine-appropriate default: SQL Server and Oracle SE2 are License
+    Included on RDS, other Oracle editions are BYOL, everything else carries no
+    license charge.
+    """
+    if rds_license_model:
+        mapped = _RDS_LICENSE_MODEL_LABELS.get(rds_license_model.strip().lower())
+        if mapped:
+            return mapped
+    if engine in _RDS_SQLSERVER_ENGINES or engine in ("oracle-se2", "oracle-se2-cdb"):
+        return "License included"
+    if engine.startswith("oracle"):
+        return "Bring your own license"
+    return "No license required"
 FALLBACK_S3_GB_MONTH: dict[str, float] = {
     "STANDARD": 0.023,
     "STANDARD_IA": 0.0125,
@@ -394,31 +437,44 @@ class PricingEngine:
         instance_class: str,
         *,
         multi_az: bool = False,
+        license_model: str | None = None,
     ) -> float:
-        """$/month for an RDS DB instance, engine- and deployment-aware.
+        """$/month for an RDS DB instance, engine/edition/license/deployment-aware.
 
         Args:
             engine: RDS engine name as returned by ``describe_db_instances`` (e.g.
                 ``"mysql"``, ``"postgres"``, ``"sqlserver-ex"``, ``"aurora-postgresql"``).
-                Case-insensitive.
+                Case-insensitive. The engine string also encodes the edition for
+                SQL Server / Oracle (``sqlserver-ee`` -> Enterprise, etc.), which is
+                pinned as a ``databaseEdition`` filter.
             instance_class: RDS instance class string (e.g. ``"db.t3.medium"``).
-            multi_az: When True, fetches the Multi-AZ deployment price (~2× Single-AZ).
+            multi_az: When True, fetches the Multi-AZ deployment-option SKU.
+            license_model: The instance's ``LicenseModel`` from describe-API
+                (``license-included`` / ``bring-your-own-license`` / …). Required
+                for accurate Oracle pricing (LI vs BYOL differ ~2.6x). When omitted
+                an engine-appropriate default is used.
 
         Returns:
             Monthly on-demand price in USD (730 hours). Returns 0.0 when both the
             Pricing API and the fallback constant are unavailable for the given key.
 
         Notes:
-            RDS pricing requires ``databaseEngine``, ``deploymentOption``, and
-            ``licenseModel`` filters in addition to ``instanceType`` + ``location``
-            to disambiguate. The generic ``get_instance_monthly_price`` is not
-            sufficient for RDS — use this method instead.
+            RDS pricing requires ``databaseEngine``, ``deploymentOption``,
+            ``licenseModel`` and (for SQL Server/Oracle) ``databaseEdition`` filters
+            in addition to ``instanceType`` + ``location`` to disambiguate. The
+            generic ``get_instance_monthly_price`` is not sufficient for RDS.
         """
         normalized = engine.lower().strip()
-        key = ("rds_instance", normalized, instance_class, "Multi-AZ" if multi_az else "Single-AZ")
+        resolved_license = _normalize_rds_license_model(license_model, normalized)
+        key = (
+            "rds_instance", normalized, instance_class,
+            "Multi-AZ" if multi_az else "Single-AZ", resolved_license,
+        )
         if (cached := self._get_cached(key)) is not None:
             return cached
-        price = self._fetch_rds_instance_price(normalized, instance_class, multi_az=multi_az)
+        price = self._fetch_rds_instance_price(
+            normalized, instance_class, multi_az=multi_az, license_model=license_model
+        )
         if price is None:
             fallback = FALLBACK_RDS_INSTANCE_MONTHLY * (FALLBACK_RDS_MULTI_AZ_FACTOR if multi_az else 1.0)
             price = self._use_fallback(
@@ -727,8 +783,15 @@ class PricingEngine:
         instance_class: str,
         *,
         multi_az: bool = False,
+        license_model: str | None = None,
     ) -> float | None:
-        """Fetch on-demand monthly RDS instance price; None on miss."""
+        """Fetch on-demand monthly RDS instance price; None on miss.
+
+        Pins ``databaseEdition`` (for SQL Server / Oracle) and ``licenseModel``
+        (from the instance's actual ``LicenseModel``) so the lookup is
+        deterministic — otherwise multiple editions / license rows match and
+        MaxResults picks one arbitrarily.
+        """
         engine_label = _RDS_ENGINE_LABELS.get(engine)
         if engine_label is None:
             # Don't silently price an unmapped engine as MySQL — record it so the
@@ -737,16 +800,19 @@ class PricingEngine:
                 f"Unknown RDS engine '{engine}' — pricing as MySQL; verify before relying on the figure"
             )
             engine_label = "MySQL"
-        license_model = "License included" if engine in _RDS_LICENSE_INCLUDED_ENGINES else "No license required"
+        resolved_license = _normalize_rds_license_model(license_model, engine)
         filters = [
             {"Type": "TERM_MATCH", "Field": "instanceType", "Value": instance_class},
             {"Type": "TERM_MATCH", "Field": "databaseEngine", "Value": engine_label},
             {"Type": "TERM_MATCH", "Field": "deploymentOption",
              "Value": _rds_multi_az_deployment_option(engine, multi_az=multi_az)},
-            {"Type": "TERM_MATCH", "Field": "licenseModel", "Value": license_model},
+            {"Type": "TERM_MATCH", "Field": "licenseModel", "Value": resolved_license},
             {"Type": "TERM_MATCH", "Field": "location", "Value": self._display_name},
             {"Type": "TERM_MATCH", "Field": "productFamily", "Value": "Database Instance"},
         ]
+        edition = _RDS_ENGINE_EDITIONS.get(engine)
+        if edition:
+            filters.append({"Type": "TERM_MATCH", "Field": "databaseEdition", "Value": edition})
         hourly = self._call_pricing_api_hourly("AmazonRDS", filters)
         return hourly * 730 if hourly is not None else None
 

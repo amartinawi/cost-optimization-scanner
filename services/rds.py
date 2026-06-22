@@ -36,13 +36,24 @@ RDS_RI_DISCOUNT_MATRIX: tuple[tuple[str, str, float], ...] = (
 )
 
 
-def _rds_monthly_price(ctx: ScanContext, engine: str, instance_class: str, *, multi_az: bool) -> float:
-    """Return RDS instance monthly $ price via PricingEngine, or 0.0 on failure."""
+def _rds_monthly_price(
+    ctx: ScanContext,
+    engine: str,
+    instance_class: str,
+    *,
+    multi_az: bool,
+    license_model: str | None = None,
+) -> float:
+    """Return RDS instance monthly $ price via PricingEngine, or 0.0 on failure.
+
+    ``license_model`` is the instance's ``LicenseModel`` from describe-API; it is
+    required for accurate Oracle/SQL Server pricing (LI vs BYOL, per-edition).
+    """
     if not ctx.pricing_engine or not engine or not instance_class:
         return 0.0
     try:
         return ctx.pricing_engine.get_rds_instance_monthly_price(
-            engine, instance_class, multi_az=multi_az
+            engine, instance_class, multi_az=multi_az, license_model=license_model
         )
     except Exception as exc:
         logger.debug("RDS pricing lookup failed for %s %s: %s", engine, instance_class, exc)
@@ -232,6 +243,7 @@ def get_enhanced_rds_checks(
                 multi_az = instance.get("MultiAZ", False)
                 backup_retention = instance.get("BackupRetentionPeriod", 0)
                 allocated_storage = instance.get("AllocatedStorage", 0)
+                license_model = instance.get("LicenseModel")
 
                 if db_instance_status not in ["available", "stopped"]:
                     continue
@@ -281,10 +293,12 @@ def get_enhanced_rds_checks(
 
                     if is_non_prod:
                         multi_az_price = _rds_monthly_price(
-                            ctx, engine or "", db_instance_class or "", multi_az=True
+                            ctx, engine or "", db_instance_class or "", multi_az=True,
+                            license_model=license_model,
                         )
                         single_az_price = _rds_monthly_price(
-                            ctx, engine or "", db_instance_class or "", multi_az=False
+                            ctx, engine or "", db_instance_class or "", multi_az=False,
+                            license_model=license_model,
                         )
                         # Saving = Multi-AZ cost − Single-AZ cost (≈ 50% of Multi-AZ).
                         multi_az_savings = max(multi_az_price - single_az_price, 0.0)
@@ -374,7 +388,8 @@ def get_enhanced_rds_checks(
                     )
                     if engine in ["mysql", "postgres", "mariadb"]:
                         sched_base_price = _rds_monthly_price(
-                            ctx, engine, db_instance_class or "", multi_az=multi_az
+                            ctx, engine, db_instance_class or "", multi_az=multi_az,
+                            license_model=license_model,
                         )
                         sched_savings = sched_base_price * RDS_NON_PROD_SCHEDULE_REDUCTION
                         checks["non_prod_scheduling"].append(
@@ -416,7 +431,8 @@ def get_enhanced_rds_checks(
                     is_likely_prod = not any(env in db_instance_id.lower() for env in ["dev", "test", "staging", "qa"])
                     ri_text = "production databases" if is_likely_prod else "long-running databases"
                     ri_base_price = _rds_monthly_price(
-                        ctx, engine or "", db_instance_class or "", multi_az=multi_az
+                        ctx, engine or "", db_instance_class or "", multi_az=multi_az,
+                        license_model=license_model,
                     )
                     ri_scenarios = [
                         {

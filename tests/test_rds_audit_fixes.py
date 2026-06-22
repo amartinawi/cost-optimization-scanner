@@ -258,9 +258,17 @@ class _FakeRdsClient:
 
 
 class _FakeRdsPricingEngine:
-    """Deterministic RDS pricing: Multi-AZ = 2× Single-AZ; storage/backup flat."""
+    """Deterministic RDS pricing: Multi-AZ = 2× Single-AZ; storage/backup flat.
 
-    def get_rds_instance_monthly_price(self, engine, instance_class, *, multi_az=False):
+    Records the license_model it was last called with so tests can assert the
+    adapter threads the instance's LicenseModel through to pricing.
+    """
+
+    def __init__(self):
+        self.last_license_model = "UNSET"
+
+    def get_rds_instance_monthly_price(self, engine, instance_class, *, multi_az=False, license_model=None):
+        self.last_license_model = license_model
         return 200.0 if multi_az else 100.0
 
     def get_rds_monthly_storage_price_per_gb(self, storage_type, *, multi_az=False):
@@ -465,3 +473,61 @@ def test_ri_finding_audit_basis_marks_advisory():
     ctx = _EnhancedCtx(_FakeRdsClient(instances=[_instance(DBInstanceIdentifier="prod-db")]))
     ri = next(r for r in _recs(ctx) if r["CheckCategory"] == "Reserved Instance Opportunities")
     assert "commitment_analysis" in ri["AuditBasis"]["metric_window"]
+
+
+# --------------------------------------------------------------------------- #
+# Slice A — N-H1 databaseEdition pinning, N-M1 license-model threading
+# --------------------------------------------------------------------------- #
+from core.pricing_engine import _normalize_rds_license_model  # noqa: E402
+
+
+def test_sqlserver_pricing_pins_edition():
+    client = _CapturingPricingClient()
+    _engine(client).get_rds_instance_monthly_price("sqlserver-se", "db.m5.large")
+    assert _filter_value(client.last_filters, "databaseEdition") == "Standard"
+
+
+def test_oracle_ee_defaults_to_byol_and_enterprise_edition():
+    # Oracle EE has no "No license required" row; the old engine-static default
+    # missed and silently fell back. It must default to BYOL + Enterprise.
+    client = _CapturingPricingClient()
+    _engine(client).get_rds_instance_monthly_price("oracle-ee", "db.m5.large")
+    assert _filter_value(client.last_filters, "licenseModel") == "Bring your own license"
+    assert _filter_value(client.last_filters, "databaseEdition") == "Enterprise"
+
+
+def test_instance_license_model_threaded_through():
+    client = _CapturingPricingClient()
+    _engine(client).get_rds_instance_monthly_price(
+        "oracle-se2", "db.m5.large", license_model="bring-your-own-license"
+    )
+    assert _filter_value(client.last_filters, "licenseModel") == "Bring your own license"
+    assert _filter_value(client.last_filters, "databaseEdition") == "Standard Two"
+
+
+def test_mysql_has_no_edition_filter_and_no_license_charge():
+    client = _CapturingPricingClient()
+    _engine(client).get_rds_instance_monthly_price("mysql", "db.t3.medium")
+    assert _filter_value(client.last_filters, "databaseEdition") is None
+    assert _filter_value(client.last_filters, "licenseModel") == "No license required"
+
+
+def test_normalize_rds_license_model():
+    assert _normalize_rds_license_model("license-included", "oracle-ee") == "License included"
+    assert _normalize_rds_license_model("bring-your-own-license", "oracle-se2") == "Bring your own license"
+    assert _normalize_rds_license_model("general-public-license", "mysql") == "No license required"
+    # Engine-appropriate defaults when the instance value is absent.
+    assert _normalize_rds_license_model(None, "oracle-ee") == "Bring your own license"
+    assert _normalize_rds_license_model(None, "oracle-se2") == "License included"
+    assert _normalize_rds_license_model(None, "sqlserver-se") == "License included"
+    assert _normalize_rds_license_model(None, "mysql") == "No license required"
+
+
+def test_adapter_threads_license_model_from_instance():
+    # The instance's LicenseModel must reach the pricing engine (N-M1).
+    pe = _FakeRdsPricingEngine()
+    instance = _instance(DBInstanceIdentifier="prod-ora", Engine="oracle-ee",
+                         LicenseModel="bring-your-own-license")
+    ctx = _EnhancedCtx(_FakeRdsClient(instances=[instance]), pricing_engine=pe)
+    _recs(ctx)
+    assert pe.last_license_model == "bring-your-own-license"
