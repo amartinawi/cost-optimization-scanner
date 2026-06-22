@@ -25,83 +25,80 @@ def _priority_class(rec: Rec) -> str:
 def render_file_systems(sources: Dict[str, Any]) -> str:
     """Render EFS and FSx findings grouped by optimisation category.
 
+    Counted findings (sources ``efs_lifecycle_analysis`` / ``fsx_optimization_analysis``)
+    are grouped by CheckCategory and show their per-finding dollar saving, so the
+    rendered cards sum to the tab's counted total. The uncounted ``advisory``
+    source renders as a separate, clearly-labelled informational group.
+
     Called by: HTMLReportGenerator._get_detailed_recommendations.
     """
-    grouped_fs = {
-        "EFS No Lifecycle": [],
-        "EFS Archive Storage Missing": [],
-        "EFS One Zone Migration": [],
-        "FSx Optimization": [],
-    }
-
-    lifecycle_recs: List[Rec] = []
-    enhanced_recs: List[Rec] = []
+    counted: List[Rec] = []
+    advisory: List[Rec] = []
     for src_name, src_data in sources.items():
-        if src_data.get("count", 0) > 0:
-            for rec in src_data.get("recommendations", []):
-                if "CheckCategory" in rec:
-                    enhanced_recs.append(rec)
-                else:
-                    lifecycle_recs.append(rec)
-
-    seen_fs: Dict[str, Rec] = {}
-    for rec in lifecycle_recs:
-        fs_id = rec.get("FileSystemId", "Unknown")
-        if fs_id not in seen_fs:
-            seen_fs[fs_id] = rec
-        elif rec.get("Name") and rec.get("Name") != "Unnamed":
-            seen_fs[fs_id] = rec
-
-    for fs_id, rec in seen_fs.items():
-        if "FileSystemType" in rec:
-            grouped_fs["FSx Optimization"].append(rec)
-        elif "HasIAPolicy" in rec or fs_id.startswith("fs-0"):
-            if not rec.get("HasIAPolicy", True):
-                grouped_fs["EFS No Lifecycle"].append(rec)
-        else:
-            if fs_id.startswith("fs-0"):
-                if not rec.get("HasIAPolicy", True):
-                    grouped_fs["EFS No Lifecycle"].append(rec)
-            else:
-                grouped_fs["FSx Optimization"].append(rec)
-
-    for rec in enhanced_recs:
-        category = rec.get("CheckCategory", "")
-        if category == "EFS Archive Storage Missing":
-            grouped_fs.setdefault("EFS Archive Storage Missing", []).append(rec)
-        elif category == "EFS One Zone Migration":
-            grouped_fs.setdefault("EFS One Zone Migration", []).append(rec)
-        else:
-            grouped_fs.setdefault("EFS Optimization", []).append(rec)
+        if src_data.get("count", 0) <= 0:
+            continue
+        bucket = advisory if src_name == "advisory" else counted
+        bucket.extend(src_data.get("recommendations", []))
 
     content = '<div class="recommendation-list">'
-    for group_name, filesystems in grouped_fs.items():
-        if not filesystems:
-            continue
 
-        content += f'<div class="rec-item{_priority_class(filesystems[0])}">'
-        label = "file system" if len(filesystems) == 1 else "file systems"
-        content += f"<h4>{group_name} ({len(filesystems)} {label})</h4>"
+    # Counted findings, grouped by category, each line showing its dollar saving.
+    grouped: Dict[str, List[Rec]] = {}
+    for rec in counted:
+        grouped.setdefault(rec.get("CheckCategory", "File System Optimization"), []).append(rec)
 
-        if group_name == "EFS No Lifecycle":
-            content += "<p><strong>Recommendation:</strong> Enable lifecycle policies to move infrequently accessed files to IA storage (Save 80%)</p>"
-        elif group_name == "EFS Archive Storage Missing":
-            content += "<p><strong>Recommendation:</strong> Enable Archive storage class for rarely accessed data to reduce storage costs by up to 50%</p>"
-        elif group_name == "EFS One Zone Migration":
-            content += "<p><strong>Recommendation:</strong> Migrate non-critical workloads to One Zone storage for cost savings</p>"
-        elif group_name == "FSx Optimization":
-            content += "<p><strong>Recommendation:</strong> Review FSx configuration for optimization opportunities</p>"
-
+    for category, recs in grouped.items():
+        total = sum(_fs_savings(r) for r in recs)
+        label = "file system" if len(recs) == 1 else "file systems"
+        content += f'<div class="rec-item{_priority_class(recs[0])}">'
+        content += f"<h4>{category} ({len(recs)} {label})</h4>"
+        content += f"<p><strong>Recommendation:</strong> {recs[0].get('Recommendation', 'Optimize file system')}</p>"
+        content += f'<p class="savings"><strong>Estimated Monthly Savings:</strong> ${total:.2f}</p>'
         content += "<p><strong>File Systems:</strong></p><ul>"
-        for fs in filesystems:
-            fs_id = fs.get("FileSystemId", "Unknown")
-            fs_name = fs.get("Name", "Unnamed")
-            size = fs.get("SizeGB", 0)
-            content += f"<li>{fs_id} - {fs_name} ({size:.2f} GB)</li>"
+        for fs in recs:
+            fs_id = fs.get("FileSystemId", fs.get("FileCacheId", "Unknown"))
+            detail = fs.get("Name") or fs.get("FileSystemType") or ""
+            size = fs.get("SizeGB", fs.get("StorageCapacity", 0))
+            savings = fs.get("EstimatedSavings", "")
+            content += (
+                f"<li>{fs_id}"
+                f"{f' - {detail}' if detail else ''} ({size:.2f} GB) — "
+                f'<span class="savings">{savings}</span></li>'
+                if isinstance(size, (int, float))
+                else f'<li>{fs_id}{f" - {detail}" if detail else ""} — <span class="savings">{savings}</span></li>'
+            )
+        content += "</ul></div>"
+
+    # Advisory (uncounted) — best practice, no account-specific dollar figure.
+    if advisory:
+        adv_groups: Dict[str, List[Rec]] = {}
+        for rec in advisory:
+            adv_groups.setdefault(rec.get("CheckCategory", "Advisory"), []).append(rec)
+        content += '<div class="rec-item">'
+        content += f"<h4>Advisory — best-practice opportunities ({len(advisory)})</h4>"
+        content += (
+            "<p><strong>Note:</strong> these are not counted toward savings — their dollar value "
+            "requires usage/backup-size evidence to quantify.</p><ul>"
+        )
+        for category, recs in adv_groups.items():
+            ids = ", ".join(str(r.get("FileSystemId", r.get("FileCacheId", "?"))) for r in recs)
+            content += f"<li><strong>{category}</strong> ({len(recs)}): {recs[0].get('Recommendation', '')} — {ids}</li>"
         content += "</ul></div>"
 
     content += "</div>"
     return content
+
+
+def _fs_savings(rec: Rec) -> float:
+    """Numeric monthly saving for a counted file-system finding."""
+    val = rec.get("_savings")
+    if isinstance(val, (int, float)):
+        return float(val)
+    savings = str(rec.get("EstimatedSavings", ""))
+    import re
+
+    m = re.search(r"\$(\d+[\d,]*\.?\d*)", savings)
+    return float(m.group(1).replace(",", "")) if m else 0.0
 
 
 def _extract_lambda_details(rec: Rec) -> Tuple[str, str]:

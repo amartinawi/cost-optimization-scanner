@@ -155,7 +155,38 @@ FALLBACK_S3_GB_MONTH: dict[str, float] = {
     "DEEP_ARCHIVE": 0.00099,
     "INTELLIGENT_TIERING": 0.023,
 }
-FALLBACK_EFS_GB_MONTH: float = 0.33
+FALLBACK_EFS_GB_MONTH: float = 0.30
+# EFS $/GB-month by storage class (us-east-1 On-Demand, verified via Pricing API
+# 2026-06). Keys are the AWS Pricing API `storageClass` attribute values.
+FALLBACK_EFS_GB_MONTH_BY_CLASS: dict[str, float] = {
+    "General Purpose": 0.30,
+    "Infrequent Access": 0.025,
+    "One Zone-General Purpose": 0.16,
+    "One Zone-Infrequent Access": 0.0133,
+    "Archive": 0.005,
+}
+# Caller-facing storage-class aliases → AWS Pricing API `storageClass` value.
+_EFS_STORAGE_CLASS_LABELS: dict[str, str] = {
+    "standard": "General Purpose",
+    "general purpose": "General Purpose",
+    "ia": "Infrequent Access",
+    "infrequent access": "Infrequent Access",
+    "one zone": "One Zone-General Purpose",
+    "one zone-general purpose": "One Zone-General Purpose",
+    "one zone-ia": "One Zone-Infrequent Access",
+    "one zone-infrequent access": "One Zone-Infrequent Access",
+    "archive": "Archive",
+}
+# FSx $/GB-month by (fileSystemType, storageType) (us-east-1 Single-AZ On-Demand,
+# verified via Pricing API 2026-06; HDD only exists for Windows/Lustre/ONTAP).
+FALLBACK_FSX_GB_MONTH: dict[tuple[str, str], float] = {
+    ("WINDOWS", "SSD"): 0.130,
+    ("WINDOWS", "HDD"): 0.013,
+    ("LUSTRE", "SSD"): 0.145,
+    ("LUSTRE", "HDD"): 0.025,
+    ("ONTAP", "SSD"): 0.144,
+    ("OPENZFS", "SSD"): 0.20,
+}
 # Network fallback constants reconciled to us-east-1 AWS list prices
 # (verified via Pricing API 2026-05). Previous values reflected a
 # higher-priced region (eu-west-1) which contradicted the per-shim
@@ -498,15 +529,52 @@ class PricingEngine:
         self._cache.set(key, price)
         return price
 
-    def get_efs_monthly_price_per_gb(self) -> float:
-        key = ("efs_gb",)
+    def get_efs_monthly_price_per_gb(self, storage_class: str = "Standard") -> float:
+        """$/GB/month for an EFS storage class in self._region.
+
+        Args:
+            storage_class: ``Standard`` (default), ``IA``, ``One Zone``,
+                ``One Zone-IA``, or ``Archive`` (case-insensitive; the AWS
+                Pricing API ``storageClass`` label is also accepted).
+        """
+        api_class = _EFS_STORAGE_CLASS_LABELS.get(storage_class.strip().lower(), "General Purpose")
+        key = ("efs_gb", api_class)
         if (cached := self._get_cached(key)) is not None:
             return cached
-        price = self._fetch_efs_price()
+        price = self._fetch_efs_price(api_class)
         if price is None:
+            fallback = FALLBACK_EFS_GB_MONTH_BY_CLASS.get(api_class, FALLBACK_EFS_GB_MONTH)
             price = self._use_fallback(
-                FALLBACK_EFS_GB_MONTH * self._fallback_multiplier,
-                f"Pricing API unavailable for EFS Standard in {self._region}; using fallback",
+                fallback * self._fallback_multiplier,
+                f"Pricing API unavailable for EFS {api_class} in {self._region}; using fallback",
+            )
+        self._cache.set(key, price)
+        return price
+
+    def get_fsx_storage_price_per_gb(
+        self, file_system_type: str, storage_type: str, deployment_option: str = "Single-AZ"
+    ) -> float:
+        """$/GB/month for FSx provisioned storage in self._region.
+
+        Args:
+            file_system_type: ``Windows`` | ``Lustre`` | ``ONTAP`` | ``OpenZFS`` (case-insensitive).
+            storage_type: ``SSD`` | ``HDD`` (case-insensitive).
+            deployment_option: AWS Pricing ``deploymentOption`` (default ``Single-AZ``);
+                only used to disambiguate the live lookup, not the fallback.
+        """
+        fs_type = file_system_type.strip().upper()
+        st = storage_type.strip().upper()
+        key = ("fsx_gb", fs_type, st, deployment_option)
+        if (cached := self._get_cached(key)) is not None:
+            return cached
+        price = self._fetch_fsx_storage_price(fs_type, st, deployment_option)
+        if price is None:
+            fallback = FALLBACK_FSX_GB_MONTH.get((fs_type, st))
+            if fallback is None:
+                fallback = FALLBACK_FSX_GB_MONTH.get((fs_type, "SSD"), 0.15)
+            price = self._use_fallback(
+                fallback * self._fallback_multiplier,
+                f"Pricing API unavailable for FSx {fs_type} {st} in {self._region}; using fallback",
             )
         self._cache.set(key, price)
         return price
@@ -751,12 +819,27 @@ class PricingEngine:
             return price_hourly * 730  # hours/month
         return None
 
-    def _fetch_efs_price(self) -> float | None:
+    def _fetch_efs_price(self, storage_class: str = "General Purpose") -> float | None:
+        # EFS prices by the `storageClass` attribute (there is NO `volumeType`
+        # attribute on AmazonEFS — the previous filter silently never matched).
         filters = [
             {"Type": "TERM_MATCH", "Field": "location", "Value": self._display_name},
-            {"Type": "TERM_MATCH", "Field": "volumeType", "Value": "Standard"},
+            {"Type": "TERM_MATCH", "Field": "storageClass", "Value": storage_class},
+            {"Type": "TERM_MATCH", "Field": "productFamily", "Value": "Storage"},
         ]
         return self._call_pricing_api("AmazonEFS", filters)
+
+    def _fetch_fsx_storage_price(
+        self, file_system_type: str, storage_type: str, deployment_option: str
+    ) -> float | None:
+        filters = [
+            {"Type": "TERM_MATCH", "Field": "location", "Value": self._display_name},
+            {"Type": "TERM_MATCH", "Field": "productFamily", "Value": "Storage"},
+            {"Type": "TERM_MATCH", "Field": "fileSystemType", "Value": file_system_type.capitalize()},
+            {"Type": "TERM_MATCH", "Field": "storageType", "Value": storage_type},
+            {"Type": "TERM_MATCH", "Field": "deploymentOption", "Value": deployment_option},
+        ]
+        return self._call_pricing_api("AmazonFSx", filters)
 
     def _fetch_eip_price(self) -> float | None:
         # EIP pricing lives in AmazonVPC (not AmazonEC2) since AWS rebilled all
