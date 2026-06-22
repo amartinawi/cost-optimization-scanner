@@ -62,6 +62,10 @@ def _render_ec2_enhanced_checks(recommendations: List[Rec], source_name: str, se
                 details.append(f"avg CPU {rec['AvgCPU']}")
             if rec.get("MaxCPU"):
                 details.append(f"max CPU {rec['MaxCPU']}")
+            if rec.get("NetworkIO"):
+                details.append(f"net {rec['NetworkIO']}")
+            if rec.get("AvgMemory"):
+                details.append(f"mem {rec['AvgMemory']}")
             detail_str = f" ({', '.join(details)})" if details else ""
             savings_str = f" — <span class=\"savings\">{savings}</span>" if savings else ""
             content += f"<li>{resource_id}{detail_str}{savings_str}</li>"

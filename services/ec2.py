@@ -113,18 +113,120 @@ def _is_spot_instance(instance: dict[str, Any]) -> bool:
     return instance.get("InstanceLifecycle") == "spot"
 
 
+def _instance_license_model(instance: dict[str, Any]) -> str:
+    """Return the AWS Pricing licenseModel implied by the instance's platform.
+
+    DescribeInstances reports ``PlatformDetails`` of "Windows BYOL" (and similar
+    BYOL variants) for bring-your-own-license instances, which are billed at the
+    lower base-compute rate. Everything else uses the on-demand list price.
+    """
+    platform = instance.get("PlatformDetails", "") or ""
+    return "Bring your own license" if "BYOL" in platform else "No License required"
+
+
+# Idle/rightsizing corroboration thresholds. NetworkIn/NetworkOut (AWS/EC2,
+# bytes) are always available without an agent and rule out "CPU-idle but
+# network-busy" false positives. Memory (CWAgent mem_used_percent) is only
+# present when the CloudWatch agent is installed; when present it prevents
+# recommending a downsize of a memory-bound instance.
+_NETWORK_IDLE_BYTES_PER_HOUR: float = 5 * 1024 * 1024  # ~5 MB/hr ⇒ effectively idle
+_MEMORY_PRESSURE_PCT: float = 80.0
+
+
+def _classify_utilization(
+    avg_cpu: float,
+    max_cpu: float,
+    net_bytes_per_hour: float | None = None,
+    mem_pct: float | None = None,
+) -> str | None:
+    """Classify an instance as ``"idle"``, ``"rightsize"``, or ``None``.
+
+    Pure decision function (no AWS calls) so the thresholds are unit-testable.
+
+    - ``idle``: very low CPU AND not clearly network-active. Network is only
+      used to *suppress* a false idle, never to invent one — when network data
+      is unavailable the CPU-only verdict stands (no regression).
+    - ``rightsize``: low CPU AND not memory-bound. Memory likewise only
+      suppresses; absent memory data leaves prior behaviour unchanged.
+    """
+    network_active = net_bytes_per_hour is not None and net_bytes_per_hour > _NETWORK_IDLE_BYTES_PER_HOUR
+    memory_bound = mem_pct is not None and mem_pct > _MEMORY_PRESSURE_PCT
+    if avg_cpu < 5 and max_cpu < 10 and not network_active:
+        return "idle"
+    if avg_cpu < 20 and max_cpu < 40 and not memory_bound:
+        return "rightsize"
+    return None
+
+
+def _network_bytes_per_hour(cloudwatch: Any, instance_id: str, start_time: Any, end_time: Any) -> float | None:
+    """Average NetworkIn+NetworkOut bytes per hour over the window, or None.
+
+    NetworkIn/NetworkOut (AWS/EC2, bytes) are published without an agent. Uses
+    the Sum statistic over hourly periods to get true bytes/hour. Returns None on
+    any error or when no datapoints exist, so the caller treats the signal as
+    unknown and the CPU-only verdict stands.
+    """
+    try:
+        total_per_hour = 0.0
+        seen = False
+        for metric in ("NetworkIn", "NetworkOut"):
+            resp = cloudwatch.get_metric_statistics(
+                Namespace="AWS/EC2",
+                MetricName=metric,
+                Dimensions=[{"Name": "InstanceId", "Value": instance_id}],
+                StartTime=start_time,
+                EndTime=end_time,
+                Period=3600,
+                Statistics=["Sum"],
+            )
+            dps = resp.get("Datapoints", [])
+            if dps:
+                seen = True
+                total_per_hour += sum(dp["Sum"] for dp in dps) / len(dps)
+        return total_per_hour if seen else None
+    except Exception:
+        return None
+
+
+def _memory_used_percent(cloudwatch: Any, instance_id: str, start_time: Any, end_time: Any) -> float | None:
+    """Average CWAgent ``mem_used_percent`` over the window, or None.
+
+    Requires the CloudWatch agent (namespace ``CWAgent``). Queried by InstanceId
+    only; if the agent publishes memory under additional dimensions the lookup
+    returns no datapoints and this yields None (treated as unknown — no effect on
+    the verdict). Best-effort precision signal, never required.
+    """
+    try:
+        resp = cloudwatch.get_metric_statistics(
+            Namespace="CWAgent",
+            MetricName="mem_used_percent",
+            Dimensions=[{"Name": "InstanceId", "Value": instance_id}],
+            StartTime=start_time,
+            EndTime=end_time,
+            Period=3600,
+            Statistics=["Average"],
+        )
+        dps = resp.get("Datapoints", [])
+        if not dps:
+            return None
+        return sum(dp["Average"] for dp in dps) / len(dps)
+    except Exception:
+        return None
+
+
 def _compute_ec2_savings(
     ctx: ScanContext,
     instance_type: str,
     category: str,
     os_name: str = "Linux",
+    license_model: str = "No License required",
 ) -> tuple[float, str]:
     """Return ``(monthly_savings, pricing_basis)`` for an instance under a check.
 
-    Looks up the on-demand hourly price for the instance's real operating
-    system via PricingEngine, converts to monthly (730 hours), and multiplies
-    by the category's reduction factor. If the OS-specific lookup yields no
-    price it falls back to Linux pricing rather than $0.
+    Looks up the on-demand hourly price for the instance's real operating system
+    and license model via PricingEngine, converts to monthly (730 hours), and
+    multiplies by the category's reduction factor. If the OS-specific lookup
+    yields no price it falls back to Linux pricing rather than $0.
 
     ``pricing_basis`` is a human-readable audit string showing exactly how the
     number was derived, e.g. ``"$0.2330/hr Windows on-demand x 730h x 40%"``,
@@ -137,7 +239,7 @@ def _compute_ec2_savings(
         return 0.0, ""
     try:
         priced_os = os_name
-        hourly = ctx.pricing_engine.get_ec2_hourly_price(instance_type, os_name)
+        hourly = ctx.pricing_engine.get_ec2_hourly_price(instance_type, os_name, license_model)
         if hourly <= 0.0 and os_name != "Linux":
             # OS-specific price unavailable — fall back to Linux so a Windows/
             # RHEL/SUSE instance still produces a (conservative) estimate.
@@ -148,7 +250,8 @@ def _compute_ec2_savings(
     savings = hourly * _HOURS_PER_MONTH * factor
     if savings <= 0.0:
         return 0.0, ""
-    basis = f"${hourly:.4f}/hr {priced_os} on-demand x {_HOURS_PER_MONTH}h x {factor:.0%}"
+    license_note = " BYOL" if license_model == "Bring your own license" else ""
+    basis = f"${hourly:.4f}/hr {priced_os}{license_note} on-demand x {_HOURS_PER_MONTH}h x {factor:.0%}"
     return savings, basis
 
 
@@ -285,6 +388,7 @@ def get_enhanced_ec2_checks(
                         continue
 
                     os_name = _instance_pricing_os(instance)
+                    license_model = _instance_license_model(instance)
 
                     if state == "running":
                         if cloudwatch is not None:
@@ -308,21 +412,40 @@ def get_enhanced_ec2_checks(
                                     )
                                     max_cpu = max(dp["Maximum"] for dp in cpu_response["Datapoints"])
 
-                                    if avg_cpu < 5 and max_cpu < 10:
+                                    # Corroborating signals (only ever *suppress* a finding, never
+                                    # invent one): network rules out CPU-idle-but-busy instances;
+                                    # memory (CW agent, often absent) protects memory-bound ones.
+                                    net_per_hr = _network_bytes_per_hour(
+                                        cloudwatch, instance_id, start_time, end_time
+                                    )
+                                    mem_pct = _memory_used_percent(
+                                        cloudwatch, instance_id, start_time, end_time
+                                    )
+                                    verdict = _classify_utilization(avg_cpu, max_cpu, net_per_hr, mem_pct)
+
+                                    evidence = {
+                                        "OS": os_name,
+                                        "AvgCPU": f"{avg_cpu:.1f}%",
+                                        "MaxCPU": f"{max_cpu:.1f}%",
+                                    }
+                                    if net_per_hr is not None:
+                                        evidence["NetworkIO"] = f"{net_per_hr / (1024 * 1024):.1f} MB/hr"
+                                    if mem_pct is not None:
+                                        evidence["AvgMemory"] = f"{mem_pct:.1f}%"
+
+                                    if verdict == "idle":
                                         idle_savings, idle_basis = _compute_ec2_savings(
-                                            ctx, instance_type, "Idle Instances", os_name
+                                            ctx, instance_type, "Idle Instances", os_name, license_model
                                         )
                                         if idle_savings > 0:
                                             checks["idle_instances"].append(
                                                 {
                                                     "InstanceId": instance_id,
                                                     "InstanceType": instance_type,
-                                                    "OS": os_name,
-                                                    "AvgCPU": f"{avg_cpu:.1f}%",
-                                                    "MaxCPU": f"{max_cpu:.1f}%",
+                                                    **evidence,
                                                     "Recommendation": (
                                                         f"Instance shows very low utilization"
-                                                        f" (avg: {avg_cpu:.1f}%,"
+                                                        f" (avg CPU: {avg_cpu:.1f}%,"
                                                         f" max: {max_cpu:.1f}%)"
                                                         " - consider terminating or"
                                                         " downsizing"
@@ -332,21 +455,19 @@ def get_enhanced_ec2_checks(
                                                     "CheckCategory": "Idle Instances",
                                                 }
                                             )
-                                    elif avg_cpu < 20 and max_cpu < 40:
+                                    elif verdict == "rightsize":
                                         rs_savings, rs_basis = _compute_ec2_savings(
-                                            ctx, instance_type, "Rightsizing Opportunities", os_name
+                                            ctx, instance_type, "Rightsizing Opportunities", os_name, license_model
                                         )
                                         if rs_savings > 0:
                                             checks["rightsizing_opportunities"].append(
                                                 {
                                                     "InstanceId": instance_id,
                                                     "InstanceType": instance_type,
-                                                    "OS": os_name,
-                                                    "AvgCPU": f"{avg_cpu:.1f}%",
-                                                    "MaxCPU": f"{max_cpu:.1f}%",
+                                                    **evidence,
                                                     "Recommendation": (
                                                         f"Low utilization"
-                                                        f" (avg: {avg_cpu:.1f}%,"
+                                                        f" (avg CPU: {avg_cpu:.1f}%,"
                                                         f" max: {max_cpu:.1f}%)"
                                                         " - consider smaller instance"
                                                         " type"
@@ -388,7 +509,7 @@ def get_enhanced_ec2_checks(
                             target_family = _PREVIOUS_GEN_TARGETS[prevgen_prefix]
                             recommended_type = target_family + instance_type[len(prevgen_prefix):]
                             prevgen_savings, prevgen_basis = _compute_ec2_savings(
-                                ctx, instance_type, "Previous Generation Migration", os_name
+                                ctx, instance_type, "Previous Generation Migration", os_name, license_model
                             )
                             if prevgen_savings > 0:
                                 checks["previous_generation"].append(
@@ -411,7 +532,7 @@ def get_enhanced_ec2_checks(
 
                         if instance.get("Placement", {}).get("Tenancy") == "dedicated":
                             dedicated_savings, dedicated_basis = _compute_ec2_savings(
-                                ctx, instance_type, "Dedicated Hosts", os_name
+                                ctx, instance_type, "Dedicated Hosts", os_name, license_model
                             )
                             if dedicated_savings > 0:
                                 checks["dedicated_hosts"].append(
@@ -486,7 +607,7 @@ def get_enhanced_ec2_checks(
                                             " instance"
                                         )
                                         burst_savings, burst_basis = _compute_ec2_savings(
-                                            ctx, instance_type, "Burstable Instance Optimization", os_name
+                                            ctx, instance_type, "Burstable Instance Optimization", os_name, license_model
                                         )
                                         if burst_savings > 0:
                                             checks["burstable_credits"].append(
@@ -639,18 +760,21 @@ def get_advanced_ec2_checks(
 ) -> dict[str, Any]:
     """Category 6: EC2 Advanced optimization checks.
 
-    When ``fast_mode`` is True, the per-instance ``describe_volumes`` enrichment
-    used by the Oversized Root Volumes check is skipped. The name-pattern and
-    instance-store checks still run because they read only the fields already
-    returned by ``describe_instances``. Cron and Batch are mutually exclusive
-    (an instance matches at most one), and Spot instances are excluded.
+    All checks read only fields returned by ``describe_instances`` (instance
+    type and name tags), so they run identically in ``fast_mode``. Cron and
+    Batch are mutually exclusive (an instance matches at most one), and Spot
+    instances are excluded.
+
+    Volume sizing is intentionally NOT handled here: it is owned by the EBS
+    adapter (AWS Compute Optimizer volume rightsizing + gp2→gp3), so emitting a
+    root-volume resize from EC2 would double-count the same dollars across the
+    EC2 and EBS tabs and lacked disk-utilization evidence.
     """
     ec2 = ctx.client("ec2")
     checks: dict[str, list[dict[str, Any]]] = {
         "cron_job_instances": [],
         "batch_job_instances": [],
         "underutilized_instance_store": [],
-        "oversized_root_volumes": [],
     }
 
     try:
@@ -676,6 +800,7 @@ def get_advanced_ec2_checks(
                         continue
 
                     os_name = _instance_pricing_os(instance)
+                    license_model = _instance_license_model(instance)
                     name = tags.get("Name", instance_id)
                     name_l = name.lower()
 
@@ -691,7 +816,7 @@ def get_advanced_ec2_checks(
 
                     if is_cron:
                         cron_savings, cron_basis = _compute_ec2_savings(
-                            ctx, instance_type, "Cron Job Instances", os_name
+                            ctx, instance_type, "Cron Job Instances", os_name, license_model
                         )
                         if cron_savings > 0:
                             checks["cron_job_instances"].append(
@@ -708,7 +833,7 @@ def get_advanced_ec2_checks(
                             )
                     elif is_batch:
                         batch_savings, batch_basis = _compute_ec2_savings(
-                            ctx, instance_type, "Batch Job Instances", os_name
+                            ctx, instance_type, "Batch Job Instances", os_name, license_model
                         )
                         if batch_savings > 0:
                             checks["batch_job_instances"].append(
@@ -724,64 +849,6 @@ def get_advanced_ec2_checks(
                                 }
                             )
 
-                    if fast_mode:
-                        # Skip the per-instance describe_volumes enrichment;
-                        # name-pattern checks above still run.
-                        continue
-
-                    for bdm in instance.get("BlockDeviceMappings", []):
-                        if bdm.get("DeviceName") in [
-                            "/dev/sda1",
-                            "/dev/xvda",
-                        ]:
-                            ebs = bdm.get("Ebs", {})
-                            volume_id = ebs.get("VolumeId")
-
-                            if volume_id:
-                                try:
-                                    volume_response = ec2.describe_volumes(VolumeIds=[volume_id])
-                                    volume = volume_response["Volumes"][0]
-                                    size_gb = volume.get("Size", 0)
-
-                                    if size_gb > 100:
-                                        volume_type = volume.get("VolumeType", "gp2")
-                                        gb_rate = (
-                                            ctx.pricing_engine.get_ebs_monthly_price_per_gb(volume_type)
-                                            if ctx.pricing_engine
-                                            else 0.10 * ctx.pricing_multiplier
-                                        )
-                                        root_savings = max(size_gb - 20, 0) * gb_rate
-                                        if root_savings > 0:
-                                            checks["oversized_root_volumes"].append(
-                                                {
-                                                    "InstanceId": instance_id,
-                                                    "InstanceType": instance_type,
-                                                    "RootVolumeSize": f"{size_gb}GB",
-                                                    "VolumeId": volume_id,
-                                                    "VolumeType": volume_type,
-                                                    "Recommendation": (
-                                                        f"Root volume ({size_gb}GB)"
-                                                        " may be oversized -"
-                                                        " consider reducing or using"
-                                                        " separate data volumes"
-                                                        " (verify actual disk usage first)"
-                                                    ),
-                                                    "EstimatedSavings": (
-                                                        f"${root_savings:.2f}"
-                                                        "/month if reduced to 20GB"
-                                                        " + separate data volume"
-                                                    ),
-                                                    "PricingBasis": (
-                                                        f"${gb_rate:.4f}/GB-mo {volume_type} x ({size_gb}-20)GB"
-                                                        " (size-based estimate, not usage-verified)"
-                                                    ),
-                                                    "CheckCategory": ("Oversized Root Volumes"),
-                                                }
-                                            )
-
-                                except Exception as e:
-                                    ctx.warn(f"Could not get volume details for {volume_id}: {e}", service="ec2")
-
                     family_token = instance_type.split(".")[0]
                     if family_token in _INSTANCE_STORE_FAMILIES and not any(
                         keyword in name_l
@@ -794,7 +861,7 @@ def get_advanced_ec2_checks(
                         )
                     ):
                         store_savings, store_basis = _compute_ec2_savings(
-                            ctx, instance_type, "Underutilized Instance Store", os_name
+                            ctx, instance_type, "Underutilized Instance Store", os_name, license_model
                         )
                         if store_savings > 0:
                             checks["underutilized_instance_store"].append(

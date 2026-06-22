@@ -45,6 +45,31 @@ def _co_instance_id(rec: dict[str, Any]) -> str:
     return arn.split("/")[-1] if "/" in arn else arn
 
 
+def _asg_member_instance_ids(ctx: Any) -> set[str]:
+    """Instance ids that belong to an Auto Scaling Group.
+
+    ASG members are sized via their launch template and covered by ASG Compute
+    Optimizer, so per-instance heuristics must defer to that source rather than
+    recommend rightsizing an individual managed instance. Returns an empty set
+    on any error (missing client, permission) so the scan never fails here.
+    """
+    try:
+        autoscaling = ctx.client("autoscaling")
+        if not autoscaling:
+            return set()
+        ids: set[str] = set()
+        paginator = autoscaling.get_paginator("describe_auto_scaling_groups")
+        for page in paginator.paginate():
+            for group in page.get("AutoScalingGroups", []):
+                for member in group.get("Instances", []):
+                    iid = member.get("InstanceId")
+                    if iid:
+                        ids.add(iid)
+        return ids
+    except Exception:
+        return set()
+
+
 class EC2Module(BaseServiceModule):
     """ServiceModule adapter for EC2. Multi-source savings strategy."""
 
@@ -105,6 +130,10 @@ class EC2Module(BaseServiceModule):
 
         co_recs = [r for r in co_recs_all if _co_instance_id(r) not in covered]
         covered |= {_co_instance_id(r) for r in co_recs if _co_instance_id(r)}
+
+        # ASG members defer to ASG Compute Optimizer / launch-template sizing —
+        # never rightsize a managed instance individually.
+        covered |= _asg_member_instance_ids(ctx)
 
         # Heuristic recs (enhanced + advanced): drop any instance already covered
         # by an AWS source, then keep at most ONE finding per instance — the

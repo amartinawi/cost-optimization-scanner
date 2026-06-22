@@ -26,6 +26,8 @@ from services.adapters.ec2 import (
     _coh_is_renderable,
 )
 from services.ec2 import (
+    _classify_utilization,
+    _instance_license_model,
     _instance_pricing_os,
     _is_spot_instance,
     get_advanced_ec2_checks,
@@ -57,6 +59,28 @@ def test_is_spot_instance():
     assert _is_spot_instance({"InstanceLifecycle": "spot"}) is True
     assert _is_spot_instance({"InstanceLifecycle": "scheduled"}) is False
     assert _is_spot_instance({}) is False
+
+
+def test_instance_license_model_detects_byol():
+    assert _instance_license_model({"PlatformDetails": "Windows BYOL"}) == "Bring your own license"
+    assert _instance_license_model({"PlatformDetails": "Windows"}) == "No License required"
+    assert _instance_license_model({"PlatformDetails": "Linux/UNIX"}) == "No License required"
+    assert _instance_license_model({}) == "No License required"
+
+
+def test_classify_utilization():
+    # Idle: very low CPU and quiet network.
+    assert _classify_utilization(2.0, 8.0, net_bytes_per_hour=1_000) == "idle"
+    # CPU-idle but network-busy -> not idle, but still a rightsize candidate.
+    assert _classify_utilization(2.0, 8.0, net_bytes_per_hour=50 * 1024 * 1024) == "rightsize"
+    # Low CPU -> rightsize when memory is healthy.
+    assert _classify_utilization(12.0, 30.0, mem_pct=40.0) == "rightsize"
+    # Memory-bound instance is NOT a rightsize candidate.
+    assert _classify_utilization(12.0, 30.0, mem_pct=92.0) is None
+    # Busy instance -> nothing.
+    assert _classify_utilization(60.0, 95.0) is None
+    # No corroborating data -> CPU-only verdict still stands (no regression).
+    assert _classify_utilization(2.0, 8.0) == "idle"
 
 
 def test_coh_is_renderable():
