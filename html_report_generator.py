@@ -2509,19 +2509,24 @@ class HTMLReportGenerator:
         snapshots = []
         seen_snapshot_ids = set()
 
-        # Check EBS enhanced checks
+        # Snapshot findings live in the dedicated ``ebs_snapshots`` source (the
+        # EBS adapter routes them there so they are not counted in the EBS tab's
+        # own savings). ``enhanced_checks`` is still scanned for backward
+        # compatibility with scan JSON produced before that split.
         ebs_service = services.get("ebs", {})
         ebs_sources = ebs_service.get("sources", {})
+        ebs_snapshot_source = ebs_sources.get("ebs_snapshots", {})
         enhanced_checks = ebs_sources.get("enhanced_checks", {})
 
-        for rec in enhanced_checks.get("recommendations", []):
-            check_category = rec.get("CheckCategory", "")
-            if "snapshot" in check_category.lower():
-                # Deduplicate by SnapshotId
-                snapshot_id = rec.get("SnapshotId", "N/A")
-                if snapshot_id != "N/A" and snapshot_id not in seen_snapshot_ids:
-                    seen_snapshot_ids.add(snapshot_id)
-                    snapshots.append(rec)
+        for source in (ebs_snapshot_source, enhanced_checks):
+            for rec in source.get("recommendations", []):
+                check_category = rec.get("CheckCategory", "")
+                if "snapshot" in check_category.lower():
+                    # Deduplicate by SnapshotId
+                    snapshot_id = rec.get("SnapshotId", "N/A")
+                    if snapshot_id != "N/A" and snapshot_id not in seen_snapshot_ids:
+                        seen_snapshot_ids.add(snapshot_id)
+                        snapshots.append(rec)
 
         return {
             "count": len(snapshots),

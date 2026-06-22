@@ -7,7 +7,7 @@ This module will later become EbsModule (T-325) implementing ServiceModule.
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from botocore.exceptions import ClientError  # type: ignore[import-untyped]
@@ -15,6 +15,49 @@ from botocore.exceptions import ClientError  # type: ignore[import-untyped]
 from core.scan_context import ScanContext
 
 logger = logging.getLogger(__name__)
+
+# Lookback window for usage-based IOPS rightsizing (matches Compute Optimizer's
+# 14-day default) and the CloudWatch sampling period in seconds.
+_IOPS_LOOKBACK_DAYS: int = 14
+_IOPS_METRIC_PERIOD_SECONDS: int = 3600
+
+
+def _observed_peak_iops(ctx: ScanContext, volume_id: str) -> float | None:
+    """Peak observed IOPS for a volume from CloudWatch, or None when unavailable.
+
+    Reads ``AWS/EBS`` ``VolumeReadOps`` + ``VolumeWriteOps`` (Sum) over the
+    lookback window and returns the sum of the per-metric peaks divided by the
+    sampling period. Summing independent peaks is a deliberate over-estimate of
+    demand, so any rightsizing recommendation stays conservative. Returns None
+    on any error or when no datapoints exist (caller must NOT emit a priced
+    finding without evidence).
+    """
+    try:
+        cw = ctx.client("cloudwatch")
+        if not cw:
+            return None
+        end = datetime.now(timezone.utc)
+        start = end - timedelta(days=_IOPS_LOOKBACK_DAYS)
+        peak = 0.0
+        saw_data = False
+        for metric in ("VolumeReadOps", "VolumeWriteOps"):
+            resp = cw.get_metric_statistics(
+                Namespace="AWS/EBS",
+                MetricName=metric,
+                Dimensions=[{"Name": "VolumeId", "Value": volume_id}],
+                StartTime=start,
+                EndTime=end,
+                Period=_IOPS_METRIC_PERIOD_SECONDS,
+                Statistics=["Sum"],
+            )
+            datapoints = resp.get("Datapoints", [])
+            if datapoints:
+                saw_data = True
+                peak += max(dp["Sum"] for dp in datapoints) / _IOPS_METRIC_PERIOD_SECONDS
+        return peak if saw_data else None
+    except Exception as e:
+        logger.warning("[ebs] CloudWatch IOPS metric check failed for %s: %s", volume_id, e)
+        return None
 
 
 def _snapshot_price_per_gb(ctx: ScanContext, pricing_multiplier: float) -> float:
@@ -253,20 +296,28 @@ def get_unattached_volumes(
                 # Check if volume is truly unattached (not attached to stopped instances)
                 attachments = volume.get("Attachments", [])
                 if not attachments:  # Completely unattached
+                    monthly_cost = _estimate_volume_cost(
+                        volume["Size"],
+                        volume["VolumeType"],
+                        volume.get("Iops"),
+                        volume.get("Throughput"),
+                        pricing_multiplier,
+                        ctx=ctx,
+                    )
                     unattached.append(
                         {
                             "VolumeId": volume["VolumeId"],
                             "Size": volume["Size"],
                             "VolumeType": volume["VolumeType"],
                             "CreateTime": volume["CreateTime"].isoformat(),
-                            "EstimatedMonthlyCost": _estimate_volume_cost(
-                                volume["Size"],
-                                volume["VolumeType"],
-                                volume.get("Iops"),
-                                volume.get("Throughput"),
-                                pricing_multiplier,
-                                ctx=ctx,
-                            ),
+                            "EstimatedMonthlyCost": monthly_cost,
+                            "AuditBasis": {
+                                "metric": "full volume storage cost (100% on delete)",
+                                "region": getattr(ctx, "region", ""),
+                                "volume_type": volume["VolumeType"],
+                                "size_gb": volume["Size"],
+                                "basis": "EstimatedMonthlyCost = size_gb × $/GB-mo (+ provisioned IOPS/throughput)",
+                            },
                         }
                     )
     except ClientError as e:
@@ -330,20 +381,127 @@ def _estimate_volume_cost(
 
     if iops and volume_type in ["gp3", "io1", "io2"]:
         if volume_type == "gp3":
+            # gp3 bills only IOPS above the free 3,000 baseline. Use the
+            # region-correct rate via PricingEngine rather than a constant.
             extra_iops = max(0, iops - 3000)
-            base_cost += extra_iops * 0.005 * pricing_multiplier
-        elif volume_type in ["io1", "io2"]:
+            base_cost += (
+                extra_iops * _gp3_iops_price(ctx, pricing_multiplier)
+                if ctx
+                else extra_iops * 0.005 * pricing_multiplier
+            )
+        elif volume_type == "io2":
+            # io2 IOPS pricing is tiered above 32,000 — a flat rate over-counts.
+            base_cost += (
+                _io2_iops_cost(ctx, iops, pricing_multiplier) if ctx else iops * 0.065 * pricing_multiplier
+            )
+        else:  # io1 — flat $/IOPS-month
             if ctx and ctx.pricing_engine:
-                iops_price = ctx.pricing_engine.get_ebs_iops_monthly_price(volume_type)
+                iops_price = ctx.pricing_engine.get_ebs_iops_monthly_price("io1")
             else:
                 iops_price = 0.065 * pricing_multiplier
             base_cost += iops * iops_price
 
     if throughput and volume_type == "gp3":
+        # gp3 bills throughput above the free 125 MB/s baseline. PricingEngine
+        # has no throughput method, so use the $0.04/MB/s constant scaled by the
+        # regional multiplier.
         extra_throughput = max(0, throughput - 125)
         base_cost += extra_throughput * 0.04 * pricing_multiplier
 
     return base_cost
+
+
+def _scan_over_provisioned_iops(
+    ctx: ScanContext,
+    ec2: Any,
+    pricing_multiplier: float,
+    checks: dict[str, Any],
+) -> None:
+    """Flag volumes whose provisioned IOPS exceed observed CloudWatch demand.
+
+    Reads each candidate's peak IOPS over the lookback window and emits a priced
+    recommendation only when a reduction is justified by real usage (peak +
+    headroom < provisioned). In ``--fast`` mode the CloudWatch reads are skipped
+    and a single warning is recorded; a volume with no CloudWatch data is
+    skipped with a per-volume warning rather than a fabricated saving.
+    """
+    from services.ebs_logic import recommend_iops_from_usage
+
+    if getattr(ctx, "fast_mode", False):
+        ctx.warn(
+            "Skipped EBS over-provisioned IOPS check in --fast mode (no CloudWatch reads); "
+            "re-run without --fast to detect IOPS rightsizing savings.",
+            service="ebs",
+        )
+        return
+
+    paginator = ec2.get_paginator("describe_volumes")
+    for page in paginator.paginate(Filters=[{"Name": "volume-type", "Values": ["io1", "io2", "gp3"]}]):
+        for volume in page.get("Volumes", []):
+            volume_type = volume["VolumeType"]
+            iops = volume.get("Iops", 0)
+            volume_id = volume["VolumeId"]
+
+            # Only volumes with billable provisioned IOPS can yield savings:
+            # gp3 bills IOPS above the free 3,000; io1/io2 bill every IOPS.
+            if iops <= 0 or (volume_type == "gp3" and iops <= 3000):
+                continue
+
+            peak = _observed_peak_iops(ctx, volume_id)
+            if peak is None:
+                ctx.warn(
+                    f"Skipped IOPS rightsizing for {volume_id}: no CloudWatch IOPS data in the "
+                    f"{_IOPS_LOOKBACK_DAYS}-day window.",
+                    service="ebs",
+                )
+                continue
+
+            baseline = 3000 if volume_type == "gp3" else 100
+            recommended = recommend_iops_from_usage(iops, peak, baseline=baseline)
+            if recommended is None:
+                continue
+
+            if volume_type == "gp3":
+                savings = (max(0, iops - 3000) - max(0, recommended - 3000)) * _gp3_iops_price(
+                    ctx, pricing_multiplier
+                )
+            elif volume_type == "io2":
+                savings = _io2_iops_cost(ctx, iops, pricing_multiplier) - _io2_iops_cost(
+                    ctx, recommended, pricing_multiplier
+                )
+            else:  # io1 — flat $/IOPS-month
+                rate = (
+                    ctx.pricing_engine.get_ebs_iops_monthly_price("io1")
+                    if ctx.pricing_engine
+                    else 0.065 * pricing_multiplier
+                )
+                savings = (iops - recommended) * rate
+
+            if savings <= 0:
+                continue
+
+            checks["over_provisioned_iops"].append(
+                {
+                    "VolumeId": volume_id,
+                    "VolumeType": volume_type,
+                    "CurrentIOPS": iops,
+                    "RecommendedIOPS": recommended,
+                    "ObservedPeakIOPS": round(peak, 1),
+                    "Recommendation": (
+                        f"Reduce provisioned IOPS from {iops} to {recommended} "
+                        f"(observed {_IOPS_LOOKBACK_DAYS}-day peak ~= {peak:.0f} IOPS)"
+                    ),
+                    "EstimatedSavings": f"${savings:.2f}/month",
+                    "AuditBasis": {
+                        "metric": f"VolumeReadOps+VolumeWriteOps peak over {_IOPS_LOOKBACK_DAYS}d",
+                        "observed_peak_iops": round(peak, 1),
+                        "current_iops": iops,
+                        "recommended_iops": recommended,
+                        "region": getattr(ctx, "region", ""),
+                        "basis": "(billable_current_iops - billable_recommended_iops) x $/IOPS-mo",
+                    },
+                }
+            )
 
 
 def compute_ebs_checks(
@@ -353,15 +511,16 @@ def compute_ebs_checks(
 ) -> dict[str, Any]:
     """Get enhanced EBS cost optimization checks.
 
-    Performs 8 categories of EBS optimization checks:
-    1. Unattached volumes (100% savings opportunity)
-    2. gp2->gp3 migration (20% savings)
-    3. Old snapshots (>90 days, storage cost reduction)
-    4. Underutilized volumes (rightsizing opportunity)
-    5. Over-provisioned IOPS (cost reduction)
-    6. Unused encrypted volumes (storage cost elimination)
-    7. Orphaned snapshots (cleanup opportunity)
-    8. Snapshot lifecycle policies (automated cost management)
+    Performs these EBS optimization checks:
+    1. gp2->gp3 migration (per-volume storage-delta savings)
+    2. Over-provisioned IOPS — usage-based, gated on CloudWatch evidence
+    3. Old snapshots (> ``old_snapshot_days``, storage cost reduction)
+    4. Orphaned snapshots (from deleted AMIs)
+
+    Unattached volumes are fetched by ``get_unattached_volumes`` (their own
+    source); the previously-emitted "unused encrypted volumes" check was removed
+    because every ``available`` encrypted volume is, by definition, also an
+    unattached volume — counting it here double-counted the same dollars.
 
     Uses pagination to support unlimited volumes.
 
@@ -373,11 +532,8 @@ def compute_ebs_checks(
         "unattached_volumes": get_unattached_volumes(ctx, pricing_multiplier),
         "gp2_migration": [],
         "old_snapshots": [],
-        "underutilized_volumes": [],
         "over_provisioned_iops": [],
-        "unused_encrypted_volumes": [],
         "orphaned_snapshots": [],
-        "snapshot_lifecycle": [],
     }
 
     try:
@@ -399,73 +555,11 @@ def compute_ebs_checks(
                     }
                 )
 
-        # Check for underutilized volumes (basic heuristic - high IOPS but low utilization)
-        for page in paginator.paginate():
-            for volume in page.get("Volumes", []):
-                volume_type = volume.get("VolumeType", "")
-                iops = volume.get("Iops", 0)
-                size = volume.get("Size", 0)
-
-                # Underutilized high-IOPS volumes flag removed: $0/month, "enable CloudWatch
-                # monitoring to validate" is a monitoring-enablement nudge.
-                _ = (volume_type, iops, size)
-
-        # Check for snapshot lifecycle opportunities
-        paginator = ec2.get_paginator("describe_snapshots")
-        snapshot_count = 0
-        for page in paginator.paginate(OwnerIds=["self"]):
-            for _snapshot in page["Snapshots"]:
-                snapshot_count += 1
-
-        # Snapshot Lifecycle finding removed: $0/month, "quantify after enabling DLM"
-        # is a feature-enablement nudge — actual savings come from snapshot deletion
-        # which is surfaced via the dedicated Snapshots tab.
-
-        # Check for over-provisioned IOPS (heuristic estimates - recommend CloudWatch validation)
-        volume_paginator = ec2.get_paginator("describe_volumes")
-        for page in volume_paginator.paginate(Filters=[{"Name": "volume-type", "Values": ["io1", "io2", "gp3"]}]):
-            for volume in page.get("Volumes", []):
-                iops = volume.get("Iops", 0) if volume["VolumeType"] in ["io1", "io2", "gp3"] else 0
-                size = volume["Size"]
-                volume_type = volume["VolumeType"]
-
-                # Check if IOPS is over-provisioned
-                if volume_type == "gp3" and iops > 3000 + size * 30:  # gp3: 3000 baseline + reasonable ratio
-                    recommended_iops = 3000 + size * 30
-                    extra_iops = iops - recommended_iops
-                    savings = extra_iops * _gp3_iops_price(ctx, pricing_multiplier)
-                    checks["over_provisioned_iops"].append(
-                        {
-                            "VolumeId": volume["VolumeId"],
-                            "CurrentIOPS": iops,
-                            "RecommendedIOPS": recommended_iops,
-                            "Recommendation": "Reduce provisioned IOPS based on actual usage",
-                            "EstimatedSavings": f"${savings:.2f}/month",
-                        }
-                    )
-                elif volume_type in ["io1", "io2"] and iops > size * 50:  # io1/io2: check for over-provisioning
-                    recommended_iops = size * 30
-                    if volume_type == "io2":
-                        savings = _io2_iops_cost(ctx, iops, pricing_multiplier) - _io2_iops_cost(
-                            ctx, recommended_iops, pricing_multiplier
-                        )
-                    else:  # io1 — flat $0.065/IOPS-mo
-                        extra_iops = iops - recommended_iops
-                        if ctx.pricing_engine:
-                            iops_rate = ctx.pricing_engine.get_ebs_iops_monthly_price("io1")
-                        else:
-                            iops_rate = 0.065 * pricing_multiplier
-                        savings = extra_iops * iops_rate
-                    checks["over_provisioned_iops"].append(
-                        {
-                            "VolumeId": volume["VolumeId"],
-                            "VolumeType": volume_type,
-                            "CurrentIOPS": iops,
-                            "RecommendedIOPS": recommended_iops,
-                            "Recommendation": "Reduce provisioned IOPS based on actual usage",
-                            "EstimatedSavings": f"${savings:.2f}/month",
-                        }
-                    )
+        # Check for over-provisioned IOPS — evidence-based. Each candidate's
+        # actual peak IOPS is read from CloudWatch; a recommendation is emitted
+        # only when observed demand (plus headroom) is below what is provisioned.
+        # No CloudWatch data → no priced finding (a warning is recorded instead).
+        _scan_over_provisioned_iops(ctx, ec2, pricing_multiplier, checks)
 
         # Check for old snapshots (>90 days for Snapshots tab) - with pagination
         snapshot_rate = _snapshot_price_per_gb(ctx, pricing_multiplier)
@@ -473,6 +567,12 @@ def compute_ebs_checks(
         for page in paginator.paginate(OwnerIds=["self"]):
             for snapshot in page["Snapshots"]:
                 age_days = (datetime.now(snapshot["StartTime"].tzinfo) - snapshot["StartTime"]).days
+                _snapshot_basis = {
+                    "metric": "snapshot data stored ($/GB-mo, max estimate)",
+                    "rate_per_gb_month": round(snapshot_rate, 6),
+                    "region": getattr(ctx, "region", ""),
+                    "basis": "VolumeSize × snapshot $/GB-mo; actual lower due to incremental storage",
+                }
                 if age_days > old_snapshot_days:  # Only snapshots older than 90 days
                     checks["old_snapshots"].append(
                         {
@@ -487,6 +587,7 @@ def compute_ebs_checks(
                             "EstimatedSavings": (
                                 f"${snapshot['VolumeSize'] * snapshot_rate:.2f}/month (max estimate)"
                             ),
+                            "AuditBasis": _snapshot_basis,
                         }
                     )
 
@@ -509,30 +610,9 @@ def compute_ebs_checks(
                             "EstimatedSavings": (
                                 f"${snapshot['VolumeSize'] * snapshot_rate:.2f}/month (max estimate)"
                             ),
+                            "AuditBasis": _snapshot_basis,
                         }
                     )
-
-        # Check for unused encrypted volumes
-        volume_paginator = ec2.get_paginator("describe_volumes")
-        for page in volume_paginator.paginate(
-            Filters=[
-                {"Name": "encrypted", "Values": ["true"]},
-                {"Name": "status", "Values": ["available"]},
-            ]
-        ):
-            for volume in page.get("Volumes", []):
-                checks["unused_encrypted_volumes"].append(
-                    {
-                        "VolumeId": volume["VolumeId"],
-                        "Size": volume["Size"],
-                        "Encrypted": True,
-                        "Recommendation": "Delete unused encrypted volume",
-                        "EstimatedSavings": (
-                            f"${_estimate_volume_cost(volume['Size'], volume['VolumeType'], volume.get('Iops'), volume.get('Throughput'), pricing_multiplier, ctx=ctx):.2f}"  # noqa: E501
-                            "/month"
-                        ),
-                    }
-                )
 
     except Exception as e:
         ctx.warn(f"Could not perform enhanced EBS checks: {e}", service="ebs")

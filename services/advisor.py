@@ -120,20 +120,43 @@ def get_ec2_compute_optimizer_recommendations(
 def get_ebs_compute_optimizer_recommendations(
     ctx: ScanContext,
 ) -> list[dict[str, Any]]:
-    """Get EBS recommendations from Compute Optimizer."""
+    """Get actionable EBS recommendations from Compute Optimizer.
+
+    Volumes whose ``finding`` is ``Optimized`` (no savings) or
+    ``UnderProvisioned`` (a cost *increase*, not a saving) are dropped here so
+    the counted total matches the rendered EBS table. Failures are recorded on
+    ``ctx`` rather than swallowed: an opt-in gap returns the synthetic
+    placeholder (which the adapter converts to a warning), a permission gap is
+    recorded via ``ctx.permission_issue``, and any other error via ``ctx.warn``.
+    """
+    from services.ebs_logic import is_actionable_co_finding
+
     compute_optimizer = ctx.client("compute-optimizer")
     recommendations: list[dict[str, Any]] = []
+
+    def _actionable(recs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [r for r in recs if is_actionable_co_finding(r.get("finding", ""))]
+
     try:
         response = compute_optimizer.get_ebs_volume_recommendations()
-        recommendations.extend(response["volumeRecommendations"])
+        recommendations.extend(_actionable(response["volumeRecommendations"]))
 
         while response.get("nextToken"):
             response = compute_optimizer.get_ebs_volume_recommendations(nextToken=response["nextToken"])
-            recommendations.extend(response["volumeRecommendations"])
+            recommendations.extend(_actionable(response["volumeRecommendations"]))
     except Exception as e:
+        msg = str(e)
         logger.warning("EBS Compute Optimizer not available: %s", e)
-        if "OptInRequiredException" in str(e) or "not registered" in str(e):
+        if "OptInRequiredException" in msg or "not registered" in msg:
             recommendations.append(_compute_optimizer_opt_in_rec("EBS", "rightsizing"))
+        elif "AccessDenied" in msg or "UnauthorizedOperation" in msg:
+            ctx.permission_issue(
+                f"Compute Optimizer EBS recommendations denied: {msg}",
+                service="ebs",
+                action="compute-optimizer:GetEBSVolumeRecommendations",
+            )
+        else:
+            ctx.warn(f"Compute Optimizer EBS recommendations unavailable: {msg}", service="ebs")
     return recommendations
 
 
