@@ -26,21 +26,30 @@ _AUTH_HEURISTIC = 2
 
 
 def normalize_rds_arn(raw: str) -> str:
-    """Canonical ``<resource-type>:<name>`` key for an RDS ARN / resource id.
+    """Canonical de-duplication key for an RDS ARN / resource id.
 
-    ``arn:aws:rds:us-east-1:1:db:prod``           -> ``db:prod``
-    ``arn:aws:rds:us-east-1:1:snapshot:s1``        -> ``snapshot:s1``
-    ``arn:aws:rds:us-east-1:1:cluster-snapshot:c`` -> ``cluster-snapshot:c``
+    DB instances and clusters reduce to their bare name so the three sources
+    converge on the same key regardless of representation::
 
-    Keeping the resource-type prefix means a snapshot id never de-duplicates
-    against an instance id (different namespaces). A bare id with no ARN
-    structure is returned unchanged; falsy input returns ``""``.
+        arn:aws:rds:us-east-1:1:db:prod       -> prod   (Compute Optimizer / heuristic)
+        prod                                  -> prod   (Cost Optimization Hub resourceId)
+        arn:aws:rds:us-east-1:1:cluster:prod  -> prod
+
+    Snapshot resource types keep their ``<type>:<name>`` prefix so a snapshot id
+    never de-duplicates against an instance id (different namespaces)::
+
+        arn:aws:rds:us-east-1:1:snapshot:s1        -> snapshot:s1
+        arn:aws:rds:us-east-1:1:cluster-snapshot:c -> cluster-snapshot:c
+
+    A bare id with no ARN structure is returned unchanged; falsy input -> ``""``.
     """
     if not raw:
         return ""
     parts = str(raw).split(":")
     if parts[0] == "arn" and len(parts) >= 7:
-        return f"{parts[5]}:{':'.join(parts[6:])}"
+        rtype = parts[5]
+        name = ":".join(parts[6:])
+        return f"{rtype}:{name}" if "snapshot" in rtype else name
     return str(raw)
 
 

@@ -355,3 +355,85 @@ def test_adapter_co_beats_heuristic_same_db(monkeypatch):
     assert findings.sources["compute_optimizer"].count == 1
     assert findings.sources["enhanced_checks"].count == 0
     assert findings.total_recommendations == 1
+
+
+# --------------------------------------------------------------------------- #
+# Slice 5 — H1: consume the Cost Optimization Hub rds bucket
+# --------------------------------------------------------------------------- #
+from services.adapters.rds import _coh_is_renderable  # noqa: E402
+from services.rds_logic import normalize_rds_arn  # noqa: E402
+
+
+def _coh_rec(resource_id, savings, action_type="Rightsize"):
+    return {
+        "resourceId": resource_id,
+        "estimatedMonthlySavings": savings,
+        "actionType": action_type,
+        "currentResourceType": "RdsDbInstance",
+    }
+
+
+def test_normalize_converges_arn_and_bare_id():
+    # CoH bare resourceId and CO/heuristic ARN must produce the same dedup key.
+    assert normalize_rds_arn("arn:aws:rds:us-east-1:1:db:prod") == "prod"
+    assert normalize_rds_arn("prod") == "prod"
+    # Snapshots keep their namespace prefix so they never collide with instances.
+    assert normalize_rds_arn("arn:aws:rds:us-east-1:1:snapshot:s1") == "snapshot:s1"
+
+
+def test_coh_is_renderable_filters_purchase_and_na():
+    assert _coh_is_renderable({"resourceId": "prod", "actionType": "Rightsize"}) is True
+    assert _coh_is_renderable({"actionType": "PurchaseReservedInstances"}) is False
+    assert _coh_is_renderable({"actionType": "PurchaseSavingsPlans"}) is False
+    assert _coh_is_renderable({"resourceId": "N/A", "actionType": "Rightsize"}) is False
+
+
+def test_adapter_consumes_coh_split(monkeypatch):
+    monkeypatch.setattr(rds_adapter, "get_rds_compute_optimizer_recommendations", lambda ctx: [])
+    monkeypatch.setattr(rds_adapter, "get_enhanced_rds_checks", lambda ctx, m, d: {"recommendations": []})
+    monkeypatch.setattr(rds_adapter, "get_rds_instance_count", lambda ctx: {"total": 1})
+
+    ctx = _FakeCtx()
+    ctx.cost_hub_splits = {"rds": [_coh_rec("prod", 60.0)]}
+    findings = rds_adapter.RdsModule().scan(ctx)
+
+    assert "cost_optimization_hub" in findings.sources
+    assert findings.sources["cost_optimization_hub"].count == 1
+    assert findings.total_monthly_savings == pytest.approx(60.0)
+    assert findings.total_recommendations == 1
+
+
+def test_coh_suppresses_co_and_heuristic_for_same_db(monkeypatch):
+    arn = "arn:aws:rds:us-east-1:1:db:prod"
+    co = [_co_rec(arn, 80.0)]
+    enhanced = [_enh(arn, "$53.00/month with single-AZ deployment", "Multi-AZ Optimization")]
+    monkeypatch.setattr(rds_adapter, "get_rds_compute_optimizer_recommendations", lambda ctx: co)
+    monkeypatch.setattr(rds_adapter, "get_enhanced_rds_checks", lambda ctx, m, d: {"recommendations": enhanced})
+    monkeypatch.setattr(rds_adapter, "get_rds_instance_count", lambda ctx: {"total": 1})
+
+    ctx = _FakeCtx()
+    ctx.cost_hub_splits = {"rds": [_coh_rec("prod", 70.0)]}
+    findings = rds_adapter.RdsModule().scan(ctx)
+
+    # CoH ($70) is authoritative: CO ($80) and heuristic ($53) for the same DB
+    # are suppressed, so only the CoH saving is counted (no double-count).
+    assert findings.total_monthly_savings == pytest.approx(70.0)
+    assert findings.sources["compute_optimizer"].count == 0
+    assert findings.sources["enhanced_checks"].count == 0
+    assert findings.sources["cost_optimization_hub"].count == 1
+    assert findings.total_recommendations == 1
+
+
+def test_coh_ri_purchase_excluded_from_rds_tab(monkeypatch):
+    monkeypatch.setattr(rds_adapter, "get_rds_compute_optimizer_recommendations", lambda ctx: [])
+    monkeypatch.setattr(rds_adapter, "get_enhanced_rds_checks", lambda ctx, m, d: {"recommendations": []})
+    monkeypatch.setattr(rds_adapter, "get_rds_instance_count", lambda ctx: {"total": 1})
+
+    ctx = _FakeCtx()
+    ctx.cost_hub_splits = {"rds": [_coh_rec("prod", 200.0, action_type="PurchaseReservedInstances")]}
+    findings = rds_adapter.RdsModule().scan(ctx)
+
+    # RI purchase recs belong to commitment_analysis, not the RDS tab.
+    assert "cost_optimization_hub" not in findings.sources
+    assert findings.total_recommendations == 0
+    assert findings.total_monthly_savings == 0.0

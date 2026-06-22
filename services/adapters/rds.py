@@ -18,6 +18,23 @@ from services.rds_logic import resolve_rds_findings
 logger = logging.getLogger(__name__)
 
 
+def _coh_is_renderable(rec: dict[str, Any]) -> bool:
+    """Filter Cost Optimization Hub recs down to ones the RDS tab should render.
+
+    Reserved-Instance / Savings-Plan purchase recommendations are routed to the
+    commitment_analysis tab by the orchestrator and must not be re-counted here;
+    N/A-resource rows carry no concrete instance. Everything else (rightsizing,
+    idle, storage findings for RdsDbInstance / RdsDbCluster) is renderable.
+    """
+    if rec.get("actionType") == "PurchaseReservedInstances":
+        return False
+    if rec.get("actionType") == "PurchaseSavingsPlans":
+        return False
+    if rec.get("resourceId") == "N/A":
+        return False
+    return True
+
+
 class RdsModule(BaseServiceModule):
     """ServiceModule adapter for RDS. Multi-source savings strategy."""
 
@@ -82,20 +99,32 @@ class RdsModule(BaseServiceModule):
         except Exception as e:
             ctx.warn(f"[rds] instance count failed: {e}", service="rds")
 
-        # Cross-source de-duplication. CoH consumption is wired in a later step;
-        # for now coh_recs is empty and the resolver dedups CO vs heuristics.
-        _coh_kept, co_kept, enhanced_kept, savings, total_recs = resolve_rds_findings(
-            co_recs, enhanced_recs
+        # Cost Optimization Hub re-surfaces RDS rightsizing/idle findings the
+        # orchestrator bucketed into ctx.cost_hub_splits["rds"]. Consume them as
+        # the authoritative source: a DB covered by CoH suppresses that DB's
+        # Compute Optimizer and heuristic findings (avoids double-counting).
+        coh_recs = [
+            r for r in getattr(ctx, "cost_hub_splits", {}).get("rds", []) if _coh_is_renderable(r)
+        ]
+
+        coh_kept, co_kept, enhanced_kept, savings, total_recs = resolve_rds_findings(
+            co_recs, enhanced_recs, coh_recs=coh_recs
         )
+
+        sources = {
+            "compute_optimizer": SourceBlock(count=len(co_kept), recommendations=tuple(co_kept)),
+            "enhanced_checks": SourceBlock(count=len(enhanced_kept), recommendations=tuple(enhanced_kept)),
+        }
+        if coh_kept:
+            sources["cost_optimization_hub"] = SourceBlock(
+                count=len(coh_kept), recommendations=tuple(coh_kept)
+            )
 
         return ServiceFindings(
             service_name="RDS",
             total_recommendations=total_recs,
             total_monthly_savings=savings,
-            sources={
-                "compute_optimizer": SourceBlock(count=len(co_kept), recommendations=tuple(co_kept)),
-                "enhanced_checks": SourceBlock(count=len(enhanced_kept), recommendations=tuple(enhanced_kept)),
-            },
+            sources=sources,
             optimization_descriptions=RDS_OPTIMIZATION_DESCRIPTIONS,
             extras={"instance_counts": rds_counts},
         )

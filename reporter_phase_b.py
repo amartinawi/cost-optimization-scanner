@@ -2277,6 +2277,7 @@ PHASE_B_HANDLERS: Dict[Tuple[str, str], Callable] = {
     ("ebs", "compute_optimizer"): _render_ebs_compute_optimizer,
     ("rds", "compute_optimizer"): _render_rds_compute_optimizer,
     ("rds", "enhanced_checks"): _render_rds_enhanced_checks,
+    ("rds", "cost_optimization_hub"): _render_cost_hub_source,
     ("s3", "enhanced_checks"): _render_s3_enhanced_checks,
     ("s3", "s3_bucket_analysis"): _render_s3_bucket_analysis,
     ("dynamodb", "enhanced_checks"): _render_dynamodb_enhanced_checks,
