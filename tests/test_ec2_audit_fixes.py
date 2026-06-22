@@ -119,7 +119,7 @@ def _fake_ctx(instances: list[dict], hourly: float = 0.10, prices: dict | None =
 
     price_map = prices or {}
 
-    def _price(instance_type, os_name="Linux", license_model="No License required"):
+    def _price(instance_type, os_name="Linux", license_model="No License required", quiet=False):
         return price_map.get(instance_type, hourly)
 
     pricing_engine = MagicMock()
@@ -218,6 +218,10 @@ def test_one_size_down():
     assert _one_size_down("t3.medium") == "t3.small"
     assert _one_size_down("m5.nano") is None  # smallest rung
     assert _one_size_down("weird") is None
+    # Real families skip the non-existent 3xlarge rung: 4xlarge -> 2xlarge.
+    assert _one_size_down("r5.4xlarge") == "r5.2xlarge"
+    assert _one_size_down("c5.4xlarge") == "c5.2xlarge"
+    assert "3xlarge" not in str(_one_size_down("m5.4xlarge"))
 
 
 def test_compute_savings_price_delta_and_factor():
@@ -225,7 +229,7 @@ def test_compute_savings_price_delta_and_factor():
 
     ctx = SimpleNamespace(pricing_engine=MagicMock())
     ctx.pricing_engine.get_ec2_hourly_price.side_effect = (
-        lambda t, o="Linux", lm="No License required": {"m5.xlarge": 0.214, "m5.large": 0.107}.get(t, 0.0)
+        lambda t, o="Linux", lm="No License required", quiet=False: {"m5.xlarge": 0.214, "m5.large": 0.107}.get(t, 0.0)
     )
     # Delta mode (target given): (0.214 - 0.107) * 730 = 78.11
     savings, basis = _compute_ec2_savings(

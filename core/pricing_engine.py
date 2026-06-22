@@ -397,7 +397,11 @@ class PricingEngine:
         return price
 
     def get_ec2_hourly_price(
-        self, instance_type: str, os: str = "Linux", license_model: str = "No License required"
+        self,
+        instance_type: str,
+        os: str = "Linux",
+        license_model: str = "No License required",
+        quiet: bool = False,
     ) -> float:
         """On-Demand hourly price for EC2 instance_type in self._region.
 
@@ -406,12 +410,19 @@ class PricingEngine:
         on-demand list price (license included for Windows); pass
         "Bring your own license" for BYOL instances, which are billed at the
         lower base-compute rate.
+
+        ``quiet=True`` suppresses the fallback warning and returns 0.0 on a miss.
+        Use it for *speculative* lookups (e.g. probing a candidate rightsizing
+        target that may not exist for the family) where a miss is expected and
+        not a data-quality concern.
         """
         key = ("ec2_hourly", instance_type, os, license_model)
         if (cached := self._get_cached(key)) is not None:
             return cached
         price = self._fetch_ec2_price(instance_type, os, license_model)
         if price is None:
+            if quiet:
+                return 0.0  # not cached: a transient miss for a speculative type
             price = self._use_fallback(
                 0.0,
                 f"Pricing API returned no result for EC2 {instance_type} ({os}, {license_model}) in {self._region}",
