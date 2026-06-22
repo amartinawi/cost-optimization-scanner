@@ -78,6 +78,11 @@ FALLBACK_RDS_STORAGE_GB_MONTH: dict[str, float] = {
     "io1": 0.200,
 }
 FALLBACK_RDS_BACKUP_GB_MONTH: float = 0.095
+# Aurora backup/snapshot storage is billed at a different (lower) rate than
+# standard RDS: us-east-1/eu-west-1 Aurora = $0.021/GB-Mo vs standard $0.095/GB-Mo
+# (verified via the Pricing API: usagetype EU-Aurora:BackupUsage). Pricing an
+# Aurora snapshot at the standard rate overstates by ~4.5x.
+FALLBACK_AURORA_BACKUP_GB_MONTH: float = 0.021
 # Single-AZ db.t3.medium MySQL us-east-1 on-demand monthly cost (730h × $0.068/h).
 # Used only when AWS Pricing API is unavailable; multiplied by the regional fallback multiplier.
 FALLBACK_RDS_INSTANCE_MONTHLY: float = 49.64
@@ -480,6 +485,7 @@ class PricingEngine:
         *,
         multi_az: bool = False,
         license_model: str | None = None,
+        aurora_io_optimized: bool = False,
     ) -> float:
         """$/month for an RDS DB instance, engine/edition/license/deployment-aware.
 
@@ -511,11 +517,13 @@ class PricingEngine:
         key = (
             "rds_instance", normalized, instance_class,
             "Multi-AZ" if multi_az else "Single-AZ", resolved_license,
+            "io-opt" if aurora_io_optimized else "std",
         )
         if (cached := self._get_cached(key)) is not None:
             return cached
         price = self._fetch_rds_instance_price(
-            normalized, instance_class, multi_az=multi_az, license_model=license_model
+            normalized, instance_class, multi_az=multi_az, license_model=license_model,
+            aurora_io_optimized=aurora_io_optimized,
         )
         if price is None:
             fallback = FALLBACK_RDS_INSTANCE_MONTHLY * (FALLBACK_RDS_MULTI_AZ_FACTOR if multi_az else 1.0)
@@ -527,16 +535,31 @@ class PricingEngine:
         self._cache.set(key, price)
         return price
 
-    def get_rds_backup_storage_price_per_gb(self) -> float:
-        """$/GB/month for RDS backup storage in self._region."""
-        key = ("rds_backup",)
+    def get_rds_backup_storage_price_per_gb(self, engine: str | None = None) -> float:
+        """$/GB/month for RDS backup/snapshot storage in self._region.
+
+        Args:
+            engine: RDS engine (from describe-API). Aurora engines are billed at a
+                distinct, lower backup rate ($0.021/GB-Mo) than standard RDS
+                ($0.095/GB-Mo); pricing an Aurora snapshot at the standard rate
+                overstates ~4.5x (audit C-A1). Omit / non-Aurora -> standard rate.
+        """
+        normalized = (engine or "").lower().strip()
+        is_aurora = normalized.startswith("aurora")
+        # Aurora flavours share one backup rate; "Aurora MySQL" is a safe
+        # representative label for the lookup. Standard engines also share one
+        # rate; pin "MySQL" for determinism (as before).
+        engine_label = "Aurora MySQL" if is_aurora else "MySQL"
+        key = ("rds_backup", "aurora" if is_aurora else "standard")
         if (cached := self._get_cached(key)) is not None:
             return cached
-        price = self._fetch_rds_backup_price()
+        price = self._fetch_rds_backup_price(engine_label)
         if price is None:
+            fallback = FALLBACK_AURORA_BACKUP_GB_MONTH if is_aurora else FALLBACK_RDS_BACKUP_GB_MONTH
             price = self._use_fallback(
-                FALLBACK_RDS_BACKUP_GB_MONTH * self._fallback_multiplier,
-                f"Pricing API unavailable for RDS backup storage in {self._region}; using fallback",
+                fallback * self._fallback_multiplier,
+                f"Pricing API unavailable for {'Aurora' if is_aurora else 'RDS'} backup storage "
+                f"in {self._region}; using fallback",
             )
         self._cache.set(key, price)
         return price
@@ -847,13 +870,16 @@ class PricingEngine:
         *,
         multi_az: bool = False,
         license_model: str | None = None,
+        aurora_io_optimized: bool = False,
     ) -> float | None:
         """Fetch on-demand monthly RDS instance price; None on miss.
 
-        Pins ``databaseEdition`` (for SQL Server / Oracle) and ``licenseModel``
-        (from the instance's actual ``LicenseModel``) so the lookup is
-        deterministic — otherwise multiple editions / license rows match and
-        MaxResults picks one arbitrarily.
+        Pins ``databaseEdition`` (for SQL Server / Oracle), ``licenseModel`` (from
+        the instance's actual ``LicenseModel``) and — for Aurora — the ``storage``
+        mode (Standard "EBS Only" vs "Aurora IO Optimization Mode") so the lookup
+        is deterministic; otherwise multiple editions / license / storage-mode rows
+        match and MaxResults picks one arbitrarily (Aurora I/O-Optimized is ~30%
+        dearer than Standard for the same class).
         """
         engine_label = _RDS_ENGINE_LABELS.get(engine)
         if engine_label is None:
@@ -876,6 +902,11 @@ class PricingEngine:
         edition = _RDS_ENGINE_EDITIONS.get(engine)
         if edition:
             filters.append({"Type": "TERM_MATCH", "Field": "databaseEdition", "Value": edition})
+        if engine.startswith("aurora"):
+            # Aurora rows are split by storage mode; pin it so Standard and
+            # I/O-Optimized don't collide (EBS Only $5.12 vs IO mode $6.656).
+            storage_value = "Aurora IO Optimization Mode" if aurora_io_optimized else "EBS Only"
+            filters.append({"Type": "TERM_MATCH", "Field": "storage", "Value": storage_value})
         hourly = self._call_pricing_api_hourly("AmazonRDS", filters)
         return hourly * 730 if hourly is not None else None
 
@@ -892,17 +923,16 @@ class PricingEngine:
         ]
         return self._call_pricing_api("AmazonRDS", filters)
 
-    def _fetch_rds_backup_price(self) -> float | None:
-        # Pin databaseEngine to a standard (non-Aurora, non-Custom) engine so the
-        # MaxResults=1 lookup is deterministic: without it the loose filter could
-        # return the Aurora row ($0.021) or an RDS Custom row instead of the
-        # standard RDS backup rate ($0.095). All standard engines share the same
-        # rate, so MySQL is a safe representative. Aurora backup is priced
-        # differently and is not covered by this method (documented limitation).
+    def _fetch_rds_backup_price(self, engine_label: str = "MySQL") -> float | None:
+        # Pin databaseEngine so the MaxResults=1 lookup is deterministic: without it
+        # the loose filter could return the wrong engine family (Aurora $0.021 vs
+        # standard $0.095, or an RDS Custom row). All standard engines share one
+        # rate (MySQL is a safe representative); Aurora flavours share another
+        # ("Aurora MySQL" represents them). See get_rds_backup_storage_price_per_gb.
         filters = [
             {"Type": "TERM_MATCH", "Field": "location", "Value": self._display_name},
             {"Type": "TERM_MATCH", "Field": "productFamily", "Value": "Storage Snapshot"},
-            {"Type": "TERM_MATCH", "Field": "databaseEngine", "Value": "MySQL"},
+            {"Type": "TERM_MATCH", "Field": "databaseEngine", "Value": engine_label},
         ]
         return self._call_pricing_api("AmazonRDS", filters)
 

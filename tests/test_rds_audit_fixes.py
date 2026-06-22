@@ -266,16 +266,22 @@ class _FakeRdsPricingEngine:
 
     def __init__(self):
         self.last_license_model = "UNSET"
+        self.last_aurora_io_optimized = None
 
-    def get_rds_instance_monthly_price(self, engine, instance_class, *, multi_az=False, license_model=None):
+    def get_rds_instance_monthly_price(
+        self, engine, instance_class, *, multi_az=False, license_model=None, aurora_io_optimized=False
+    ):
         self.last_license_model = license_model
-        return 200.0 if multi_az else 100.0
+        self.last_aurora_io_optimized = aurora_io_optimized
+        base = 200.0 if multi_az else 100.0
+        return base * (1.3 if aurora_io_optimized else 1.0)
 
     def get_rds_monthly_storage_price_per_gb(self, storage_type, *, multi_az=False):
         return 0.115
 
-    def get_rds_backup_storage_price_per_gb(self):
-        return 0.095
+    def get_rds_backup_storage_price_per_gb(self, engine=None):
+        # Aurora backup is cheaper than standard RDS (C-A1).
+        return 0.021 if (engine or "").lower().startswith("aurora") else 0.095
 
 
 class _FakeCloudWatch:
@@ -665,3 +671,108 @@ def test_backup_retention_excluded_from_savings_but_rendered():
     assert savings == 0.0          # not summed into the headline
     assert len(kept_enh) == 1      # but still rendered
     assert count == 1
+
+
+# --------------------------------------------------------------------------- #
+# C-A1 — Aurora snapshots priced at the Aurora backup rate, not standard RDS
+# --------------------------------------------------------------------------- #
+from datetime import datetime, timedelta, timezone  # noqa: E402
+
+
+def test_backup_price_engine_aware_filter():
+    client = _CapturingPricingClient()
+    _engine(client).get_rds_backup_storage_price_per_gb("aurora-mysql")
+    assert _filter_value(client.last_filters, "databaseEngine") == "Aurora MySQL"
+    client2 = _CapturingPricingClient()
+    _engine(client2).get_rds_backup_storage_price_per_gb("mysql")
+    assert _filter_value(client2.last_filters, "databaseEngine") == "MySQL"
+    client3 = _CapturingPricingClient()
+    _engine(client3).get_rds_backup_storage_price_per_gb()  # default standard
+    assert _filter_value(client3.last_filters, "databaseEngine") == "MySQL"
+
+
+def test_aurora_cluster_snapshot_uses_aurora_rate():
+    old = datetime.now(timezone.utc) - timedelta(days=600)
+    snap = {
+        "DBClusterSnapshotIdentifier": "levelshoes-final-snapshot",
+        "SnapshotCreateTime": old,
+        "AllocatedStorage": 3460,
+        "Engine": "aurora-mysql",
+    }
+    ctx = _EnhancedCtx(_FakeRdsClient(cluster_snapshots=[snap]))
+    rec = next(r for r in _recs(ctx) if r["CheckCategory"] == "Old Aurora Cluster Snapshots")
+    # 3460 GB x $0.021 (Aurora) = $72.66, NOT x $0.095 ($328.70).
+    assert "$72.66/month" in rec["EstimatedSavings"]
+    assert rec["AuditBasis"]["rate"] == pytest.approx(0.021)
+    assert rec["AuditBasis"]["engine"] == "aurora-mysql"
+
+
+def test_standard_db_snapshot_uses_standard_rate():
+    old = datetime.now(timezone.utc) - timedelta(days=200)
+    snap = {
+        "DBSnapshotIdentifier": "mysql-old-snap",
+        "SnapshotCreateTime": old,
+        "AllocatedStorage": 100,
+        "Engine": "mysql",
+    }
+    ctx = _EnhancedCtx(_FakeRdsClient(snapshots=[snap]))
+    rec = next(r for r in _recs(ctx) if r["CheckCategory"] == "Old RDS Snapshots")
+    # 100 GB x $0.095 = $9.50.
+    assert "$9.50/month" in rec["EstimatedSavings"]
+    assert rec["AuditBasis"]["rate"] == pytest.approx(0.095)
+
+
+# --------------------------------------------------------------------------- #
+# M-A1 — Aurora storage mode pinned (Standard vs I/O-Optimized)
+# --------------------------------------------------------------------------- #
+def test_aurora_io_optimized_storage_filter():
+    client = _CapturingPricingClient()
+    _engine(client).get_rds_instance_monthly_price("aurora-mysql", "db.r5.8xlarge", aurora_io_optimized=True)
+    assert _filter_value(client.last_filters, "storage") == "Aurora IO Optimization Mode"
+    client2 = _CapturingPricingClient()
+    _engine(client2).get_rds_instance_monthly_price("aurora-mysql", "db.r5.8xlarge", aurora_io_optimized=False)
+    assert _filter_value(client2.last_filters, "storage") == "EBS Only"
+
+
+def test_non_aurora_has_no_storage_filter():
+    client = _CapturingPricingClient()
+    _engine(client).get_rds_instance_monthly_price("mysql", "db.t3.medium")
+    assert _filter_value(client.last_filters, "storage") is None
+
+
+def test_ri_detects_io_optimized_cluster():
+    # An Aurora member whose cluster is aurora-iopt1 must price I/O-Optimized.
+    pe = _FakeRdsPricingEngine()
+    inst = _instance(DBInstanceIdentifier="prod-writer", Engine="aurora-mysql",
+                     DBInstanceClass="db.r5.8xlarge", DBClusterIdentifier="cl1")
+    cluster = {"DBClusterIdentifier": "cl1", "StorageType": "aurora-iopt1", "Engine": "aurora-mysql"}
+    ctx = _EnhancedCtx(_FakeRdsClient(instances=[inst], clusters=[cluster]), pricing_engine=pe)
+    _recs(ctx)
+    assert pe.last_aurora_io_optimized is True
+
+
+def test_ri_standard_cluster_not_io_optimized():
+    pe = _FakeRdsPricingEngine()
+    inst = _instance(DBInstanceIdentifier="prod-writer", Engine="aurora-mysql",
+                     DBInstanceClass="db.r5.8xlarge", DBClusterIdentifier="cl1")
+    cluster = {"DBClusterIdentifier": "cl1", "StorageType": "aurora", "Engine": "aurora-mysql"}
+    ctx = _EnhancedCtx(_FakeRdsClient(instances=[inst], clusters=[cluster]), pricing_engine=pe)
+    _recs(ctx)
+    assert pe.last_aurora_io_optimized is False
+
+
+# --------------------------------------------------------------------------- #
+# L-A1 — instance count classifies aurora-mysql as Aurora, not MySQL
+# --------------------------------------------------------------------------- #
+def test_instance_count_classifies_aurora():
+    from services.rds import get_rds_instance_count
+
+    insts = [
+        {"DBInstanceStatus": "available", "Engine": "aurora-mysql"},
+        {"DBInstanceStatus": "available", "Engine": "aurora-postgresql"},
+        {"DBInstanceStatus": "available", "Engine": "mysql"},
+    ]
+    ctx = _EnhancedCtx(_FakeRdsClient(instances=insts))
+    counts = get_rds_instance_count(ctx)
+    assert counts["aurora"] == 2
+    assert counts["mysql"] == 1

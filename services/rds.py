@@ -83,21 +83,36 @@ def _rds_monthly_price(
     *,
     multi_az: bool,
     license_model: str | None = None,
+    aurora_io_optimized: bool = False,
 ) -> float:
     """Return RDS instance monthly $ price via PricingEngine, or 0.0 on failure.
 
-    ``license_model`` is the instance's ``LicenseModel`` from describe-API; it is
-    required for accurate Oracle/SQL Server pricing (LI vs BYOL, per-edition).
+    ``license_model`` is the instance's ``LicenseModel`` from describe-API (needed
+    for Oracle/SQL Server LI-vs-BYOL/per-edition pricing). ``aurora_io_optimized``
+    selects the Aurora I/O-Optimized SKU (≈30% dearer) vs Standard.
     """
     if not ctx.pricing_engine or not engine or not instance_class:
         return 0.0
     try:
         return ctx.pricing_engine.get_rds_instance_monthly_price(
-            engine, instance_class, multi_az=multi_az, license_model=license_model
+            engine, instance_class, multi_az=multi_az, license_model=license_model,
+            aurora_io_optimized=aurora_io_optimized,
         )
     except Exception as exc:
         logger.debug("RDS pricing lookup failed for %s %s: %s", engine, instance_class, exc)
         return 0.0
+
+
+def _backup_rate(ctx: ScanContext, engine: str | None, pricing_multiplier: float) -> float:
+    """Engine-aware RDS/Aurora backup-storage $/GB-month, with offline fallback.
+
+    Aurora snapshots bill at ~$0.021/GB-mo vs standard RDS ~$0.095/GB-mo; pricing
+    an Aurora snapshot at the standard rate overstates ~4.5x (audit C-A1).
+    """
+    if ctx.pricing_engine:
+        return ctx.pricing_engine.get_rds_backup_storage_price_per_gb(engine)
+    is_aurora = (engine or "").lower().startswith("aurora")
+    return (0.021 if is_aurora else 0.095) * pricing_multiplier
 
 RDS_OPTIMIZATION_DESCRIPTIONS: dict[str, dict[str, str]] = {
     "idle_databases": {
@@ -208,12 +223,15 @@ def get_rds_instance_count(ctx: ScanContext) -> dict[str, int]:
                 counts["stopped"] += 1
 
             engine = instance.get("Engine", "").lower()
-            if "mysql" in engine:
+            # Check aurora FIRST: "aurora-mysql"/"aurora-postgresql" contain the
+            # "mysql"/"postgres" substrings, so an aurora-first test avoids
+            # miscounting Aurora instances as MySQL/PostgreSQL (audit L-A1).
+            if "aurora" in engine:
+                counts["aurora"] += 1
+            elif "mysql" in engine:
                 counts["mysql"] += 1
             elif "postgres" in engine:
                 counts["postgres"] += 1
-            elif "aurora" in engine:
-                counts["aurora"] += 1
             elif "oracle" in engine:
                 counts["oracle"] += 1
             elif "sqlserver" in engine:
@@ -285,6 +303,19 @@ def get_enhanced_rds_checks(
         "old_snapshots": [],
         "non_prod_scheduling": [],
     }
+
+    # Map cluster id -> StorageType so Aurora member-instance pricing can select
+    # the right storage-mode SKU (aurora-iopt1 = I/O-Optimized, else Standard).
+    clusters_by_id: dict[str, dict[str, Any]] = {}
+    try:
+        cl_paginator = rds.get_paginator("describe_db_clusters")
+        for page in cl_paginator.paginate():
+            for cluster in page.get("DBClusters", []):
+                cid = cluster.get("DBClusterIdentifier")
+                if cid:
+                    clusters_by_id[cid] = cluster
+    except Exception as e:
+        ctx.warn(f"[rds] could not list DB clusters for storage-mode pricing: {e}", service="rds")
 
     try:
         paginator = rds.get_paginator("describe_db_instances")
@@ -550,9 +581,15 @@ def get_enhanced_rds_checks(
                 if db_instance_status == "available":
                     is_likely_prod = not any(env in db_instance_id.lower() for env in ["dev", "test", "staging", "qa"])
                     ri_text = "production databases" if is_likely_prod else "long-running databases"
+                    # Aurora members inherit their cluster's storage mode, which
+                    # changes the instance rate (Standard vs I/O-Optimized).
+                    cluster_of = instance.get("DBClusterIdentifier")
+                    aurora_io = bool(cluster_of) and clusters_by_id.get(cluster_of, {}).get(
+                        "StorageType"
+                    ) == "aurora-iopt1"
                     ri_base_price = _rds_monthly_price(
                         ctx, engine or "", db_instance_class or "", multi_az=multi_az,
-                        license_model=license_model,
+                        license_model=license_model, aurora_io_optimized=aurora_io,
                     )
                     ri_scenarios = [
                         {
@@ -604,35 +641,38 @@ def get_enhanced_rds_checks(
                     snapshot_id = snapshot.get("DBSnapshotIdentifier")
                     create_time = snapshot.get("SnapshotCreateTime")
                     snap_allocated_storage = snapshot.get("AllocatedStorage", 0)
+                    snap_engine = snapshot.get("Engine")
 
                     if create_time:
                         age_days = (datetime.now(create_time.tzinfo) - create_time).days
                         if age_days > old_snapshot_days:
+                            snap_rate = _backup_rate(ctx, snap_engine, pricing_multiplier)
+                            snap_savings = snap_allocated_storage * snap_rate
                             checks["old_snapshots"].append(
                                 {
                                     "SnapshotId": snapshot_id,
                                     "resourceArn": (f"arn:aws:rds:{region}:{account_id}:snapshot:{snapshot_id}"),
                                     "AgeDays": age_days,
                                     "AllocatedStorage": snap_allocated_storage,
+                                    "engine": snap_engine,
                                     "Recommendation": (
                                         f"Delete {age_days}-day old manual"
                                         " snapshot (savings based on"
                                         " allocated storage estimate)"
                                     ),
-                                    "EstimatedSavings": (
-                                        f"${snap_allocated_storage * (ctx.pricing_engine.get_rds_backup_storage_price_per_gb() if ctx.pricing_engine else 0.095 * pricing_multiplier):.2f}"
-                                        "/month (coarse estimate)"
-                                    ),
+                                    "EstimatedSavings": f"${snap_savings:.2f}/month (coarse estimate)",
                                     "CheckCategory": "Old RDS Snapshots",
                                     "instanceFinding": (f"{age_days} days old ({snap_allocated_storage}GB)"),
                                     "AuditBasis": {
                                         "rate_basis": "RDS backup storage $/GB-month (live Pricing API)",
                                         "region": region,
+                                        "engine": snap_engine,
+                                        "rate": round(snap_rate, 4),
                                         "metric_window": (
                                             f"describe-API snapshot age {age_days}d > {old_snapshot_days}d threshold"
                                         ),
                                         "formula": (
-                                            f"{snap_allocated_storage}GB x backup $/GB-mo "
+                                            f"{snap_allocated_storage}GB x ${snap_rate:.4f}/GB-mo "
                                             "(allocated-size estimate, coarse)"
                                         ),
                                     },
@@ -661,10 +701,15 @@ def get_enhanced_rds_checks(
                         snapshot_id = snapshot.get("DBClusterSnapshotIdentifier")
                         create_time = snapshot.get("SnapshotCreateTime")
                         cluster_allocated_storage = snapshot.get("AllocatedStorage", 0)
+                        # Cluster snapshots are Aurora; price at the Aurora backup
+                        # rate ($0.021/GB-mo), not the standard RDS rate (C-A1).
+                        snap_engine = snapshot.get("Engine") or "aurora"
 
                         if create_time:
                             age_days = (datetime.now(create_time.tzinfo) - create_time).days
                             if age_days > old_snapshot_days:
+                                snap_rate = _backup_rate(ctx, snap_engine, pricing_multiplier)
+                                snap_savings = cluster_allocated_storage * snap_rate
                                 checks["old_snapshots"].append(
                                     {
                                         "SnapshotId": snapshot_id,
@@ -673,16 +718,14 @@ def get_enhanced_rds_checks(
                                         ),
                                         "AgeDays": age_days,
                                         "AllocatedStorage": (cluster_allocated_storage),
+                                        "engine": snap_engine,
                                         "Recommendation": (
                                             f"Delete {age_days}-day old"
                                             " Aurora cluster snapshot"
                                             " (savings based on allocated"
                                             " storage estimate)"
                                         ),
-                                        "EstimatedSavings": (
-                                            f"${cluster_allocated_storage * (ctx.pricing_engine.get_rds_backup_storage_price_per_gb() if ctx.pricing_engine else 0.095 * pricing_multiplier):.2f}"
-                                            "/month (coarse estimate)"
-                                        ),
+                                        "EstimatedSavings": f"${snap_savings:.2f}/month (coarse estimate)",
                                         "CheckCategory": ("Old Aurora Cluster Snapshots"),
                                         "instanceFinding": (
                                             f"{age_days} days old Aurora"
@@ -690,14 +733,16 @@ def get_enhanced_rds_checks(
                                             f" ({cluster_allocated_storage}GB)"
                                         ),
                                         "AuditBasis": {
-                                            "rate_basis": "RDS backup storage $/GB-month (live Pricing API)",
+                                            "rate_basis": "Aurora backup storage $/GB-month (live Pricing API)",
                                             "region": region,
+                                            "engine": snap_engine,
+                                            "rate": round(snap_rate, 4),
                                             "metric_window": (
                                                 f"describe-API snapshot age {age_days}d > "
                                                 f"{old_snapshot_days}d threshold"
                                             ),
                                             "formula": (
-                                                f"{cluster_allocated_storage}GB x backup $/GB-mo "
+                                                f"{cluster_allocated_storage}GB x ${snap_rate:.4f}/GB-mo "
                                                 "(allocated-size estimate, coarse)"
                                             ),
                                         },
