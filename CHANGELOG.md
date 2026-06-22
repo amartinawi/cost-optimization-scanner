@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (RDS deep-audit second pass)
+- **SQL Server / Oracle edition pricing (N-H1)**. Instance pricing pinned only
+  `databaseEngine`, so all editions collided and MaxResults returned one
+  arbitrarily (db.m5.large SQL Server Web $0.311/hr vs Standard $0.977/hr — 3.1x).
+  Now derive `databaseEdition` from the engine string and pin it.
+- **License model from the instance (N-M1)**. License was hardcoded by a static
+  engine set; Oracle EE (BYOL-only, no "No license required" row) matched nothing
+  and silently fell back to the MySQL constant, and Oracle SE2 LI ($0.438/hr) vs
+  BYOL ($0.171/hr) is a 2.6x swing. Now read each instance's `LicenseModel` and
+  thread it through pricing.
+- **Backup retention is advisory (N-M2)**. The old `allocated×rate×days/30` model
+  double-counted and ignored the free allotment (= 100% of provisioned storage).
+  The billable excess isn't derivable at scan time, so the check is now advisory
+  (rendered/counted, excluded from the savings headline) with the free-allotment
+  rule + per-GB rate instead of a fabricated figure.
+- **Multi-AZ / scheduling now require CloudWatch evidence (N-M3)**. Both gated on
+  a DatabaseConnections read (idle→schedule, sustained-load→keep HA); fast_mode
+  skips with a warning, no data warns + skips, AccessDenied → permission_issue.
+- **Scheduling covers all non-Aurora engines (N-M4)** (was mysql/postgres/mariadb
+  only, silently excluding Oracle/SQL Server).
+
 ### Fixed (RDS cost-accuracy audit)
 See `docs/audits/RDS_REMEDIATION_PLAN.md` for the full finding catalogue.
 - **Phantom gp2→gp3 storage savings removed (C1)**. Unlike EBS, RDS gp2 and gp3
