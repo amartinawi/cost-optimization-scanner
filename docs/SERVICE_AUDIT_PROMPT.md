@@ -124,5 +124,12 @@ codebase/search tools to trace actual code paths.
 - CloudWatch / Cost Explorer permission failure printed but not recorded.
 - Heuristic that assumes a target (e.g. "shrink to 20GB") with no usage evidence.
 - Cross-adapter overlap (same volume/IP/snapshot in two tabs).
+- **Reduction factor instead of exact price delta**: a rightsizing/migration saving computed as `price × factor` rather than `(current_price − target_price)`. Prefer the real delta to a concrete recommended target (migration map, one size smaller); validated factors can be off 2–3× (EC2 m4→m6i was 2.8× too high).
+- **Single-signal utilization**: idle/rightsizing from CPU alone. Corroborate with always-available signals (NetworkIn/Out) and, when present, agent metrics (memory) — but only to *suppress* false positives, never to invent findings.
+- **Agent-metric dimension mismatch**: CloudWatch-agent metrics (CWAgent mem/disk) published under more dimensions than InstanceId; a get_metric_statistics by InstanceId alone silently returns nothing. Use list_metrics to discover the real dimension set.
+- **Managed-fleet double count**: per-instance heuristics applied to Auto Scaling Group members (which are sized via launch template / ASG Compute Optimizer). Add ASG members to the dedup `covered` set.
+- **License model**: BYOL detected from `PlatformDetails` ("Windows BYOL") priced at the license-included rate (overstated). Map to the BYOL `licenseModel` SKU.
+- **Unquantifiable interruptibility**: never recommend Spot implicitly — require an explicit operator tag (workload is interruptible) and price the on-demand−Spot delta from `describe_spot_price_history`.
+- **Scheduling**: non-prod 24/7 instances → quantify an off-hours stop schedule from the real monthly cost × a documented off-fraction (not a bare nudge).
 
 ## PROMPT (end)

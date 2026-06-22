@@ -21,6 +21,9 @@ logger = logging.getLogger(__name__)
 # guidance — kept as a single table so the audit trail is one diff away.
 EC2_SAVINGS_FACTORS: dict[str, float] = {
     "Idle Instances": 1.0,
+    # Previous Generation / Rightsizing / Burstable now use EXACT current->target
+    # price deltas (see _compute_ec2_savings target_type mode); their factors here
+    # are retained only as a fallback and are not used on the delta path.
     "Rightsizing Opportunities": 0.40,
     "Burstable Instance Optimization": 0.30,
     "Previous Generation Migration": 0.10,
@@ -28,7 +31,40 @@ EC2_SAVINGS_FACTORS: dict[str, float] = {
     "Batch Job Instances": 0.75,
     "Underutilized Instance Store": 0.15,
     "Dedicated Hosts": 0.30,
+    # Non-prod scheduling: stop instances outside business hours. Off-fraction
+    # assumes ~12h/weekday uptime (≈264 of 730 monthly hours) ⇒ ~64% recoverable.
+    "Non-Prod Scheduling": 0.64,
 }
+
+# Tag values that mark an instance as non-production (safe to stop off-hours).
+_NONPROD_ENV_VALUES: frozenset[str] = frozenset(
+    {"dev", "development", "test", "testing", "staging", "stage", "qa", "uat", "sandbox", "sbx", "demo"}
+)
+# Tag keys/values that explicitly opt an instance into Spot (interruptible).
+_SPOT_ELIGIBLE_TAG_KEYS: frozenset[str] = frozenset({"spot-eligible", "spoteligible", "interruptible", "spot"})
+
+
+def _is_nonprod(tags: dict[str, str]) -> bool:
+    """True when an Environment/Env/Stage tag marks the instance as non-production."""
+    for key in ("Environment", "environment", "Env", "env", "Stage", "stage"):
+        if tags.get(key, "").strip().lower() in _NONPROD_ENV_VALUES:
+            return True
+    return False
+
+
+def _is_spot_eligible(tags: dict[str, str]) -> bool:
+    """True only when a tag explicitly marks the workload as interruptible.
+
+    Spot is never recommended implicitly — running on Spot risks interruption, so
+    we require an explicit operator signal rather than guessing from the workload.
+    """
+    for key, value in tags.items():
+        kl = key.strip().lower()
+        if kl in _SPOT_ELIGIBLE_TAG_KEYS and value.strip().lower() in ("true", "yes", "1", ""):
+            return True
+        if kl == "workload" and value.strip().lower() in ("batch", "spot", "interruptible"):
+            return True
+    return False
 
 _HOURS_PER_MONTH: int = 730
 
@@ -132,6 +168,33 @@ def _instance_license_model(instance: dict[str, Any]) -> str:
 _NETWORK_IDLE_BYTES_PER_HOUR: float = 5 * 1024 * 1024  # ~5 MB/hr ⇒ effectively idle
 _MEMORY_PRESSURE_PCT: float = 80.0
 
+# EC2 instance size ladder (small → large). Used to derive the "one size smaller"
+# rightsizing/burstable target so savings are the *actual* price delta between
+# the current and target size rather than an arbitrary reduction factor.
+_SIZE_LADDER: tuple[str, ...] = (
+    "nano", "micro", "small", "medium", "large", "xlarge",
+    "2xlarge", "3xlarge", "4xlarge", "6xlarge", "8xlarge", "9xlarge",
+    "12xlarge", "16xlarge", "18xlarge", "24xlarge", "32xlarge", "48xlarge",
+)
+
+
+def _one_size_down(instance_type: str) -> str | None:
+    """Return the next-smaller size in the same family, or None.
+
+    e.g. ``m5.xlarge`` -> ``m5.large``. Returns None for the smallest rung or an
+    unparseable type. If the derived target does not actually exist for the
+    family, the pricing lookup returns 0 and the caller emits no finding.
+    """
+    if "." not in instance_type:
+        return None
+    family, size = instance_type.split(".", 1)
+    if size not in _SIZE_LADDER:
+        return None
+    idx = _SIZE_LADDER.index(size)
+    if idx == 0:
+        return None
+    return f"{family}.{_SIZE_LADDER[idx - 1]}"
+
 
 def _classify_utilization(
     avg_cpu: float,
@@ -188,30 +251,103 @@ def _network_bytes_per_hour(cloudwatch: Any, instance_id: str, start_time: Any, 
         return None
 
 
-def _memory_used_percent(cloudwatch: Any, instance_id: str, start_time: Any, end_time: Any) -> float | None:
-    """Average CWAgent ``mem_used_percent`` over the window, or None.
+def _discover_mem_dimension_sets(cloudwatch: Any, instance_id: str) -> list[list[dict[str, str]]]:
+    """Discover the full CWAgent ``mem_used_percent`` dimension sets for an instance.
 
-    Requires the CloudWatch agent (namespace ``CWAgent``). Queried by InstanceId
-    only; if the agent publishes memory under additional dimensions the lookup
-    returns no datapoints and this yields None (treated as unknown — no effect on
-    the verdict). Best-effort precision signal, never required.
+    The CloudWatch agent often publishes memory under more dimensions than just
+    InstanceId (ImageId, InstanceType, AutoScalingGroupName, …), and
+    get_metric_statistics requires an exact dimension match. list_metrics with a
+    partial InstanceId filter returns every matching metric's full dimension set.
+    Always includes the InstanceId-only set as a fallback.
     """
+    sets: list[list[dict[str, str]]] = []
     try:
-        resp = cloudwatch.get_metric_statistics(
+        resp = cloudwatch.list_metrics(
             Namespace="CWAgent",
             MetricName="mem_used_percent",
             Dimensions=[{"Name": "InstanceId", "Value": instance_id}],
-            StartTime=start_time,
-            EndTime=end_time,
-            Period=3600,
-            Statistics=["Average"],
         )
-        dps = resp.get("Datapoints", [])
-        if not dps:
-            return None
-        return sum(dp["Average"] for dp in dps) / len(dps)
+        for metric in resp.get("Metrics", []):
+            dims = [{"Name": d["Name"], "Value": d["Value"]} for d in metric.get("Dimensions", [])]
+            if dims and dims not in sets:
+                sets.append(dims)
+    except Exception:
+        pass
+    instance_only = [{"Name": "InstanceId", "Value": instance_id}]
+    if instance_only not in sets:
+        sets.append(instance_only)
+    return sets
+
+
+def _memory_used_percent(cloudwatch: Any, instance_id: str, start_time: Any, end_time: Any) -> float | None:
+    """Average CWAgent ``mem_used_percent`` over the window, or None.
+
+    Requires the CloudWatch agent (namespace ``CWAgent``). Discovers the agent's
+    actual dimension set via list_metrics (the agent rarely publishes by
+    InstanceId alone) and queries each until one returns data. Yields None when
+    the agent is absent (treated as unknown — no effect on the verdict). A
+    best-effort precision signal, never required.
+    """
+    try:
+        for dim_set in _discover_mem_dimension_sets(cloudwatch, instance_id):
+            resp = cloudwatch.get_metric_statistics(
+                Namespace="CWAgent",
+                MetricName="mem_used_percent",
+                Dimensions=dim_set,
+                StartTime=start_time,
+                EndTime=end_time,
+                Period=3600,
+                Statistics=["Average"],
+            )
+            dps = resp.get("Datapoints", [])
+            if dps:
+                return sum(dp["Average"] for dp in dps) / len(dps)
+        return None
     except Exception:
         return None
+
+
+def _ec2_hourly(ctx: ScanContext, instance_type: str, os_name: str, license_model: str) -> tuple[float, str]:
+    """Hourly price for (type, os, license) with Linux fallback. Returns (price, priced_os)."""
+    if not ctx.pricing_engine:
+        return 0.0, os_name
+    priced_os = os_name
+    hourly = ctx.pricing_engine.get_ec2_hourly_price(instance_type, os_name, license_model)
+    if hourly <= 0.0 and os_name != "Linux":
+        hourly = ctx.pricing_engine.get_ec2_hourly_price(instance_type, "Linux")
+        priced_os = "Linux"
+    return hourly, priced_os
+
+
+_PRICING_OS_TO_SPOT_PRODUCT: dict[str, str] = {
+    "Linux": "Linux/UNIX",
+    "Windows": "Windows",
+    "RHEL": "Red Hat Enterprise Linux",
+    "SUSE": "SUSE Linux",
+}
+
+
+def _spot_hourly(ctx: ScanContext, instance_type: str, os_name: str) -> float | None:
+    """Latest Spot price/hr for the instance type, or None.
+
+    Spot prices live in the EC2 ``describe_spot_price_history`` API (not the
+    Pricing API). Returns None on any error or when no history exists so the
+    caller emits no Spot finding.
+    """
+    product = _PRICING_OS_TO_SPOT_PRODUCT.get(os_name, "Linux/UNIX")
+    try:
+        ec2 = ctx.client("ec2")
+        resp = ec2.describe_spot_price_history(
+            InstanceTypes=[instance_type],
+            ProductDescriptions=[product],
+            MaxResults=1,
+        )
+        history = resp.get("SpotPriceHistory", [])
+        if history:
+            return float(history[0]["SpotPrice"])
+    except Exception:
+        return None
+    return None
 
 
 def _compute_ec2_savings(
@@ -220,39 +356,57 @@ def _compute_ec2_savings(
     category: str,
     os_name: str = "Linux",
     license_model: str = "No License required",
+    target_type: str | None = None,
 ) -> tuple[float, str]:
     """Return ``(monthly_savings, pricing_basis)`` for an instance under a check.
 
-    Looks up the on-demand hourly price for the instance's real operating system
-    and license model via PricingEngine, converts to monthly (730 hours), and
-    multiplies by the category's reduction factor. If the OS-specific lookup
-    yields no price it falls back to Linux pricing rather than $0.
+    Two modes:
 
-    ``pricing_basis`` is a human-readable audit string showing exactly how the
-    number was derived, e.g. ``"$0.2330/hr Windows on-demand x 730h x 40%"``,
-    so every emitted savings figure is defensible from the report alone.
-    Returns ``(0.0, "")`` when the category is unknown, pricing is unavailable,
-    or any lookup fails — never crashes the scan.
+    * **Exact price-delta** (when ``target_type`` is given): savings are the real
+      ``(current_price − target_price) × 730`` between the current instance and a
+      concrete recommended type (e.g. previous-gen migration target, one size
+      smaller). This is exact, not a reduction-factor estimate. If the target is
+      not cheaper or has no price, no finding is emitted.
+    * **Factor** (no ``target_type``): for actions with no single instance target
+      (terminate = full cost; move-to-serverless), savings are
+      ``current_price × 730 × EC2_SAVINGS_FACTORS[category]``.
+
+    Both price by the instance's real OS and license model (Linux fallback), and
+    return a human-readable ``pricing_basis`` so every figure is defensible from
+    the report alone. Returns ``(0.0, "")`` on any unavailable/failed lookup —
+    never crashes the scan.
     """
-    factor = EC2_SAVINGS_FACTORS.get(category, 0.0)
-    if factor <= 0.0 or not ctx.pricing_engine or not instance_type:
-        return 0.0, ""
-    try:
-        priced_os = os_name
-        hourly = ctx.pricing_engine.get_ec2_hourly_price(instance_type, os_name, license_model)
-        if hourly <= 0.0 and os_name != "Linux":
-            # OS-specific price unavailable — fall back to Linux so a Windows/
-            # RHEL/SUSE instance still produces a (conservative) estimate.
-            hourly = ctx.pricing_engine.get_ec2_hourly_price(instance_type, "Linux")
-            priced_os = "Linux"
-    except Exception:
-        return 0.0, ""
-    savings = hourly * _HOURS_PER_MONTH * factor
-    if savings <= 0.0:
+    if not ctx.pricing_engine or not instance_type:
         return 0.0, ""
     license_note = " BYOL" if license_model == "Bring your own license" else ""
-    basis = f"${hourly:.4f}/hr {priced_os}{license_note} on-demand x {_HOURS_PER_MONTH}h x {factor:.0%}"
-    return savings, basis
+    try:
+        hourly, priced_os = _ec2_hourly(ctx, instance_type, os_name, license_model)
+        if hourly <= 0.0:
+            return 0.0, ""
+
+        if target_type:
+            target_hourly, _ = _ec2_hourly(ctx, target_type, os_name, license_model)
+            if target_hourly <= 0.0 or target_hourly >= hourly:
+                # Target unpriced or not actually cheaper — emit nothing rather
+                # than fabricate a saving.
+                return 0.0, ""
+            savings = (hourly - target_hourly) * _HOURS_PER_MONTH
+            basis = (
+                f"${hourly:.4f}->${target_hourly:.4f}/hr {priced_os}{license_note} on-demand"
+                f" ({instance_type}->{target_type}) x {_HOURS_PER_MONTH}h"
+            )
+            return savings, basis
+
+        factor = EC2_SAVINGS_FACTORS.get(category, 0.0)
+        if factor <= 0.0:
+            return 0.0, ""
+        savings = hourly * _HOURS_PER_MONTH * factor
+        if savings <= 0.0:
+            return 0.0, ""
+        basis = f"${hourly:.4f}/hr {priced_os}{license_note} on-demand x {_HOURS_PER_MONTH}h x {factor:.0%}"
+        return savings, basis
+    except Exception:
+        return 0.0, ""
 
 
 def get_ec2_instance_count(ctx: ScanContext) -> int:
@@ -456,8 +610,14 @@ def get_enhanced_ec2_checks(
                                                 }
                                             )
                                     elif verdict == "rightsize":
-                                        rs_savings, rs_basis = _compute_ec2_savings(
-                                            ctx, instance_type, "Rightsizing Opportunities", os_name, license_model
+                                        rs_target = _one_size_down(instance_type)
+                                        rs_savings, rs_basis = (
+                                            _compute_ec2_savings(
+                                                ctx, instance_type, "Rightsizing Opportunities",
+                                                os_name, license_model, target_type=rs_target,
+                                            )
+                                            if rs_target
+                                            else (0.0, "")
                                         )
                                         if rs_savings > 0:
                                             checks["rightsizing_opportunities"].append(
@@ -469,8 +629,7 @@ def get_enhanced_ec2_checks(
                                                         f"Low utilization"
                                                         f" (avg CPU: {avg_cpu:.1f}%,"
                                                         f" max: {max_cpu:.1f}%)"
-                                                        " - consider smaller instance"
-                                                        " type"
+                                                        f" - consider downsizing to {rs_target}"
                                                     ),
                                                     "EstimatedSavings": f"${rs_savings:.2f}/month if rightsized",
                                                     "PricingBasis": rs_basis,
@@ -509,7 +668,8 @@ def get_enhanced_ec2_checks(
                             target_family = _PREVIOUS_GEN_TARGETS[prevgen_prefix]
                             recommended_type = target_family + instance_type[len(prevgen_prefix):]
                             prevgen_savings, prevgen_basis = _compute_ec2_savings(
-                                ctx, instance_type, "Previous Generation Migration", os_name, license_model
+                                ctx, instance_type, "Previous Generation Migration", os_name, license_model,
+                                target_type=recommended_type,
                             )
                             if prevgen_savings > 0:
                                 checks["previous_generation"].append(
@@ -597,17 +757,18 @@ def get_enhanced_ec2_checks(
                                     min_credits = min(dp["Minimum"] for dp in credit_datapoints)
                                     avg_cpu = sum(dp["Average"] for dp in cpu_datapoints) / len(cpu_datapoints)
 
-                                    if min_credits < 10 and avg_cpu <= 40:
+                                    burst_target = _one_size_down(instance_type)
+                                    if min_credits < 10 and avg_cpu <= 40 and burst_target:
                                         recommendation = (
                                             f"CloudWatch shows credit exhaustion"
                                             f" (min: {min_credits:.1f})"
                                             f" despite low CPU"
                                             f" (avg: {avg_cpu:.1f}%)"
-                                            " - consider smaller fixed"
-                                            " instance"
+                                            f" - consider smaller fixed instance ({burst_target})"
                                         )
                                         burst_savings, burst_basis = _compute_ec2_savings(
-                                            ctx, instance_type, "Burstable Instance Optimization", os_name, license_model
+                                            ctx, instance_type, "Burstable Instance Optimization",
+                                            os_name, license_model, target_type=burst_target,
                                         )
                                         if burst_savings > 0:
                                             checks["burstable_credits"].append(
@@ -775,6 +936,8 @@ def get_advanced_ec2_checks(
         "cron_job_instances": [],
         "batch_job_instances": [],
         "underutilized_instance_store": [],
+        "nonprod_scheduling": [],
+        "spot_migration": [],
     }
 
     try:
@@ -879,6 +1042,56 @@ def get_advanced_ec2_checks(
                                     "EstimatedSavings": f"${store_savings:.2f}/month with non-storage equivalent",
                                     "PricingBasis": store_basis,
                                     "CheckCategory": ("Underutilized Instance Store"),
+                                }
+                            )
+
+                    # Non-prod scheduling: stop tagged non-production instances
+                    # outside business hours (≈64% recoverable). Quantified from
+                    # the instance's real monthly cost × documented off-fraction.
+                    if _is_nonprod(tags):
+                        sched_savings, sched_basis = _compute_ec2_savings(
+                            ctx, instance_type, "Non-Prod Scheduling", os_name, license_model
+                        )
+                        if sched_savings > 0:
+                            checks["nonprod_scheduling"].append(
+                                {
+                                    "InstanceId": instance_id,
+                                    "InstanceType": instance_type,
+                                    "OS": os_name,
+                                    "Name": name,
+                                    "Environment": tags.get("Environment", tags.get("environment", "")),
+                                    "Recommendation": (
+                                        "Non-production instance runs 24/7 - schedule stop/start"
+                                        " outside business hours (e.g. via Instance Scheduler)"
+                                    ),
+                                    "EstimatedSavings": f"${sched_savings:.2f}/month with an off-hours schedule",
+                                    "PricingBasis": sched_basis,
+                                    "CheckCategory": "Non-Prod Scheduling",
+                                }
+                            )
+
+                    # Spot migration: only when an explicit tag marks the workload
+                    # interruptible. Savings = live on-demand minus Spot price.
+                    if _is_spot_eligible(tags):
+                        on_demand, priced_os = _ec2_hourly(ctx, instance_type, os_name, license_model)
+                        spot = _spot_hourly(ctx, instance_type, os_name)
+                        if on_demand > 0 and spot and spot < on_demand:
+                            spot_savings = (on_demand - spot) * _HOURS_PER_MONTH
+                            checks["spot_migration"].append(
+                                {
+                                    "InstanceId": instance_id,
+                                    "InstanceType": instance_type,
+                                    "OS": priced_os,
+                                    "Name": name,
+                                    "Recommendation": (
+                                        "Tagged interruptible - run on Spot capacity"
+                                        " (use a mixed-instances ASG / capacity-optimized allocation)"
+                                    ),
+                                    "EstimatedSavings": f"${spot_savings:.2f}/month on Spot vs on-demand",
+                                    "PricingBasis": (
+                                        f"${on_demand:.4f}->${spot:.4f}/hr (on-demand->spot) x {_HOURS_PER_MONTH}h"
+                                    ),
+                                    "CheckCategory": "Spot Migration",
                                 }
                             )
 

@@ -4,6 +4,7 @@ Provides specialised renderers for complex services (EC2, EBS, RDS, S3, etc.)
 and generic fallback renderers used by ``HTMLReportGenerator``.
 """
 
+import html
 import logging
 from typing import Any, Callable, Dict, List, Tuple
 
@@ -68,7 +69,9 @@ def _render_ec2_enhanced_checks(recommendations: List[Rec], source_name: str, se
                 details.append(f"mem {rec['AvgMemory']}")
             detail_str = f" ({', '.join(details)})" if details else ""
             savings_str = f" — <span class=\"savings\">{savings}</span>" if savings else ""
-            content += f"<li>{resource_id}{detail_str}{savings_str}</li>"
+            basis = rec.get("PricingBasis", "")
+            basis_str = f" <span class=\"pricing-basis\">[{html.escape(basis)}]</span>" if basis else ""
+            content += f"<li>{resource_id}{detail_str}{savings_str}{basis_str}</li>"
         content += "</ul></div>"
     return content
 
@@ -132,11 +135,25 @@ def _render_ec2_cost_hub(recommendations: List[Rec], source_name: str, service_d
                 if rec.get("actionType") == "MigrateToGraviton"
                 else ""
             )
+            # Confidence/risk signals already present on Cost Hub recs.
+            signals: List[str] = []
+            pct = rec.get("estimatedSavingsPercentage")
+            if pct:
+                signals.append(f"{float(pct):.0f}% saving")
+            effort = rec.get("implementationEffort")
+            if effort:
+                signals.append(f"{effort} effort")
+            if rec.get("restartNeeded"):
+                signals.append("restart needed")
+            signal_str = f" <span class=\"pricing-basis\">[{', '.join(signals)}]</span>" if signals else ""
 
             if current_type != "N/A" and rec_type != "N/A":
-                content += f"<li>{resource_id}: {current_type} → {rec_type} (${savings:.2f}/month){caveat}</li>"
+                content += (
+                    f"<li>{resource_id}: {current_type} → {rec_type} "
+                    f"(${savings:.2f}/month){caveat}{signal_str}</li>"
+                )
             else:
-                content += f"<li>{resource_id} (${savings:.2f}/month){caveat}</li>"
+                content += f"<li>{resource_id} (${savings:.2f}/month){caveat}{signal_str}</li>"
         content += "</ul></div>"
     return content
 

@@ -102,19 +102,32 @@ def test_co_and_coh_instance_id():
 # --------------------------------------------------------------------------- #
 # Heuristic checks: cron/batch exclusivity & expanded prev-gen
 # --------------------------------------------------------------------------- #
-def _fake_ctx(instances: list[dict], hourly: float = 0.10):
-    """Build a minimal ScanContext stand-in driving describe_instances."""
+def _fake_ctx(instances: list[dict], hourly: float = 0.10, prices: dict | None = None, spot_price: str | None = None):
+    """Build a minimal ScanContext stand-in driving describe_instances.
+
+    ``prices`` maps instance type -> hourly rate (so price-delta checks can be
+    exercised); types not in the map fall back to ``hourly``.
+    """
     paginator = MagicMock()
     paginator.paginate.return_value = [{"Reservations": [{"Instances": instances}]}]
     ec2_client = MagicMock()
     ec2_client.get_paginator.return_value = paginator
+    # Default: no spot history (spot checks emit nothing unless a test sets it).
+    ec2_client.describe_spot_price_history.return_value = {
+        "SpotPriceHistory": [{"SpotPrice": spot_price}] if spot_price else []
+    }
+
+    price_map = prices or {}
+
+    def _price(instance_type, os_name="Linux", license_model="No License required"):
+        return price_map.get(instance_type, hourly)
 
     pricing_engine = MagicMock()
-    pricing_engine.get_ec2_hourly_price.return_value = hourly
+    pricing_engine.get_ec2_hourly_price.side_effect = _price
 
     return SimpleNamespace(
         region="us-east-1",
-        fast_mode=True,  # skip CloudWatch / describe_volumes enrichment
+        fast_mode=True,  # skip CloudWatch enrichment
         pricing_multiplier=1.0,
         pricing_engine=pricing_engine,
         client=lambda name, region=None: ec2_client,
@@ -156,8 +169,8 @@ def test_cron_token_wins_over_batch():
     assert [r["CheckCategory"] for r in recs] == ["Cron Job Instances"]
 
 
-def test_previous_generation_covers_more_than_t2():
-    """m4 (not just t2) is detected and mapped to a current-gen target."""
+def test_previous_generation_uses_exact_price_delta():
+    """m4 (not just t2) detected; savings = exact current->target price delta."""
     ctx = _fake_ctx(
         [
             {
@@ -167,37 +180,135 @@ def test_previous_generation_covers_more_than_t2():
                 "PlatformDetails": "Linux/UNIX",
                 "Tags": [],
             }
-        ]
+        ],
+        prices={"m4.large": 0.111, "m6i.large": 0.107},
     )
     recs = get_enhanced_ec2_checks(ctx, 1.0, fast_mode=True)["recommendations"]
     prevgen = [r for r in recs if r["CheckCategory"] == "Previous Generation Migration"]
     assert len(prevgen) == 1
-    assert "m6i.large" in prevgen[0]["EstimatedSavings"]
-    # Transparency fields: OS + pricing basis recorded for audit.
+    # Exact delta: (0.111 - 0.107) * 730 = 2.92 — NOT the old 0.10 factor ($8.10).
+    assert prevgen[0]["EstimatedSavings"].startswith("$2.92")
+    assert "m4.large->m6i.large" in prevgen[0]["PricingBasis"]
     assert prevgen[0]["OS"] == "Linux"
-    assert "on-demand" in prevgen[0]["PricingBasis"]
-    assert "730h" in prevgen[0]["PricingBasis"]
 
 
-def test_windows_pricing_basis_records_os():
-    """A Windows instance records Windows in both the OS field and pricing basis."""
+def test_previous_generation_skips_when_target_not_cheaper():
+    """If the migration target isn't cheaper, no finding is fabricated."""
     ctx = _fake_ctx(
         [
             {
-                "InstanceId": "i-win",
+                "InstanceId": "i-4",
                 "InstanceType": "m4.large",
                 "State": {"Name": "running"},
-                "PlatformDetails": "Windows",
+                "PlatformDetails": "Linux/UNIX",
                 "Tags": [],
             }
         ],
-        hourly=0.30,
+        prices={"m4.large": 0.107, "m6i.large": 0.107},  # equal -> no saving
     )
     recs = get_enhanced_ec2_checks(ctx, 1.0, fast_mode=True)["recommendations"]
-    prevgen = [r for r in recs if r["CheckCategory"] == "Previous Generation Migration"][0]
-    assert prevgen["OS"] == "Windows"
-    assert "Windows" in prevgen["PricingBasis"]
-    assert "$0.3000/hr" in prevgen["PricingBasis"]
+    assert [r for r in recs if r["CheckCategory"] == "Previous Generation Migration"] == []
+
+
+def test_one_size_down():
+    from services.ec2 import _one_size_down
+
+    assert _one_size_down("m5.xlarge") == "m5.large"
+    assert _one_size_down("m5.2xlarge") == "m5.xlarge"
+    assert _one_size_down("t3.medium") == "t3.small"
+    assert _one_size_down("m5.nano") is None  # smallest rung
+    assert _one_size_down("weird") is None
+
+
+def test_compute_savings_price_delta_and_factor():
+    from services.ec2 import _compute_ec2_savings
+
+    ctx = SimpleNamespace(pricing_engine=MagicMock())
+    ctx.pricing_engine.get_ec2_hourly_price.side_effect = (
+        lambda t, o="Linux", lm="No License required": {"m5.xlarge": 0.214, "m5.large": 0.107}.get(t, 0.0)
+    )
+    # Delta mode (target given): (0.214 - 0.107) * 730 = 78.11
+    savings, basis = _compute_ec2_savings(
+        ctx, "m5.xlarge", "Rightsizing Opportunities", "Linux", "No License required", target_type="m5.large"
+    )
+    assert round(savings, 2) == 78.11
+    assert "m5.xlarge->m5.large" in basis
+    # Factor mode (no target): idle = full cost = 0.214 * 730 * 1.0
+    full, basis2 = _compute_ec2_savings(ctx, "m5.xlarge", "Idle Instances", "Linux")
+    assert round(full, 2) == round(0.214 * 730, 2)
+    assert "x 100%" in basis2
+
+
+def test_is_nonprod_and_spot_eligible():
+    from services.ec2 import _is_nonprod, _is_spot_eligible
+
+    assert _is_nonprod({"Environment": "dev"}) is True
+    assert _is_nonprod({"Stage": "QA"}) is True
+    assert _is_nonprod({"Environment": "production"}) is False
+    assert _is_nonprod({}) is False
+    assert _is_spot_eligible({"spot-eligible": "true"}) is True
+    assert _is_spot_eligible({"Workload": "batch"}) is True
+    assert _is_spot_eligible({"Environment": "dev"}) is False
+
+
+def test_nonprod_scheduling_check():
+    """A non-prod instance gets a quantified scheduling saving (cost x off-fraction)."""
+    ctx = _fake_ctx(
+        [
+            {
+                "InstanceId": "i-np",
+                "InstanceType": "m5.large",
+                "State": {"Name": "running"},
+                "PlatformDetails": "Linux/UNIX",
+                "Tags": [{"Key": "Environment", "Value": "dev"}, {"Key": "Name", "Value": "dev-app"}],
+            }
+        ],
+        hourly=0.10,
+    )
+    recs = get_advanced_ec2_checks(ctx, 1.0, fast_mode=True)["recommendations"]
+    sched = [r for r in recs if r["CheckCategory"] == "Non-Prod Scheduling"]
+    assert len(sched) == 1
+    # 0.10 * 730 * 0.64 = 46.72
+    assert sched[0]["EstimatedSavings"].startswith("$46.72")
+    assert sched[0]["Environment"] == "dev"
+
+
+def test_spot_migration_only_when_tagged_interruptible():
+    ctx = _fake_ctx(
+        [
+            {
+                "InstanceId": "i-sp",
+                "InstanceType": "m5.large",
+                "State": {"Name": "running"},
+                "PlatformDetails": "Linux/UNIX",
+                "Tags": [{"Key": "interruptible", "Value": "true"}, {"Key": "Name", "Value": "render-farm"}],
+            }
+        ],
+        hourly=0.107,
+        spot_price="0.035",
+    )
+    recs = get_advanced_ec2_checks(ctx, 1.0, fast_mode=True)["recommendations"]
+    spot = [r for r in recs if r["CheckCategory"] == "Spot Migration"]
+    assert len(spot) == 1
+    # (0.107 - 0.035) * 730 = 52.56
+    assert spot[0]["EstimatedSavings"].startswith("$52.56")
+    assert "on-demand->spot" in spot[0]["PricingBasis"]
+
+
+def test_no_spot_finding_without_tag():
+    ctx = _fake_ctx(
+        [
+            {
+                "InstanceId": "i-nospot",
+                "InstanceType": "m5.large",
+                "State": {"Name": "running"},
+                "Tags": [{"Key": "Name", "Value": "render-farm"}],
+            }
+        ],
+        spot_price="0.035",
+    )
+    recs = get_advanced_ec2_checks(ctx, 1.0, fast_mode=True)["recommendations"]
+    assert [r for r in recs if r["CheckCategory"] == "Spot Migration"] == []
 
 
 def test_spot_instances_are_skipped():

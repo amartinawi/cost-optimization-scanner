@@ -11,7 +11,7 @@ Use `ctx.pricing_engine` (PricingEngine) for AWS Pricing API lookups. Fall back 
 
 | Adapter | Method | Pricing Source |
 |---------|--------|---------------|
-| `ec2.py` | `get_ec2_hourly_price()` × 730 × per-check factor (see `EC2_SAVINGS_FACTORS` in `services/ec2.py`) | AWS Pricing API |
+| `ec2.py` | OS/license-aware `get_ec2_hourly_price(type, os, license_model)`. Prev-gen / rightsizing / burstable use the **exact current→target price delta** (target = migration map or one-size-down); idle = full cost; cron/batch/dedicated/instance-store/non-prod-scheduling use `EC2_SAVINGS_FACTORS`; spot = on-demand−Spot via `describe_spot_price_history`. Cross-source + ASG-member dedup in the adapter; every finding records `OS` + `PricingBasis`. | AWS Pricing API + EC2 Spot history |
 | `ebs.py` | `get_ebs_monthly_price_per_gb()`; Compute Optimizer via `compute_optimizer_savings()` | AWS Pricing API |
 | `rds.py` | `get_rds_instance_monthly_price()`, `get_rds_monthly_storage_price_per_gb(multi_az=)`; Compute Optimizer via `compute_optimizer_savings()` | AWS Pricing API |
 | `s3.py` | `get_s3_monthly_price_per_gb()` | AWS Pricing API |
