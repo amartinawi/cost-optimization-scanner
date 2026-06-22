@@ -136,7 +136,7 @@ def test_co_other_error_records_warning():
 def test_adapter_placeholder_becomes_warning_not_rec(monkeypatch):
     placeholder = {"ResourceId": "compute-optimizer-service", "estimatedMonthlySavings": 0.0}
     monkeypatch.setattr(rds_adapter, "get_rds_compute_optimizer_recommendations", lambda ctx: [placeholder])
-    monkeypatch.setattr(rds_adapter, "get_enhanced_rds_checks", lambda ctx, mult, days: {"recommendations": []})
+    monkeypatch.setattr(rds_adapter, "get_enhanced_rds_checks", lambda ctx, mult, days, fast=False: {"recommendations": []})
     monkeypatch.setattr(rds_adapter, "get_rds_instance_count", lambda ctx: {"total": 0})
 
     ctx = _FakeCtx()
@@ -151,7 +151,7 @@ def test_adapter_placeholder_becomes_warning_not_rec(monkeypatch):
 def test_adapter_real_co_rec_is_counted(monkeypatch):
     rec = _co_rec("arn:aws:rds:us-east-1:1:db:real", 40.0)
     monkeypatch.setattr(rds_adapter, "get_rds_compute_optimizer_recommendations", lambda ctx: [rec])
-    monkeypatch.setattr(rds_adapter, "get_enhanced_rds_checks", lambda ctx, mult, days: {"recommendations": []})
+    monkeypatch.setattr(rds_adapter, "get_enhanced_rds_checks", lambda ctx, mult, days, fast=False: {"recommendations": []})
     monkeypatch.setattr(rds_adapter, "get_rds_instance_count", lambda ctx: {"total": 1})
 
     ctx = _FakeCtx()
@@ -278,13 +278,36 @@ class _FakeRdsPricingEngine:
         return 0.095
 
 
+class _FakeCloudWatch:
+    """Fake CloudWatch returning one DatabaseConnections datapoint (or empty)."""
+
+    def __init__(self, avg=0.5, mx=2.0, empty=False, error=None):
+        self._avg = avg
+        self._mx = mx
+        self._empty = empty
+        self._error = error
+
+    def get_metric_statistics(self, **kwargs):
+        if self._error:
+            raise self._error
+        if self._empty:
+            return {"Datapoints": []}
+        return {"Datapoints": [{"Average": self._avg, "Maximum": self._mx}]}
+
+
 class _EnhancedCtx(_FakeCtx):
-    def __init__(self, rds_client, pricing_engine=None):
+    def __init__(self, rds_client, pricing_engine=None, cloudwatch=None):
         super().__init__(pricing_engine=pricing_engine or _FakeRdsPricingEngine())
         self._rds_client = rds_client
+        # Default to a low-usage signal so evidence-gated checks fire in tests.
+        self._cloudwatch = cloudwatch if cloudwatch is not None else _FakeCloudWatch()
 
     def client(self, name, region=None):
-        return self._rds_client if name == "rds" else None
+        if name == "rds":
+            return self._rds_client
+        if name == "cloudwatch":
+            return self._cloudwatch
+        return None
 
 
 def _instance(**over):
@@ -333,7 +356,7 @@ def test_adapter_dedups_multiremediation_and_excludes_ri(monkeypatch):
         _enh(arn, "up to $40.00/month (1yr All Upfront)", "Reserved Instance Opportunities"),
     ]
     monkeypatch.setattr(rds_adapter, "get_rds_compute_optimizer_recommendations", lambda ctx: [])
-    monkeypatch.setattr(rds_adapter, "get_enhanced_rds_checks", lambda ctx, m, d: {"recommendations": enhanced})
+    monkeypatch.setattr(rds_adapter, "get_enhanced_rds_checks", lambda ctx, m, d, fast=False: {"recommendations": enhanced})
     monkeypatch.setattr(rds_adapter, "get_rds_instance_count", lambda ctx: {"total": 1})
 
     findings = rds_adapter.RdsModule().scan(_FakeCtx())
@@ -353,7 +376,7 @@ def test_adapter_co_beats_heuristic_same_db(monkeypatch):
     co = [_co_rec(arn, 80.0)]
     enhanced = [_enh(arn, "$53.00/month with single-AZ deployment", "Multi-AZ Optimization")]
     monkeypatch.setattr(rds_adapter, "get_rds_compute_optimizer_recommendations", lambda ctx: co)
-    monkeypatch.setattr(rds_adapter, "get_enhanced_rds_checks", lambda ctx, m, d: {"recommendations": enhanced})
+    monkeypatch.setattr(rds_adapter, "get_enhanced_rds_checks", lambda ctx, m, d, fast=False: {"recommendations": enhanced})
     monkeypatch.setattr(rds_adapter, "get_rds_instance_count", lambda ctx: {"total": 1})
 
     findings = rds_adapter.RdsModule().scan(_FakeCtx())
@@ -398,7 +421,7 @@ def test_coh_is_renderable_filters_purchase_and_na():
 
 def test_adapter_consumes_coh_split(monkeypatch):
     monkeypatch.setattr(rds_adapter, "get_rds_compute_optimizer_recommendations", lambda ctx: [])
-    monkeypatch.setattr(rds_adapter, "get_enhanced_rds_checks", lambda ctx, m, d: {"recommendations": []})
+    monkeypatch.setattr(rds_adapter, "get_enhanced_rds_checks", lambda ctx, m, d, fast=False: {"recommendations": []})
     monkeypatch.setattr(rds_adapter, "get_rds_instance_count", lambda ctx: {"total": 1})
 
     ctx = _FakeCtx()
@@ -416,7 +439,7 @@ def test_coh_suppresses_co_and_heuristic_for_same_db(monkeypatch):
     co = [_co_rec(arn, 80.0)]
     enhanced = [_enh(arn, "$53.00/month with single-AZ deployment", "Multi-AZ Optimization")]
     monkeypatch.setattr(rds_adapter, "get_rds_compute_optimizer_recommendations", lambda ctx: co)
-    monkeypatch.setattr(rds_adapter, "get_enhanced_rds_checks", lambda ctx, m, d: {"recommendations": enhanced})
+    monkeypatch.setattr(rds_adapter, "get_enhanced_rds_checks", lambda ctx, m, d, fast=False: {"recommendations": enhanced})
     monkeypatch.setattr(rds_adapter, "get_rds_instance_count", lambda ctx: {"total": 1})
 
     ctx = _FakeCtx()
@@ -434,7 +457,7 @@ def test_coh_suppresses_co_and_heuristic_for_same_db(monkeypatch):
 
 def test_coh_ri_purchase_excluded_from_rds_tab(monkeypatch):
     monkeypatch.setattr(rds_adapter, "get_rds_compute_optimizer_recommendations", lambda ctx: [])
-    monkeypatch.setattr(rds_adapter, "get_enhanced_rds_checks", lambda ctx, m, d: {"recommendations": []})
+    monkeypatch.setattr(rds_adapter, "get_enhanced_rds_checks", lambda ctx, m, d, fast=False: {"recommendations": []})
     monkeypatch.setattr(rds_adapter, "get_rds_instance_count", lambda ctx: {"total": 1})
 
     ctx = _FakeCtx()
@@ -531,3 +554,89 @@ def test_adapter_threads_license_model_from_instance():
     ctx = _EnhancedCtx(_FakeRdsClient(instances=[instance]), pricing_engine=pe)
     _recs(ctx)
     assert pe.last_license_model == "bring-your-own-license"
+
+
+# --------------------------------------------------------------------------- #
+# Slice B — N-M3 CloudWatch evidence gating, N-M4 broadened scheduling engines
+# --------------------------------------------------------------------------- #
+def _recs_fast(ctx):
+    from services.rds import get_enhanced_rds_checks
+
+    return get_enhanced_rds_checks(ctx, 1.0, 90, fast_mode=True)["recommendations"]
+
+
+def test_scheduling_emitted_with_idle_evidence():
+    # dev DB with avg connections <= 1.0 -> schedulable.
+    ctx = _EnhancedCtx(
+        _FakeRdsClient(instances=[_instance(DBInstanceIdentifier="dev-db")]),
+        cloudwatch=_FakeCloudWatch(avg=0.2, mx=1.0),
+    )
+    cats = [r["CheckCategory"] for r in _recs(ctx)]
+    assert "Non-Production Scheduling" in cats
+
+
+def test_scheduling_suppressed_when_busy():
+    # dev DB but sustained connections -> not idle -> no scheduling finding.
+    ctx = _EnhancedCtx(
+        _FakeRdsClient(instances=[_instance(DBInstanceIdentifier="dev-db")]),
+        cloudwatch=_FakeCloudWatch(avg=42.0, mx=80.0),
+    )
+    cats = [r["CheckCategory"] for r in _recs(ctx)]
+    assert "Non-Production Scheduling" not in cats
+
+
+def test_scheduling_covers_non_aurora_engines():
+    # N-M4: SQL Server (previously excluded) is schedulable when idle.
+    ctx = _EnhancedCtx(
+        _FakeRdsClient(instances=[_instance(DBInstanceIdentifier="test-mssql", Engine="sqlserver-se")]),
+        cloudwatch=_FakeCloudWatch(avg=0.0, mx=0.0),
+    )
+    cats = [r["CheckCategory"] for r in _recs(ctx)]
+    assert "Non-Production Scheduling" in cats
+
+
+def test_aurora_engine_not_scheduled():
+    ctx = _EnhancedCtx(
+        _FakeRdsClient(instances=[_instance(DBInstanceIdentifier="dev-aurora", Engine="aurora-mysql")]),
+        cloudwatch=_FakeCloudWatch(avg=0.0, mx=0.0),
+    )
+    cats = [r["CheckCategory"] for r in _recs(ctx)]
+    assert "Non-Production Scheduling" not in cats
+
+
+def test_multiaz_suppressed_when_busy():
+    inst = _instance(DBInstanceIdentifier="dev-db", MultiAZ=True)
+    ctx = _EnhancedCtx(
+        _FakeRdsClient(instances=[inst]),
+        cloudwatch=_FakeCloudWatch(avg=50.0, mx=120.0),
+    )
+    cats = [r["CheckCategory"] for r in _recs(ctx)]
+    assert "Multi-AZ Optimization" not in cats
+
+
+def test_fast_mode_skips_metric_gated_checks_with_warning():
+    inst = _instance(DBInstanceIdentifier="dev-db", MultiAZ=True)
+    ctx = _EnhancedCtx(_FakeRdsClient(instances=[inst]))
+    cats = [r["CheckCategory"] for r in _recs_fast(ctx)]
+    assert "Multi-AZ Optimization" not in cats
+    assert "Non-Production Scheduling" not in cats
+    assert any("fast mode" in w for w in ctx.warnings)
+
+
+def test_no_metric_data_skips_and_warns():
+    inst = _instance(DBInstanceIdentifier="dev-db", MultiAZ=True)
+    ctx = _EnhancedCtx(_FakeRdsClient(instances=[inst]), cloudwatch=_FakeCloudWatch(empty=True))
+    cats = [r["CheckCategory"] for r in _recs(ctx)]
+    assert "Multi-AZ Optimization" not in cats
+    assert "Non-Production Scheduling" not in cats
+    assert any("no DatabaseConnections data" in w for w in ctx.warnings)
+
+
+def test_cloudwatch_accessdenied_records_permission_issue():
+    from botocore.exceptions import ClientError
+
+    err = ClientError({"Error": {"Code": "AccessDenied", "Message": "no"}}, "GetMetricStatistics")
+    inst = _instance(DBInstanceIdentifier="dev-db", MultiAZ=True)
+    ctx = _EnhancedCtx(_FakeRdsClient(instances=[inst]), cloudwatch=_FakeCloudWatch(error=err))
+    _recs(ctx)
+    assert any(p["action"] == "cloudwatch:GetMetricStatistics" for p in ctx.permission_issues)

@@ -7,7 +7,7 @@ This module will later become RdsModule (T-329) implementing ServiceModule.
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from botocore.exceptions import ClientError  # type: ignore[import-untyped]
@@ -15,6 +15,46 @@ from botocore.exceptions import ClientError  # type: ignore[import-untyped]
 from core.scan_context import ScanContext
 
 logger = logging.getLogger(__name__)
+
+# Evidence-gating thresholds for the metric-backed heuristic checks (N-M3).
+# A heuristic that assumes a target with no usage evidence is a guess; both the
+# Multi-AZ-disable and non-prod-scheduling checks now require a CloudWatch
+# DatabaseConnections read over this window before emitting a saving.
+RDS_METRIC_WINDOW_DAYS: int = 14
+# Avg connections at/below which a non-prod DB is treated as idle enough to stop
+# nights/weekends (scheduling). ~0 sustained connections => genuinely schedulable.
+RDS_SCHEDULE_IDLE_MAX_AVG_CONN: float = 1.0
+# Avg connections above which we DON'T suggest dropping Multi-AZ even on a
+# non-prod-tagged DB — sustained load implies a workload worth keeping HA on
+# (corroborating suppressor, mirrors the EC2 "signals only suppress" rule).
+RDS_MULTI_AZ_BUSY_AVG_CONN: float = 20.0
+
+
+def _rds_connection_signal(cloudwatch: Any, db_instance_id: str) -> dict[str, float] | None:
+    """Return {avg_conn, max_conn} from AWS/RDS DatabaseConnections, or None on no data.
+
+    Reads hourly DatabaseConnections (Average/Maximum) over the last
+    ``RDS_METRIC_WINDOW_DAYS`` for the given DB instance. Returns None when the
+    metric has no datapoints (so callers warn and skip rather than fabricate a
+    saving). Exceptions propagate to the caller for permission classification.
+    """
+    end = datetime.now(UTC)
+    start = end - timedelta(days=RDS_METRIC_WINDOW_DAYS)
+    resp = cloudwatch.get_metric_statistics(
+        Namespace="AWS/RDS",
+        MetricName="DatabaseConnections",
+        Dimensions=[{"Name": "DBInstanceIdentifier", "Value": db_instance_id}],
+        StartTime=start,
+        EndTime=end,
+        Period=3600,
+        Statistics=["Average", "Maximum"],
+    )
+    datapoints = resp.get("Datapoints", [])
+    if not datapoints:
+        return None
+    avg_conn = sum(d["Average"] for d in datapoints) / len(datapoints)
+    max_conn = max(d["Maximum"] for d in datapoints)
+    return {"avg_conn": avg_conn, "max_conn": max_conn}
 
 # Per-check reduction factors applied to live instance pricing.
 # Values reflect typical AWS guidance:
@@ -211,11 +251,27 @@ def get_enhanced_rds_checks(
     ctx: ScanContext,
     pricing_multiplier: float,
     old_snapshot_days: int = 90,
+    fast_mode: bool = False,
 ) -> dict[str, Any]:
-    """Get enhanced RDS cost optimization checks."""
+    """Get enhanced RDS cost optimization checks.
+
+    The Multi-AZ-disable and non-prod-scheduling checks are gated on a CloudWatch
+    DatabaseConnections read (N-M3): in ``fast_mode`` the metric reads are skipped
+    (one warning) and those two checks are suppressed; with no metric data the
+    instance is skipped with a warning rather than emitting a guessed saving.
+    """
     rds = ctx.client("rds")
     region = ctx.region
     account_id = ctx.account_id
+
+    cloudwatch = ctx.client("cloudwatch") if not fast_mode else None
+    if fast_mode:
+        ctx.warn(
+            "[rds] fast mode: Multi-AZ and non-prod-scheduling checks need CloudWatch "
+            "DatabaseConnections metrics and were skipped.",
+            service="rds",
+        )
+    cw_denied = False  # latch so a permission gap is reported once, not per instance
 
     # Only categories that are actually populated below. Idle / rightsizing /
     # storage / Aurora-Serverless candidate buckets were removed (audit L4):
@@ -247,6 +303,35 @@ def get_enhanced_rds_checks(
 
                 if db_instance_status not in ["available", "stopped"]:
                     continue
+
+                # CloudWatch DatabaseConnections evidence shared by the Multi-AZ
+                # and scheduling checks. Computed once per instance; None means
+                # fast-mode, a permission gap, an error, or no datapoints — in all
+                # cases the metric-gated checks below are skipped (never guessed).
+                conn_signal: dict[str, float] | None = None
+                if cloudwatch is not None and db_instance_status == "available":
+                    try:
+                        conn_signal = _rds_connection_signal(cloudwatch, db_instance_id or "")
+                        if conn_signal is None:
+                            ctx.warn(
+                                f"[rds] no DatabaseConnections data for {db_instance_id}; "
+                                "skipping evidence-gated Multi-AZ/scheduling checks",
+                                service="rds",
+                            )
+                    except ClientError as ce:
+                        code = ce.response.get("Error", {}).get("Code", "")
+                        if code in ("AccessDenied", "UnauthorizedOperation"):
+                            if not cw_denied:
+                                ctx.permission_issue(
+                                    f"get_metric_statistics denied: {code}",
+                                    service="rds",
+                                    action="cloudwatch:GetMetricStatistics",
+                                )
+                                cw_denied = True
+                        else:
+                            ctx.warn(f"[rds] CloudWatch read failed for {db_instance_id}: {ce}", service="rds")
+                    except Exception as e:
+                        ctx.warn(f"[rds] CloudWatch read failed for {db_instance_id}: {e}", service="rds")
 
                 if multi_az:
                     try:
@@ -291,7 +376,16 @@ def get_enhanced_rds_checks(
                             "non-prod",
                         )
 
-                    if is_non_prod:
+                    # Evidence gate (N-M3): require a connections signal and
+                    # suppress on sustained load (a busy DB likely wants HA even if
+                    # mis-tagged non-prod). No signal -> skip (already warned).
+                    multi_az_evidenced = (
+                        is_non_prod
+                        and conn_signal is not None
+                        and conn_signal["avg_conn"] <= RDS_MULTI_AZ_BUSY_AVG_CONN
+                    )
+                    if multi_az_evidenced and conn_signal is not None:
+                        maz_avg_conn = conn_signal["avg_conn"]
                         multi_az_price = _rds_monthly_price(
                             ctx, engine or "", db_instance_class or "", multi_az=True,
                             license_model=license_model,
@@ -322,7 +416,12 @@ def get_enhanced_rds_checks(
                                     "region": region,
                                     "engine": engine,
                                     "instance_class": db_instance_class,
-                                    "metric_window": "non-prod tag/name heuristic (no CloudWatch usage)",
+                                    "license_model": license_model,
+                                    "metric_window": (
+                                        f"non-prod ({env_name}); {RDS_METRIC_WINDOW_DAYS}d avg "
+                                        f"DatabaseConnections {maz_avg_conn:.1f} "
+                                        f"(<= {RDS_MULTI_AZ_BUSY_AVG_CONN:.0f})"
+                                    ),
                                     "formula": (
                                         f"Multi-AZ ${multi_az_price:.2f} - Single-AZ ${single_az_price:.2f}"
                                     ),
@@ -386,9 +485,20 @@ def get_enhanced_rds_checks(
                         (env for env in ["dev", "test", "staging", "qa"] if env in db_instance_id.lower()),
                         "non-prod",
                     )
-                    if engine in ["mysql", "postgres", "mariadb"]:
+                    # N-M4: any non-Aurora RDS instance can be stopped/started on a
+                    # schedule (Aurora stops at the cluster level, handled elsewhere).
+                    # N-M3: require CloudWatch evidence the DB is genuinely idle on
+                    # average before claiming a nights/weekends saving.
+                    schedulable_engine = bool(engine) and not engine.startswith("aurora")
+                    sched_evidenced = (
+                        schedulable_engine
+                        and conn_signal is not None
+                        and conn_signal["avg_conn"] <= RDS_SCHEDULE_IDLE_MAX_AVG_CONN
+                    )
+                    if sched_evidenced and conn_signal is not None:
+                        sched_avg_conn = conn_signal["avg_conn"]
                         sched_base_price = _rds_monthly_price(
-                            ctx, engine, db_instance_class or "", multi_az=multi_az,
+                            ctx, engine or "", db_instance_class or "", multi_az=multi_az,
                             license_model=license_model,
                         )
                         sched_savings = sched_base_price * RDS_NON_PROD_SCHEDULE_REDUCTION
@@ -413,7 +523,12 @@ def get_enhanced_rds_checks(
                                     "region": region,
                                     "engine": engine,
                                     "instance_class": db_instance_class,
-                                    "metric_window": "name-substring heuristic (no CloudWatch usage)",
+                                    "license_model": license_model,
+                                    "metric_window": (
+                                        f"non-prod ({env_name}); {RDS_METRIC_WINDOW_DAYS}d avg "
+                                        f"DatabaseConnections {sched_avg_conn:.1f} "
+                                        f"(<= {RDS_SCHEDULE_IDLE_MAX_AVG_CONN:.0f}, idle)"
+                                    ),
                                     "formula": (
                                         f"${sched_base_price:.2f} x {RDS_NON_PROD_SCHEDULE_REDUCTION} "
                                         "(nights/weekends shutdown)"

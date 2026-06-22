@@ -41,10 +41,12 @@ class RdsModule(BaseServiceModule):
     key: str = "rds"
     cli_aliases: tuple[str, ...] = ("rds",)
     display_name: str = "RDS"
+    requires_cloudwatch: bool = True
+    reads_fast_mode: bool = True
 
     def required_clients(self) -> tuple[str, ...]:
         """Returns boto3 client names required for RDS scanning."""
-        return ("rds", "compute-optimizer")
+        return ("rds", "compute-optimizer", "cloudwatch")
 
     def scan(self, ctx: Any) -> ServiceFindings:
         """Scan RDS instances for cost optimization opportunities.
@@ -88,7 +90,9 @@ class RdsModule(BaseServiceModule):
 
         enhanced_recs: list[dict[str, Any]] = []
         try:
-            enhanced_result = get_enhanced_rds_checks(ctx, ctx.pricing_multiplier, ctx.old_snapshot_days)
+            enhanced_result = get_enhanced_rds_checks(
+                ctx, ctx.pricing_multiplier, ctx.old_snapshot_days, ctx.fast_mode
+            )
             enhanced_recs = enhanced_result.get("recommendations", [])
         except Exception as e:
             ctx.warn(f"[rds] enhanced checks failed: {e}", service="rds")
