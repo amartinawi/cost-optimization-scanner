@@ -661,7 +661,14 @@ class PricingEngine:
         multi_az: bool = False,
     ) -> float | None:
         """Fetch on-demand monthly RDS instance price; None on miss."""
-        engine_label = _RDS_ENGINE_LABELS.get(engine, "MySQL")
+        engine_label = _RDS_ENGINE_LABELS.get(engine)
+        if engine_label is None:
+            # Don't silently price an unmapped engine as MySQL — record it so the
+            # mismatch is visible, then fall back to MySQL as a best effort.
+            self.warnings.append(
+                f"Unknown RDS engine '{engine}' — pricing as MySQL; verify before relying on the figure"
+            )
+            engine_label = "MySQL"
         license_model = "License included" if engine in _RDS_LICENSE_INCLUDED_ENGINES else "No license required"
         filters = [
             {"Type": "TERM_MATCH", "Field": "instanceType", "Value": instance_class},

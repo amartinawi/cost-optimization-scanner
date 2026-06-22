@@ -18,18 +18,14 @@ logger = logging.getLogger(__name__)
 
 # Per-check reduction factors applied to live instance pricing.
 # Values reflect typical AWS guidance:
-#   - Multi-AZ disable: Multi-AZ is ≈ 2× Single-AZ, so dropping it on a Multi-AZ
-#     instance saves ≈ 50% of the Multi-AZ price (= Single-AZ price).
 #   - Non-prod schedule: nights + weekends shutdown ≈ 12h/day weekdays only,
 #     yielding ≈ 65% reduction relative to 24/7.
-#   - Reserved Instance: 1-yr no-upfront on AWS is ≈ 40% off on-demand.
 #   - The RI scenario matrix below (1yr / 3yr × No Upfront / Partial Upfront /
 #     All Upfront) reflects AWS public guidance averages. Discount tiers vary
 #     by engine + instance family; treat these as planning estimates and
 #     confirm exact savings in the AWS RI marketplace before purchase.
-RDS_MULTI_AZ_REDUCTION: float = 0.50
+# (Multi-AZ savings use the exact live price delta, not a fixed reduction factor.)
 RDS_NON_PROD_SCHEDULE_REDUCTION: float = 0.65
-RDS_RESERVED_INSTANCE_REDUCTION: float = 0.40
 RDS_RI_DISCOUNT_MATRIX: tuple[tuple[str, str, float], ...] = (
     ("1yr", "No Upfront", 0.38),
     ("1yr", "Partial Upfront", 0.41),
@@ -210,17 +206,17 @@ def get_enhanced_rds_checks(
     region = ctx.region
     account_id = ctx.account_id
 
+    # Only categories that are actually populated below. Idle / rightsizing /
+    # storage / Aurora-Serverless candidate buckets were removed (audit L4):
+    # idle and rightsizing come from Compute Optimizer, the gp2->gp3 storage
+    # check was removed (C1), and the Aurora-Serverless nudges emitted no
+    # concrete savings.
     checks: dict[str, Any] = {
-        "idle_databases": [],
-        "instance_rightsizing": [],
         "reserved_instances": [],
-        "storage_optimization": [],
         "multi_az_unnecessary": [],
         "backup_retention_excessive": [],
         "old_snapshots": [],
         "non_prod_scheduling": [],
-        "aurora_serverless_candidates": [],
-        "aurora_serverless_v2": [],
     }
 
     try:
@@ -307,6 +303,16 @@ def get_enhanced_rds_checks(
                                 ),
                                 "CheckCategory": "Multi-AZ Optimization",
                                 "instanceFinding": (f"Multi-AZ enabled in {env_name} environment"),
+                                "AuditBasis": {
+                                    "rate_basis": "RDS on-demand instance price (live Pricing API)",
+                                    "region": region,
+                                    "engine": engine,
+                                    "instance_class": db_instance_class,
+                                    "metric_window": "non-prod tag/name heuristic (no CloudWatch usage)",
+                                    "formula": (
+                                        f"Multi-AZ ${multi_az_price:.2f} - Single-AZ ${single_az_price:.2f}"
+                                    ),
+                                },
                             }
                         )
 
@@ -338,6 +344,17 @@ def get_enhanced_rds_checks(
                             "instanceFinding": (
                                 f"{backup_retention} days retention (recommend 7 days for non-critical DBs)"
                             ),
+                            "AuditBasis": {
+                                "rate_basis": "RDS backup storage $/GB-month (live Pricing API)",
+                                "region": region,
+                                "engine": engine,
+                                "rate": round(backup_price, 4),
+                                "metric_window": "describe-API retention; assumes free tier exhausted",
+                                "formula": (
+                                    f"{allocated_storage}GB x ${backup_price:.4f} x "
+                                    f"({backup_retention}-7)/30 days"
+                                ),
+                            },
                         }
                     )
 
@@ -376,6 +393,17 @@ def get_enhanced_rds_checks(
                                 ),
                                 "CheckCategory": "Non-Production Scheduling",
                                 "instanceFinding": (f"{env_name} database - eligible for automated scheduling"),
+                                "AuditBasis": {
+                                    "rate_basis": "RDS on-demand instance price (live Pricing API)",
+                                    "region": region,
+                                    "engine": engine,
+                                    "instance_class": db_instance_class,
+                                    "metric_window": "name-substring heuristic (no CloudWatch usage)",
+                                    "formula": (
+                                        f"${sched_base_price:.2f} x {RDS_NON_PROD_SCHEDULE_REDUCTION} "
+                                        "(nights/weekends shutdown)"
+                                    ),
+                                },
                             }
                         )
 
@@ -416,6 +444,17 @@ def get_enhanced_rds_checks(
                             "instanceFinding": (f"Instance ({db_instance_class}) - RI candidate"),
                             "RIScenarios": ri_scenarios,
                             "OnDemandMonthlyEstimate": round(ri_base_price, 2),
+                            "AuditBasis": {
+                                "rate_basis": "RDS on-demand instance price (live Pricing API)",
+                                "region": region,
+                                "engine": engine,
+                                "instance_class": db_instance_class,
+                                "metric_window": "advisory — excluded from headline (see commitment_analysis)",
+                                "formula": (
+                                    f"${ri_base_price:.2f} x {best_scenario['discount_pct']}% "
+                                    f"({best_scenario['term']} {best_scenario['payment_option']})"
+                                ),
+                            },
                         }
                     )
 
@@ -450,6 +489,17 @@ def get_enhanced_rds_checks(
                                     ),
                                     "CheckCategory": "Old RDS Snapshots",
                                     "instanceFinding": (f"{age_days} days old ({snap_allocated_storage}GB)"),
+                                    "AuditBasis": {
+                                        "rate_basis": "RDS backup storage $/GB-month (live Pricing API)",
+                                        "region": region,
+                                        "metric_window": (
+                                            f"describe-API snapshot age {age_days}d > {old_snapshot_days}d threshold"
+                                        ),
+                                        "formula": (
+                                            f"{snap_allocated_storage}GB x backup $/GB-mo "
+                                            "(allocated-size estimate, coarse)"
+                                        ),
+                                    },
                                 }
                             )
         except Exception as e:
@@ -503,6 +553,18 @@ def get_enhanced_rds_checks(
                                             " cluster snapshot"
                                             f" ({cluster_allocated_storage}GB)"
                                         ),
+                                        "AuditBasis": {
+                                            "rate_basis": "RDS backup storage $/GB-month (live Pricing API)",
+                                            "region": region,
+                                            "metric_window": (
+                                                f"describe-API snapshot age {age_days}d > "
+                                                f"{old_snapshot_days}d threshold"
+                                            ),
+                                            "formula": (
+                                                f"{cluster_allocated_storage}GB x backup $/GB-mo "
+                                                "(allocated-size estimate, coarse)"
+                                            ),
+                                        },
                                     }
                                 )
             except Exception as e:

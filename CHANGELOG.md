@@ -5,6 +5,44 @@ All notable changes to the AWS Cost Optimization Scanner project will be documen
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed (RDS cost-accuracy audit)
+See `docs/audits/RDS_REMEDIATION_PLAN.md` for the full finding catalogue.
+- **Phantom gp2→gp3 storage savings removed (C1)**. Unlike EBS, RDS gp2 and gp3
+  *base* storage cost the same per GB ($0.115/GB-Mo for every engine, verified
+  live via the Pricing API). The flat "20% of gp2 storage cost" produced a saving
+  that does not exist for RDS; removed.
+- **Cost Optimization Hub bucket now consumed (H1)**. The orchestrator bucketed
+  `RdsDbInstance`/`RdsDbCluster` recs into `ctx.cost_hub_splits["rds"]` but no
+  adapter read it — the savings were silently dropped. The adapter now consumes
+  the bucket as the authoritative source (suppresses a DB's CO/heuristic findings),
+  emits a `cost_optimization_hub` source, and registers the matching reporter
+  handler.
+- **Counted == rendered (H3)**. De-duplication moved into the pure
+  `services/rds_logic.resolve_rds_findings`: only the single highest-savings
+  finding survives per DB, and losing recs are dropped from the emitted sources
+  (previously the savings total was deduped but every rec still rendered, so the
+  cards summed to more than the tab total).
+- **Compute Optimizer opt-in placeholder no longer counted (H2)**. The synthetic
+  "enable Compute Optimizer" $0 rec is converted to a warning and dropped from the
+  count (it rendered to nothing), mirroring EC2.
+- **Compute Optimizer permission/opt-in classified (H4, H5)**. RDS CO failures are
+  recorded via `ctx.permission_issue` / `ctx.warn` instead of logger-only, and
+  non-actionable (`Optimized` / zero-savings) recs are filtered at the source.
+- **Reserved Instances demoted to advisory (M1)**. Still rendered, but excluded
+  from the savings headline (`commitment_analysis` is the authoritative RI source
+  and RI stacks with — rather than replaces — a rightsizing saving).
+- **RDS pricing filters corrected (M2, M3, M4)**: storage `volumeType` mapped to
+  the real Price List labels (`General Purpose`, `General Purpose-GP3`, …; the old
+  `.upper()` never matched); SQL Server Multi-AZ resolved to
+  `Multi-AZ (SQL Server Mirror)`; backup-storage lookup pinned to a deterministic
+  engine.
+- **Unknown RDS engine no longer priced silently as MySQL (L1)**; dead reduction
+  constants and never-populated check buckets removed (L4); each finding now
+  carries a structured `AuditBasis` (rate / region / engine / metric-window /
+  formula) (L2).
+
 ## [3.4.0] - 2026-05-14
 
 ### Removed (Cost-Only Scope Refinement)

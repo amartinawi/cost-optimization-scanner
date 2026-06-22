@@ -437,3 +437,31 @@ def test_coh_ri_purchase_excluded_from_rds_tab(monkeypatch):
     assert "cost_optimization_hub" not in findings.sources
     assert findings.total_recommendations == 0
     assert findings.total_monthly_savings == 0.0
+
+
+# --------------------------------------------------------------------------- #
+# Slice 6 — L1 engine-unknown warning, L2 AuditBasis on findings
+# --------------------------------------------------------------------------- #
+def test_unknown_engine_records_pricing_warning():
+    client = _CapturingPricingClient()
+    eng = _engine(client)
+    eng.get_rds_instance_monthly_price("frobdb", "db.t3.medium")
+    assert any("Unknown RDS engine" in w for w in eng.warnings)
+
+
+def test_multiaz_finding_carries_audit_basis():
+    instance = _instance(
+        DBInstanceIdentifier="dev-db", MultiAZ=True, BackupRetentionPeriod=7, StorageType="gp3"
+    )
+    ctx = _EnhancedCtx(_FakeRdsClient(instances=[instance]))
+    multi_az = next(r for r in _recs(ctx) if r["CheckCategory"] == "Multi-AZ Optimization")
+    basis = multi_az["AuditBasis"]
+    assert basis["region"] == "us-east-1"
+    assert basis["engine"] == "mysql"
+    assert "Multi-AZ" in basis["formula"] and "Single-AZ" in basis["formula"]
+
+
+def test_ri_finding_audit_basis_marks_advisory():
+    ctx = _EnhancedCtx(_FakeRdsClient(instances=[_instance(DBInstanceIdentifier="prod-db")]))
+    ri = next(r for r in _recs(ctx) if r["CheckCategory"] == "Reserved Instance Opportunities")
+    assert "commitment_analysis" in ri["AuditBasis"]["metric_window"]
