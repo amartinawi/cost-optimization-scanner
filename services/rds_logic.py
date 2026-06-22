@@ -1,0 +1,171 @@
+"""Pure decision logic for the RDS adapter — no AWS, no ScanContext.
+
+Extracted so cross-source de-duplication (Cost Hub > Compute Optimizer >
+heuristic), the Reserved-Instance demotion, and the savings/count arithmetic
+can be unit-tested without boto3 or live pricing. Mirrors ``services/ebs_logic``.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from services._savings import compute_optimizer_savings, parse_dollar_savings
+
+# Enhanced-check category that is shown for context but whose dollar value is
+# NOT summed into the RDS headline: Reserved Instances are the authoritative
+# domain of the commitment_analysis tab (which renders CoH RI recommendations),
+# and an RI saving stacks with — rather than replaces — a rightsizing/Multi-AZ
+# saving on the same DB. Kept as a clearly-conditional "up to $X" advisory card.
+RI_CATEGORY = "Reserved Instance Opportunities"
+
+# Authority ranks for cross-source de-duplication (lower wins). Cost Hub
+# (rank -1, handled separately via coh_keys suppression) > Compute Optimizer >
+# heuristic.
+_AUTH_CO = 1
+_AUTH_HEURISTIC = 2
+
+
+def normalize_rds_arn(raw: str) -> str:
+    """Canonical ``<resource-type>:<name>`` key for an RDS ARN / resource id.
+
+    ``arn:aws:rds:us-east-1:1:db:prod``           -> ``db:prod``
+    ``arn:aws:rds:us-east-1:1:snapshot:s1``        -> ``snapshot:s1``
+    ``arn:aws:rds:us-east-1:1:cluster-snapshot:c`` -> ``cluster-snapshot:c``
+
+    Keeping the resource-type prefix means a snapshot id never de-duplicates
+    against an instance id (different namespaces). A bare id with no ARN
+    structure is returned unchanged; falsy input returns ``""``.
+    """
+    if not raw:
+        return ""
+    parts = str(raw).split(":")
+    if parts[0] == "arn" and len(parts) >= 7:
+        return f"{parts[5]}:{':'.join(parts[6:])}"
+    return str(raw)
+
+
+def co_rds_key(rec: dict[str, Any]) -> str:
+    """Normalized dedup key for a Compute Optimizer RDS recommendation."""
+    return normalize_rds_arn(rec.get("resourceArn") or rec.get("resourceId") or "")
+
+
+def coh_rds_key(rec: dict[str, Any]) -> str:
+    """Normalized dedup key for a Cost Optimization Hub RDS recommendation."""
+    return normalize_rds_arn(rec.get("resourceArn") or rec.get("resourceId") or "")
+
+
+def enhanced_rds_key(rec: dict[str, Any]) -> str:
+    """Normalized dedup key for an in-house heuristic RDS recommendation."""
+    return normalize_rds_arn(rec.get("resourceArn") or "")
+
+
+def is_ri_rec(rec: dict[str, Any]) -> bool:
+    """True when an enhanced rec is a Reserved-Instance advisory (not summed)."""
+    return rec.get("CheckCategory") == RI_CATEGORY
+
+
+def is_snapshot_rec(rec: dict[str, Any]) -> bool:
+    """True when an enhanced rec belongs to a snapshot category (independent key)."""
+    return "snapshot" in str(rec.get("CheckCategory", "")).lower()
+
+
+def enhanced_savings(rec: dict[str, Any]) -> float:
+    """Monthly $ parsed from an enhanced rec's ``EstimatedSavings`` string."""
+    est = rec.get("EstimatedSavings", "")
+    return parse_dollar_savings(est) if "$" in est else 0.0
+
+
+def partition_enhanced(
+    recs: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Split enhanced recs into ``(concrete, snapshots, reserved_instances)``.
+
+    - ``concrete``  — single-remediation cost findings that dedup against each
+      other and against Compute Optimizer (Multi-AZ disable, scheduling, backup).
+    - ``snapshots`` — old-snapshot findings; independent keys, counted.
+    - ``reserved_instances`` — advisory RI cards; rendered but not summed.
+    """
+    concrete: list[dict[str, Any]] = []
+    snaps: list[dict[str, Any]] = []
+    ri: list[dict[str, Any]] = []
+    for rec in recs:
+        if is_ri_rec(rec):
+            ri.append(rec)
+        elif is_snapshot_rec(rec):
+            snaps.append(rec)
+        else:
+            concrete.append(rec)
+    return concrete, snaps, ri
+
+
+def resolve_rds_findings(
+    co_recs: list[dict[str, Any]],
+    enhanced_recs: list[dict[str, Any]],
+    *,
+    coh_recs: list[dict[str, Any]] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], float, int]:
+    """De-duplicate cost findings across sources; demote RI to advisory.
+
+    Authority **Cost Hub > Compute Optimizer > heuristic**, keyed by normalized
+    RDS resource id. Cost Optimization Hub is the authoritative aggregator (it
+    re-surfaces Compute Optimizer's own rightsizing finding), so any DB covered
+    by CoH suppresses that DB's CO and heuristic findings entirely. Among the
+    remaining Compute Optimizer (rightsizing) and heuristic (Multi-AZ disable,
+    scheduling, backup) findings — which are *different* remediations the user
+    picks between, not redundant detections of the same one — only the single
+    **highest-savings** finding survives per DB. The result: the rendered cards,
+    the recommendation count, and the savings total all agree (no "cards sum to
+    more than the tab total"). Snapshots are independent keys and always counted.
+    Reserved-Instance recs are kept for display but excluded from the savings total.
+
+    Args:
+        co_recs: actionable Compute Optimizer recs (already opt-in/Optimized
+            filtered upstream).
+        enhanced_recs: heuristic recs from ``get_enhanced_rds_checks``.
+        coh_recs: Cost Optimization Hub recs (highest authority). When a DB is
+            covered by CoH, its CO and heuristic findings are suppressed; the CoH
+            recs themselves are returned for the caller to render in their own
+            source and are summed into the total.
+
+    Returns:
+        ``(kept_coh, kept_co, kept_enhanced, total_savings, total_recommendations)``.
+    """
+    coh_recs = coh_recs or []
+    coh_keys = {coh_rds_key(r) for r in coh_recs} - {""}
+
+    concrete, snaps, ri = partition_enhanced(enhanced_recs)
+
+    # Candidate single-remediation cost findings, excluding CoH-covered ids.
+    # Each tuple: (authority, savings, origin, key, rec).
+    candidates: list[tuple[int, float, str, str, dict[str, Any]]] = []
+    for i, rec in enumerate(co_recs):
+        key = co_rds_key(rec) or f"_anon_co_{i}"
+        sav = compute_optimizer_savings(rec)
+        if sav > 0 and key not in coh_keys:
+            candidates.append((_AUTH_CO, sav, "co", key, rec))
+    for i, rec in enumerate(concrete):
+        key = enhanced_rds_key(rec) or f"_anon_enh_{i}"
+        sav = enhanced_savings(rec)
+        if sav > 0 and key not in coh_keys:
+            candidates.append((_AUTH_HEURISTIC, sav, "enh", key, rec))
+
+    # Winner per key: highest savings; ties broken toward Compute Optimizer
+    # (lower _AUTH rank) for determinism.
+    best: dict[str, tuple[int, float, str, dict[str, Any]]] = {}
+    for auth, sav, origin, key, rec in candidates:
+        cur = best.get(key)
+        if cur is None or (sav, -auth) > (cur[1], -cur[0]):
+            best[key] = (auth, sav, origin, rec)
+
+    kept_co = [v[3] for v in best.values() if v[2] == "co"]
+    kept_concrete = [v[3] for v in best.values() if v[2] == "enh"]
+    cost_savings = sum(v[1] for v in best.values())
+
+    snap_savings = sum(enhanced_savings(r) for r in snaps)
+    coh_savings = sum(float(r.get("estimatedMonthlySavings", 0.0) or 0.0) for r in coh_recs)
+
+    total_savings = coh_savings + cost_savings + snap_savings  # RI excluded by design
+    kept_enhanced = kept_concrete + snaps + ri
+    total_recs = len(coh_recs) + len(kept_co) + len(kept_enhanced)
+
+    return list(coh_recs), kept_co, kept_enhanced, total_savings, total_recs

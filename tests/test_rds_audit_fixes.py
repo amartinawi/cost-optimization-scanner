@@ -308,3 +308,50 @@ def test_no_gp2_gp3_storage_recommendation():
     ctx = _EnhancedCtx(_FakeRdsClient(instances=[_instance(StorageType="gp2")]))
     cats = [r.get("CheckCategory", "") for r in _recs(ctx)]
     assert not any("Storage" in c for c in cats)
+
+
+# --------------------------------------------------------------------------- #
+# Slice 4 — H3 source-level dedup + M1-b RI demotion (adapter level)
+# --------------------------------------------------------------------------- #
+def _enh(arn, savings_str, category):
+    return {"resourceArn": arn, "EstimatedSavings": savings_str, "CheckCategory": category}
+
+
+def test_adapter_dedups_multiremediation_and_excludes_ri(monkeypatch):
+    arn = "arn:aws:rds:us-east-1:1:db:prod"
+    enhanced = [
+        _enh(arn, "$53.00/month with single-AZ deployment", "Multi-AZ Optimization"),
+        _enh(arn, "$34.00/month with nights/weekends shutdown", "Non-Production Scheduling"),
+        _enh(arn, "up to $40.00/month (1yr All Upfront)", "Reserved Instance Opportunities"),
+    ]
+    monkeypatch.setattr(rds_adapter, "get_rds_compute_optimizer_recommendations", lambda ctx: [])
+    monkeypatch.setattr(rds_adapter, "get_enhanced_rds_checks", lambda ctx, m, d: {"recommendations": enhanced})
+    monkeypatch.setattr(rds_adapter, "get_rds_instance_count", lambda ctx: {"total": 1})
+
+    findings = rds_adapter.RdsModule().scan(_FakeCtx())
+
+    # Concrete checks dedup to the single max ($53); RI is excluded from savings.
+    assert findings.total_monthly_savings == pytest.approx(53.0)
+    # Rendered enhanced recs = winning concrete ($53) + RI advisory = 2; CO = 0.
+    enhanced_recs = findings.sources["enhanced_checks"].recommendations
+    assert len(enhanced_recs) == 2
+    assert findings.sources["compute_optimizer"].count == 0
+    # counted == rendered
+    assert findings.total_recommendations == len(enhanced_recs)
+
+
+def test_adapter_co_beats_heuristic_same_db(monkeypatch):
+    arn = "arn:aws:rds:us-east-1:1:db:prod"
+    co = [_co_rec(arn, 80.0)]
+    enhanced = [_enh(arn, "$53.00/month with single-AZ deployment", "Multi-AZ Optimization")]
+    monkeypatch.setattr(rds_adapter, "get_rds_compute_optimizer_recommendations", lambda ctx: co)
+    monkeypatch.setattr(rds_adapter, "get_enhanced_rds_checks", lambda ctx, m, d: {"recommendations": enhanced})
+    monkeypatch.setattr(rds_adapter, "get_rds_instance_count", lambda ctx: {"total": 1})
+
+    findings = rds_adapter.RdsModule().scan(_FakeCtx())
+
+    # CO ($80) wins; heuristic Multi-AZ dropped from the enhanced source.
+    assert findings.total_monthly_savings == pytest.approx(80.0)
+    assert findings.sources["compute_optimizer"].count == 1
+    assert findings.sources["enhanced_checks"].count == 0
+    assert findings.total_recommendations == 1

@@ -7,55 +7,15 @@ from typing import Any
 
 from core.contracts import ServiceFindings, SourceBlock
 from services._base import BaseServiceModule
-from services._savings import compute_optimizer_savings, parse_dollar_savings
 from services.rds import (
     RDS_OPTIMIZATION_DESCRIPTIONS,
     get_enhanced_rds_checks,
     get_rds_compute_optimizer_recommendations,
     get_rds_instance_count,
 )
+from services.rds_logic import resolve_rds_findings
 
 logger = logging.getLogger(__name__)
-
-
-def _aggregate_rds_savings(
-    co_recs: list[dict[str, Any]],
-    enhanced_recs: list[dict[str, Any]],
-) -> float:
-    """Compute total RDS monthly savings with per-resource deduplication.
-
-    Compute Optimizer (rightsizing) and enhanced checks (Multi-AZ disable,
-    non-prod scheduling, Reserved Instances) can fire concurrently on the
-    same DB instance. Their remediations are not freely additive — the user
-    can only realistically pick one large remediation per instance. To
-    avoid inflating the headline, this aggregator groups by ``resourceArn``
-    and counts only the **maximum** savings per resource.
-
-    Old-snapshot recs use a snapshot ARN (``arn:…:snapshot:…``) which is in
-    a different namespace from DB instance ARNs, so they don't dedup against
-    instance-level recs — that's the desired behaviour.
-    """
-    by_resource: dict[str, float] = {}
-    untagged_total = 0.0
-
-    for rec in co_recs:
-        arn = rec.get("resourceArn") or ""
-        amount = compute_optimizer_savings(rec)
-        if arn:
-            by_resource[arn] = max(by_resource.get(arn, 0.0), amount)
-        else:
-            untagged_total += amount
-
-    for rec in enhanced_recs:
-        arn = rec.get("resourceArn") or ""
-        est = rec.get("EstimatedSavings", "")
-        amount = parse_dollar_savings(est) if "$" in est else 0.0
-        if arn:
-            by_resource[arn] = max(by_resource.get(arn, 0.0), amount)
-        else:
-            untagged_total += amount
-
-    return sum(by_resource.values()) + untagged_total
 
 
 class RdsModule(BaseServiceModule):
@@ -72,10 +32,13 @@ class RdsModule(BaseServiceModule):
     def scan(self, ctx: Any) -> ServiceFindings:
         """Scan RDS instances for cost optimization opportunities.
 
-        Consults Compute Optimizer and enhanced RDS checks. Savings are
-        aggregated per-resource (``resourceArn``) and only the maximum
-        single-remediation value per DB instance is counted toward the
-        headline — see :func:`_aggregate_rds_savings` for rationale.
+        Consults Compute Optimizer and enhanced RDS checks, then de-duplicates
+        across sources so that only one single-remediation finding survives per
+        DB instance (authority Compute Optimizer > heuristic). The surviving
+        recommendations are the ones emitted, so the rendered cards, the
+        recommendation count, and the savings total all agree — see
+        :func:`services.rds_logic.resolve_rds_findings`. Reserved-Instance recs
+        are kept for display but excluded from the savings total.
 
         Args:
             ctx: ScanContext with region, clients, and pricing data.
@@ -119,16 +82,19 @@ class RdsModule(BaseServiceModule):
         except Exception as e:
             ctx.warn(f"[rds] instance count failed: {e}", service="rds")
 
-        savings = _aggregate_rds_savings(co_recs, enhanced_recs)
-        total_recs = len(co_recs) + len(enhanced_recs)
+        # Cross-source de-duplication. CoH consumption is wired in a later step;
+        # for now coh_recs is empty and the resolver dedups CO vs heuristics.
+        _coh_kept, co_kept, enhanced_kept, savings, total_recs = resolve_rds_findings(
+            co_recs, enhanced_recs
+        )
 
         return ServiceFindings(
             service_name="RDS",
             total_recommendations=total_recs,
             total_monthly_savings=savings,
             sources={
-                "compute_optimizer": SourceBlock(count=len(co_recs), recommendations=tuple(co_recs)),
-                "enhanced_checks": SourceBlock(count=len(enhanced_recs), recommendations=tuple(enhanced_recs)),
+                "compute_optimizer": SourceBlock(count=len(co_kept), recommendations=tuple(co_kept)),
+                "enhanced_checks": SourceBlock(count=len(enhanced_kept), recommendations=tuple(enhanced_kept)),
             },
             optimization_descriptions=RDS_OPTIMIZATION_DESCRIPTIONS,
             extras={"instance_counts": rds_counts},
