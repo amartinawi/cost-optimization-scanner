@@ -195,36 +195,100 @@ def _render_ec2_compute_optimizer(recommendations: List[Rec], source_name: str, 
     return content
 
 
+# Plain-language reason for each AWS Cost Optimization Hub EBS ``actionType`` so
+# the report explains WHY a volume is flagged (the actionType alone — e.g.
+# "Delete" — does not say what the finding was or whether the volume is attached).
+_COH_EBS_ACTION_REASON: Dict[str, str] = {
+    "Delete": (
+        "AWS Cost Optimization Hub identified these volumes as idle / unused over the lookback "
+        "window — deleting recovers 100% of their storage cost. Snapshot first if the data may be "
+        "needed; an attached volume must be detached before it can be deleted."
+    ),
+    "Rightsize": (
+        "AWS Cost Optimization Hub recommends a smaller or cheaper configuration (size, IOPS, or "
+        "throughput) based on observed utilization. Applied in place, no data loss."
+    ),
+    "Stop": "AWS Cost Optimization Hub recommends stopping the associated resource.",
+    "Upgrade": "AWS Cost Optimization Hub recommends an upgraded configuration that lowers cost.",
+    "MigrateToGraviton": "AWS Cost Optimization Hub recommends migrating to a Graviton-based configuration.",
+}
+
+
+def _fmt_ebs_config(cfg: Dict) -> str:
+    """One-line ``type SIZE GB, N IOPS, N MB/s`` summary of an EBS volume config."""
+    storage = cfg.get("storage", {}) or {}
+    perf = cfg.get("performance", {}) or {}
+    vol_type = storage.get("type", "N/A")
+    size = storage.get("sizeInGb", 0) or 0
+    parts = [f"{vol_type} {int(size)} GB" if size else vol_type]
+    if perf.get("iops"):
+        parts.append(f"{int(perf['iops'])} IOPS")
+    if perf.get("throughput"):
+        parts.append(f"{int(perf['throughput'])} MB/s")
+    return ", ".join(parts)
+
+
 def _render_ebs_cost_hub(recommendations: List[Rec], source_name: str, service_data: Dict) -> str:
-    """Renders EBS Cost Optimization Hub recommendations grouped by action. Called by: HTMLReportGenerator._get_detailed_recommendations."""
+    """Renders EBS Cost Optimization Hub recommendations grouped by action.
+
+    Each group states the action, a plain-language reason, and the dollar
+    impact; each volume line shows its current configuration, attachment state,
+    the savings (with %), and — for Rightsize — the recommended target config so
+    the recommendation is defensible from the report alone.
+
+    Called by: HTMLReportGenerator._get_detailed_recommendations.
+    """
     grouped_actions: Dict[str, List[Rec]] = {}
     for rec in recommendations:
         if "actionType" not in rec or "ebsVolume" not in rec.get("currentResourceDetails", {}):
             continue
-        finding = rec.get("finding", "").lower()
+        finding = (rec.get("finding") or "").lower()
         if finding == "optimized":
             continue
 
         action = rec.get("actionType", "Other")
-        if action not in grouped_actions:
-            grouped_actions[action] = []
-        grouped_actions[action].append(rec)
+        grouped_actions.setdefault(action, []).append(rec)
 
     content = ""
     for action, recs in grouped_actions.items():
         total_savings = sum(r.get("estimatedMonthlySavings", 0) for r in recs)
-        content += f'<div class="rec-item{_priority_class(recs[0])}">'
+        reason = _COH_EBS_ACTION_REASON.get(action, f"AWS Cost Optimization Hub recommended action: {action}.")
+        first = recs[0]
+        lookback = first.get("costCalculationLookbackPeriodInDays") or first.get("recommendationLookbackPeriodInDays")
+        effort = first.get("implementationEffort", "")
+        restart = first.get("restartNeeded")
+
+        content += f'<div class="rec-item{_priority_class(first)}">'
         content += f"<h4>Action: {action} ({len(recs)} volumes)</h4>"
+        content += f'<p><strong>Source:</strong> AWS Cost Optimization Hub &middot; <strong>Why:</strong> {reason}</p>'
+        evidence: List[str] = []
+        if lookback:
+            evidence.append(f"{int(lookback)}-day usage lookback")
+        if effort:
+            evidence.append(f"implementation effort: {html.escape(str(effort))}")
+        if restart is not None:
+            evidence.append("restart required" if restart else "no restart needed")
+        if evidence:
+            content += f'<p class="pricing-basis"><strong>Basis:</strong> {" &middot; ".join(evidence)}</p>'
         content += f'<p class="savings"><strong>Total Monthly Savings:</strong> ${total_savings:.2f}</p>'
         content += "<p><strong>Volumes:</strong></p><ul>"
         for rec in recs:
             resource_id = rec.get("resourceId", "N/A")
-            ebs_config = rec.get("currentResourceDetails", {}).get("ebsVolume", {}).get("configuration", {})
-            volume_type = ebs_config.get("storage", {}).get("type", "N/A")
-            volume_size = ebs_config.get("storage", {}).get("sizeInGb", 0)
+            cur_cfg = rec.get("currentResourceDetails", {}).get("ebsVolume", {}).get("configuration", {})
             savings = rec.get("estimatedMonthlySavings", 0)
+            pct = rec.get("estimatedSavingsPercentage")
+            attach = (cur_cfg.get("attachmentState") or "").lower()
 
-            content += f"<li>{resource_id}: {volume_type} ({volume_size} GB) - ${savings:.2f}/month</li>"
+            line = f"{resource_id}: {_fmt_ebs_config(cur_cfg)}"
+            if attach:
+                line += f" ({attach})"
+            if action == "Rightsize":
+                rec_cfg = rec.get("recommendedResourceDetails", {}).get("ebsVolume", {}).get("configuration", {})
+                if rec_cfg:
+                    line += f" &rarr; {_fmt_ebs_config(rec_cfg)}"
+            pct_str = f" ({pct:.0f}%)" if isinstance(pct, (int, float)) and pct else ""
+            line += f' — <span class="savings">${savings:.2f}/month{pct_str}</span>'
+            content += f"<li>{line}</li>"
         content += "</ul></div>"
     return content
 
