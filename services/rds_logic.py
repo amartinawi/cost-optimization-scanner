@@ -11,12 +11,18 @@ from typing import Any
 
 from services._savings import compute_optimizer_savings, parse_dollar_savings
 
-# Enhanced-check category that is shown for context but whose dollar value is
-# NOT summed into the RDS headline: Reserved Instances are the authoritative
-# domain of the commitment_analysis tab (which renders CoH RI recommendations),
-# and an RI saving stacks with — rather than replaces — a rightsizing/Multi-AZ
-# saving on the same DB. Kept as a clearly-conditional "up to $X" advisory card.
+# Enhanced-check categories shown for context but whose dollar value is NOT
+# summed into the RDS headline ("advisory"):
+#   - Reserved Instances: the authoritative domain of the commitment_analysis tab
+#     (which renders CoH RI recs); an RI saving stacks with — rather than replaces
+#     — a rightsizing/Multi-AZ saving on the same DB.
+#   - Backup Retention: the billable backup amount cannot be derived at scan time
+#     (free allotment = 100% of provisioned storage; the excess needs Cost
+#     Explorer / actual backup bytes), so we surface the lever without a fabricated
+#     $ figure rather than guess (audit N-M2).
 RI_CATEGORY = "Reserved Instance Opportunities"
+BACKUP_CATEGORY = "Backup Retention Optimization"
+ADVISORY_CATEGORIES = frozenset({RI_CATEGORY, BACKUP_CATEGORY})
 
 # Authority ranks for cross-source de-duplication (lower wins). Cost Hub
 # (rank -1, handled separately via coh_keys suppression) > Compute Optimizer >
@@ -68,9 +74,9 @@ def enhanced_rds_key(rec: dict[str, Any]) -> str:
     return normalize_rds_arn(rec.get("resourceArn") or "")
 
 
-def is_ri_rec(rec: dict[str, Any]) -> bool:
-    """True when an enhanced rec is a Reserved-Instance advisory (not summed)."""
-    return rec.get("CheckCategory") == RI_CATEGORY
+def is_advisory_rec(rec: dict[str, Any]) -> bool:
+    """True when an enhanced rec is advisory (rendered/counted but not summed)."""
+    return rec.get("CheckCategory") in ADVISORY_CATEGORIES
 
 
 def is_snapshot_rec(rec: dict[str, Any]) -> bool:
@@ -87,24 +93,25 @@ def enhanced_savings(rec: dict[str, Any]) -> float:
 def partition_enhanced(
     recs: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
-    """Split enhanced recs into ``(concrete, snapshots, reserved_instances)``.
+    """Split enhanced recs into ``(concrete, snapshots, advisory)``.
 
     - ``concrete``  — single-remediation cost findings that dedup against each
-      other and against Compute Optimizer (Multi-AZ disable, scheduling, backup).
+      other and against Compute Optimizer (Multi-AZ disable, scheduling).
     - ``snapshots`` — old-snapshot findings; independent keys, counted.
-    - ``reserved_instances`` — advisory RI cards; rendered but not summed.
+    - ``advisory``  — RI + backup-retention cards; rendered/counted but not summed
+      into the savings headline (see ADVISORY_CATEGORIES).
     """
     concrete: list[dict[str, Any]] = []
     snaps: list[dict[str, Any]] = []
-    ri: list[dict[str, Any]] = []
+    advisory: list[dict[str, Any]] = []
     for rec in recs:
-        if is_ri_rec(rec):
-            ri.append(rec)
+        if is_advisory_rec(rec):
+            advisory.append(rec)
         elif is_snapshot_rec(rec):
             snaps.append(rec)
         else:
             concrete.append(rec)
-    return concrete, snaps, ri
+    return concrete, snaps, advisory
 
 
 def resolve_rds_findings(
@@ -142,7 +149,7 @@ def resolve_rds_findings(
     coh_recs = coh_recs or []
     coh_keys = {coh_rds_key(r) for r in coh_recs} - {""}
 
-    concrete, snaps, ri = partition_enhanced(enhanced_recs)
+    concrete, snaps, advisory = partition_enhanced(enhanced_recs)
 
     # Candidate single-remediation cost findings, excluding CoH-covered ids.
     # Each tuple: (authority, savings, origin, key, rec).
@@ -173,8 +180,8 @@ def resolve_rds_findings(
     snap_savings = sum(enhanced_savings(r) for r in snaps)
     coh_savings = sum(float(r.get("estimatedMonthlySavings", 0.0) or 0.0) for r in coh_recs)
 
-    total_savings = coh_savings + cost_savings + snap_savings  # RI excluded by design
-    kept_enhanced = kept_concrete + snaps + ri
+    total_savings = coh_savings + cost_savings + snap_savings  # advisory excluded by design
+    kept_enhanced = kept_concrete + snaps + advisory
     total_recs = len(coh_recs) + len(kept_co) + len(kept_enhanced)
 
     return list(coh_recs), kept_co, kept_enhanced, total_savings, total_recs

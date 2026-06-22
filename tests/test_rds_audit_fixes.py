@@ -640,3 +640,28 @@ def test_cloudwatch_accessdenied_records_permission_issue():
     ctx = _EnhancedCtx(_FakeRdsClient(instances=[inst]), cloudwatch=_FakeCloudWatch(error=err))
     _recs(ctx)
     assert any(p["action"] == "cloudwatch:GetMetricStatistics" for p in ctx.permission_issues)
+
+
+# --------------------------------------------------------------------------- #
+# Slice C — N-M2: backup retention is advisory (no fabricated $), excluded from total
+# --------------------------------------------------------------------------- #
+def test_backup_retention_is_advisory_no_dollar():
+    inst = _instance(DBInstanceIdentifier="prod-db", BackupRetentionPeriod=30, AllocatedStorage=500)
+    ctx = _EnhancedCtx(_FakeRdsClient(instances=[inst]))
+    backup = next(r for r in _recs(ctx) if r["CheckCategory"] == "Backup Retention Optimization")
+    # No fabricated "$X/month" figure (advisory only).
+    assert "/month" not in backup["EstimatedSavings"]
+    assert "advisory" in backup["EstimatedSavings"].lower()
+
+
+def test_backup_retention_excluded_from_savings_but_rendered():
+    arn = "arn:aws:rds:us-east-1:1:db:prod"
+    enhanced = [
+        {"resourceArn": arn, "CheckCategory": "Backup Retention Optimization",
+         "EstimatedSavings": "advisory — see Cost Explorer"},
+    ]
+    from services.rds_logic import resolve_rds_findings
+    _coh, _co, kept_enh, savings, count = resolve_rds_findings([], enhanced)
+    assert savings == 0.0          # not summed into the headline
+    assert len(kept_enh) == 1      # but still rendered
+    assert count == 1

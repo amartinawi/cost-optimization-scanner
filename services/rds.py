@@ -298,7 +298,6 @@ def get_enhanced_rds_checks(
                 db_instance_status = instance.get("DBInstanceStatus")
                 multi_az = instance.get("MultiAZ", False)
                 backup_retention = instance.get("BackupRetentionPeriod", 0)
-                allocated_storage = instance.get("AllocatedStorage", 0)
                 license_model = instance.get("LicenseModel")
 
                 if db_instance_status not in ["available", "stopped"]:
@@ -430,17 +429,19 @@ def get_enhanced_rds_checks(
                         )
 
                 if backup_retention > 7:
-                    extra_backup_days = backup_retention - 7
                     backup_price = (
                         ctx.pricing_engine.get_rds_backup_storage_price_per_gb()
                         if ctx.pricing_engine
                         else 0.095 * pricing_multiplier
                     )
-                    # AWS provides free backup storage = 100% of total provisioned
-                    # DB storage in the region. This estimate assumes that pool is
-                    # already exhausted and additional retention is fully billable;
-                    # accounts under the free tier may see lower realized savings.
-                    backup_savings = allocated_storage * backup_price * extra_backup_days / 30
+                    # N-M2: the billable backup amount cannot be derived at scan
+                    # time. AWS gives free backup storage = 100% of total provisioned
+                    # DB storage; only the excess (actual incremental snapshot bytes
+                    # beyond that pool) is billed at the rate below. We have neither
+                    # the actual backup bytes nor the account-wide provisioned pool
+                    # here, so we surface the lever as ADVISORY (no fabricated $;
+                    # excluded from the headline) rather than guess. The old
+                    # allocated×days/30 model double-counted and ignored the free tier.
                     checks["backup_retention_excessive"].append(
                         {
                             "DBInstanceIdentifier": db_instance_id,
@@ -448,10 +449,14 @@ def get_enhanced_rds_checks(
                             "engine": engine,
                             "engineVersion": instance.get("EngineVersion", ""),
                             "BackupRetentionPeriod": backup_retention,
-                            "Recommendation": (f"Reduce backup retention from {backup_retention} to 7 days"),
+                            "Recommendation": (
+                                f"Reduce backup retention from {backup_retention} to 7 days for "
+                                "non-critical DBs to shrink billable backup storage"
+                            ),
                             "EstimatedSavings": (
-                                f"${backup_savings:.2f}/month (estimate assumes regional"
-                                " free tier — 100% of provisioned storage — is exhausted)"
+                                "advisory — billable backup = snapshot bytes beyond the free "
+                                f"allotment (100% of provisioned storage), billed at "
+                                f"${backup_price:.4f}/GB-month; see Cost Explorer for the exact amount"
                             ),
                             "CheckCategory": "Backup Retention Optimization",
                             "instanceFinding": (
@@ -462,11 +467,11 @@ def get_enhanced_rds_checks(
                                 "region": region,
                                 "engine": engine,
                                 "rate": round(backup_price, 4),
-                                "metric_window": "describe-API retention; assumes free tier exhausted",
-                                "formula": (
-                                    f"{allocated_storage}GB x ${backup_price:.4f} x "
-                                    f"({backup_retention}-7)/30 days"
+                                "metric_window": (
+                                    "advisory — free allotment = 100% of provisioned storage; "
+                                    "billable excess not derivable at scan time"
                                 ),
+                                "formula": "billable_backup_GB x rate (billable_backup_GB unknown at scan time)",
                             },
                         }
                     )
