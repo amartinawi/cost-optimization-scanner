@@ -67,6 +67,9 @@ FALLBACK_EBS_IOPS_MONTH: dict[str, float] = {
 #   >64,000 IOPS:         $0.032/IOPS-month
 FALLBACK_IO2_IOPS_TIER2_MONTH: float = 0.0455
 FALLBACK_IO2_IOPS_TIER3_MONTH: float = 0.032
+# gp3 provisioned throughput above the free 125 MiB/s baseline (us-east-1:
+# $40.96/GiBps-mo = $0.04/MiBps-mo).
+FALLBACK_EBS_THROUGHPUT_MIBPS_MONTH: float = 0.04
 FALLBACK_EBS_SNAPSHOT_GB_MONTH: float = 0.05
 FALLBACK_EBS_SNAPSHOT_ARCHIVE_GB_MONTH: float = 0.0125
 FALLBACK_RDS_STORAGE_GB_MONTH: dict[str, float] = {
@@ -362,10 +365,30 @@ class PricingEngine:
         self._cache.set(key, price)
         return price
 
+    def _io2_tier_rate(self, group: str, fallback: float) -> float:
+        """Region-correct $/IOPS-month for one io2 IOPS tier.
+
+        AWS publishes the three io2 tiers as distinct SKUs distinguished by the
+        ``group`` attribute (``EBS IOPS`` / ``EBS IOPS Tier 2`` / ``EBS IOPS
+        Tier 3``), so each tier's rate is fetched directly for the region rather
+        than approximated by scaling the base rate.
+        """
+        key = ("ebs_io2_tier", group)
+        if (cached := self._get_cached(key)) is not None:
+            return cached
+        price = self._fetch_io2_tier_price(group)
+        if price is None:
+            price = self._use_fallback(
+                fallback * self._fallback_multiplier,
+                f"Pricing API unavailable for io2 '{group}' in {self._region}; using fallback",
+            )
+        self._cache.set(key, price)
+        return price
+
     def get_ebs_io2_iops_cost(self, iops: int) -> float:
         """Total $/month for `iops` provisioned IOPS on an io2 volume.
 
-        AWS io2 tiers (us-east-1, regional multiplier applied uniformly):
+        AWS io2 tiers (rates fetched per region from the tier-specific SKUs):
           0–32,000        IOPS @ base rate (≈ $0.065)
           32,001–64,000   IOPS @ tier 2 rate (≈ $0.0455, 30 % discount)
           > 64,000        IOPS @ tier 3 rate (≈ $0.032, 51 % discount)
@@ -374,18 +397,37 @@ class PricingEngine:
         """
         if iops <= 0:
             return 0.0
-        base_rate = self.get_ebs_iops_monthly_price("io2")
-        # Apply the same scaling factor that base_rate has relative to the
-        # us-east-1 reference so tier 2/3 rates stay region-consistent.
-        ratio = base_rate / FALLBACK_EBS_IOPS_MONTH["io2"] if FALLBACK_EBS_IOPS_MONTH["io2"] else 1.0
-        tier2_rate = FALLBACK_IO2_IOPS_TIER2_MONTH * ratio
-        tier3_rate = FALLBACK_IO2_IOPS_TIER3_MONTH * ratio
+        base_rate = self._io2_tier_rate("EBS IOPS", FALLBACK_EBS_IOPS_MONTH["io2"])
+        tier2_rate = self._io2_tier_rate("EBS IOPS Tier 2", FALLBACK_IO2_IOPS_TIER2_MONTH)
+        tier3_rate = self._io2_tier_rate("EBS IOPS Tier 3", FALLBACK_IO2_IOPS_TIER3_MONTH)
         cost = min(iops, 32000) * base_rate
         if iops > 32000:
             cost += min(iops - 32000, 32000) * tier2_rate
         if iops > 64000:
             cost += (iops - 64000) * tier3_rate
         return cost
+
+    def get_ebs_throughput_monthly_price(self, volume_type: str = "gp3") -> float:
+        """$/MiBps-month for provisioned EBS throughput above the free baseline.
+
+        gp3 bills provisioned throughput above 125 MiB/s. The AWS SKU is priced
+        per GiBps-month (≈ $40.96), so the live value is converted to per-MiBps
+        (÷1024) to match how callers meter throughput in MiB/s.
+        """
+        key = ("ebs_throughput", volume_type)
+        if (cached := self._get_cached(key)) is not None:
+            return cached
+        raw = self._fetch_ebs_throughput_price(volume_type)
+        if raw is None:
+            price = self._use_fallback(
+                FALLBACK_EBS_THROUGHPUT_MIBPS_MONTH * self._fallback_multiplier,
+                f"Pricing API unavailable for EBS {volume_type} throughput in {self._region}; using fallback",
+            )
+        else:
+            # SKU is priced per GiBps-month; convert to per-MiBps-month.
+            price = raw / 1024.0
+        self._cache.set(key, price)
+        return price
 
     def get_ebs_snapshot_price_per_gb(self, *, archive_tier: bool = False) -> float:
         """$/GB/month for EBS Snapshots in self._region.
@@ -765,6 +807,27 @@ class PricingEngine:
             {"Type": "TERM_MATCH", "Field": "volumeApiName", "Value": volume_type},
             {"Type": "TERM_MATCH", "Field": "location", "Value": self._display_name},
             {"Type": "TERM_MATCH", "Field": "productFamily", "Value": "System Operation"},
+        ]
+        # io2 has three IOPS SKUs (base + tier 2 + tier 3); pin the base group so
+        # MaxResults=1 cannot non-deterministically return a discounted tier.
+        if volume_type == "io2":
+            filters.append({"Type": "TERM_MATCH", "Field": "group", "Value": "EBS IOPS"})
+        return self._call_pricing_api("AmazonEC2", filters)
+
+    def _fetch_io2_tier_price(self, group: str) -> float | None:
+        filters = [
+            {"Type": "TERM_MATCH", "Field": "volumeApiName", "Value": "io2"},
+            {"Type": "TERM_MATCH", "Field": "location", "Value": self._display_name},
+            {"Type": "TERM_MATCH", "Field": "productFamily", "Value": "System Operation"},
+            {"Type": "TERM_MATCH", "Field": "group", "Value": group},
+        ]
+        return self._call_pricing_api("AmazonEC2", filters)
+
+    def _fetch_ebs_throughput_price(self, volume_type: str) -> float | None:
+        filters = [
+            {"Type": "TERM_MATCH", "Field": "volumeApiName", "Value": volume_type},
+            {"Type": "TERM_MATCH", "Field": "location", "Value": self._display_name},
+            {"Type": "TERM_MATCH", "Field": "productFamily", "Value": "Provisioned Throughput"},
         ]
         return self._call_pricing_api("AmazonEC2", filters)
 

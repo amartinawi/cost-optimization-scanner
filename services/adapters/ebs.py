@@ -17,6 +17,8 @@ from services.ebs import (
 )
 from services.ebs_logic import (
     dedupe_by_authority,
+    gp2_baseline_iops,
+    gp2_to_gp3_net_savings,
     partition_enhanced_recs,
 )
 
@@ -96,7 +98,7 @@ class EbsModule(BaseServiceModule):
         # --- Gather raw recommendations from every source ----------------------
         coh_recs = [r for r in getattr(ctx, "cost_hub_splits", {}).get("ebs", []) if _coh_is_renderable(r)]
 
-        co_raw = get_ebs_compute_optimizer_recs(ctx, ctx.pricing_multiplier)
+        co_raw = get_ebs_compute_optimizer_recs(ctx)
         # The advisor returns a synthetic $0 "enable Compute Optimizer" placeholder
         # when CO is not opted in. That is an informational signal, not a cost
         # finding — surface it as a warning rather than a $0-savings recommendation
@@ -121,19 +123,26 @@ class EbsModule(BaseServiceModule):
             coh_recs, co_recs_all, [unattached_volumes, gp2_recs, other_recs]
         )
 
-        # Per-volume gp2→gp3 savings (region-correct delta) computed on kept recs
-        # so the renderer shows real dollars instead of "20% cost reduction" prose.
+        # Per-volume gp2→gp3 savings: region-correct storage delta NET of the gp3
+        # IOPS that a large gp2 volume (baseline > 3,000 IOPS) must provision to
+        # keep its performance — so the number is not overstated for >1 TB volumes.
         delta_per_gb = _gp2_to_gp3_savings_per_gb(ctx)
+        if ctx.pricing_engine:
+            gp3_iops_rate = ctx.pricing_engine.get_ebs_iops_monthly_price("gp3")
+        else:
+            gp3_iops_rate = 0.005 * ctx.pricing_multiplier
         gp2_total = 0.0
         for rec in gp2_kept:
             size = rec.get("Size", 0)
-            per_vol = size * delta_per_gb
+            per_vol = gp2_to_gp3_net_savings(size, delta_per_gb, gp3_iops_rate)
             rec["EstimatedSavings"] = f"${per_vol:.2f}/month"
             rec["AuditBasis"] = {
-                "metric": "gp2→gp3 storage rate delta",
+                "metric": "gp2→gp3 storage delta net of gp3 IOPS parity",
                 "rate_per_gb_month": round(delta_per_gb, 6),
+                "gp3_iops_rate_per_iops_month": round(gp3_iops_rate, 6),
+                "gp2_baseline_iops": gp2_baseline_iops(size),
                 "region": getattr(ctx, "region", ""),
-                "basis": "size_gb × (gp2 $/GB-mo − gp3 $/GB-mo)",
+                "basis": "size×(gp2−gp3 $/GB) − max(0, gp2_baseline_iops−3000)×gp3 IOPS rate; throughput parity not modelled",
             }
             gp2_total += per_vol
 

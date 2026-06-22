@@ -119,6 +119,27 @@ def dedupe_by_authority(
     return co_kept, heuristic_kept
 
 
+def gp2_baseline_iops(size_gb: float) -> int:
+    """gp2 baseline IOPS for a volume: 3 IOPS/GB, floor 100, ceiling 16,000."""
+    return int(min(16000, max(100, 3 * size_gb)))
+
+
+def gp2_to_gp3_net_savings(size_gb: float, gb_delta_per_gb: float, gp3_iops_rate: float) -> float:
+    """Net monthly gp2→gp3 saving, accounting for IOPS parity on large volumes.
+
+    The storage-rate delta overstates the saving for volumes whose gp2 baseline
+    IOPS exceed gp3's free 3,000: matching that performance on gp3 requires
+    provisioning ``baseline − 3000`` IOPS, which is netted out here. For volumes
+    ≤ 1,000 GB (gp2 baseline ≤ 3,000) gp3's free tier already matches or exceeds,
+    so the full storage delta applies. (Throughput parity is not modelled — gp2's
+    size-derived throughput curve is workload-dependent — and is noted as a caveat.)
+    """
+    storage_savings = max(size_gb, 0.0) * max(gb_delta_per_gb, 0.0)
+    provisioned_iops = max(0, gp2_baseline_iops(size_gb) - 3000)
+    iops_cost = provisioned_iops * max(gp3_iops_rate, 0.0)
+    return max(storage_savings - iops_cost, 0.0)
+
+
 def recommend_iops_from_usage(
     provisioned_iops: int,
     observed_peak_iops: float,

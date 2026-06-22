@@ -17,9 +17,11 @@ from core.scan_context import ScanContext
 logger = logging.getLogger(__name__)
 
 # Lookback window for usage-based IOPS rightsizing (matches Compute Optimizer's
-# 14-day default) and the CloudWatch sampling period in seconds.
+# 14-day default). The sampling period is 900s (15 min) — the finest granularity
+# that still fits a 14-day window inside CloudWatch's 1,440-datapoint cap
+# (14d / 900s = 1,344 points), giving a truer peak than an hourly average.
 _IOPS_LOOKBACK_DAYS: int = 14
-_IOPS_METRIC_PERIOD_SECONDS: int = 3600
+_IOPS_METRIC_PERIOD_SECONDS: int = 900
 
 
 def _observed_peak_iops(ctx: ScanContext, volume_id: str) -> float | None:
@@ -244,10 +246,7 @@ def get_ebs_volume_count(ctx: ScanContext) -> dict[str, int]:
         return empty
 
 
-def get_ebs_compute_optimizer_recs(
-    ctx: ScanContext,
-    pricing_multiplier: float,
-) -> list[dict[str, Any]]:
+def get_ebs_compute_optimizer_recs(ctx: ScanContext) -> list[dict[str, Any]]:
     """Get EBS recommendations from Compute Optimizer.
 
     Delegates to services.advisor — the canonical location for all
@@ -402,13 +401,39 @@ def _estimate_volume_cost(
             base_cost += iops * iops_price
 
     if throughput and volume_type == "gp3":
-        # gp3 bills throughput above the free 125 MB/s baseline. PricingEngine
-        # has no throughput method, so use the $0.04/MB/s constant scaled by the
-        # regional multiplier.
+        # gp3 bills provisioned throughput above the free 125 MiB/s baseline,
+        # priced region-correct via PricingEngine (fallback $0.04/MiBps-mo).
         extra_throughput = max(0, throughput - 125)
-        base_cost += extra_throughput * 0.04 * pricing_multiplier
+        if ctx and ctx.pricing_engine:
+            tp_rate = ctx.pricing_engine.get_ebs_throughput_monthly_price("gp3")
+        else:
+            tp_rate = 0.04 * pricing_multiplier
+        base_cost += extra_throughput * tp_rate
 
     return base_cost
+
+
+def _current_ami_snapshot_ids(ctx: ScanContext) -> set[str]:
+    """Snapshot ids that back a currently-registered self-owned AMI.
+
+    These are priced by the AMI adapter (per the AMI's BlockDeviceMappings), so
+    the EBS snapshot checks skip them to avoid counting the same storage twice
+    across the EBS Snapshots tab and the AMI tab. Returns an empty set on any
+    error so the EBS scan still runs (it would simply not dedup).
+    """
+    ids: set[str] = set()
+    try:
+        ec2 = ctx.client("ec2")
+        paginator = ec2.get_paginator("describe_images")
+        for page in paginator.paginate(Owners=["self"]):
+            for ami in page.get("Images", []):
+                for bdm in ami.get("BlockDeviceMappings", []):
+                    snap = bdm.get("Ebs", {}).get("SnapshotId")
+                    if snap:
+                        ids.add(snap)
+    except Exception as e:
+        ctx.warn(f"Could not list AMI-backed snapshots for cross-tab dedup: {e}", service="ebs")
+    return ids
 
 
 def _scan_over_provisioned_iops(
@@ -561,22 +586,52 @@ def compute_ebs_checks(
         # No CloudWatch data → no priced finding (a warning is recorded instead).
         _scan_over_provisioned_iops(ctx, ec2, pricing_multiplier, checks)
 
-        # Check for old snapshots (>90 days for Snapshots tab) - with pagination
+        # Check for old snapshots (>90 days for Snapshots tab) - with pagination.
+        # Snapshots that back a CURRENTLY-REGISTERED self-owned AMI are priced by
+        # the AMI adapter (services/adapters/ami.py via the AMI's BlockDeviceMappings),
+        # so EBS cedes them to avoid double-counting the same storage across tabs.
+        # Only snapshots from DEREGISTERED AMIs (truly orphaned) and standalone
+        # snapshots are surfaced here. old vs orphaned are mutually exclusive.
+        ami_backed_snapshot_ids = _current_ami_snapshot_ids(ctx)
         snapshot_rate = _snapshot_price_per_gb(ctx, pricing_multiplier)
         paginator = ec2.get_paginator("describe_snapshots")
         for page in paginator.paginate(OwnerIds=["self"]):
             for snapshot in page["Snapshots"]:
+                snapshot_id = snapshot["SnapshotId"]
+                if snapshot_id in ami_backed_snapshot_ids:
+                    continue  # owned by the AMI tab
                 age_days = (datetime.now(snapshot["StartTime"].tzinfo) - snapshot["StartTime"]).days
+                if age_days <= old_snapshot_days:
+                    continue
                 _snapshot_basis = {
                     "metric": "snapshot data stored ($/GB-mo, max estimate)",
                     "rate_per_gb_month": round(snapshot_rate, 6),
                     "region": getattr(ctx, "region", ""),
                     "basis": "VolumeSize × snapshot $/GB-mo; actual lower due to incremental storage",
                 }
-                if age_days > old_snapshot_days:  # Only snapshots older than 90 days
+                estimated = f"${snapshot['VolumeSize'] * snapshot_rate:.2f}/month (max estimate)"
+                # A "Created by CreateImage" snapshot NOT backing a current AMI is
+                # from a deregistered AMI → orphaned. Everything else → old.
+                if snapshot.get("Description", "").startswith("Created by CreateImage"):
+                    checks["orphaned_snapshots"].append(
+                        {
+                            "SnapshotId": snapshot_id,
+                            "AgeDays": age_days,
+                            "VolumeSize": snapshot["VolumeSize"],
+                            "Description": snapshot.get("Description", ""),
+                            "Recommendation": (
+                                "Snapshot from a deregistered AMI — verify and delete"
+                                " (Note: Actual savings may be lower due to incremental storage)"
+                            ),
+                            "CheckCategory": "Orphaned Snapshots",
+                            "EstimatedSavings": estimated,
+                            "AuditBasis": _snapshot_basis,
+                        }
+                    )
+                else:
                     checks["old_snapshots"].append(
                         {
-                            "SnapshotId": snapshot["SnapshotId"],
+                            "SnapshotId": snapshot_id,
                             "AgeDays": age_days,
                             "VolumeSize": snapshot["VolumeSize"],
                             "CheckCategory": "Old Snapshots",
@@ -584,32 +639,7 @@ def compute_ebs_checks(
                                 f"Review {age_days}-day old snapshot for deletion"
                                 " (Note: Actual savings may be lower due to incremental storage)"
                             ),
-                            "EstimatedSavings": (
-                                f"${snapshot['VolumeSize'] * snapshot_rate:.2f}/month (max estimate)"
-                            ),
-                            "AuditBasis": _snapshot_basis,
-                        }
-                    )
-
-                # Check for orphaned snapshots (from deleted AMIs) - only if >90 days old
-                if (
-                    snapshot.get("Description", "").startswith("Created by CreateImage")
-                    and age_days > old_snapshot_days
-                ):
-                    checks["orphaned_snapshots"].append(
-                        {
-                            "SnapshotId": snapshot["SnapshotId"],
-                            "AgeDays": age_days,
-                            "VolumeSize": snapshot["VolumeSize"],
-                            "Description": snapshot.get("Description", ""),
-                            "Recommendation": (
-                                "Check if snapshot is from deleted AMI and can be removed"
-                                " (Note: Actual savings may be lower due to incremental storage)"
-                            ),
-                            "CheckCategory": "Orphaned Snapshots",
-                            "EstimatedSavings": (
-                                f"${snapshot['VolumeSize'] * snapshot_rate:.2f}/month (max estimate)"
-                            ),
+                            "EstimatedSavings": estimated,
                             "AuditBasis": _snapshot_basis,
                         }
                     )

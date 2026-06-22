@@ -33,6 +33,9 @@ class _FakeEngine:
     def get_ebs_monthly_price_per_gb(self, volume_type: str) -> float:
         return {"gp2": self._gp2, "gp3": self._gp3}.get(volume_type, 0.0)
 
+    def get_ebs_iops_monthly_price(self, volume_type: str) -> float:
+        return 0.005
+
 
 def _ctx(**overrides):
     """Build a SimpleNamespace ScanContext with collected warnings/permissions."""
@@ -346,14 +349,16 @@ class _FakeEc2:
 
 class _FakeCloudWatch:
     def __init__(self, peak_ops):
-        self._peak_ops = peak_ops  # Sum per 3600s period
+        self._peak_ops = peak_ops  # target peak IOPS
 
     def get_metric_statistics(self, **kw):
+        from services.ebs import _IOPS_METRIC_PERIOD_SECONDS
+
         if self._peak_ops is None:
             return {"Datapoints": []}
-        # Split across the two metrics; read carries the load.
+        # Sum over the period that yields the target peak IOPS on the read metric.
         if kw["MetricName"] == "VolumeReadOps":
-            return {"Datapoints": [{"Sum": self._peak_ops * 3600}]}
+            return {"Datapoints": [{"Sum": self._peak_ops * _IOPS_METRIC_PERIOD_SECONDS}]}
         return {"Datapoints": [{"Sum": 0}]}
 
 
@@ -417,3 +422,107 @@ class TestOverProvisionedIops:
         ctx = _iops_ctx(_FakeCloudWatch(3500))  # peak 3500 → 3500*1.3 > 4000
         _scan_over_provisioned_iops(ctx, _FakeEc2([vol]), 1.0, checks)
         assert checks["over_provisioned_iops"] == []
+
+
+# --------------------------------------------------------------------------- #
+# gp2→gp3 net savings (IOPS parity) + io2 tiers + throughput pricing
+# --------------------------------------------------------------------------- #
+from services.ebs_logic import gp2_baseline_iops, gp2_to_gp3_net_savings  # noqa: E402
+
+
+class TestGp2NetSavings:
+    @pytest.mark.parametrize("size,expected", [(50, 150), (2000, 6000), (6000, 16000), (10, 100)])
+    def test_gp2_baseline_iops(self, size, expected):
+        assert gp2_baseline_iops(size) == expected
+
+    def test_small_volume_full_delta(self):
+        # 50 GB: baseline 150 < 3000 → no IOPS cost → full storage delta.
+        assert gp2_to_gp3_net_savings(50, 0.02, 0.005) == pytest.approx(1.00)
+
+    def test_large_volume_nets_iops_cost(self):
+        # 2000 GB: baseline 6000 → provision 3000 IOPS × $0.005 = $15 off $40 storage.
+        assert gp2_to_gp3_net_savings(2000, 0.02, 0.005) == pytest.approx(25.0)
+
+    def test_never_negative(self):
+        assert gp2_to_gp3_net_savings(2000, 0.001, 0.005) == 0.0
+
+
+class TestIo2TieredPricing:
+    def _engine(self):
+        from unittest.mock import MagicMock
+        from core.pricing_engine import PricingEngine
+
+        client = MagicMock()
+        client.get_products.side_effect = Exception("no api")  # force fallback tiers
+        return PricingEngine("us-east-1", client, fallback_multiplier=1.0)
+
+    def test_tiered_cost_100k_iops(self):
+        # 32000×0.065 + 32000×0.0455 + 36000×0.032 = 2080 + 1456 + 1152
+        assert self._engine().get_ebs_io2_iops_cost(100_000) == pytest.approx(4688.0)
+
+    def test_base_tier_only(self):
+        assert self._engine().get_ebs_io2_iops_cost(10_000) == pytest.approx(650.0)  # 10000×0.065
+
+    def test_throughput_fallback_rate(self):
+        assert self._engine().get_ebs_throughput_monthly_price("gp3") == pytest.approx(0.04)
+
+
+# --------------------------------------------------------------------------- #
+# Cross-tab snapshot dedup (EBS cedes AMI-backed snapshots to the AMI tab)
+# --------------------------------------------------------------------------- #
+from datetime import datetime, timezone  # noqa: E402
+
+
+class _SnapPaginator:
+    def __init__(self, data):
+        self._data = data
+
+    def paginate(self, **kw):
+        return [self._data]
+
+
+class _FakeEc2Snapshots:
+    def __init__(self, images, snapshots):
+        self._images = images
+        self._snapshots = snapshots
+
+    def get_paginator(self, op):
+        return _SnapPaginator(
+            {
+                "describe_images": {"Images": self._images},
+                "describe_snapshots": {"Snapshots": self._snapshots},
+                "describe_volumes": {"Volumes": []},
+                "describe_instances": {"Reservations": []},
+            }[op]
+        )
+
+
+def _old_snap(sid, desc=""):
+    return {"SnapshotId": sid, "VolumeSize": 100, "StartTime": datetime(2020, 1, 1, tzinfo=timezone.utc), "Description": desc}
+
+
+class TestSnapshotCrossTabDedup:
+    def test_ami_backed_skipped_orphan_kept_standalone_old(self):
+        from services.ebs import compute_ebs_checks
+
+        images = [{"BlockDeviceMappings": [{"Ebs": {"SnapshotId": "snap-ami-existing"}}]}]
+        snapshots = [
+            _old_snap("snap-ami-existing", "Created by CreateImage(ami-1) for ami-1"),  # AMI tab owns → skip
+            _old_snap("snap-ami-orphan", "Created by CreateImage(ami-gone) for ami-gone"),  # deregistered → orphaned
+            _old_snap("snap-standalone", "nightly backup"),  # standalone → old
+        ]
+        ec2 = _FakeEc2Snapshots(images, snapshots)
+        ctx = SimpleNamespace(
+            region="us-east-1", pricing_engine=None, pricing_multiplier=1.0, fast_mode=True,
+            old_snapshot_days=90,
+            client=lambda name, region=None: ec2 if name == "ec2" else None,
+            warn=lambda message, service="": None,
+        )
+
+        result = compute_ebs_checks(ctx, 1.0, 90)
+        old_ids = {r["SnapshotId"] for r in result["old_snapshots"]}
+        orphan_ids = {r["SnapshotId"] for r in result["orphaned_snapshots"]}
+
+        assert "snap-ami-existing" not in old_ids and "snap-ami-existing" not in orphan_ids  # ceded to AMI tab
+        assert orphan_ids == {"snap-ami-orphan"}
+        assert old_ids == {"snap-standalone"}
