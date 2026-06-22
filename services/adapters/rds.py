@@ -5,8 +5,6 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from botocore.exceptions import ClientError  # type: ignore[import-untyped]
-
 from core.contracts import ServiceFindings, SourceBlock
 from services._base import BaseServiceModule
 from services._savings import compute_optimizer_savings, parse_dollar_savings
@@ -87,21 +85,26 @@ class RdsModule(BaseServiceModule):
         """
         logger.debug("RDS adapter scan starting")
 
-        co_recs: list[dict[str, Any]] = []
+        co_raw: list[dict[str, Any]] = []
         try:
-            co_recs = get_rds_compute_optimizer_recommendations(ctx)
-        except ClientError as ec:
-            code = ec.response.get("Error", {}).get("Code", "")
-            if code in ("AccessDenied", "UnauthorizedOperation", "OptInRequiredException"):
-                ctx.permission_issue(
-                    f"Compute Optimizer denied: {code}",
-                    service="rds",
-                    action="compute-optimizer:GetRDSDatabaseRecommendations",
-                )
-            else:
-                ctx.warn(f"[rds] Compute Optimizer check failed: {ec}", service="rds")
+            co_raw = get_rds_compute_optimizer_recommendations(ctx)
         except Exception as e:
+            # Permission / opt-in errors are classified inside the advisor and
+            # recorded on ctx; this guard only catches unexpected failures.
             ctx.warn(f"[rds] Compute Optimizer check failed: {e}", service="rds")
+
+        # The advisor returns a synthetic $0 "enable Compute Optimizer" placeholder
+        # when CO is not opted in. That is an informational signal, not a cost
+        # recommendation — surface it as a warning instead of a $0-savings finding
+        # that would inflate the recommendation count and render to nothing
+        # (the renderer skips recs without a resourceArn). Mirrors EC2Module.
+        if any(r.get("ResourceId") == "compute-optimizer-service" for r in co_raw):
+            ctx.warn(
+                "AWS Compute Optimizer is not enabled — RDS rightsizing recommendations "
+                "from Compute Optimizer are unavailable (enable it for additional savings detection).",
+                service="rds",
+            )
+        co_recs = [r for r in co_raw if r.get("ResourceId") != "compute-optimizer-service"]
 
         enhanced_recs: list[dict[str, Any]] = []
         try:

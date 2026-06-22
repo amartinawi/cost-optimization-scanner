@@ -163,20 +163,48 @@ def get_ebs_compute_optimizer_recommendations(
 def get_rds_compute_optimizer_recommendations(
     ctx: ScanContext,
 ) -> list[dict[str, Any]]:
-    """Get RDS recommendations from Compute Optimizer."""
+    """Get actionable RDS recommendations from Compute Optimizer.
+
+    DB instances whose recommendation carries no positive
+    ``estimatedMonthlySavings`` (e.g. ``Optimized``, or an ``Underprovisioned``
+    upsize that *costs more*) are dropped here so the counted total matches the
+    rendered RDS table — filtering at the source keeps the count and the table
+    in agreement (mirrors ``get_ec2_compute_optimizer_recommendations`` and
+    ``get_ebs_compute_optimizer_recommendations``).
+
+    Failures are recorded on ``ctx`` rather than swallowed: an opt-in gap
+    returns the synthetic placeholder (which the adapter converts to a warning),
+    a permission gap is recorded via ``ctx.permission_issue``, and any other
+    error via ``ctx.warn``.
+    """
+    from services._savings import compute_optimizer_savings
+
     compute_optimizer = ctx.client("compute-optimizer")
     recommendations: list[dict[str, Any]] = []
+
+    def _actionable(recs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [r for r in recs if compute_optimizer_savings(r) > 0]
+
     try:
         response = compute_optimizer.get_rds_database_recommendations()
-        recommendations.extend(response["rdsDBRecommendations"])
+        recommendations.extend(_actionable(response["rdsDBRecommendations"]))
 
         while response.get("nextToken"):
             response = compute_optimizer.get_rds_database_recommendations(nextToken=response["nextToken"])
-            recommendations.extend(response["rdsDBRecommendations"])
+            recommendations.extend(_actionable(response["rdsDBRecommendations"]))
     except Exception as e:
+        msg = str(e)
         logger.warning("RDS Compute Optimizer not available: %s", e)
-        if "OptInRequiredException" in str(e) or "not registered" in str(e):
+        if "OptInRequiredException" in msg or "not registered" in msg:
             recommendations.append(_compute_optimizer_opt_in_rec("RDS", "rightsizing"))
+        elif "AccessDenied" in msg or "UnauthorizedOperation" in msg:
+            ctx.permission_issue(
+                f"Compute Optimizer RDS recommendations denied: {msg}",
+                service="rds",
+                action="compute-optimizer:GetRDSDatabaseRecommendations",
+            )
+        else:
+            ctx.warn(f"Compute Optimizer RDS recommendations unavailable: {msg}", service="rds")
     return recommendations
 
 
