@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (RDS Aurora pricing — found via prod scan)
+- **Aurora snapshots priced at the Aurora backup rate (C-A1, CRITICAL)**. Aurora
+  cluster/DB snapshots were billed at the standard RDS rate ($0.095/GB-mo) instead
+  of Aurora's $0.021/GB-mo, inflating every Aurora snapshot saving ~4.5×. A real
+  eu-west-1 scan headline dropped from **$619.22 → $136.88/mo** after the fix.
+  `get_rds_backup_storage_price_per_gb(engine)` is now engine-aware and snapshots
+  carry `engine`/`rate` in their AuditBasis.
+- **Aurora storage mode pinned (M-A1)**. Instance pricing now selects Standard
+  ("EBS Only") vs I/O-Optimized ("Aurora IO Optimization Mode") from the cluster's
+  StorageType, so the two SKUs ($5.12 vs $6.656/hr for db.r5.8xlarge) no longer
+  collide non-deterministically.
+- **Aurora instance counting (L-A1)**. `aurora-mysql`/`aurora-postgresql` were
+  miscounted as MySQL/PostgreSQL (substring order); Aurora is now checked first.
+
 ### Fixed (RDS deep-audit second pass)
 - **SQL Server / Oracle edition pricing (N-H1)**. Instance pricing pinned only
   `databaseEngine`, so all editions collided and MaxResults returned one
