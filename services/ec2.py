@@ -171,19 +171,26 @@ _MEMORY_PRESSURE_PCT: float = 80.0
 # EC2 instance size ladder (small → large). Used to derive the "one size smaller"
 # rightsizing/burstable target so savings are the *actual* price delta between
 # the current and target size rather than an arbitrary reduction factor.
+#
+# Only sizes that exist across the vast majority of families are listed: the
+# uncommon rungs (3xlarge, 6xlarge, 9xlarge, 18xlarge — present on only a few
+# families) are deliberately omitted so the derived target is a real size for
+# most families (e.g. r5.4xlarge -> r5.2xlarge, not the non-existent r5.3xlarge).
+# A derived target that still doesn't exist for the family prices to 0 (quietly)
+# and the caller emits no finding.
 _SIZE_LADDER: tuple[str, ...] = (
     "nano", "micro", "small", "medium", "large", "xlarge",
-    "2xlarge", "3xlarge", "4xlarge", "6xlarge", "8xlarge", "9xlarge",
-    "12xlarge", "16xlarge", "18xlarge", "24xlarge", "32xlarge", "48xlarge",
+    "2xlarge", "4xlarge", "8xlarge", "12xlarge", "16xlarge", "24xlarge", "32xlarge", "48xlarge",
 )
 
 
 def _one_size_down(instance_type: str) -> str | None:
     """Return the next-smaller size in the same family, or None.
 
-    e.g. ``m5.xlarge`` -> ``m5.large``. Returns None for the smallest rung or an
-    unparseable type. If the derived target does not actually exist for the
-    family, the pricing lookup returns 0 and the caller emits no finding.
+    e.g. ``m5.xlarge`` -> ``m5.large``, ``r5.4xlarge`` -> ``r5.2xlarge``. Returns
+    None for the smallest rung or an unparseable type. The target is validated by
+    a (quiet) pricing lookup downstream, so a size that doesn't exist for the
+    family simply yields no finding.
     """
     if "." not in instance_type:
         return None
@@ -307,14 +314,21 @@ def _memory_used_percent(cloudwatch: Any, instance_id: str, start_time: Any, end
         return None
 
 
-def _ec2_hourly(ctx: ScanContext, instance_type: str, os_name: str, license_model: str) -> tuple[float, str]:
-    """Hourly price for (type, os, license) with Linux fallback. Returns (price, priced_os)."""
+def _ec2_hourly(
+    ctx: ScanContext, instance_type: str, os_name: str, license_model: str, quiet: bool = False
+) -> tuple[float, str]:
+    """Hourly price for (type, os, license) with Linux fallback. Returns (price, priced_os).
+
+    ``quiet=True`` is used for speculative target lookups (candidate rightsizing
+    types that may not exist for the family) so an expected miss does not emit a
+    pricing-fallback warning.
+    """
     if not ctx.pricing_engine:
         return 0.0, os_name
     priced_os = os_name
-    hourly = ctx.pricing_engine.get_ec2_hourly_price(instance_type, os_name, license_model)
+    hourly = ctx.pricing_engine.get_ec2_hourly_price(instance_type, os_name, license_model, quiet=quiet)
     if hourly <= 0.0 and os_name != "Linux":
-        hourly = ctx.pricing_engine.get_ec2_hourly_price(instance_type, "Linux")
+        hourly = ctx.pricing_engine.get_ec2_hourly_price(instance_type, "Linux", quiet=quiet)
         priced_os = "Linux"
     return hourly, priced_os
 
@@ -385,7 +399,7 @@ def _compute_ec2_savings(
             return 0.0, ""
 
         if target_type:
-            target_hourly, _ = _ec2_hourly(ctx, target_type, os_name, license_model)
+            target_hourly, _ = _ec2_hourly(ctx, target_type, os_name, license_model, quiet=True)
             if target_hourly <= 0.0 or target_hourly >= hourly:
                 # Target unpriced or not actually cheaper — emit nothing rather
                 # than fabricate a saving.
