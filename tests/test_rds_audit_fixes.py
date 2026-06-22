@@ -160,3 +160,66 @@ def test_adapter_real_co_rec_is_counted(monkeypatch):
     assert findings.total_recommendations == 1
     assert findings.sources["compute_optimizer"].count == 1
     assert findings.total_monthly_savings == pytest.approx(40.0)
+
+
+# --------------------------------------------------------------------------- #
+# Slice 2 — RDS pricing filters (M3 storage volumeType, M4 Multi-AZ deployment,
+# M2 deterministic backup engine pin)
+# --------------------------------------------------------------------------- #
+from core.pricing_engine import PricingEngine  # noqa: E402
+
+
+class _CapturingPricingClient:
+    """Fake boto3 pricing client recording the Filters of the last get_products call."""
+
+    def __init__(self):
+        self.last_filters: list[dict] = []
+
+    def get_products(self, ServiceCode, Filters, MaxResults=1):  # noqa: N803 (boto3 casing)
+        self.last_filters = Filters
+        return {"PriceList": []}  # empty -> engine falls back; we only inspect filters
+
+
+def _filter_value(filters: list[dict], field: str):
+    return next((f["Value"] for f in filters if f["Field"] == field), None)
+
+
+def _engine(client):
+    return PricingEngine("us-east-1", client, fallback_multiplier=1.0)
+
+
+def test_storage_filter_maps_gp3_volume_type():
+    client = _CapturingPricingClient()
+    _engine(client).get_rds_monthly_storage_price_per_gb("gp3")
+    assert _filter_value(client.last_filters, "volumeType") == "General Purpose-GP3"
+
+
+def test_storage_filter_maps_gp2_volume_type():
+    client = _CapturingPricingClient()
+    _engine(client).get_rds_monthly_storage_price_per_gb("gp2")
+    assert _filter_value(client.last_filters, "volumeType") == "General Purpose"
+
+
+def test_instance_filter_sqlserver_multiaz_uses_mirror_deployment():
+    client = _CapturingPricingClient()
+    _engine(client).get_rds_instance_monthly_price("sqlserver-se", "db.m5.large", multi_az=True)
+    assert _filter_value(client.last_filters, "deploymentOption") == "Multi-AZ (SQL Server Mirror)"
+
+
+def test_instance_filter_mysql_multiaz_uses_plain_multiaz():
+    client = _CapturingPricingClient()
+    _engine(client).get_rds_instance_monthly_price("mysql", "db.t3.medium", multi_az=True)
+    assert _filter_value(client.last_filters, "deploymentOption") == "Multi-AZ"
+
+
+def test_instance_filter_single_az():
+    client = _CapturingPricingClient()
+    _engine(client).get_rds_instance_monthly_price("mysql", "db.t3.medium", multi_az=False)
+    assert _filter_value(client.last_filters, "deploymentOption") == "Single-AZ"
+
+
+def test_backup_filter_pins_engine_for_determinism():
+    client = _CapturingPricingClient()
+    _engine(client).get_rds_backup_storage_price_per_gb()
+    assert _filter_value(client.last_filters, "databaseEngine") == "MySQL"
+    assert _filter_value(client.last_filters, "productFamily") == "Storage Snapshot"

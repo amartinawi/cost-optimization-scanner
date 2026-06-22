@@ -116,6 +116,36 @@ _RDS_LICENSE_INCLUDED_ENGINES: frozenset[str] = frozenset({
     "sqlserver-ee", "sqlserver-se", "sqlserver-ex", "sqlserver-web",
     "oracle-se2",
 })
+
+# RDS engines whose Multi-AZ deployment is published under the "SQL Server
+# Mirror" deploymentOption rather than plain "Multi-AZ" (verified via the
+# Pricing API: deploymentOption values include "Multi-AZ (SQL Server Mirror)").
+_RDS_SQLSERVER_ENGINES: frozenset[str] = frozenset({
+    "sqlserver-ee", "sqlserver-se", "sqlserver-ex", "sqlserver-web",
+})
+
+# RDS describe-API storage type -> AWS Pricing API 'volumeType' attribute value.
+# The Price List uses human-readable labels ("General Purpose", "General
+# Purpose-GP3", "Provisioned IOPS", "Provisioned IOPS-IO2"), NOT the gp2/gp3/io1
+# wire names — filtering with the raw upper-cased name never matches and silently
+# falls back. Verified via get_pricing_attribute_values('AmazonRDS','volumeType').
+_RDS_STORAGE_VOLUME_TYPES: dict[str, str] = {
+    "gp2": "General Purpose",
+    "gp3": "General Purpose-GP3",
+    "io1": "Provisioned IOPS",
+    "io2": "Provisioned IOPS-IO2",
+}
+
+
+def _rds_multi_az_deployment_option(engine: str, *, multi_az: bool) -> str:
+    """Return the Pricing API 'deploymentOption' value for an RDS engine.
+
+    SQL Server publishes Multi-AZ under "Multi-AZ (SQL Server Mirror)"; all other
+    engines use plain "Multi-AZ". Single-AZ is uniform across engines.
+    """
+    if not multi_az:
+        return "Single-AZ"
+    return "Multi-AZ (SQL Server Mirror)" if engine in _RDS_SQLSERVER_ENGINES else "Multi-AZ"
 FALLBACK_S3_GB_MONTH: dict[str, float] = {
     "STANDARD": 0.023,
     "STANDARD_IA": 0.0125,
@@ -636,7 +666,8 @@ class PricingEngine:
         filters = [
             {"Type": "TERM_MATCH", "Field": "instanceType", "Value": instance_class},
             {"Type": "TERM_MATCH", "Field": "databaseEngine", "Value": engine_label},
-            {"Type": "TERM_MATCH", "Field": "deploymentOption", "Value": "Multi-AZ" if multi_az else "Single-AZ"},
+            {"Type": "TERM_MATCH", "Field": "deploymentOption",
+             "Value": _rds_multi_az_deployment_option(engine, multi_az=multi_az)},
             {"Type": "TERM_MATCH", "Field": "licenseModel", "Value": license_model},
             {"Type": "TERM_MATCH", "Field": "location", "Value": self._display_name},
             {"Type": "TERM_MATCH", "Field": "productFamily", "Value": "Database Instance"},
@@ -646,18 +677,28 @@ class PricingEngine:
 
     def _fetch_rds_storage_price(self, storage_type: str, *, multi_az: bool = False) -> float | None:
         deployment_option = "Multi-AZ" if multi_az else "Single-AZ"
+        # Map the gp2/gp3/io1/io2 wire name to the Price List 'volumeType' label;
+        # the raw upper-cased name ("GP2") never matches and silently falls back.
+        volume_type_label = _RDS_STORAGE_VOLUME_TYPES.get(storage_type.lower(), storage_type)
         filters = [
             {"Type": "TERM_MATCH", "Field": "location", "Value": self._display_name},
             {"Type": "TERM_MATCH", "Field": "productFamily", "Value": "Database Storage"},
-            {"Type": "TERM_MATCH", "Field": "volumeType", "Value": storage_type.upper()},
+            {"Type": "TERM_MATCH", "Field": "volumeType", "Value": volume_type_label},
             {"Type": "TERM_MATCH", "Field": "deploymentOption", "Value": deployment_option},
         ]
         return self._call_pricing_api("AmazonRDS", filters)
 
     def _fetch_rds_backup_price(self) -> float | None:
+        # Pin databaseEngine to a standard (non-Aurora, non-Custom) engine so the
+        # MaxResults=1 lookup is deterministic: without it the loose filter could
+        # return the Aurora row ($0.021) or an RDS Custom row instead of the
+        # standard RDS backup rate ($0.095). All standard engines share the same
+        # rate, so MySQL is a safe representative. Aurora backup is priced
+        # differently and is not covered by this method (documented limitation).
         filters = [
             {"Type": "TERM_MATCH", "Field": "location", "Value": self._display_name},
             {"Type": "TERM_MATCH", "Field": "productFamily", "Value": "Storage Snapshot"},
+            {"Type": "TERM_MATCH", "Field": "databaseEngine", "Value": "MySQL"},
         ]
         return self._call_pricing_api("AmazonRDS", filters)
 
