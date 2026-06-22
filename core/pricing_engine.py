@@ -549,6 +549,12 @@ class PricingEngine:
     # ── Private fetch methods ─────────────────────────────────────────────────
 
     def _fetch_ec2_price(self, instance_type: str, os: str) -> float | None:
+        # licenseModel is pinned to "No License required" — the on-demand list
+        # price. Without it, Windows matches three SKUs (license-included
+        # $0.233, license-infra $0.141, BYOL $0.141) and MaxResults=1 would pick
+        # one non-deterministically. "No License required" is AWS's published
+        # on-demand rate (license included) and the correct default when the
+        # instance's licensing can't be inferred from DescribeInstances.
         filters = [
             {"Type": "TERM_MATCH", "Field": "instanceType", "Value": instance_type},
             {"Type": "TERM_MATCH", "Field": "location", "Value": self._display_name},
@@ -556,6 +562,7 @@ class PricingEngine:
             {"Type": "TERM_MATCH", "Field": "tenancy", "Value": "Shared"},
             {"Type": "TERM_MATCH", "Field": "capacityStatus", "Value": "Used"},
             {"Type": "TERM_MATCH", "Field": "preInstalledSw", "Value": "NA"},
+            {"Type": "TERM_MATCH", "Field": "licenseModel", "Value": "No License required"},
         ]
         return self._call_pricing_api("AmazonEC2", filters)
 

@@ -2308,28 +2308,20 @@ class HTMLReportGenerator:
             '</dl>'
         )
 
-        # Reconciliation footnote: only when per-service sum diverges from the
-        # headline by more than $1 (avoid noise from rounding).
+        # Reconciliation footnote: surface a divergence between the sum of the
+        # per-tab totals and the headline if one ever arises (> $1, to avoid
+        # rounding noise). De-duplication now happens inside each adapter, so the
+        # headline equals the sum of (already de-duplicated) per-service totals
+        # and this footnote is normally silent — it remains only as a guard that
+        # makes any future divergence visible rather than silent.
         dedup_delta = raw_per_service_sum - total_savings
         if dedup_delta > 1.0:
             out += (
                 '<p class="reconciliation-note">'
                 f"Per-tab sum: <strong>${raw_per_service_sum:,.2f}</strong> "
-                f"&minus; deduplication adjustment <strong>${dedup_delta:,.2f}</strong> "
-                f"(Cost Optimization Hub recommendations counted once across overlapping services) "
+                f"&minus; reconciliation <strong>${dedup_delta:,.2f}</strong> "
                 f"= headline <strong>${total_savings:,.2f}</strong>."
                 "</p>"
-            )
-
-        graviton_count = self._count_graviton_exclusions()
-        if graviton_count > 0:
-            out += (
-                '<div class="info-note"><p>'
-                '<svg class="icon icon-sm"><use href="#icon-clipboard"/></svg> '
-                f'Note: {graviton_count} Graviton migration recommendations excluded from '
-                'per-service detail. These require architecture-level review and are available '
-                'via AWS Compute Optimizer.'
-                '</p></div>'
             )
 
         out += "</section>"
@@ -2795,10 +2787,6 @@ class HTMLReportGenerator:
             '</div>'
         )
 
-        graviton_count = self._count_graviton_exclusions()
-        if graviton_count > 0:
-            content += f'<div class="info-note"><p><svg class="icon icon-sm"><use href="#icon-clipboard"/></svg> Note: {graviton_count} Graviton migration recommendations excluded from per-service detail. These require architecture-level review and are available via AWS Compute Optimizer.</p></div>'
-
         # Accessible data table fallback for the canvas charts — visually hidden
         # but read aloud by screen readers. PRODUCT.md commits to colorblind- and
         # SR-equivalent reads.
@@ -2950,37 +2938,28 @@ class HTMLReportGenerator:
         )
 
     def _filter_recommendations(self, service_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Filter out non-relevant recommendations like MigrateToGraviton"""
+        """Drop only non-actionable recommendations (OPTIMIZED findings).
+
+        MigrateToGraviton recommendations are NO LONGER excluded: they are
+        concrete, AWS-quantified savings (specific instance + target type) and
+        were previously counted in the headline but hidden from the detail,
+        producing service tabs that showed a savings figure but no cards. They
+        now render alongside other recommendations (with an ARM-compatibility
+        caveat in the renderer), so the counted total and the rendered detail
+        agree.
+        """
         filtered_data = copy.deepcopy(service_data)
 
         if "sources" in filtered_data:
             for source_name, source_data in filtered_data["sources"].items():
                 if "recommendations" in source_data:
-                    # Filter out MigrateToGraviton recommendations
                     original_recs = source_data["recommendations"]
+                    # Only OPTIMIZED findings carry no savings opportunity.
                     filtered_recs = [
-                        rec
-                        for rec in original_recs
-                        if isinstance(rec, dict) and rec.get("actionType") != "MigrateToGraviton"
+                        rec for rec in original_recs if isinstance(rec, dict) and rec.get("finding") != "OPTIMIZED"
                     ]
-                    filtered_recs = [
-                        rec for rec in filtered_recs if isinstance(rec, dict) and rec.get("finding") != "OPTIMIZED"
-                    ]
-
-                    # Update counts and savings
                     filtered_data["sources"][source_name]["recommendations"] = filtered_recs
                     filtered_data["sources"][source_name]["count"] = len(filtered_recs)
-
-                    # Recalculate total recommendations and savings
-                    if source_name == "cost_optimization_hub":
-                        graviton_savings = sum(
-                            rec.get("estimatedMonthlySavings", 0)
-                            for rec in original_recs
-                            if isinstance(rec, dict) and rec.get("actionType") == "MigrateToGraviton"
-                        )
-                        filtered_data["total_monthly_savings"] = max(
-                            0, filtered_data.get("total_monthly_savings", 0) - graviton_savings
-                        )
 
         # Recalculate total recommendations - only count sources with actual recommendations
         total_recs = 0
@@ -3009,16 +2988,6 @@ class HTMLReportGenerator:
                 filtered_data["total_monthly_savings"] = 0
 
         return filtered_data
-
-    def _count_graviton_exclusions(self) -> int:
-        count = 0
-        for service_data in self.scan_results.get("services", {}).values():
-            for source_data in service_data.get("sources", {}).values():
-                if isinstance(source_data, dict):
-                    for rec in source_data.get("recommendations", []):
-                        if isinstance(rec, dict) and rec.get("actionType") == "MigrateToGraviton":
-                            count += 1
-        return count
 
     def _get_affected_resources_list(self, service_key: str, service_data: Dict[str, Any]) -> str:
         """Get list of affected resources for each recommendation type"""

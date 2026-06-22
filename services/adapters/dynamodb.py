@@ -129,7 +129,24 @@ class DynamoDbModule(BaseServiceModule):
             rec["EstimatedMonthlySavings"] = round(rec_savings, 2)
             savings += rec_savings
 
-        total_recs = len(opt_opps) + len(enhanced_recs)
+        # AWS Cost Optimization Hub DynamoDBTable recommendations (e.g. capacity
+        # mode / reserved-capacity savings). Previously fetched by the orchestrator
+        # but dropped because no adapter consumed them. De-duplicate by table name
+        # against the higher-fidelity per-table checks above so a table covered by
+        # both is not counted twice.
+        covered_tables = {r.get("TableName") for r in opt_opps} | {r.get("TableName") for r in enhanced_recs}
+        covered_tables.discard(None)
+        cost_hub_recs = getattr(ctx, "cost_hub_splits", {}).get("dynamodb", [])
+        coh_kept: list[dict[str, Any]] = []
+        for rec in cost_hub_recs:
+            resource_id = str(rec.get("resourceId", "") or "")
+            table_name = resource_id.split("/")[-1] if resource_id else ""
+            if table_name and table_name in covered_tables:
+                continue
+            coh_kept.append(rec)
+            savings += float(rec.get("estimatedMonthlySavings", 0.0) or 0.0)
+
+        total_recs = len(opt_opps) + len(enhanced_recs) + len(coh_kept)
 
         return ServiceFindings(
             service_name="DynamoDB",
@@ -138,6 +155,7 @@ class DynamoDbModule(BaseServiceModule):
             sources={
                 "dynamodb_table_analysis": SourceBlock(count=len(opt_opps), recommendations=tuple(opt_opps)),
                 "enhanced_checks": SourceBlock(count=len(enhanced_recs), recommendations=tuple(enhanced_recs)),
+                "cost_optimization_hub": SourceBlock(count=len(coh_kept), recommendations=tuple(coh_kept)),
             },
             optimization_descriptions=get_dynamodb_optimization_descriptions(),
             total_count=dynamodb_data.get("total_tables", 0),

@@ -59,6 +59,7 @@ class ScanOrchestrator:
             "redshift",
             "s3",
             "eks",
+            "dynamodb",
             # Catch ECS / EKS service-level recs and any cross-service CoH
             # findings that previously lived in the dedicated CoH tab.
             "containers",
@@ -89,6 +90,7 @@ class ScanOrchestrator:
             "RedshiftCluster": "redshift",
             "S3Bucket": "s3",
             "EksCluster": "eks",
+            "DynamoDBTable": "dynamodb",
             # ECS / container-level
             "EcsService": "containers",
             "EcsTask": "containers",
@@ -105,15 +107,28 @@ class ScanOrchestrator:
             "EC2InstanceSavingsPlans": "commitment_analysis",
             "SageMakerSavingsPlans": "commitment_analysis",
         }
+        # A full scan selects every module; a focused --scan-only run selects a
+        # subset. Cost Optimization Hub returns recommendations for the whole
+        # account in one call, so on a focused scan most rows belong to services
+        # the user deliberately excluded.
+        is_full_scan = selected >= {m.key for m in self.modules}
+
         unbucketed_types: set[str] = set()
         for rec in all_recs:
             rec_type = rec.get("currentResourceType", "")
             bucket = type_map.get(rec_type, "")
             if bucket and bucket in splits:
-                splits[bucket].append(rec)
+                # Only retain recommendations for services actually being scanned;
+                # the rest would have no tab to render in a focused scan.
+                if bucket in selected:
+                    splits[bucket].append(rec)
             else:
                 unbucketed_types.add(rec_type or "<unknown>")
-        if unbucketed_types:
+
+        # Only surface the "dropped type" gap on a full scan. In a focused scan
+        # the dropped types almost always belong to unselected services, so the
+        # warning would be misleading noise (e.g. a DynamoDB rec during --scan-only ec2).
+        if unbucketed_types and is_full_scan:
             self.ctx.warn(
                 f"Cost Optimization Hub: {len(unbucketed_types)} recommendation "
                 f"type(s) had no service bucket and were dropped: "

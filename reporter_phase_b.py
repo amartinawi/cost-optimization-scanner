@@ -27,28 +27,12 @@ def _render_ec2_enhanced_checks(recommendations: List[Rec], source_name: str, se
     """Renders EC2 enhanced-check recommendations grouped by category. Called by: HTMLReportGenerator._get_detailed_recommendations."""
     grouped_recs: Dict[str, List[Rec]] = {}
     for rec in recommendations:
-        resource_id = rec.get(
-            "InstanceId",
-            rec.get(
-                "ImageId",
-                rec.get("AllocationId", rec.get("ResourceId", rec.get("resourceId", "Resource"))),
-            ),
-        )
-        resource_name = rec.get("Name", rec.get("ResourceName", ""))
-
-        all_text = f"{resource_id} {resource_name}".lower()
-        if (
-            "ecs-cluster" in all_text
-            or "/cronjob" in all_text
-            or "forwarder" in all_text
-            or "lambda" in all_text
-            or "ecs" in all_text
-        ):
-            continue
-
-        # Spot-related recommendations are intentionally rendered: they count
-        # toward total_recommendations and total_monthly_savings at the adapter
-        # layer, so dropping them here would desync the headline from the table.
+        # NOTE: every rec reaching this renderer was already counted toward
+        # total_recommendations and total_monthly_savings by the EC2 adapter.
+        # Dropping recs here (by name substring, etc.) would desync the rendered
+        # table from the tab's headline savings, so we render whatever we are
+        # given. EKS-managed instances are already excluded upstream in the
+        # adapter's scan; no name-substring filtering happens here.
         finding = rec.get("finding", rec.get("instanceFinding", rec.get("InstanceFinding", ""))).lower()
         if finding == "optimized":
             continue
@@ -72,6 +56,8 @@ def _render_ec2_enhanced_checks(recommendations: List[Rec], source_name: str, se
             details: List[str] = []
             if instance_type:
                 details.append(instance_type)
+            if rec.get("OS"):
+                details.append(rec["OS"])
             if rec.get("AvgCPU"):
                 details.append(f"avg CPU {rec['AvgCPU']}")
             if rec.get("MaxCPU"):
@@ -89,21 +75,14 @@ def _render_ec2_cost_hub(recommendations: List[Rec], source_name: str, service_d
     for rec in recommendations:
         if "actionType" not in rec:
             continue
+        # ECS service/cluster recs belong to the containers tab, not EC2.
         resource_details = rec.get("currentResourceDetails", {})
         if "ecsService" in resource_details or "ecsCluster" in resource_details:
             continue
-        resource_id = rec.get("resourceId", "N/A")
-        resource_name = rec.get("Name", rec.get("ResourceName", ""))
-        all_text = f"{resource_id} {resource_name}".lower()
-        if (
-            "ecs-cluster" in all_text
-            or "/cronjob" in all_text
-            or "forwarder" in all_text
-            or "lambda" in all_text
-            or "ecs" in all_text
-        ):
-            continue
-        # Spot recs are kept (adapter already counted them); see _render_ec2_enhanced_checks.
+        # NOTE: no name-substring filtering here — every rec was already counted
+        # toward the EC2 tab's savings/count by the adapter, so dropping recs at
+        # render time would leave the headline savings unbacked by visible cards
+        # (the bug that hid the whole EC2 tab when all findings were Graviton).
         finding = rec.get("finding", "").lower()
         if finding == "optimized":
             continue
@@ -136,12 +115,24 @@ def _render_ec2_cost_hub(recommendations: List[Rec], source_name: str, service_d
                 .get("instance", {})
                 .get("type", "N/A")
             )
+            # Fall back to the top-level resource-type fields (always present on
+            # Cost Hub recs, including Graviton migrations) when the nested
+            # configuration block is absent.
+            if current_type == "N/A":
+                current_type = rec.get("currentResourceType", "N/A")
+            if rec_type == "N/A":
+                rec_type = rec.get("recommendedResourceType", "N/A")
             savings = rec.get("estimatedMonthlySavings", 0)
+            caveat = (
+                " — requires ARM/Graviton compatibility review"
+                if rec.get("actionType") == "MigrateToGraviton"
+                else ""
+            )
 
             if current_type != "N/A" and rec_type != "N/A":
-                content += f"<li>{resource_id}: {current_type} → {rec_type} (${savings:.2f}/month)</li>"
+                content += f"<li>{resource_id}: {current_type} → {rec_type} (${savings:.2f}/month){caveat}</li>"
             else:
-                content += f"<li>{resource_id} (${savings:.2f}/month)</li>"
+                content += f"<li>{resource_id} (${savings:.2f}/month){caveat}</li>"
         content += "</ul></div>"
     return content
 
@@ -2205,6 +2196,7 @@ PHASE_B_HANDLERS: Dict[Tuple[str, str], Callable] = {
     ("s3", "s3_bucket_analysis"): _render_s3_bucket_analysis,
     ("dynamodb", "enhanced_checks"): _render_dynamodb_enhanced_checks,
     ("dynamodb", "dynamodb_table_analysis"): _render_dynamodb_enhanced_checks,
+    ("dynamodb", "cost_optimization_hub"): _render_cost_hub_source,
     ("containers", "enhanced_checks"): _render_containers_enhanced_checks,
     ("elasticache", "enhanced_checks"): _render_elasticache_enhanced_checks,
     ("opensearch", "enhanced_checks"): _render_opensearch_enhanced_checks,

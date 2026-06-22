@@ -12,6 +12,8 @@ from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Any
 
+from botocore.exceptions import ClientError  # type: ignore[import-untyped]
+
 
 @dataclass(frozen=True)
 class TrendAnalysisResult:
@@ -224,9 +226,29 @@ def analyze_spend_trends(ctx: Any, days_back: int = 90) -> TrendAnalysisResult:
             fastest_growing=tuple(fastest_growing),
         )
 
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "")
+        print(f"🔍 [core/trend_analysis.py] Trend analysis failed: {type(exc).__name__}: {exc}")
+        print(f"🔍 [core/trend_analysis.py] Full traceback:\n{traceback.format_exc()}")
+        # Record the failure so the missing spend trend is visible in the report
+        # and scan_doctor rather than only printed to the console.
+        if code in ("AccessDenied", "AccessDeniedException", "UnauthorizedOperation"):
+            ctx.permission_issue(
+                f"Cost Explorer spend-trend unavailable ({code}); executive-summary trend omitted",
+                service="trend_analysis",
+                action="ce:GetCostAndUsage",
+            )
+        else:
+            ctx.warn(
+                f"Cost Explorer spend-trend unavailable ({code or type(exc).__name__})",
+                service="trend_analysis",
+            )
+        return _empty_trend(days_back)
+
     except Exception as exc:
         print(f"🔍 [core/trend_analysis.py] Trend analysis failed: {type(exc).__name__}: {exc}")
         print(f"🔍 [core/trend_analysis.py] Full traceback:\n{traceback.format_exc()}")
+        ctx.warn(f"Cost Explorer spend-trend unavailable ({type(exc).__name__})", service="trend_analysis")
         return _empty_trend(days_back)
 
 

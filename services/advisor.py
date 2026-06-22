@@ -90,16 +90,26 @@ def get_detailed_cost_hub_recommendations(
 def get_ec2_compute_optimizer_recommendations(
     ctx: ScanContext,
 ) -> list[dict[str, Any]]:
-    """Get EC2 recommendations from Compute Optimizer."""
+    """Get EC2 recommendations from Compute Optimizer.
+
+    Instances whose ``finding`` is ``Optimized`` carry no savings opportunity and
+    are dropped here so they do not inflate the EC2 recommendation count (the
+    reporter already filters them at render time; filtering at the source keeps
+    the counted total and the rendered table in agreement).
+    """
     compute_optimizer = ctx.client("compute-optimizer")
     recommendations: list[dict[str, Any]] = []
+
+    def _actionable(recs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [r for r in recs if str(r.get("finding", "")).lower() != "optimized"]
+
     try:
         response = compute_optimizer.get_ec2_instance_recommendations()
-        recommendations.extend(response["instanceRecommendations"])
+        recommendations.extend(_actionable(response["instanceRecommendations"]))
 
         while response.get("nextToken"):
             response = compute_optimizer.get_ec2_instance_recommendations(nextToken=response["nextToken"])
-            recommendations.extend(response["instanceRecommendations"])
+            recommendations.extend(_actionable(response["instanceRecommendations"]))
     except Exception as e:
         logger.warning("Compute Optimizer not available: %s", e)
         if "OptInRequiredException" in str(e) or "not registered" in str(e):
