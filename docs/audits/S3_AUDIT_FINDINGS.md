@@ -115,6 +115,28 @@ to the resource's home region (shared global pricing client, separate
 region-correct cache). `_s3_price_per_gb` and `_calculate_s3_storage_cost` now
 price at `bucket_region`. Reusable by any adapter with cross-region resources.
 
+### 🟠 S3-J — `REGION_DISPLAY_NAMES` EU naming made cross-region lookups fall back
+**Found during validation of the post-S3-I report.** Once S3-I started pricing
+buckets at their home region, eu-central-1 and eu-west-2 buckets silently fell
+back to the us-east-1 constant ($0.023) instead of live regional pricing. Root
+cause: the AWS **Price List API** names older EU regions `"EU (Frankfurt)"` /
+`"EU (London)"` etc., but `REGION_DISPLAY_NAMES` had `"Europe (Frankfurt)"` /
+`"Europe (London)"` — the `location` filter matched nothing and every lookup fell
+back. Pre-existing and **cross-service** (verified identical for
+AmazonS3 / AmazonEC2 / AmazonRDS, 2026-06-23): any *direct* scan of those regions
+mis-priced too; S3-I merely surfaced it.
+
+**Fix**: corrected `REGION_DISPLAY_NAMES` for the five older EU regions to the
+`"EU (X)"` form (London, Paris, Frankfurt, Stockholm, Milan). Ireland already
+used `"EU (Ireland)"`; the two newest regions genuinely use `"Europe (X)"`
+(`eu-central-2` Zurich, `eu-south-2` Spain) and are unchanged. Locked by
+`test_eu_region_display_names_match_price_list_api`.
+
+**Impact on the validated report**: the one credited bucket
+(`360mea-medialive-main-frankfurt`, eu-central-1) was **understated** — reported
+$35.34 (fallback $0.0105 delta) vs correct **$37.03** (live Frankfurt
+$0.0245 − $0.0135 = $0.0110); current cost $77.42 → $82.47.
+
 ---
 
 ## 2. New / changed symbols

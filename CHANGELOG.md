@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (pricing — EU region Price List names, audit S3-J)
+- **`REGION_DISPLAY_NAMES` corrected for older EU regions.** The AWS Price List
+  API names them `"EU (Frankfurt|London|Paris|Stockholm|Milan)"`, but the map had
+  `"Europe (...)"`, so every pricing lookup for those regions silently fell back
+  to us-east-1 constants (verified cross-service: S3/EC2/RDS). Surfaced once S3-I
+  began pricing buckets at their home region — the credited eu-central-1 bucket
+  was understated ($35.34 → correct $37.03; live Frankfurt $0.0245−$0.0135).
+  `eu-central-2` (Zurich) and `eu-south-2` (Spain) genuinely use `"Europe (...)"`
+  and are unchanged. Locked by `test_eu_region_display_names_match_price_list_api`.
+
 ### Changed (S3 adapter — cost-fidelity remediation, audit `docs/audits/S3_AUDIT_FINDINGS.md`)
 - **Evidence-gated savings replace assumed percentages (S3-A/S3-B).** Removed
   `S3_SAVINGS_FACTORS` (0.30/0.20/0.40 "assume ~65% IA-eligible"). A bucket now
