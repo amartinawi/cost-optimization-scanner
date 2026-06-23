@@ -694,10 +694,10 @@ def _render_s3_bucket_analysis(recommendations: List[Rec], source_name: str, ser
     """Renders S3 bucket-level recommendations grouped by optimisation type.
 
     Handles the ``s3_bucket_analysis`` source shape (Name + SizeGB +
-    EstimatedMonthlyCost + SavingsDelta). Per-group savings sum the
-    per-bucket ``SavingsDelta`` values computed by ``services/s3.py`` from
-    ``S3_SAVINGS_FACTORS`` (audit L2-S3-001) — replaces the legacy hard-coded
-    "40-95%" prose strings.
+    EstimatedMonthlyCost + SavingsDelta). Per-group savings sum the per-bucket
+    ``SavingsDelta`` values, which ``services/s3.py`` computes as the evidence-
+    gated Standard→Standard-IA delta on cold Standard bytes (audit S3-A/S3-B).
+    Buckets with a config gap but no access evidence render as $0 advisories.
 
     Called by: HTMLReportGenerator._get_detailed_recommendations.
     """
@@ -769,9 +769,16 @@ def _render_s3_bucket_analysis(recommendations: List[Rec], source_name: str, ser
             content += (
                 f'<p class="savings"><strong>Estimated Savings:</strong> ${total_savings:.2f}/month</p>'
             )
-        else:
+        elif group_name == "Static Website Optimization":
             content += (
                 '<p class="savings"><strong>Estimated Savings:</strong> $0.00/month — data transfer dependent</p>'
+            )
+        else:
+            # Honest advisory: a config gap with no cold-access evidence is not
+            # a quantified saving (audit S3-B/S3-C).
+            content += (
+                '<p class="savings"><strong>Estimated Savings:</strong> $0.00/month — advisory; '
+                "enable S3 Storage Class Analysis or request metrics to quantify</p>"
             )
 
         if total_cost > 0:
@@ -789,6 +796,12 @@ def _render_s3_bucket_analysis(recommendations: List[Rec], source_name: str, ser
                 if bucket_savings > 0:
                     content += f", save ${bucket_savings:.2f}/month"
                 content += ")"
+            if bucket_savings > 0 and bucket.get("PricingBasis"):
+                content += f" — <em>{bucket['PricingBasis']}</em>"
+            elif bucket.get("Advisory"):
+                content += " — <em>advisory: no access-pattern evidence</em>"
+            if bucket.get("FastModeWarning"):
+                content += " — <em>fast mode: size sampled, may be understated</em>"
             content += "</li>"
         content += "</ul></div>"
     return content

@@ -124,6 +124,74 @@ class TestPricingEngine:
         engine = _make_engine(api_return=None)
         assert engine.get_s3_monthly_price_per_gb("STANDARD") == FALLBACK_S3_GB_MONTH["STANDARD"]
 
+    def test_s3_standard_selects_base_tier_not_first_dimension(self):
+        """Audit S3-D — pick the beginRange==0 tier ($0.023), not whichever
+        priceDimension the API serializes first ($0.022)."""
+        price_item = {
+            "product": {"attributes": {"usagetype": "TimedStorage-ByteHrs"}},
+            "terms": {
+                "OnDemand": {
+                    "SKU.TERM": {
+                        "priceDimensions": {
+                            # Deliberately list the $0.022 "next 450 TB" tier first.
+                            "d1": {"beginRange": "51200", "pricePerUnit": {"USD": "0.0220000000"}},
+                            "d2": {"beginRange": "512000", "pricePerUnit": {"USD": "0.0210000000"}},
+                            "d3": {"beginRange": "0", "pricePerUnit": {"USD": "0.0230000000"}},
+                        }
+                    }
+                }
+            },
+        }
+        mock_client = MagicMock()
+        mock_client.get_products.return_value = {"PriceList": [json.dumps(price_item)]}
+        engine = PricingEngine("us-east-1", mock_client)
+        assert engine.get_s3_monthly_price_per_gb("STANDARD") == pytest.approx(0.023)
+
+    def test_for_region_same_region_returns_self(self):
+        engine = _make_engine(api_return=None)
+        assert engine.for_region("us-east-1") is engine
+
+    def test_for_region_builds_and_caches_sibling(self):
+        """Audit S3-I — a sibling engine prices at the requested region and is cached."""
+        engine = _make_engine(api_return=None)
+        sib = engine.for_region("eu-central-1")
+        assert sib is not engine
+        assert sib._region == "eu-central-1"
+        assert sib._display_name == "Europe (Frankfurt)"
+        # Same client reused; sibling cached (identity stable across calls).
+        assert sib._pricing is engine._pricing
+        assert engine.for_region("eu-central-1") is sib
+
+    def test_for_region_uses_target_region_location_filter(self):
+        """The sibling must query the target region's location, not the scan region."""
+        mock_client = MagicMock()
+        mock_client.get_products.return_value = {"PriceList": []}
+        engine = PricingEngine("ap-south-1", mock_client)
+        engine.for_region("us-east-1").get_s3_monthly_price_per_gb("STANDARD")
+        # The most recent get_products call must filter on US East (N. Virginia).
+        _, kwargs = mock_client.get_products.call_args
+        locations = [f["Value"] for f in kwargs["Filters"] if f["Field"] == "location"]
+        assert locations == ["US East (N. Virginia)"]
+
+    def test_s3_skips_staging_and_overhead_rows(self):
+        """Audit S3-E/S3-D — select the timed *storage* SKU, not Staging/Overhead."""
+        staging = {
+            "product": {"attributes": {"usagetype": "TimedStorage-GDA-Staging"}},
+            "terms": {"OnDemand": {"S.T": {"priceDimensions": {
+                "d": {"beginRange": "0", "pricePerUnit": {"USD": "0.0210000000"}}}}}},
+        }
+        storage = {
+            "product": {"attributes": {"usagetype": "TimedStorage-GDA-ByteHrs"}},
+            "terms": {"OnDemand": {"S.T": {"priceDimensions": {
+                "d": {"beginRange": "0", "pricePerUnit": {"USD": "0.0009900000"}}}}}},
+        }
+        mock_client = MagicMock()
+        mock_client.get_products.return_value = {
+            "PriceList": [json.dumps(staging), json.dumps(storage)]
+        }
+        engine = PricingEngine("us-east-1", mock_client)
+        assert engine.get_s3_monthly_price_per_gb("DEEP_ARCHIVE") == pytest.approx(0.00099)
+
     def test_ebs_iops_fallback(self):
         engine = _make_engine(api_return=None)
         assert engine.get_ebs_iops_monthly_price("io1") == FALLBACK_EBS_IOPS_MONTH["io1"]

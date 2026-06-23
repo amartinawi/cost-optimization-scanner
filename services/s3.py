@@ -87,27 +87,28 @@ S3_STORAGE_COSTS: dict[str, float] = {
 
 S3_INTELLIGENT_TIERING_MONITORING_FEE: float = 0.0025
 
-# Per-opportunity savings factors applied to a bucket's current monthly storage
-# cost. Replaces the legacy blanket × 0.40 multiplier flagged in audit
-# L2-S3-001. Values are conservative midpoints grounded in AWS S3 docs:
+# Evidence-gated savings model (audit S3-B). The legacy S3_SAVINGS_FACTORS
+# (0.30 / 0.20 / 0.40) assumed an access pattern — "~65% IA-eligible" — with no
+# evidence the data was actually cold, and applied that fraction to a cost base
+# that itself charged every byte at the Standard rate (audit S3-A). Both are
+# removed.
 #
-# - lifecycle_missing: Standard → IA after 30 days saves
-#   (0.023 − 0.0125)/0.023 ≈ 45.6% on the transitioned slice. Assuming ~65% of
-#   bucket data is IA-eligible (industry-typical for general-purpose buckets)
-#   the conservative bucket-level reduction is ~0.30.
-# - intelligent_tiering: AWS documents 20-40% savings for variable access
-#   patterns; conservative midpoint 0.20.
-# - both_missing: combined effect dominated by lifecycle; capped at 0.40 to
-#   avoid double-counting overlapping savings.
-# - static_website: storage-class change does not apply; CloudFront data
-#   transfer savings are usage-dependent — emit as $0.00/month informational.
-S3_SAVINGS_FACTORS: dict[str, float] = {
-    "lifecycle_missing": 0.30,
-    "intelligent_tiering": 0.20,
-    "both_missing": 0.40,
-    "static_website": 0.0,
-    "other": 0.0,
-}
+# Replacement: a bucket only earns a concrete dollar saving when (a) it holds
+# bytes in S3 Standard that a lifecycle/Intelligent-Tiering transition could
+# move, AND (b) CloudWatch S3 *request metrics* show the bucket received zero
+# GET requests over the lookback window (i.e. the data is demonstrably cold).
+# The saving is then the real Standard→Standard-IA rate delta on the Standard
+# bytes — account-specific, grounded in measured size and live pricing. When no
+# access-pattern evidence exists (request metrics not enabled, or fast mode),
+# the finding is emitted as a $0.00 advisory pointing at Storage Class Analysis
+# rather than inventing a dollar figure.
+COLD_LOOKBACK_DAYS: int = 30
+
+# Opportunity classes that represent a transition gap a lifecycle policy or
+# Intelligent-Tiering could close (and therefore may carry real savings).
+_GAP_OPPORTUNITY_CLASSES: frozenset[str] = frozenset(
+    {"both_missing", "lifecycle_missing", "intelligent_tiering"}
+)
 
 # Bucket-error classifier — used by all bucket-level S3 calls to route
 # AccessDenied / AllAccessDisabled / 403 through ctx.permission_issue and
@@ -162,6 +163,14 @@ def _route_bucket_error(
         return
     logger.debug("S3 %s error on bucket %s: %s", action, bucket_name, exc)
 
+# Fallback-only relative-price multipliers vs us-east-1, used solely when the
+# PricingEngine is unavailable (audit S3-G). The authoritative path is
+# ``PricingEngine.get_s3_monthly_price_per_gb`` (region-correct live pricing);
+# these estimates are a last resort. Key drift is tolerated: newer-region
+# entries use "GLACIER" while older entries use "GLACIER_FLEXIBLE_RETRIEVAL" /
+# "GLACIER_INSTANT_RETRIEVAL", but every Glacier multiplier is 1.0, so a missed
+# lookup falls through to 1.0 with no effect. Only the STANDARD/IA multipliers
+# materially affect the fallback path.
 S3_REGIONAL_MULTIPLIERS: dict[str, dict[str, float]] = {
     "us-east-1": {
         "STANDARD": 1.0,
@@ -529,8 +538,10 @@ S3_OPTIMIZATION_DESCRIPTIONS: dict[str, dict[str, str]] = {
         "action": (
             "1. Review buckets without lifecycle policies\n"
             "2. Enable Intelligent-Tiering for variable access patterns\n"
-            "3. Transition old data to lower-cost storage classes\n"
-            "4. Estimated savings: 40-95% depending on optimization type"
+            "3. Transition cold data to lower-cost storage classes\n"
+            "4. Quantified savings shown are the Standard->Standard-IA delta on"
+            " bytes proven cold by request metrics; enable S3 Storage Class"
+            " Analysis to quantify advisory buckets"
         ),
     },
     "enhanced_checks": {
@@ -611,25 +622,12 @@ def _calculate_s3_storage_cost(
 ) -> float:
     """Return monthly storage cost for ``size_gb`` in ``storage_class`` and ``region``.
 
-    Uses ``PricingEngine`` (live) when available; falls back to module-const
-    rates × regional multiplier. ``_SC_MAP`` normalizes storage-class names so
-    that lookups against both ``S3_STORAGE_COSTS`` and
-    ``S3_REGIONAL_MULTIPLIERS`` share a single namespace (audit L2-S3-004).
+    Thin wrapper over ``_s3_price_per_gb`` (which prices at ``region`` via a
+    region-correct ``PricingEngine``, audit S3-I, and falls back to module-const
+    rates × regional multiplier). Used by the fast-mode single-class estimate.
     """
     try:
-        engine_key = _SC_MAP.get(storage_class, storage_class)
-        if ctx and ctx.pricing_engine:
-            price = ctx.pricing_engine.get_s3_monthly_price_per_gb(engine_key)
-            return round(size_gb * price, 2)
-        base_cost = S3_STORAGE_COSTS.get(storage_class, S3_STORAGE_COSTS["STANDARD"])
-        # Regional multipliers index by the same engine_key so the
-        # GLACIER_FLEXIBLE_RETRIEVAL vs GLACIER spelling drift no longer hides
-        # the multiplier in regions that use the legacy key.
-        regional_multiplier = (
-            S3_REGIONAL_MULTIPLIERS.get(region, {}).get(engine_key)
-            or S3_REGIONAL_MULTIPLIERS.get(region, {}).get(storage_class, 1.0)
-        )
-        return round(size_gb * base_cost * regional_multiplier, 2)
+        return round(size_gb * _s3_price_per_gb(ctx, storage_class, region), 2)
     except Exception as e:
         logger.debug("S3 storage cost calc failed for %s/%s: %s", region, storage_class, e)
         return round(size_gb * S3_STORAGE_COSTS["STANDARD"], 2)
@@ -651,10 +649,12 @@ def _is_static_website_bucket(bucket_name: str, s3_client: Any) -> bool:
 
 
 def _classify_opportunities(bucket_info: dict[str, Any]) -> str:
-    """Return the ``S3_SAVINGS_FACTORS`` key matching this bucket's gaps.
+    """Return the opportunity-class label matching this bucket's config gaps.
 
-    Resolves the per-opportunity savings model that replaces the legacy
-    blanket × 0.40 factor (audit L2-S3-001).
+    Used to group buckets in the report and to decide which buckets are
+    eligible for an evidence-gated saving (see ``_GAP_OPPORTUNITY_CLASSES``).
+    Returns ``static_website``, ``both_missing``, ``lifecycle_missing``,
+    ``intelligent_tiering``, or ``other`` (fully optimized).
     """
     has_lifecycle = bucket_info.get("HasLifecyclePolicy", False)
     has_tiering = bucket_info.get("HasIntelligentTiering", False)
@@ -670,106 +670,133 @@ def _classify_opportunities(bucket_info: dict[str, Any]) -> str:
     return "other"
 
 
-def _estimate_s3_bucket_cost(
+# CloudWatch BucketSizeBytes `StorageType` dimension → our storage-class key.
+_CW_STORAGE_TYPE_TO_CLASS: dict[str, str] = {
+    "StandardStorage": "STANDARD",
+    "StandardIAStorage": "STANDARD_IA",
+    "OneZoneIAStorage": "ONEZONE_IA",
+    "GlacierStorage": "GLACIER",
+    "DeepArchiveStorage": "DEEP_ARCHIVE",
+    "IntelligentTieringStorage": "INTELLIGENT_TIERING",
+}
+
+
+def _s3_price_per_gb(ctx: ScanContext | None, storage_class: str, region: str) -> float:
+    """Return the unrounded $/GB-month rate for ``storage_class`` in ``region``.
+
+    Uses a ``PricingEngine`` scoped to ``region`` via ``for_region`` so a bucket
+    is priced at its OWN home region, not the scan region (audit S3-I) — S3 is
+    global and buckets routinely live elsewhere. Falls back to the module
+    constant × regional multiplier when no engine is available. Returns the raw
+    per-GB rate (no rounding) so cheap classes (e.g. Deep Archive $0.00099)
+    survive multiplication.
+    """
+    engine_key = _SC_MAP.get(storage_class, storage_class)
+    try:
+        if ctx and ctx.pricing_engine:
+            # Price at the BUCKET's home region, not the scan region — S3 is
+            # global and buckets routinely live elsewhere (audit S3-I).
+            engine = ctx.pricing_engine.for_region(region)
+            price = engine.get_s3_monthly_price_per_gb(engine_key)
+            if price > 0:
+                return price
+    except Exception as e:  # noqa: BLE001 — pricing must never crash a scan
+        logger.debug("S3 per-GB price lookup failed for %s in %s: %s", engine_key, region, e)
+    base_cost = S3_STORAGE_COSTS.get(storage_class, S3_STORAGE_COSTS["STANDARD"])
+    regional_multiplier = (
+        S3_REGIONAL_MULTIPLIERS.get(region, {}).get(engine_key)
+        or S3_REGIONAL_MULTIPLIERS.get(region, {}).get(storage_class, 1.0)
+    )
+    return base_cost * regional_multiplier
+
+
+def _cost_from_class_sizes(
+    ctx: ScanContext | None,
+    region: str,
+    class_sizes: dict[str, float],
+) -> float:
+    """Monthly storage cost summed across each class at its OWN rate.
+
+    Replaces the legacy path that priced every byte at the Standard rate
+    regardless of the bucket's actual storage-class mix (audit S3-A) — a bucket
+    already in Glacier/Deep-Archive was over-stated by up to ~23×.
+    """
+    total = 0.0
+    for storage_class, size_gb in class_sizes.items():
+        if size_gb and size_gb > 0:
+            total += size_gb * _s3_price_per_gb(ctx, storage_class, region)
+    return round(total, 2)
+
+
+def _assess_bucket_coldness(
     ctx: ScanContext,
     bucket_name: str,
-    size_gb: float,
+    s3_client: Any,
     bucket_region: str,
-) -> float:
+) -> str:
+    """Classify a bucket's access pattern from measured evidence.
+
+    Returns one of:
+
+    - ``"cold"``  — CloudWatch S3 request metrics are enabled for the whole
+      bucket AND recorded zero GET requests over ``COLD_LOOKBACK_DAYS``. The
+      data is demonstrably untouched, so a lifecycle/Intelligent-Tiering
+      transition to Infrequent Access saves money without incurring retrieval.
+    - ``"warm"`` — request metrics show GET activity; an IA transition could
+      add retrieval/per-request cost, so no storage saving is credited.
+    - ``"unknown"`` — no request-metrics evidence is available (the feature is
+      off, or access was denied). The caller emits a $0 advisory rather than a
+      fabricated dollar figure (audit S3-B).
+
+    This is the only access-pattern signal the scanner reads directly; S3
+    Storage Class Analysis exports its results to a destination bucket and
+    cannot be read inline, so it is surfaced as an advisory pointer instead.
+    """
     try:
-        cloudwatch = _bucket_cloudwatch_client(ctx, bucket_region)
-        if cloudwatch is None:
-            # Region marked dead earlier in the scan — fall through to size-only fallback.
-            raise ConnectTimeoutError(endpoint_url=f"monitoring.{bucket_region}.amazonaws.com")
+        metrics_response = s3_client.list_bucket_metrics_configurations(Bucket=bucket_name)
+    except Exception as e:  # noqa: BLE001
+        _route_bucket_error(ctx, bucket_name, e, action="s3:GetMetricsConfiguration")
+        return "unknown"
 
-        storage_classes = [
-            "StandardStorage",
-            "StandardIAStorage",
-            "OneZoneIAStorage",
-            "GlacierStorage",
-            "DeepArchiveStorage",
-            "IntelligentTieringStorage",
-        ]
+    configs = metrics_response.get("MetricsConfigurationList", [])
+    # An entire-bucket request-metrics filter (no Filter key, or an explicit
+    # whole-bucket filter) is required to reason about total access.
+    filter_ids = [
+        c["Id"]
+        for c in configs
+        if "Filter" not in c or not c.get("Filter")
+    ]
+    if not filter_ids:
+        return "unknown"
 
-        total_cost: float = 0
-        total_accounted_gb: float = 0
+    cloudwatch = _bucket_cloudwatch_client(ctx, bucket_region)
+    if cloudwatch is None:
+        return "unknown"
 
-        for storage_class in storage_classes:
-            try:
-                response = cloudwatch.get_metric_statistics(
-                    Namespace="AWS/S3",
-                    MetricName="BucketSizeBytes",
-                    Dimensions=[
-                        {"Name": "BucketName", "Value": bucket_name},
-                        {"Name": "StorageType", "Value": storage_class},
-                    ],
-                    StartTime=datetime.now(UTC) - timedelta(days=2),
-                    EndTime=datetime.now(UTC),
-                    Period=86400,
-                    Statistics=["Average"],
-                )
-
-                if response["Datapoints"]:
-                    class_size_gb = response["Datapoints"][-1]["Average"] / (1024**3)
-                    total_accounted_gb += class_size_gb
-
-                    cost_key = {
-                        "StandardStorage": "STANDARD",
-                        "StandardIAStorage": "STANDARD_IA",
-                        "OneZoneIAStorage": "ONEZONE_IA",
-                        "GlacierStorage": "GLACIER",
-                        "DeepArchiveStorage": "DEEP_ARCHIVE",
-                        "IntelligentTieringStorage": "INTELLIGENT_TIERING",
-                    }.get(storage_class, "STANDARD")
-
-                    base_cost = S3_STORAGE_COSTS.get(
-                        cost_key, S3_STORAGE_COSTS.get("GLACIER_FLEXIBLE_RETRIEVAL", S3_STORAGE_COSTS["STANDARD"])
-                    )
-                    if ctx.pricing_engine:
-                        regional_cost = ctx.pricing_engine.get_s3_monthly_price_per_gb(cost_key)
-                    else:
-                        regional_multiplier = S3_REGIONAL_MULTIPLIERS.get(bucket_region, {}).get(cost_key, 1.0)
-                        regional_cost = base_cost * regional_multiplier
-                    storage_cost = class_size_gb * regional_cost
-
-                    # Intelligent-Tiering monitoring fee depends on real object
-                    # count ($0.0025 per 1000 objects/month). The legacy heuristic
-                    # of class_size_gb × 1000 (audit L2-S3-005) silently invents
-                    # a number; without a CloudWatch NumberOfObjects metric we
-                    # omit the fee rather than guess. Buckets with many small
-                    # objects will be slightly under-estimated; large-object
-                    # buckets will be on the nose.
-                    total_cost += storage_cost
-
-            except Exception as e:
-                if _is_endpoint_unreachable(e):
-                    _mark_region_dead(ctx, bucket_region, f"S3 cost-estimate for {bucket_name}/{storage_class}")
-                    break  # Stop iterating storage classes — endpoint is gone.
-                logger.debug("Error calculating S3 costs for %s: %s", bucket_name, e)
-                continue
-
-        if total_accounted_gb < size_gb * 0.1:
-            if ctx.pricing_engine:
-                total_cost = size_gb * ctx.pricing_engine.get_s3_monthly_price_per_gb("STANDARD")
+    total_get_requests = 0.0
+    for filter_id in filter_ids:
+        try:
+            response = cloudwatch.get_metric_statistics(
+                Namespace="AWS/S3",
+                MetricName="GetRequests",
+                Dimensions=[
+                    {"Name": "BucketName", "Value": bucket_name},
+                    {"Name": "FilterId", "Value": filter_id},
+                ],
+                StartTime=datetime.now(UTC) - timedelta(days=COLD_LOOKBACK_DAYS),
+                EndTime=datetime.now(UTC),
+                Period=86400,
+                Statistics=["Sum"],
+            )
+        except Exception as e:  # noqa: BLE001
+            if _is_endpoint_unreachable(e):
+                _mark_region_dead(ctx, bucket_region, f"S3 request metrics for {bucket_name}")
             else:
-                base_cost = S3_STORAGE_COSTS["STANDARD"]
-                regional_multiplier = S3_REGIONAL_MULTIPLIERS.get(bucket_region, {}).get("STANDARD", 1.0)
-                regional_cost = base_cost * regional_multiplier
-                total_cost = size_gb * regional_cost
+                logger.debug("S3 GetRequests metric error on %s: %s", bucket_name, e)
+            return "unknown"
+        total_get_requests += sum(dp.get("Sum", 0.0) for dp in response.get("Datapoints", []))
 
-        return round(total_cost, 2)
-
-    except Exception as e:
-        if _is_endpoint_unreachable(e):
-            _mark_region_dead(ctx, bucket_region, f"S3 cost-estimate outer for {bucket_name}")
-        else:
-            logger.debug("S3 storage cost calc outer error for %s: %s", bucket_name, e)
-        if ctx.pricing_engine:
-            return round(size_gb * ctx.pricing_engine.get_s3_monthly_price_per_gb("STANDARD"), 2)
-        base_cost = S3_STORAGE_COSTS["STANDARD"]
-        regional_multiplier = S3_REGIONAL_MULTIPLIERS.get(bucket_region, {}).get("STANDARD", 1.0)
-        regional_cost = base_cost * regional_multiplier
-        return round(size_gb * regional_cost, 2)
+    return "cold" if total_get_requests == 0 else "warm"
 
 
 def get_s3_bucket_analysis(
@@ -779,10 +806,17 @@ def get_s3_bucket_analysis(
 ) -> dict[str, Any]:
     """Scan every accessible S3 bucket and emit per-bucket recommendations.
 
-    Each bucket's ``SavingsDelta`` is derived from a per-opportunity factor
-    (``S3_SAVINGS_FACTORS``) applied to the bucket's estimated monthly storage
-    cost — see ``_classify_opportunities``. Replaces the legacy blanket
-    ``× 0.40`` multiplier flagged in audit L2-S3-001.
+    Cost (``EstimatedMonthlyCost``) is summed per storage class at each class's
+    own live rate — a bucket already in Glacier/Deep-Archive is no longer priced
+    as Standard (audit S3-A).
+
+    ``SavingsDelta`` is evidence-gated (audit S3-B): a bucket earns a concrete
+    dollar only when it holds S3 Standard bytes a lifecycle/Intelligent-Tiering
+    transition could move AND CloudWatch request metrics show those bytes are
+    cold (zero GET requests over ``COLD_LOOKBACK_DAYS``); the saving is the real
+    Standard→Standard-IA rate delta on those bytes. Buckets with a config gap
+    but no access-pattern evidence are emitted as ``$0.00`` advisories. The old
+    assumed-percentage factors (0.30/0.20/0.40) are gone.
 
     Note: ``pricing_multiplier`` is accepted for ABI compatibility with the
     adapter signature. Per-storage-class costs come from ``PricingEngine``
@@ -885,23 +919,19 @@ def get_s3_bucket_analysis(
 
                     total_size_gb = 0
                     region_dead_mid_loop = False
-                    storage_classes = [
-                        "StandardStorage",
-                        "StandardIAStorage",
-                        "OneZoneIAStorage",
-                        "GlacierStorage",
-                        "DeepArchiveStorage",
-                        "IntelligentTieringStorage",
-                    ]
+                    # Per-class GB, keyed by our storage-class keys. Drives both
+                    # the cost (each class at its own rate, audit S3-A) and the
+                    # Standard-bytes-only savings model (audit S3-B).
+                    class_sizes: dict[str, float] = {}
 
-                    for storage_class in storage_classes:
+                    for cw_storage_type, class_key in _CW_STORAGE_TYPE_TO_CLASS.items():
                         try:
                             size_response = bucket_cloudwatch_client.get_metric_statistics(
                                 Namespace="AWS/S3",
                                 MetricName="BucketSizeBytes",
                                 Dimensions=[
                                     {"Name": "BucketName", "Value": bucket_name},
-                                    {"Name": "StorageType", "Value": storage_class},
+                                    {"Name": "StorageType", "Value": cw_storage_type},
                                 ],
                                 StartTime=datetime.now(UTC) - timedelta(days=2),
                                 EndTime=datetime.now(UTC),
@@ -910,20 +940,21 @@ def get_s3_bucket_analysis(
                             )
                             if size_response["Datapoints"]:
                                 class_size_gb = size_response["Datapoints"][-1]["Average"] / (1024**3)
+                                class_sizes[class_key] = class_size_gb
                                 total_size_gb += class_size_gb
                         except Exception as e:
                             if _is_endpoint_unreachable(e):
                                 _mark_region_dead(
                                     ctx,
                                     bucket_region,
-                                    f"S3 size metric for {bucket_name}/{storage_class}",
+                                    f"S3 size metric for {bucket_name}/{cw_storage_type}",
                                 )
                                 region_dead_mid_loop = True
                                 break  # Stop iterating storage classes for this bucket.
                             logger.debug(
                                 "Error getting S3 metrics for %s/%s: %s",
                                 bucket_name,
-                                storage_class,
+                                cw_storage_type,
                                 e,
                             )
                             continue
@@ -936,8 +967,10 @@ def get_s3_bucket_analysis(
                     if total_size_gb > 0:
                         bucket_info["SizeBytes"] = int(total_size_gb * (1024**3))
                         bucket_info["SizeGB"] = total_size_gb
-                        bucket_info["EstimatedMonthlyCost"] = _calculate_s3_storage_cost(
-                            total_size_gb, "STANDARD", bucket_region, ctx=ctx
+                        bucket_info["ClassSizes"] = class_sizes
+                        bucket_info["StandardGB"] = class_sizes.get("STANDARD", 0.0)
+                        bucket_info["EstimatedMonthlyCost"] = _cost_from_class_sizes(
+                            ctx, bucket_region, class_sizes
                         )
 
                 except Exception as e:
@@ -998,13 +1031,33 @@ def get_s3_bucket_analysis(
                     "High priority: No cost optimization configured"
                 )
 
-            # Per-opportunity savings: classify the bucket's gap and apply the
-            # matching factor from S3_SAVINGS_FACTORS. Replaces blanket × 0.40.
+            # Evidence-gated savings (audit S3-A + S3-B). A bucket earns a
+            # concrete dollar only when it has Standard bytes a transition could
+            # move AND request metrics prove those bytes are cold. Otherwise it
+            # is a $0 advisory — never a fabricated figure.
             opportunity_key = _classify_opportunities(bucket_info)
-            factor = S3_SAVINGS_FACTORS.get(opportunity_key, 0.0)
-            cost = bucket_info.get("EstimatedMonthlyCost", 0) or 0
-            if bucket_info["OptimizationOpportunities"] and factor > 0:
-                savings = round(cost * factor, 2)
+            bucket_info["OpportunityClass"] = opportunity_key
+            standard_gb = bucket_info.get("StandardGB", 0.0) or 0.0
+            has_gap = opportunity_key in _GAP_OPPORTUNITY_CLASSES
+
+            savings = 0.0
+            if has_gap and standard_gb > 0 and not fast_mode:
+                coldness = _assess_bucket_coldness(
+                    ctx, bucket_name, bucket_s3_client, bucket_region
+                )
+                bucket_info["AccessSignal"] = coldness
+                if coldness == "cold":
+                    std_rate = _s3_price_per_gb(ctx, "STANDARD", bucket_region)
+                    ia_rate = _s3_price_per_gb(ctx, "STANDARD_IA", bucket_region)
+                    delta = max(std_rate - ia_rate, 0.0)
+                    savings = round(standard_gb * delta, 2)
+                    bucket_info["PricingBasis"] = (
+                        f"{standard_gb:.1f} GB in S3 Standard x ${delta:.4f}/GB "
+                        f"Standard->Standard-IA delta; 0 GET requests over "
+                        f"{COLD_LOOKBACK_DAYS}d (request metrics)"
+                    )
+
+            if savings > 0:
                 bucket_info["SavingsDelta"] = savings
                 bucket_info["EstimatedSavings"] = f"${savings:.2f}/month"
             else:
@@ -1013,9 +1066,16 @@ def get_s3_bucket_analysis(
                     bucket_info["EstimatedSavings"] = (
                         "$0.00/month - data transfer dependent (CloudFront CDN)"
                     )
+                elif has_gap and (standard_gb > 0 or fast_mode):
+                    # Real transition gap, but no cold-access evidence (metrics
+                    # off, or fast-mode sample) — advise, don't invent dollars.
+                    bucket_info["Advisory"] = True
+                    bucket_info["EstimatedSavings"] = (
+                        "$0.00/month - enable S3 Storage Class Analysis or request "
+                        "metrics to quantify (no access-pattern evidence)"
+                    )
                 else:
                     bucket_info["EstimatedSavings"] = "$0.00/month"
-            bucket_info["OpportunityClass"] = opportunity_key
 
             bucket_metrics.append(bucket_info)
             analysis["optimization_opportunities"].append(bucket_info)

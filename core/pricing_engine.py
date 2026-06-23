@@ -205,6 +205,23 @@ FALLBACK_S3_GB_MONTH: dict[str, float] = {
     "GLACIER": 0.0036,
     "DEEP_ARCHIVE": 0.00099,
     "INTELLIGENT_TIERING": 0.023,
+    "EXPRESS_ONE_ZONE": 0.11,
+}
+
+# Caller storage-class key → AWS Pricing API `volumeType` value. The Pricing
+# API `storageClass` attribute is ambiguous (e.g. "Archive" covers both
+# Glacier Flexible Retrieval and Deep Archive), so we pin `volumeType` instead
+# and then select the timed-storage row (audit S3-E). INTELLIGENT_TIERING maps
+# to its Frequent Access tier — the rate an active object is billed at.
+_S3_VOLUME_TYPE_BY_CLASS: dict[str, str] = {
+    "STANDARD": "Standard",
+    "STANDARD_IA": "Standard - Infrequent Access",
+    "ONEZONE_IA": "One Zone - Infrequent Access",
+    "GLACIER_IR": "Glacier Instant Retrieval",
+    "GLACIER": "Amazon Glacier",
+    "DEEP_ARCHIVE": "Glacier Deep Archive",
+    "INTELLIGENT_TIERING": "Intelligent-Tiering Frequent Access",
+    "EXPRESS_ONE_ZONE": "Express One Zone",
 }
 FALLBACK_EFS_GB_MONTH: float = 0.30
 # EFS $/GB-month by storage class (us-east-1 On-Demand, verified via Pricing API
@@ -289,12 +306,35 @@ class PricingEngine:
         self._fallback_multiplier = fallback_multiplier
         self._cache = PricingCache()
         self.warnings: list[str] = []
+        # Lazily-built sibling engines for OTHER regions, sharing the (global)
+        # pricing client but each with its own region-scoped cache. Lets adapters
+        # price cross-region resources (e.g. S3 buckets, which are global) at the
+        # resource's home-region rate instead of the scan region's (audit S3-I).
+        self._siblings: dict[str, PricingEngine] = {}
         self._stats: dict[str, int] = {
             "api_calls": 0,
             "cache_hits": 0,
             "fallbacks": 0,
             "api_errors": 0,
         }
+
+    def for_region(self, region_code: str) -> "PricingEngine":
+        """Return a ``PricingEngine`` scoped to ``region_code``.
+
+        Returns ``self`` when ``region_code`` matches this engine's region;
+        otherwise returns a cached sibling that reuses the same global pricing
+        client but keeps a separate region-correct cache. Sibling engines use a
+        neutral ``fallback_multiplier`` of 1.0 (the scan-region multiplier does
+        not apply to other regions); the live Pricing API path is region-correct
+        regardless.
+        """
+        if region_code == self._region:
+            return self
+        sibling = self._siblings.get(region_code)
+        if sibling is None:
+            sibling = PricingEngine(region_code, self._pricing, fallback_multiplier=1.0)
+            self._siblings[region_code] = sibling
+        return sibling
 
     # ── Observability ─────────────────────────────────────────────────────────
 
@@ -937,21 +977,61 @@ class PricingEngine:
         return self._call_pricing_api("AmazonRDS", filters)
 
     def _fetch_s3_price(self, storage_class: str) -> float | None:
-        storage_class_map = {
-            "STANDARD": "General Purpose",
-            "STANDARD_IA": "Infrequent Access",
-            "ONEZONE_IA": "One Zone - Infrequent Access",
-            "GLACIER_IR": "Amazon Glacier Instant Retrieval",
-            "GLACIER": "Amazon Glacier Flexible Retrieval",
-            "DEEP_ARCHIVE": "Amazon Glacier Deep Archive",
-            "INTELLIGENT_TIERING": "Intelligent-Tiering",
-        }
-        storage_class_label = storage_class_map.get(storage_class, "General Purpose")
+        """$/GB-month for an S3 storage class via the Pricing API.
+
+        Pins ``volumeType`` + ``productFamily=Storage`` and then selects the
+        timed-storage row (excluding Staging/Overhead SKUs) and its base usage
+        tier (``beginRange == "0"``). The previous implementation filtered on
+        ``storageClass`` alone with ``MaxResults=1``, which (a) returned an
+        arbitrary tiered dimension — $0.022 instead of the $0.023 marginal
+        Standard rate (audit S3-D) — and (b) used ``storageClass`` labels that
+        don't exist as attribute values for Glacier/One-Zone classes, silently
+        falling back to constants (audit S3-E).
+        """
+        volume_type = _S3_VOLUME_TYPE_BY_CLASS.get(storage_class, "Standard")
         filters = [
             {"Type": "TERM_MATCH", "Field": "location", "Value": self._display_name},
-            {"Type": "TERM_MATCH", "Field": "storageClass", "Value": storage_class_label},
+            {"Type": "TERM_MATCH", "Field": "productFamily", "Value": "Storage"},
+            {"Type": "TERM_MATCH", "Field": "volumeType", "Value": volume_type},
         ]
-        return self._call_pricing_api("AmazonS3", filters)
+        return self._select_s3_storage_rate(filters)
+
+    def _select_s3_storage_rate(self, filters: list[dict]) -> float | None:
+        """Pick the canonical timed-storage $/GB-month from S3 Pricing results.
+
+        S3 returns several SKUs per ``volumeType`` (timed storage, staging,
+        per-object overhead, retrieval). We keep only the ``TimedStorage*``
+        storage SKU (skipping Staging/Overhead) and read its base usage tier.
+        """
+        key_fields = {f["Field"]: f["Value"] for f in filters if f["Field"] not in _LOG_SKIP_FIELDS}
+        try:
+            resp = self._pricing.get_products(
+                ServiceCode="AmazonS3",
+                Filters=filters,
+                MaxResults=100,
+            )
+            self._stats["api_calls"] += 1
+            price_list = resp.get("PriceList", [])
+            if not price_list:
+                logger.debug("pricing:GetProducts  AmazonS3  %s  → no results", key_fields)
+                return None
+            for raw in price_list:
+                item = json.loads(raw)
+                usagetype = item.get("product", {}).get("attributes", {}).get("usagetype", "")
+                if "TimedStorage" not in usagetype:
+                    continue
+                if "Staging" in usagetype or "Overhead" in usagetype:
+                    continue
+                price = _extract_s3_base_rate(item)
+                if price is not None:
+                    logger.debug("pricing:GetProducts  AmazonS3  %s  → $%.6f", key_fields, price)
+                    return price
+            logger.debug("pricing:GetProducts  AmazonS3  %s  → no timed-storage row", key_fields)
+            return None
+        except Exception as exc:
+            self._stats["api_errors"] += 1
+            logger.debug("pricing:GetProducts  AmazonS3  %s  → FAILED: %s", key_fields, exc)
+            return None
 
     def _fetch_msk_broker_price(self, instance_type: str) -> float | None:
         filters = [
@@ -1123,6 +1203,32 @@ def _extract_usd(price_item: dict) -> float | None:
         dimension = next(iter(term["priceDimensions"].values()))
         usd_str = dimension["pricePerUnit"].get("USD", "0")
         value = float(usd_str)
+        return value if value > 0 else None
+    except (KeyError, StopIteration, ValueError):
+        return None
+
+
+def _extract_s3_base_rate(price_item: dict) -> float | None:
+    """Return the base-tier ($/GB-month) OnDemand rate for an S3 storage SKU.
+
+    S3 Standard (and the Intelligent-Tiering Frequent Access tier) encode
+    volume-tiered pricing as multiple ``priceDimensions`` within one OnDemand
+    term (first 50 TB / next 450 TB / over 500 TB). We deliberately select the
+    base tier (``beginRange == "0"``, e.g. $0.023) rather than whichever
+    dimension the API happens to serialize first (audit S3-D).
+    """
+    try:
+        on_demand = price_item["terms"]["OnDemand"]
+        term = next(iter(on_demand.values()))
+        dimensions = term["priceDimensions"]
+        chosen = None
+        for dim in dimensions.values():
+            if dim.get("beginRange") == "0":
+                chosen = dim
+                break
+        if chosen is None:
+            chosen = next(iter(dimensions.values()))
+        value = float(chosen["pricePerUnit"].get("USD", "0"))
         return value if value > 0 else None
     except (KeyError, StopIteration, ValueError):
         return None

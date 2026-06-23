@@ -7,38 +7,105 @@ import pytest
 from services._savings import parse_dollar_savings
 from services.adapters.s3 import _DEDICATED_CATEGORIES, S3Module
 from services.s3 import (
-    S3_SAVINGS_FACTORS,
+    _GAP_OPPORTUNITY_CLASSES,
+    _assess_bucket_coldness,
     _classify_opportunities,
+    _cost_from_class_sizes,
     _is_access_denied,
+    _s3_price_per_gb,
 )
 
 
-class TestS3SavingsFactors:
-    """Audit L2-S3-001 — replaces the legacy blanket × 0.40 multiplier."""
+class TestPerClassCosting:
+    """Audit S3-A — cost each storage class at its OWN rate, not all at Standard."""
 
-    def test_factor_dict_completeness(self):
-        """All four opportunity classes plus the 'other' sentinel must exist."""
-        assert set(S3_SAVINGS_FACTORS) == {
+    def test_price_per_gb_standard(self):
+        # Fallback path (ctx=None) → module constant × us-east-1 multiplier (1.0).
+        assert _s3_price_per_gb(None, "STANDARD", "us-east-1") == pytest.approx(0.023)
+
+    def test_price_per_gb_deep_archive_not_rounded_to_zero(self):
+        """Cheap classes must survive (no premature rounding)."""
+        assert _s3_price_per_gb(None, "DEEP_ARCHIVE", "us-east-1") == pytest.approx(0.00099)
+
+    def test_cost_sums_each_class_at_own_rate(self):
+        """A mostly-Deep-Archive bucket must NOT be priced as if all Standard."""
+        class_sizes = {"STANDARD": 100.0, "DEEP_ARCHIVE": 1000.0}
+        cost = _cost_from_class_sizes(None, "us-east-1", class_sizes)
+        # Correct: 100×0.023 + 1000×0.00099 = 2.30 + 0.99 = 3.29
+        assert cost == pytest.approx(3.29)
+        # Legacy STANDARD-only bug would have produced 1100×0.023 = 25.30.
+        assert cost < 25.30
+
+    def test_empty_classes_cost_zero(self):
+        assert _cost_from_class_sizes(None, "us-east-1", {}) == 0.0
+
+
+class TestEvidenceGatedSavingsClasses:
+    """Audit S3-B — only transition-gap classes are savings-eligible."""
+
+    def test_gap_classes_are_the_transitionable_ones(self):
+        assert _GAP_OPPORTUNITY_CLASSES == {
+            "both_missing",
             "lifecycle_missing",
             "intelligent_tiering",
-            "both_missing",
-            "static_website",
-            "other",
         }
 
-    def test_factors_are_bounded(self):
-        """No factor exceeds the legacy 0.40 cap (audit anchor)."""
-        for key, value in S3_SAVINGS_FACTORS.items():
-            assert 0.0 <= value <= 0.40, f"{key} = {value} out of bounds"
+    def test_static_website_is_not_a_gap_class(self):
+        assert "static_website" not in _GAP_OPPORTUNITY_CLASSES
 
-    def test_static_website_factor_is_zero(self):
-        """Static-website CloudFront savings are data-transfer dependent — must not invent storage savings."""
-        assert S3_SAVINGS_FACTORS["static_website"] == 0.0
+    def test_other_is_not_a_gap_class(self):
+        assert "other" not in _GAP_OPPORTUNITY_CLASSES
 
-    def test_both_missing_dominates(self):
-        """Both-missing should be ≥ either single-gap class."""
-        assert S3_SAVINGS_FACTORS["both_missing"] >= S3_SAVINGS_FACTORS["lifecycle_missing"]
-        assert S3_SAVINGS_FACTORS["both_missing"] >= S3_SAVINGS_FACTORS["intelligent_tiering"]
+
+class TestColdnessAssessment:
+    """Audit S3-B — coldness is read from request metrics, never assumed."""
+
+    def _ctx(self):
+        from unittest.mock import MagicMock
+        return MagicMock()
+
+    def test_no_metrics_config_is_unknown(self):
+        from unittest.mock import MagicMock
+        s3_client = MagicMock()
+        s3_client.list_bucket_metrics_configurations.return_value = {"MetricsConfigurationList": []}
+        assert _assess_bucket_coldness(self._ctx(), "b", s3_client, "us-east-1") == "unknown"
+
+    def test_access_denied_is_unknown(self):
+        from unittest.mock import MagicMock
+        s3_client = MagicMock()
+        s3_client.list_bucket_metrics_configurations.side_effect = Exception("AccessDenied")
+        assert _assess_bucket_coldness(self._ctx(), "b", s3_client, "us-east-1") == "unknown"
+
+    def test_filtered_only_config_is_unknown(self):
+        """A metrics config scoped to a prefix can't speak for the whole bucket."""
+        from unittest.mock import MagicMock
+        s3_client = MagicMock()
+        s3_client.list_bucket_metrics_configurations.return_value = {
+            "MetricsConfigurationList": [{"Id": "prefixed", "Filter": {"Prefix": "logs/"}}]
+        }
+        assert _assess_bucket_coldness(self._ctx(), "b", s3_client, "us-east-1") == "unknown"
+
+    def test_zero_get_requests_is_cold(self, monkeypatch):
+        from unittest.mock import MagicMock
+        s3_client = MagicMock()
+        s3_client.list_bucket_metrics_configurations.return_value = {
+            "MetricsConfigurationList": [{"Id": "EntireBucket"}]
+        }
+        cw = MagicMock()
+        cw.get_metric_statistics.return_value = {"Datapoints": []}
+        monkeypatch.setattr("services.s3._bucket_cloudwatch_client", lambda *a, **k: cw)
+        assert _assess_bucket_coldness(self._ctx(), "b", s3_client, "us-east-1") == "cold"
+
+    def test_nonzero_get_requests_is_warm(self, monkeypatch):
+        from unittest.mock import MagicMock
+        s3_client = MagicMock()
+        s3_client.list_bucket_metrics_configurations.return_value = {
+            "MetricsConfigurationList": [{"Id": "EntireBucket"}]
+        }
+        cw = MagicMock()
+        cw.get_metric_statistics.return_value = {"Datapoints": [{"Sum": 4200.0}]}
+        monkeypatch.setattr("services.s3._bucket_cloudwatch_client", lambda *a, **k: cw)
+        assert _assess_bucket_coldness(self._ctx(), "b", s3_client, "us-east-1") == "warm"
 
 
 class TestClassifyOpportunities:
@@ -177,8 +244,11 @@ class TestAdapterSavingsAggregation:
             lambda *_a, **_k: enhanced_result,
         )
         findings = S3Module().scan(self._ctx())
-        # 1 from bucket_analysis + 2 non-dedicated enhanced = 3
-        assert findings.total_recommendations == 3
+        # Count hygiene (audit S3-C): only the $30 savings-bearing bucket counts;
+        # the two $0 informational enhanced checks are advisory, not counted.
+        assert findings.total_recommendations == 1
+        assert findings.sources["enhanced_checks"].count == 2  # still rendered
+        assert findings.extras["advisory_count"] == 2
         # bucket_analysis contributes $30; enhanced informational both parse to 0
         assert findings.total_monthly_savings == pytest.approx(30.0)
 
@@ -213,6 +283,8 @@ class TestAdapterSavingsAggregation:
         findings = S3Module().scan(self._ctx())
         # If the bug were back: 1000 × 0.40 = 400. With the fix: 0.0.
         assert findings.total_monthly_savings == 0.0
+        # And a $0 bucket is not a counted recommendation (audit S3-C).
+        assert findings.total_recommendations == 0
 
 
 class TestEnhancedSavingsStringsParse:

@@ -48,9 +48,10 @@ class S3Module(BaseServiceModule):
         Per-source savings:
 
         - **s3_bucket_analysis**: dedicated dollar source. Each bucket's
-          ``SavingsDelta`` is derived from a per-opportunity factor
-          (``S3_SAVINGS_FACTORS``) applied to its CloudWatch-derived monthly
-          storage cost — replaces the legacy blanket × 0.40 multiplier.
+          ``SavingsDelta`` is evidence-gated — the real Standard→Standard-IA
+          rate delta on its measured Standard bytes, credited only when request
+          metrics show the data is cold (audit S3-A/S3-B). Buckets with a config
+          gap but no access evidence are $0 advisories.
         - **enhanced_checks**: config-pattern flags (multipart uploads,
           versioning, replication, server-access logs, empty buckets).
           Every record carries a parseable ``EstimatedSavings`` string; the
@@ -72,8 +73,7 @@ class S3Module(BaseServiceModule):
             if r.get("CheckCategory") not in _DEDICATED_CATEGORIES
         ]
 
-        # Dedicated source — real per-opportunity dollars, no arbitrary
-        # factor fallback (audit L2-S3-001).
+        # Dedicated source — real evidence-gated dollars (audit S3-A/S3-B).
         savings = sum(float(rec.get("SavingsDelta", 0.0) or 0.0) for rec in opt_opps)
         # Enhanced checks contribute only via parseable EstimatedSavings; the
         # informational $0.00/month form parses to 0.0 (audit L2-S3-002).
@@ -81,7 +81,20 @@ class S3Module(BaseServiceModule):
             parse_dollar_savings(rec.get("EstimatedSavings", "")) for rec in other_recs
         )
 
-        total_recs = len(opt_opps) + len(other_recs)
+        # Count hygiene (audit S3-C): only recommendations that carry a concrete
+        # dollar saving count toward total_recommendations. Advisory/visibility
+        # records (static-website, no-evidence gaps, $0 enhanced checks) remain
+        # in the source blocks for the report but must not inflate the headline.
+        savings_bearing_buckets = sum(
+            1 for rec in opt_opps if float(rec.get("SavingsDelta", 0.0) or 0.0) > 0
+        )
+        savings_bearing_enhanced = sum(
+            1 for rec in other_recs if parse_dollar_savings(rec.get("EstimatedSavings", "")) > 0
+        )
+        total_recs = savings_bearing_buckets + savings_bearing_enhanced
+        advisory_count = (len(opt_opps) - savings_bearing_buckets) + (
+            len(other_recs) - savings_bearing_enhanced
+        )
 
         return ServiceFindings(
             service_name="S3",
@@ -109,6 +122,10 @@ class S3Module(BaseServiceModule):
                     "without_intelligent_tiering": len(
                         s3_data.get("buckets_without_intelligent_tiering", [])
                     ),
-                }
+                },
+                # Records shown for visibility but excluded from
+                # total_recommendations because they carry no concrete $ saving
+                # (audit S3-C).
+                "advisory_count": advisory_count,
             },
         )
