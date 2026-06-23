@@ -114,6 +114,34 @@ def _backup_rate(ctx: ScanContext, engine: str | None, pricing_multiplier: float
     is_aurora = (engine or "").lower().startswith("aurora")
     return (0.021 if is_aurora else 0.095) * pricing_multiplier
 
+
+def _snapshot_savings_text(size_gb: float, rate: float) -> tuple[str, str, float]:
+    """Build (EstimatedSavings, AuditBasis formula, savings) for a snapshot finding.
+
+    - Size unreported (0/None): AWS does not return the snapshot's size for some
+      snapshots (notably Aurora cluster snapshots), so the saving cannot be
+      quantified — emit an ADVISORY string (no ``$``) instead of a misleading
+      ``$0.00`` finding (audit B1/B2). The snapshot still bills for backup storage.
+    - Size present: the figure is an UPPER BOUND — it uses the provisioned/allocated
+      size, but AWS bills snapshots on actual (compressed/incremental) bytes, which
+      are typically lower (audit B3).
+    """
+    if not size_gb or size_gb <= 0:
+        return (
+            "advisory — snapshot size not reported by the API; delete to stop "
+            "backup charges (quantify in console)",
+            "size not reported by API; not quantifiable at scan time",
+            0.0,
+        )
+    savings = size_gb * rate
+    return (
+        f"${savings:.2f}/month (upper bound — provisioned size; "
+        "actual backup bytes are typically lower)",
+        f"{size_gb}GB x ${rate:.4f}/GB-mo (provisioned-size upper bound)",
+        savings,
+    )
+
+
 RDS_OPTIMIZATION_DESCRIPTIONS: dict[str, dict[str, str]] = {
     "idle_databases": {
         "title": "Stop or Delete Idle RDS Instances",
@@ -647,7 +675,9 @@ def get_enhanced_rds_checks(
                         age_days = (datetime.now(create_time.tzinfo) - create_time).days
                         if age_days > old_snapshot_days:
                             snap_rate = _backup_rate(ctx, snap_engine, pricing_multiplier)
-                            snap_savings = snap_allocated_storage * snap_rate
+                            snap_est, snap_formula, _snap_sv = _snapshot_savings_text(
+                                snap_allocated_storage, snap_rate
+                            )
                             checks["old_snapshots"].append(
                                 {
                                     "SnapshotId": snapshot_id,
@@ -660,7 +690,7 @@ def get_enhanced_rds_checks(
                                         " snapshot (savings based on"
                                         " allocated storage estimate)"
                                     ),
-                                    "EstimatedSavings": f"${snap_savings:.2f}/month (coarse estimate)",
+                                    "EstimatedSavings": snap_est,
                                     "CheckCategory": "Old RDS Snapshots",
                                     "instanceFinding": (f"{age_days} days old ({snap_allocated_storage}GB)"),
                                     "AuditBasis": {
@@ -671,10 +701,7 @@ def get_enhanced_rds_checks(
                                         "metric_window": (
                                             f"describe-API snapshot age {age_days}d > {old_snapshot_days}d threshold"
                                         ),
-                                        "formula": (
-                                            f"{snap_allocated_storage}GB x ${snap_rate:.4f}/GB-mo "
-                                            "(allocated-size estimate, coarse)"
-                                        ),
+                                        "formula": snap_formula,
                                     },
                                 }
                             )
@@ -709,7 +736,9 @@ def get_enhanced_rds_checks(
                             age_days = (datetime.now(create_time.tzinfo) - create_time).days
                             if age_days > old_snapshot_days:
                                 snap_rate = _backup_rate(ctx, snap_engine, pricing_multiplier)
-                                snap_savings = cluster_allocated_storage * snap_rate
+                                snap_est, snap_formula, _snap_sv = _snapshot_savings_text(
+                                    cluster_allocated_storage, snap_rate
+                                )
                                 checks["old_snapshots"].append(
                                     {
                                         "SnapshotId": snapshot_id,
@@ -725,7 +754,7 @@ def get_enhanced_rds_checks(
                                             " (savings based on allocated"
                                             " storage estimate)"
                                         ),
-                                        "EstimatedSavings": f"${snap_savings:.2f}/month (coarse estimate)",
+                                        "EstimatedSavings": snap_est,
                                         "CheckCategory": ("Old Aurora Cluster Snapshots"),
                                         "instanceFinding": (
                                             f"{age_days} days old Aurora"
@@ -741,10 +770,7 @@ def get_enhanced_rds_checks(
                                                 f"describe-API snapshot age {age_days}d > "
                                                 f"{old_snapshot_days}d threshold"
                                             ),
-                                            "formula": (
-                                                f"{cluster_allocated_storage}GB x ${snap_rate:.4f}/GB-mo "
-                                                "(allocated-size estimate, coarse)"
-                                            ),
+                                            "formula": snap_formula,
                                         },
                                     }
                                 )

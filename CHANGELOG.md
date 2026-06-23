@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (RDS snapshot finding quality — found via prod scan)
+- **No more `$0.00` snapshot findings (B1)**. Some snapshots (notably Aurora
+  cluster snapshots) return `AllocatedStorage=0`, which produced `$0.00/month`
+  cards. Size-unreported snapshots are now emitted as **advisory** ("size not
+  reported by the API; delete to stop backup charges") — still surfaced/counted,
+  but no misleading zero.
+- **Snapshot $ labelled as an upper bound (B2/B3)**. Snapshot savings use the
+  provisioned/allocated size, but AWS bills on actual (compressed/incremental)
+  bytes, so the figure is now stated as an **upper bound** in both EstimatedSavings
+  and AuditBasis. Aurora cluster-snapshot sizing via `AllocatedStorage` is
+  documented as unreliable.
+
 ### Fixed (RDS Aurora pricing — found via prod scan)
 - **Aurora snapshots priced at the Aurora backup rate (C-A1, CRITICAL)**. Aurora
   cluster/DB snapshots were billed at the standard RDS rate ($0.095/GB-mo) instead

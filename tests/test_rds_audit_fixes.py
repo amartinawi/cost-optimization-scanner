@@ -776,3 +776,57 @@ def test_instance_count_classifies_aurora():
     counts = get_rds_instance_count(ctx)
     assert counts["aurora"] == 2
     assert counts["mysql"] == 1
+
+
+# --------------------------------------------------------------------------- #
+# B1/B2/B3 — snapshot size-unknown advisory + upper-bound wording
+# --------------------------------------------------------------------------- #
+def test_snapshot_savings_text_zero_size_is_advisory():
+    from services.rds import _snapshot_savings_text
+
+    est, formula, sv = _snapshot_savings_text(0, 0.023)
+    assert sv == 0.0
+    assert "$" not in est                      # no fabricated $0.00
+    assert "advisory" in est.lower()
+    assert "not reported" in est.lower()
+
+
+def test_snapshot_savings_text_nonzero_is_upper_bound():
+    from services.rds import _snapshot_savings_text
+
+    est, formula, sv = _snapshot_savings_text(1000, 0.023)
+    assert sv == pytest.approx(23.0)
+    assert "$23.00/month" in est
+    assert "upper bound" in est.lower()
+
+
+def test_zero_size_cluster_snapshot_emits_advisory_not_dollar_zero():
+    old = datetime.now(timezone.utc) - timedelta(days=400)
+    snaps = [
+        {"DBClusterSnapshotIdentifier": "preupgrade-green-0gb", "SnapshotCreateTime": old,
+         "AllocatedStorage": 0, "Engine": "aurora-mysql"},
+        {"DBClusterSnapshotIdentifier": "real-1000gb", "SnapshotCreateTime": old,
+         "AllocatedStorage": 1000, "Engine": "aurora-mysql"},
+    ]
+    ctx = _EnhancedCtx(_FakeRdsClient(cluster_snapshots=snaps))
+    recs = [r for r in _recs(ctx) if r["CheckCategory"] == "Old Aurora Cluster Snapshots"]
+    by_id = {r["SnapshotId"]: r for r in recs}
+    # Zero-size -> advisory, no "$0.00/month"; non-zero -> upper-bound $.
+    assert "$0.00" not in by_id["preupgrade-green-0gb"]["EstimatedSavings"]
+    assert "advisory" in by_id["preupgrade-green-0gb"]["EstimatedSavings"].lower()
+    assert "$21.00/month" in by_id["real-1000gb"]["EstimatedSavings"]  # 1000 x $0.021 (fake)
+
+
+def test_zero_size_snapshot_counted_but_adds_zero_to_total():
+    arn0 = "arn:aws:rds:ap-south-1:1:cluster-snapshot:zero"
+    arn1 = "arn:aws:rds:ap-south-1:1:cluster-snapshot:real"
+    enhanced = [
+        {"resourceArn": arn0, "CheckCategory": "Old Aurora Cluster Snapshots",
+         "EstimatedSavings": "advisory — snapshot size not reported by the API; delete to stop backup charges"},
+        {"resourceArn": arn1, "CheckCategory": "Old Aurora Cluster Snapshots",
+         "EstimatedSavings": "$23.00/month (upper bound — provisioned size; actual backup bytes are typically lower)"},
+    ]
+    from services.rds_logic import resolve_rds_findings
+    _coh, _co, kept_enh, savings, count = resolve_rds_findings([], enhanced)
+    assert savings == pytest.approx(23.0)   # advisory snapshot adds 0
+    assert count == 2                        # both rendered/counted
