@@ -830,3 +830,38 @@ def test_zero_size_snapshot_counted_but_adds_zero_to_total():
     _coh, _co, kept_enh, savings, count = resolve_rds_findings([], enhanced)
     assert savings == pytest.approx(23.0)   # advisory snapshot adds 0
     assert count == 2                        # both rendered/counted
+
+
+# --------------------------------------------------------------------------- #
+# Reporter — snapshot/RI caveats are surfaced in the HTML (advise follow-up)
+# --------------------------------------------------------------------------- #
+def test_reporter_surfaces_snapshot_and_advisory_caveats():
+    from reporter_phase_b import _render_rds_enhanced_checks
+
+    recs = [
+        {"SnapshotId": "real", "CheckCategory": "Old Aurora Cluster Snapshots",
+         "AllocatedStorage": 1000, "engine": "aurora-mysql",
+         "EstimatedSavings": "$21.00/month (upper bound — provisioned size; actual backup bytes are typically lower)",
+         "instanceFinding": "400 days old Aurora cluster snapshot (1000GB)"},
+        {"SnapshotId": "zero", "CheckCategory": "Old Aurora Cluster Snapshots",
+         "AllocatedStorage": 0, "engine": "aurora-mysql",
+         "EstimatedSavings": "advisory — snapshot size not reported by the API; delete to stop backup charges",
+         "instanceFinding": "400 days old Aurora cluster snapshot (0GB)"},
+    ]
+    html = _render_rds_enhanced_checks(recs, "enhanced_checks", {})
+    assert "upper bound" in html                       # B3 caveat now visible
+    assert "size not reported (still billable)" in html  # B1/B2 marker on the 0GB snapshot
+
+
+def test_reporter_marks_ri_as_advisory_not_in_total():
+    from reporter_phase_b import _render_rds_enhanced_checks
+
+    recs = [{
+        "DBInstanceIdentifier": "db1", "CheckCategory": "Reserved Instance Opportunities",
+        "EstimatedSavings": "up to $100.00/month (3yr All Upfront)",
+        "RIScenarios": [{"term": "3yr", "payment_option": "All Upfront", "monthly_savings": 100.0,
+                         "discount_pct": 62.0, "ondemand_monthly_estimate": 161.0}],
+        "OnDemandMonthlyEstimate": 161.0,
+    }]
+    html = _render_rds_enhanced_checks(recs, "enhanced_checks", {})
+    assert "advisory — not included in the tab total" in html

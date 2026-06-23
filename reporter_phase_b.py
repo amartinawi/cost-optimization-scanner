@@ -571,6 +571,11 @@ def _render_rds_enhanced_checks(recommendations: List[Rec], source_name: str, se
             grouped_categories[category] = []
         grouped_categories[category].append(rec)
 
+    # Categories rendered for context but excluded from the tab total (mirrors
+    # services.rds_logic.ADVISORY_CATEGORIES — RI is the commitment_analysis tab's
+    # domain; backup-retention isn't quantifiable at scan time).
+    advisory_categories = {"Reserved Instance Opportunities", "Backup Retention Optimization"}
+
     content = ""
     for category, recs in grouped_categories.items():
         content += f'<div class="rec-item{_priority_class(recs[0])}">'
@@ -591,7 +596,8 @@ def _render_rds_enhanced_checks(recommendations: List[Rec], source_name: str, se
             best_total = sum(max(s.get("monthly_savings", 0) for s in r.get("RIScenarios", [])) for r in recs)
             content += (
                 '<p class="savings"><strong>Estimated Savings:</strong> '
-                f'up to ${best_total:,.2f}/month at the best-tier scenario per database'
+                f'up to ${best_total:,.2f}/month at the best-tier scenario per database '
+                '<em>(advisory — not included in the tab total)</em>'
                 '</p>'
             )
             content += _render_rds_ri_scenarios_table(recs)
@@ -611,10 +617,24 @@ def _render_rds_enhanced_checks(recommendations: List[Rec], source_name: str, se
                 except (ValueError, AttributeError) as e:
                     logger.debug("Could not parse grouped savings %r: %s", savings_str, e)
 
+        is_snapshot_category = "Snapshot" in category
         if has_numeric_savings:
-            content += f'<p class="savings"><strong>Estimated Savings:</strong> ${total_savings:.2f}/month</p>'
+            caveat = (
+                ' <em>(upper bound — based on provisioned size; actual backup bytes are typically lower)</em>'
+                if is_snapshot_category else ""
+            )
+            content += (
+                f'<p class="savings"><strong>Estimated Savings:</strong> ${total_savings:.2f}/month{caveat}</p>'
+            )
         else:
-            content += f'<p class="savings"><strong>Estimated Savings:</strong> {recs[0].get("EstimatedSavings", "Cost optimization")}</p>'
+            advisory_note = (
+                ' <em>(advisory — not included in the tab total)</em>'
+                if category in advisory_categories else ""
+            )
+            content += (
+                '<p class="savings"><strong>Estimated Savings:</strong> '
+                f'{recs[0].get("EstimatedSavings", "Cost optimization")}{advisory_note}</p>'
+            )
 
         if "Snapshot" in category:
             content += "<p><strong>Affected Snapshots:</strong></p><ul>"
@@ -633,6 +653,11 @@ def _render_rds_enhanced_checks(recommendations: List[Rec], source_name: str, se
                 display_str = db_id
                 if finding:
                     display_str += f" - {finding}"
+                # Flag snapshots whose size the API did not report: they still bill
+                # for backup storage, so "0GB" must not read as "nothing to delete".
+                est_lower = str(rec.get("EstimatedSavings", "")).lower()
+                if est_lower.startswith("advisory") or not rec.get("AllocatedStorage"):
+                    display_str += " — size not reported (still billable)"
             else:
                 display_str = db_id
                 if engine:
