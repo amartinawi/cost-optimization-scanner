@@ -20,13 +20,19 @@ REGION_DISPLAY_NAMES: dict[str, str] = {
     "us-gov-west-1": "AWS GovCloud (US-West)",
     "ca-central-1": "Canada (Central)",
     "ca-west-1": "Canada West (Calgary)",
+    # AWS Price List location names are inconsistent for EU regions: the older
+    # regions use "EU (X)" while the two newest (Zurich, Spain) use "Europe (X)".
+    # Verified across AmazonS3 / AmazonEC2 / AmazonRDS (2026-06-23). Using the
+    # wrong form makes EVERY pricing lookup for that region silently fall back to
+    # us-east-1 constants (audit S3-J — found when S3-I began pricing buckets at
+    # their home region).
     "eu-west-1": "EU (Ireland)",
-    "eu-west-2": "Europe (London)",
-    "eu-west-3": "Europe (Paris)",
-    "eu-central-1": "Europe (Frankfurt)",
+    "eu-west-2": "EU (London)",
+    "eu-west-3": "EU (Paris)",
+    "eu-central-1": "EU (Frankfurt)",
     "eu-central-2": "Europe (Zurich)",
-    "eu-north-1": "Europe (Stockholm)",
-    "eu-south-1": "Europe (Milan)",
+    "eu-north-1": "EU (Stockholm)",
+    "eu-south-1": "EU (Milan)",
     "eu-south-2": "Europe (Spain)",
     "ap-south-1": "Asia Pacific (Mumbai)",
     "ap-south-2": "Asia Pacific (Hyderabad)",

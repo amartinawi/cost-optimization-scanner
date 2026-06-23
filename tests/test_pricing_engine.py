@@ -147,6 +147,22 @@ class TestPricingEngine:
         engine = PricingEngine("us-east-1", mock_client)
         assert engine.get_s3_monthly_price_per_gb("STANDARD") == pytest.approx(0.023)
 
+    def test_eu_region_display_names_match_price_list_api(self):
+        """Audit S3-J — older EU regions use 'EU (X)' in the Price List API; the
+        two newest (Zurich, Spain) use 'Europe (X)'. Verified across
+        AmazonS3/EC2/RDS. A wrong form makes every lookup for that region
+        silently fall back to us-east-1 constants."""
+        from core.pricing_engine import REGION_DISPLAY_NAMES
+        assert REGION_DISPLAY_NAMES["eu-west-1"] == "EU (Ireland)"
+        assert REGION_DISPLAY_NAMES["eu-west-2"] == "EU (London)"
+        assert REGION_DISPLAY_NAMES["eu-west-3"] == "EU (Paris)"
+        assert REGION_DISPLAY_NAMES["eu-central-1"] == "EU (Frankfurt)"
+        assert REGION_DISPLAY_NAMES["eu-north-1"] == "EU (Stockholm)"
+        assert REGION_DISPLAY_NAMES["eu-south-1"] == "EU (Milan)"
+        # Newest two regions genuinely use the "Europe (X)" form.
+        assert REGION_DISPLAY_NAMES["eu-central-2"] == "Europe (Zurich)"
+        assert REGION_DISPLAY_NAMES["eu-south-2"] == "Europe (Spain)"
+
     def test_for_region_same_region_returns_self(self):
         engine = _make_engine(api_return=None)
         assert engine.for_region("us-east-1") is engine
@@ -157,7 +173,7 @@ class TestPricingEngine:
         sib = engine.for_region("eu-central-1")
         assert sib is not engine
         assert sib._region == "eu-central-1"
-        assert sib._display_name == "Europe (Frankfurt)"
+        assert sib._display_name == "EU (Frankfurt)"  # Price List API form (audit S3-J)
         # Same client reused; sibling cached (identity stable across calls).
         assert sib._pricing is engine._pricing
         assert engine.for_region("eu-central-1") is sib
