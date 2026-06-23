@@ -146,26 +146,33 @@ def reconcile_snapshot_savings(
     for group_key, items in (("aurora", aurora), ("standard", standard)):
         cap = backup_actuals.get(group_key)
         upper = sum(enhanced_savings(s) for s in items)
-        if cap is not None and 0 < cap < upper:
-            factor = cap / upper
-            for s in items:
-                sv = enhanced_savings(s)
-                if sv <= 0:  # advisory / size-unknown — leave as-is
-                    out.append(s)
-                    continue
-                new_rec = dict(s)
+        apply_cap = cap is not None and 0 < cap < upper
+        factor = (cap / upper) if (cap is not None and apply_cap and upper) else 1.0
+        for s in items:
+            sv = enhanced_savings(s)
+            if sv <= 0:  # advisory / size-unknown — leave untouched
+                out.append(s)
+                continue
+            # Always copy + annotate numeric snaps so the report is auditable even
+            # when no cap is applied (distinguishes "actual >= upper" from a CE gap).
+            new_rec = dict(s)
+            basis = dict(s.get("AuditBasis", {}))
+            if cap is not None and cap > 0:
+                basis["actual_billed_backup_pool"] = round(cap, 2)
+            if apply_cap:
                 new_rec["EstimatedSavings"] = (
                     f"${sv * factor:.2f}/month (reconciled to actual billed backup via Cost Explorer)"
                 )
-                basis = dict(s.get("AuditBasis", {}))
-                basis["reconciled_to_actual_billed"] = round(cap, 2)
+                basis["reconciled_to_actual_billed"] = round(cap, 2)  # type: ignore[arg-type]
                 basis["reconciliation_factor"] = round(factor, 4)
                 basis["upper_bound_before_reconciliation"] = round(sv, 2)
-                new_rec["AuditBasis"] = basis
                 new_rec["Reconciled"] = True
-                out.append(new_rec)
-        else:
-            out.extend(items)
+            elif cap is not None and cap > 0:
+                basis["reconciliation"] = "not capped — upper bound <= actual billed backup"
+            else:
+                basis["reconciliation"] = "no Cost Explorer actual available — upper bound retained"
+            new_rec["AuditBasis"] = basis
+            out.append(new_rec)
     return out
 
 

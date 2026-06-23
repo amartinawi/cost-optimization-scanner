@@ -993,3 +993,35 @@ def test_reporter_shows_reconciled_caveat():
     html = _render_rds_enhanced_checks(recs, "enhanced_checks", {})
     assert "reconciled to actual billed backup" in html
     assert "$72.00/mo" in html
+
+
+# --------------------------------------------------------------------------- #
+# Tier 1 observability — record CE actual even when no cap is applied
+# --------------------------------------------------------------------------- #
+def test_reconcile_records_actual_when_not_capped():
+    from services.rds_logic import reconcile_snapshot_savings
+
+    snaps = [_snap("aurora-mysql", "$100.00/month (upper bound)")]
+    out = reconcile_snapshot_savings(snaps, {"aurora": 500.0})  # actual >= upper -> no cap
+    assert not out[0].get("Reconciled")
+    ab = out[0]["AuditBasis"]
+    assert ab["actual_billed_backup_pool"] == 500.0
+    assert "not capped" in ab["reconciliation"]
+
+
+def test_reconcile_records_no_ce_data_when_missing():
+    from services.rds_logic import reconcile_snapshot_savings
+
+    snaps = [_snap("aurora-mysql", "$100.00/month (upper bound)")]
+    out = reconcile_snapshot_savings(snaps, {"standard": 50.0})  # aurora pool absent
+    assert "no Cost Explorer actual available" in out[0]["AuditBasis"]["reconciliation"]
+
+
+def test_reporter_shows_actual_when_not_capped():
+    from reporter_phase_b import _render_rds_enhanced_checks
+
+    recs = [{"SnapshotId": "a", "CheckCategory": "Old Aurora Cluster Snapshots", "engine": "aurora-mysql",
+             "AuditBasis": {"actual_billed_backup_pool": 500.0},
+             "EstimatedSavings": "$100.00/month (upper bound)", "instanceFinding": "old"}]
+    html = _render_rds_enhanced_checks(recs, "enhanced_checks", {})
+    assert "actual billed backup $500.00/mo (Cost Explorer)" in html

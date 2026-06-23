@@ -626,9 +626,18 @@ def _render_rds_enhanced_checks(recommendations: List[Rec], source_name: str, se
                 cap_txt = f"${cap:,.2f}/mo" if isinstance(cap, (int, float)) else "actual billed backup"
                 caveat = f' <em>(reconciled to actual billed backup {cap_txt} via Cost Explorer)</em>'
             else:
+                actual = next(
+                    (r.get("AuditBasis", {}).get("actual_billed_backup_pool")
+                     for r in recs if r.get("AuditBasis", {}).get("actual_billed_backup_pool") is not None),
+                    None,
+                )
+                actual_txt = (
+                    f"; actual billed backup ${actual:,.2f}/mo (Cost Explorer)"
+                    if isinstance(actual, (int, float)) else ""
+                )
                 caveat = (
                     ' <em>(upper bound — based on provisioned size; '
-                    'actual backup bytes are typically lower)</em>'
+                    f'actual backup bytes are typically lower{actual_txt})</em>'
                 )
         if has_numeric_savings:
             content += (
