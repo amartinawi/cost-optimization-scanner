@@ -15,11 +15,82 @@ Extracted from:
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime, timedelta
 from typing import Any
+
+from botocore.exceptions import ClientError  # type: ignore[import-untyped]
 
 from core.scan_context import ScanContext
 
 logger = logging.getLogger(__name__)
+
+
+def get_rds_backup_actuals(ctx: ScanContext) -> dict[str, float]:
+    """Actual billed RDS/Aurora backup spend ($/month) for the scan region.
+
+    Queries Cost Explorer for the **last complete calendar month**, scoped to the
+    RDS service and ``ctx.region``, grouped by ``USAGE_TYPE``. Sums the billed
+    backup usage types (region prefixes like ``APS3-``/``EU-`` are tolerated):
+
+      - ``standard`` — usage types containing ``ChargedBackupUsage``
+        (e.g. ``APS3-RDS:ChargedBackupUsage``, also RDS Custom).
+      - ``aurora``   — usage types containing ``Aurora:BackupUsage``.
+
+    Returns ``{"standard": usd, "aurora": usd}`` (either may be 0.0 when CE
+    responded but the region had no such charge), or ``{}`` when the data is
+    unavailable (no CE client, permission gap, or error). Used to cap the
+    snapshot upper-bound estimates at real spend — see
+    ``services.rds_logic.reconcile_snapshot_savings``.
+    """
+    ce = ctx.client("ce")
+    if ce is None:
+        ctx.warn("Cost Explorer client unavailable; snapshot savings left as upper bound", service="rds")
+        return {}
+
+    today = datetime.now(UTC).date()
+    first_of_this_month = today.replace(day=1)
+    start = (first_of_this_month - timedelta(days=1)).replace(day=1)  # first day of previous month
+    end = first_of_this_month  # End is exclusive -> covers the whole previous month
+
+    try:
+        resp = ce.get_cost_and_usage(
+            TimePeriod={"Start": start.isoformat(), "End": end.isoformat()},
+            Granularity="MONTHLY",
+            Metrics=["UnblendedCost"],
+            GroupBy=[{"Type": "DIMENSION", "Key": "USAGE_TYPE"}],
+            Filter={
+                "And": [
+                    {"Dimensions": {"Key": "SERVICE", "Values": ["Amazon Relational Database Service"]}},
+                    {"Dimensions": {"Key": "REGION", "Values": [ctx.region]}},
+                ]
+            },
+        )
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code in ("AccessDenied", "AccessDeniedException", "UnauthorizedOperation"):
+            ctx.permission_issue(
+                f"Cost Explorer backup actuals unavailable ({code}); snapshot savings left as upper bound",
+                service="rds",
+                action="ce:GetCostAndUsage",
+            )
+        else:
+            ctx.warn(f"Cost Explorer backup actuals unavailable ({code or 'error'})", service="rds")
+        return {}
+    except Exception as exc:
+        ctx.warn(f"Cost Explorer backup actuals unavailable ({type(exc).__name__})", service="rds")
+        return {}
+
+    standard = 0.0
+    aurora = 0.0
+    for period in resp.get("ResultsByTime", []):
+        for group in period.get("Groups", []):
+            key = (group.get("Keys") or [""])[0]
+            amount = float(group.get("Metrics", {}).get("UnblendedCost", {}).get("Amount", 0) or 0.0)
+            if "Aurora:BackupUsage" in key:
+                aurora += amount
+            elif "ChargedBackupUsage" in key:
+                standard += amount
+    return {"standard": standard, "aurora": aurora}
 
 
 def _compute_optimizer_opt_in_rec(service_label: str, action_summary: str) -> dict[str, Any]:

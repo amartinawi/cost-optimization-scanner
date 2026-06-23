@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (RDS snapshot savings reconciled to actual spend — Tier 1)
+- **Snapshot upper bounds are now capped at actual billed backup (Cost Explorer).**
+  `services.advisor.get_rds_backup_actuals` queries CE (`GetCostAndUsage`, last
+  complete month, RDS service, region-scoped, grouped by `USAGE_TYPE`) and sums
+  the billed backup usage types per engine (`*:ChargedBackupUsage` standard,
+  `Aurora:BackupUsage` Aurora). `services.rds_logic.reconcile_snapshot_savings`
+  caps each engine pool's snapshot savings at that actual — but only when the
+  actual is a positive number below the upper bound (a 0/missing actual leaves the
+  upper bound untouched, so a CE gap never zeroes real savings). Findings carry
+  `reconciled_to_actual_billed` / `reconciliation_factor` in AuditBasis, and the
+  reporter shows "(reconciled to actual billed backup $X/mo via Cost Explorer)".
+  Skipped in `fast_mode`; needs `ce:GetCostAndUsage`. Live M360 ap-south-1
+  headline: **$838.83 → $328.22** (standard snapshots $621.30 → actual $110.69).
+  Note: the cap is bounded by *total* billed backup (incl. automated backups), so
+  it remains a conservative ceiling, not exact per-snapshot attribution.
+
 ### Fixed (RDS snapshot finding quality — found via prod scan)
 - **No more `$0.00` snapshot findings (B1)**. Some snapshots (notably Aurora
   cluster snapshots) return `AllocatedStorage=0`, which produced `$0.00/month`

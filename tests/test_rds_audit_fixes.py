@@ -865,3 +865,131 @@ def test_reporter_marks_ri_as_advisory_not_in_total():
     }]
     html = _render_rds_enhanced_checks(recs, "enhanced_checks", {})
     assert "advisory — not included in the tab total" in html
+
+
+# --------------------------------------------------------------------------- #
+# Tier 1 — Cost Explorer backup actuals + snapshot reconciliation
+# --------------------------------------------------------------------------- #
+class _FakeCeClient:
+    def __init__(self, groups=None, error=None):
+        self._groups = groups or []
+        self._error = error
+
+    def get_cost_and_usage(self, **kwargs):
+        if self._error:
+            raise self._error
+        return {
+            "ResultsByTime": [
+                {"Groups": [
+                    {"Keys": [k], "Metrics": {"UnblendedCost": {"Amount": str(v)}}}
+                    for k, v in self._groups
+                ]}
+            ]
+        }
+
+
+class _CeCtx(_FakeCtx):
+    def __init__(self, ce):
+        super().__init__()
+        self._ce = ce
+
+    def client(self, name, region=None):
+        return self._ce if name == "ce" else None
+
+
+def test_backup_actuals_sums_by_engine():
+    from services.advisor import get_rds_backup_actuals
+
+    ce = _FakeCeClient(groups=[
+        ("APS3-RDS:ChargedBackupUsage", 621.30),
+        ("APS3-Aurora:BackupUsage", 183.22),
+        ("APS3-InstanceUsage:db.r5.large", 999.0),  # ignored (not backup)
+    ])
+    out = get_rds_backup_actuals(_CeCtx(ce))
+    assert out["standard"] == pytest.approx(621.30)
+    assert out["aurora"] == pytest.approx(183.22)
+
+
+def test_backup_actuals_accessdenied_records_permission_issue():
+    from botocore.exceptions import ClientError
+    from services.advisor import get_rds_backup_actuals
+
+    err = ClientError({"Error": {"Code": "AccessDenied", "Message": "x"}}, "GetCostAndUsage")
+    ctx = _CeCtx(_FakeCeClient(error=err))
+    assert get_rds_backup_actuals(ctx) == {}
+    assert any(p["action"] == "ce:GetCostAndUsage" for p in ctx.permission_issues)
+
+
+def test_backup_actuals_no_client_returns_empty():
+    from services.advisor import get_rds_backup_actuals
+
+    assert get_rds_backup_actuals(_FakeCtx()) == {}
+
+
+def _snap(engine, savings_str, cat="Old Aurora Cluster Snapshots"):
+    return {"engine": engine, "CheckCategory": cat, "EstimatedSavings": savings_str}
+
+
+def test_reconcile_caps_when_actual_below_upper():
+    from services.rds_logic import enhanced_savings, reconcile_snapshot_savings
+
+    snaps = [_snap("aurora-mysql", "$100.00/month (upper bound)"),
+             _snap("aurora-mysql", "$100.00/month (upper bound)")]
+    out = reconcile_snapshot_savings(snaps, {"aurora": 50.0, "standard": 0.0})
+    assert sum(enhanced_savings(s) for s in out) == pytest.approx(50.0)
+    assert all(s.get("Reconciled") for s in out)
+    assert all(s["AuditBasis"]["reconciled_to_actual_billed"] == 50.0 for s in out)
+
+
+def test_reconcile_noop_when_actual_above_upper():
+    from services.rds_logic import enhanced_savings, reconcile_snapshot_savings
+
+    snaps = [_snap("aurora-mysql", "$100.00/month (upper bound)")]
+    out = reconcile_snapshot_savings(snaps, {"aurora": 500.0})
+    assert sum(enhanced_savings(s) for s in out) == pytest.approx(100.0)
+    assert not any(s.get("Reconciled") for s in out)
+
+
+def test_reconcile_noop_when_missing_or_zero():
+    from services.rds_logic import enhanced_savings, reconcile_snapshot_savings
+
+    snaps = [_snap("aurora-mysql", "$100.00/month (upper bound)")]
+    assert reconcile_snapshot_savings(snaps, {}) == snaps          # no data
+    out = reconcile_snapshot_savings(snaps, {"aurora": 0.0})       # 0 == no data (CE gap guard)
+    assert sum(enhanced_savings(s) for s in out) == pytest.approx(100.0)
+
+
+def test_reconcile_per_engine_independent():
+    from services.rds_logic import enhanced_savings, reconcile_snapshot_savings
+
+    snaps = [
+        _snap("aurora-mysql", "$200.00/month (upper bound)"),
+        _snap("mysql", "$400.00/month (upper bound)", cat="Old RDS Snapshots"),
+    ]
+    out = reconcile_snapshot_savings(snaps, {"aurora": 50.0, "standard": 100.0})
+    by_eng = {s["engine"]: enhanced_savings(s) for s in out}
+    assert by_eng["aurora-mysql"] == pytest.approx(50.0)
+    assert by_eng["mysql"] == pytest.approx(100.0)
+
+
+def test_resolve_applies_backup_actuals_cap():
+    from services.rds_logic import resolve_rds_findings
+
+    enhanced = [{"resourceArn": "arn:aws:rds:ap-south-1:1:cluster-snapshot:a", "engine": "aurora-mysql",
+                 "CheckCategory": "Old Aurora Cluster Snapshots",
+                 "EstimatedSavings": "$300.00/month (upper bound)"}]
+    _coh, _co, kept, savings, count = resolve_rds_findings([], enhanced, backup_actuals={"aurora": 72.0})
+    assert savings == pytest.approx(72.0)
+    assert count == 1
+
+
+def test_reporter_shows_reconciled_caveat():
+    from reporter_phase_b import _render_rds_enhanced_checks
+
+    recs = [{"SnapshotId": "a", "CheckCategory": "Old Aurora Cluster Snapshots", "engine": "aurora-mysql",
+             "Reconciled": True, "AuditBasis": {"reconciled_to_actual_billed": 72.0},
+             "EstimatedSavings": "$72.00/month (reconciled to actual billed backup via Cost Explorer)",
+             "instanceFinding": "600 days old"}]
+    html = _render_rds_enhanced_checks(recs, "enhanced_checks", {})
+    assert "reconciled to actual billed backup" in html
+    assert "$72.00/mo" in html

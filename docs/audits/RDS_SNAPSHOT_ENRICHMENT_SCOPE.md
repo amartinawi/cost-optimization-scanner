@@ -1,7 +1,7 @@
 # Scope: RDS/Aurora snapshot savings — from upper-bound to actual
 
 **Date**: 2026-06-23
-**Status**: SCOPE / DESIGN — not implemented.
+**Status**: Tier 1 IMPLEMENTED 2026-06-23 (CE reconciliation). Tier 2 deferred.
 **Trigger**: snapshot savings are the dominant line in real RDS reports (e.g. M360
 ap-south-1: snapshots = ~96% of the $838.83 headline) and are currently an
 **upper bound** (provisioned `AllocatedStorage` × backup rate), labelled as such

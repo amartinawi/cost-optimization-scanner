@@ -7,6 +7,7 @@ from typing import Any
 
 from core.contracts import ServiceFindings, SourceBlock
 from services._base import BaseServiceModule
+from services.advisor import get_rds_backup_actuals
 from services.rds import (
     RDS_OPTIMIZATION_DESCRIPTIONS,
     get_enhanced_rds_checks,
@@ -46,7 +47,7 @@ class RdsModule(BaseServiceModule):
 
     def required_clients(self) -> tuple[str, ...]:
         """Returns boto3 client names required for RDS scanning."""
-        return ("rds", "compute-optimizer", "cloudwatch")
+        return ("rds", "compute-optimizer", "cloudwatch", "ce")
 
     def scan(self, ctx: Any) -> ServiceFindings:
         """Scan RDS instances for cost optimization opportunities.
@@ -111,8 +112,18 @@ class RdsModule(BaseServiceModule):
             r for r in getattr(ctx, "cost_hub_splits", {}).get("rds", []) if _coh_is_renderable(r)
         ]
 
+        # Cap the snapshot upper-bound savings at the actual billed backup spend
+        # (Cost Explorer, last complete month). Skipped in fast_mode to avoid the
+        # extra paid CE call. Empty result leaves the upper bounds untouched.
+        backup_actuals: dict[str, float] = {}
+        if not ctx.fast_mode:
+            try:
+                backup_actuals = get_rds_backup_actuals(ctx)
+            except Exception as e:
+                ctx.warn(f"[rds] backup actuals lookup failed: {e}", service="rds")
+
         coh_kept, co_kept, enhanced_kept, savings, total_recs = resolve_rds_findings(
-            co_recs, enhanced_recs, coh_recs=coh_recs
+            co_recs, enhanced_recs, coh_recs=coh_recs, backup_actuals=backup_actuals
         )
 
         sources = {

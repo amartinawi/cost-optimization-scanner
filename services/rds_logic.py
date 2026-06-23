@@ -114,11 +114,67 @@ def partition_enhanced(
     return concrete, snaps, advisory
 
 
+def reconcile_snapshot_savings(
+    snaps: list[dict[str, Any]],
+    backup_actuals: dict[str, float] | None,
+) -> list[dict[str, Any]]:
+    """Cap snapshot upper-bound savings at actual billed backup, per engine pool.
+
+    Snapshot savings use provisioned size (an upper bound). When Cost Explorer
+    reports the *actual* billed backup for the region (``services.advisor.
+    get_rds_backup_actuals``), cap each engine group's snapshot savings at it:
+    manual snapshots are a subset of total backup spend, so the actual is a valid
+    (tighter) ceiling. Capping is applied **only** when the actual is a POSITIVE
+    number below the group's summed upper bound — a 0/missing actual is treated as
+    "no data" and leaves the upper bound untouched, so a CE gap never silently
+    zeroes real savings. Advisory/size-unknown snaps (no ``$``) pass through.
+
+    Returns a new list; capped recs are copies with an updated EstimatedSavings
+    and AuditBasis (``reconciled_to_actual_billed`` / ``reconciliation_factor``).
+    """
+    if not backup_actuals:
+        return snaps
+
+    def _is_aurora(s: dict[str, Any]) -> bool:
+        return str(s.get("engine") or "").lower().startswith("aurora") or "Aurora" in str(
+            s.get("CheckCategory", "")
+        )
+
+    aurora = [s for s in snaps if _is_aurora(s)]
+    standard = [s for s in snaps if not _is_aurora(s)]
+    out: list[dict[str, Any]] = []
+    for group_key, items in (("aurora", aurora), ("standard", standard)):
+        cap = backup_actuals.get(group_key)
+        upper = sum(enhanced_savings(s) for s in items)
+        if cap is not None and 0 < cap < upper:
+            factor = cap / upper
+            for s in items:
+                sv = enhanced_savings(s)
+                if sv <= 0:  # advisory / size-unknown — leave as-is
+                    out.append(s)
+                    continue
+                new_rec = dict(s)
+                new_rec["EstimatedSavings"] = (
+                    f"${sv * factor:.2f}/month (reconciled to actual billed backup via Cost Explorer)"
+                )
+                basis = dict(s.get("AuditBasis", {}))
+                basis["reconciled_to_actual_billed"] = round(cap, 2)
+                basis["reconciliation_factor"] = round(factor, 4)
+                basis["upper_bound_before_reconciliation"] = round(sv, 2)
+                new_rec["AuditBasis"] = basis
+                new_rec["Reconciled"] = True
+                out.append(new_rec)
+        else:
+            out.extend(items)
+    return out
+
+
 def resolve_rds_findings(
     co_recs: list[dict[str, Any]],
     enhanced_recs: list[dict[str, Any]],
     *,
     coh_recs: list[dict[str, Any]] | None = None,
+    backup_actuals: dict[str, float] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], float, int]:
     """De-duplicate cost findings across sources; demote RI to advisory.
 
@@ -142,6 +198,9 @@ def resolve_rds_findings(
             covered by CoH, its CO and heuristic findings are suppressed; the CoH
             recs themselves are returned for the caller to render in their own
             source and are summed into the total.
+        backup_actuals: ``{"standard": usd, "aurora": usd}`` from Cost Explorer
+            (``get_rds_backup_actuals``); caps snapshot upper-bound savings at the
+            actual billed backup per engine pool. Omit/``{}`` to keep upper bounds.
 
     Returns:
         ``(kept_coh, kept_co, kept_enhanced, total_savings, total_recommendations)``.
@@ -150,6 +209,8 @@ def resolve_rds_findings(
     coh_keys = {coh_rds_key(r) for r in coh_recs} - {""}
 
     concrete, snaps, advisory = partition_enhanced(enhanced_recs)
+    # Cap snapshot upper-bound savings at actual billed backup (Cost Explorer).
+    snaps = reconcile_snapshot_savings(snaps, backup_actuals)
 
     # Candidate single-remediation cost findings, excluding CoH-covered ids.
     # Each tuple: (authority, savings, origin, key, rec).

@@ -618,11 +618,19 @@ def _render_rds_enhanced_checks(recommendations: List[Rec], source_name: str, se
                     logger.debug("Could not parse grouped savings %r: %s", savings_str, e)
 
         is_snapshot_category = "Snapshot" in category
+        caveat = ""
+        if is_snapshot_category:
+            reconciled = next((r for r in recs if r.get("Reconciled")), None)
+            if reconciled:
+                cap = reconciled.get("AuditBasis", {}).get("reconciled_to_actual_billed")
+                cap_txt = f"${cap:,.2f}/mo" if isinstance(cap, (int, float)) else "actual billed backup"
+                caveat = f' <em>(reconciled to actual billed backup {cap_txt} via Cost Explorer)</em>'
+            else:
+                caveat = (
+                    ' <em>(upper bound — based on provisioned size; '
+                    'actual backup bytes are typically lower)</em>'
+                )
         if has_numeric_savings:
-            caveat = (
-                ' <em>(upper bound — based on provisioned size; actual backup bytes are typically lower)</em>'
-                if is_snapshot_category else ""
-            )
             content += (
                 f'<p class="savings"><strong>Estimated Savings:</strong> ${total_savings:.2f}/month{caveat}</p>'
             )
