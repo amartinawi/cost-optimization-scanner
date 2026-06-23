@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed (S3 adapter — cost-fidelity remediation, audit `docs/audits/S3_AUDIT_FINDINGS.md`)
+- **Evidence-gated savings replace assumed percentages (S3-A/S3-B).** Removed
+  `S3_SAVINGS_FACTORS` (0.30/0.20/0.40 "assume ~65% IA-eligible"). A bucket now
+  earns a concrete dollar only when it holds S3 Standard bytes AND CloudWatch
+  request metrics (`GetRequests`, whole-bucket FilterId, 30d) show **zero** GETs
+  → the saving is the real `standard_gb × (Standard − Standard-IA)` rate delta,
+  recorded in `PricingBasis`. No evidence (metrics off / fast mode) → `$0.00`
+  advisory. Adds `_assess_bucket_coldness`, `COLD_LOOKBACK_DAYS`,
+  `_GAP_OPPORTUNITY_CLASSES`. New IAM dependency `s3:GetMetricsConfiguration`
+  (fail-safe on denial). Live M360 ap-south-1: old factor model **$323.62/mo** →
+  evidence-gated **$37.70/mo**; suppresses ~$263/mo of fabricated savings on hot,
+  actively-served media buckets (where IA would *raise* cost).
+- **Per-class costing (S3-A/S3-F).** `EstimatedMonthlyCost` now sums each storage
+  class at its own live rate (`_cost_from_class_sizes`/`_s3_price_per_gb`); a
+  Glacier/Deep-Archive bucket is no longer priced as Standard (was up to ~23×
+  over). Dead `_estimate_s3_bucket_cost` removed.
+- **Region-correct pricing (S3-I).** `PricingEngine.for_region(region)` returns a
+  cached sibling engine scoped to a resource's home region (shared global pricing
+  client, separate cache). S3 buckets are now priced at their own region, not the
+  scan region — fixes out-of-region buckets reading the scan rate (e.g. us-east-1
+  buckets priced at ap-south-1's $0.025 instead of $0.023, +8.7%).
+- **Correct S3 SKU + tier selection (S3-D/S3-E).** `_fetch_s3_price` pins
+  `volumeType`+`productFamily=Storage` and `_select_s3_storage_rate` skips
+  Staging/Overhead rows; `_extract_s3_base_rate` selects the `beginRange==0` base
+  tier ($0.023, not the API's first-serialized $0.022). Verified live vs Pricing
+  API (2026-06-18).
+- **Count hygiene (S3-C).** `total_recommendations` counts only $-bearing records;
+  advisory/visibility records stay rendered and are tallied in
+  `extras["advisory_count"]`.
+- **Reporter caveats (S3-H).** Renders `PricingBasis`, advisory note, and
+  fast-mode sampling warning per bucket. Regional multipliers documented as
+  fallback-only (S3-G). SUMMARY.md S3 verdict WARN → PASS.
+
 ### Added (RDS snapshot savings reconciled to actual spend — Tier 1)
 - **Snapshot upper bounds are now capped at actual billed backup (Cost Explorer).**
   `services.advisor.get_rds_backup_actuals` queries CE (`GetCostAndUsage`, last

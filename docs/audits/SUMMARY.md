@@ -37,7 +37,7 @@ Of the 28 service adapters audited:
 | 01 | EBS | PASS | PricingEngine (live) | Computed from price delta | None — reference implementation |
 | 02 | EC2 | PASS | PricingEngine (live) | Computed from rightsizing/scheduling | None — reference implementation |
 | 03 | RDS | PASS (remediated 2026-06-22) | PricingEngine (live) + Cost Hub | Instance price delta; CoH>CO>heuristic dedup | Fixed via `RDS_REMEDIATION_PLAN.md`: C1 phantom gp2→gp3 removed, H1 orphaned CoH bucket consumed, H3 counted==rendered, H2/H4/H5 CO placeholder/permission, M1 RI demoted, M2-M4 pricing filters |
-| 04 | S3 | WARN | PricingEngine + tier logic | Lifecycle savings approximate | Lifecycle $ savings not fully derived from pricing API |
+| 04 | S3 | PASS (remediated 2026-06-23) | PricingEngine (live, region-correct) | Standard→IA delta on cold Standard bytes; evidence-gated | Fixed via `S3_AUDIT_FINDINGS.md`: S3-A per-class costing, S3-B evidence-gated savings (request metrics; no assumed factors), S3-C count==$-bearing, S3-D/E correct S3 SKU+tier, S3-F dead code, S3-G/H docs+caveats, S3-I cross-region pricing (`for_region`) |
 | 05 | Network | WARN | PricingEngine (NAT) + flat (EIP/VPC) | Mixed live and flat-rate | EIP and VPC savings use static rates |
 | 06 | Lambda | WARN | CloudWatch + simplified $/GB-s | Memory rightsizing | $/GB-second pricing simplified, ignores tier |
 | 07 | DynamoDB | WARN | Partial RCU/WCU pricing | On-demand vs provisioned | RCU/WCU pricing incomplete |
