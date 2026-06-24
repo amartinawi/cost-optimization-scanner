@@ -17,15 +17,20 @@ number here is derived locally from DescribeFileSystems + the live Pricing API.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from typing import Any
+
+from botocore.exceptions import ClientError  # type: ignore[import-untyped]
 
 from core.scan_context import ScanContext
 from services.file_systems_logic import (
     EFS_IA_TRANSITION_FRACTION,
+    EFS_METRIC_WINDOW_DAYS,
     EFS_MIN_LIFECYCLE_GB,
     EFS_ONE_ZONE_MIN_GB,
     FSX_SSD_TO_HDD_MIN_GB,
     efs_idle_savings,
+    efs_lifecycle_net_savings,
     efs_lifecycle_savings,
     efs_one_zone_savings,
     fsx_ssd_to_hdd_savings,
@@ -33,14 +38,34 @@ from services.file_systems_logic import (
 
 SMALL_EFS_SIZE_GB: float = 0.1
 EXCESSIVE_BACKUP_RETENTION_DAYS: int = 30
-# FSx file-system types that support an HDD storage tier (OpenZFS does not).
-_FSX_HDD_ELIGIBLE: frozenset[str] = frozenset({"WINDOWS", "LUSTRE", "ONTAP"})
+# Only FSx for Windows File Server exposes an HDD tier with a clean, in-place
+# SSD->HDD price delta we can COUNT. ONTAP has no HDD storage type (SSD +
+# capacity-pool tiering only). Lustre HDD exists but only on Persistent
+# deployments and at a different throughput-per-TiB tier, so the swap is not
+# like-for-like — Lustre and ONTAP are surfaced as advisory, never counted.
+_FSX_HDD_COUNTED_ELIGIBLE: frozenset[str] = frozenset({"WINDOWS"})
+
+
+def _report_aws_error(
+    ctx: ScanContext, exc: Exception, message: str, service: str, action: str | None = None
+) -> None:
+    """Route an AWS error to permission_issue (AccessDenied) or warn (all else).
+
+    A throttled or denied describe/CloudWatch read must never silently become
+    "no usage -> no/false saving"; it is recorded so the gap is visible.
+    """
+    if isinstance(exc, ClientError):
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code in ("AccessDenied", "AccessDeniedException", "UnauthorizedOperation"):
+            ctx.permission_issue(f"{message}: {code}", service=service, action=action)
+            return
+    ctx.warn(f"{message}: {exc}", service=service)
 
 FILE_SYSTEM_OPTIMIZATION_DESCRIPTIONS: dict[str, dict[str, str]] = {
     "efs_lifecycle_policies": {
         "title": "Configure EFS Lifecycle Policies",
         "description": "Automatically move infrequently accessed files to IA storage to cut storage cost on cold data.",
-        "action": "1. Enable Transition to IA after 30 days\n2. Configure Transition back to Standard on access\n3. Savings shown are based on measured Standard-class bytes.",
+        "action": "1. Enable Transition to IA after 30 days\n2. Configure Transition back to Standard on access\n3. Counted when CloudWatch access metrics prove a cold Standard set and the saving is net-positive after IA access charges; otherwise advisory.",
     },
     "efs_idle_systems": {
         "title": "Delete Idle EFS File Systems",
@@ -78,14 +103,61 @@ def _efs_rate(ctx: ScanContext, storage_class: str, pricing_multiplier: float) -
     return FALLBACK_EFS_GB_MONTH_BY_CLASS.get(api_class, FALLBACK_EFS_GB_MONTH) * pricing_multiplier
 
 
+def _efs_ia_access_rate(ctx: ScanContext, pricing_multiplier: float) -> float:
+    """Region-correct EFS IA per-GB data-access rate (fallback when no engine)."""
+    if ctx.pricing_engine is not None:
+        return ctx.pricing_engine.get_efs_ia_access_price_per_gb()
+    from core.pricing_engine import FALLBACK_EFS_IA_ACCESS_GB
+
+    return FALLBACK_EFS_IA_ACCESS_GB * pricing_multiplier
+
+
+def _efs_access_signal(cloudwatch: Any, fs_id: str) -> float | None:
+    """GB of data read+written for an EFS file system over the metric window.
+
+    Sums daily ``DataReadIOBytes`` + ``DataWriteIOBytes`` (Bytes, Sum) over the
+    last ``EFS_METRIC_WINDOW_DAYS`` and returns GB — the measured "hot" volume.
+    Returns ``None`` when NEITHER metric has datapoints, so callers warn and keep
+    the finding advisory rather than fabricating a saving. AWS errors propagate to
+    the caller for permission classification.
+    """
+    end = datetime.now(UTC)
+    start = end - timedelta(days=EFS_METRIC_WINDOW_DAYS)
+    total_bytes = 0.0
+    found = False
+    for metric in ("DataReadIOBytes", "DataWriteIOBytes"):
+        resp = cloudwatch.get_metric_statistics(
+            Namespace="AWS/EFS",
+            MetricName=metric,
+            Dimensions=[{"Name": "FileSystemId", "Value": fs_id}],
+            StartTime=start,
+            EndTime=end,
+            Period=86400,
+            Statistics=["Sum"],
+        )
+        datapoints = resp.get("Datapoints", [])
+        if datapoints:
+            found = True
+            total_bytes += sum(d.get("Sum", 0.0) for d in datapoints)
+    if not found:
+        return None
+    return total_bytes / (1024**3)
+
+
 def _fsx_rate(ctx: ScanContext, fs_type: str, storage_type: str, deployment: str, pricing_multiplier: float) -> float:
     """Region-correct FSx $/GB-month for a (type, storage, deployment)."""
     if ctx.pricing_engine is not None:
         return ctx.pricing_engine.get_fsx_storage_price_per_gb(fs_type, storage_type, deployment)
-    from core.pricing_engine import FALLBACK_FSX_GB_MONTH
+    from core.pricing_engine import FALLBACK_FSX_GB_MONTH, FALLBACK_FSX_MULTI_AZ_GB_MONTH
 
+    table = FALLBACK_FSX_MULTI_AZ_GB_MONTH if "MULTI" in deployment.upper() else FALLBACK_FSX_GB_MONTH
     key = (fs_type.upper(), storage_type.upper())
-    rate = FALLBACK_FSX_GB_MONTH.get(key) or FALLBACK_FSX_GB_MONTH.get((fs_type.upper(), "SSD"), 0.15)
+    rate = (
+        table.get(key)
+        or table.get((fs_type.upper(), "SSD"))
+        or FALLBACK_FSX_GB_MONTH.get(key)
+        or FALLBACK_FSX_GB_MONTH.get((fs_type.upper(), "SSD"), 0.15)
+    )
     return rate * pricing_multiplier
 
 
@@ -133,7 +205,7 @@ def get_efs_file_system_count(ctx: ScanContext) -> dict[str, Any]:
         counts["total_size_gb"] = round(counts["total_size_gb"], 2)
         return counts
     except Exception as e:
-        ctx.warn(f"Could not get EFS file system count: {e}", "efs")
+        _report_aws_error(ctx, e, "Could not get EFS file system count", "efs", "elasticfilesystem:DescribeFileSystems")
         return dict(empty)
 
 
@@ -151,7 +223,8 @@ def get_fsx_file_system_count(ctx: ScanContext) -> dict[str, Any]:
             file_systems.extend(page.get("FileSystems", []))
         try:
             caches = fsx.describe_file_caches().get("FileCaches", [])
-        except Exception:
+        except Exception as e:
+            _report_aws_error(ctx, e, "Could not list FSx file caches", "fsx", "fsx:DescribeFileCaches")
             caches = []
 
         counts: dict[str, Any] = {**empty, "underutilized_systems": [], "file_cache": len(caches)}
@@ -172,7 +245,7 @@ def get_fsx_file_system_count(ctx: ScanContext) -> dict[str, Any]:
             counts["total_capacity_gb"] += cache.get("StorageCapacity", 0)
         return counts
     except Exception as e:
-        ctx.warn(f"Could not get FSx file system count: {e}", "fsx")
+        _report_aws_error(ctx, e, "Could not get FSx file system count", "fsx", "fsx:DescribeFileSystems")
         return dict(empty)
 
 
@@ -183,15 +256,29 @@ def get_file_system_optimization_descriptions() -> dict[str, dict[str, str]]:
 # ── EFS findings ─────────────────────────────────────────────────────────────
 
 
-def get_efs_findings(ctx: ScanContext, pricing_multiplier: float) -> dict[str, list[dict[str, Any]]]:
+def get_efs_findings(
+    ctx: ScanContext, pricing_multiplier: float, fast_mode: bool = False
+) -> dict[str, list[dict[str, Any]]]:
     """Return ``{"counted": [...], "advisory": [...]}`` for EFS file systems.
 
     Counted savings use the storage-class breakdown DescribeFileSystems already
     reports (``SizeInBytes.ValueInStandard`` / ``ValueInIA``) plus the live
-    per-class rate, so every dollar is anchored to measured data.
+    per-class rate. The IA-lifecycle saving is counted ONLY when CloudWatch
+    access metrics (``DataReadIOBytes`` / ``DataWriteIOBytes``) prove a cold
+    Standard set and the saving is net-positive after the IA access charge;
+    otherwise it stays advisory. ``fast_mode`` skips the per-FS metric reads.
     """
     counted: list[dict[str, Any]] = []
     advisory: list[dict[str, Any]] = []
+    # CloudWatch evidence gates the counted lifecycle saving. Skipped in fast
+    # mode (one warning) and unavailable when the client isn't provisioned.
+    cloudwatch = None if fast_mode else ctx.client("cloudwatch")
+    if fast_mode:
+        ctx.warn(
+            "EFS IA-lifecycle savings require DataReadIOBytes/DataWriteIOBytes metrics; "
+            "skipped in fast mode — lifecycle opportunities shown as advisory.",
+            "efs",
+        )
     try:
         efs = ctx.client("efs")
         paginator = efs.get_paginator("describe_file_systems")
@@ -200,6 +287,11 @@ def get_efs_findings(ctx: ScanContext, pricing_multiplier: float) -> dict[str, l
         for page in paginator.paginate():
             for fs in page["FileSystems"]:
                 fs_id = fs["FileSystemId"]
+                # Skip transient lifecycle states (creating/updating/deleting/
+                # error). A just-created FS has 0 mount targets transiently and
+                # would otherwise emit a spurious idle-delete saving.
+                if str(fs.get("LifeCycleState", "")).lower() not in ("available", ""):
+                    continue
                 name = fs.get("Name", "Unnamed")
                 size = fs.get("SizeInBytes", {})
                 total_gb = (size.get("Value", 0) or 0) / (1024**3)
@@ -215,7 +307,10 @@ def get_efs_findings(ctx: ScanContext, pricing_multiplier: float) -> dict[str, l
                 try:
                     lifecycle = efs.describe_lifecycle_configuration(FileSystemId=fs_id).get("LifecyclePolicies", [])
                 except Exception as e:
-                    ctx.warn(f"Could not read EFS lifecycle config for {fs_id}: {e}", "efs")
+                    _report_aws_error(
+                        ctx, e, f"Could not read EFS lifecycle config for {fs_id}",
+                        "efs", "elasticfilesystem:DescribeLifecycleConfiguration",
+                    )
                     lifecycle = []
                 has_ia_policy = any(p.get("TransitionToIA") for p in lifecycle)
                 has_archive_policy = any(p.get("TransitionToArchive") for p in lifecycle)
@@ -238,25 +333,110 @@ def get_efs_findings(ctx: ScanContext, pricing_multiplier: float) -> dict[str, l
                     )
 
                 # 2) Lifecycle — no IA policy and measurable Standard data.
+                # COUNTED only with CloudWatch evidence: cold_gb = Standard bytes
+                # NOT accessed over the window, and the saving must be net-positive
+                # after the IA per-GB access charge. Otherwise ADVISORY (indicative
+                # gross), mirroring the evidence-gated S3 adapter.
                 elif not has_ia_policy and standard_gb >= EFS_MIN_LIFECYCLE_GB:
-                    savings = efs_lifecycle_savings(standard_gb, std_rate, ia_rate)
-                    counted.append(
-                        {
-                            "FileSystemId": fs_id, "Name": name, "SizeGB": round(total_gb, 2),
-                            "StorageClass": std_class, "HasIAPolicy": False,
-                            "CheckCategory": "EFS No Lifecycle",
-                            "Recommendation": "Enable IA lifecycle policy for infrequently accessed data",
-                            "EstimatedSavings": f"${savings:.2f}/month", "_savings": savings, "Counted": True,
-                            "AuditBasis": {
-                                "metric": "measured Standard-class bytes x (Standard-IA rate) x transition fraction",
-                                "region": region, "standard_gb": round(standard_gb, 2),
-                                "standard_rate_per_gb_month": round(std_rate, 6),
-                                "ia_rate_per_gb_month": round(ia_rate, 6),
-                                "transition_fraction": EFS_IA_TRANSITION_FRACTION,
-                                "basis": "assumes ~50% of Standard data is infrequently accessed; actual depends on access patterns",
-                            },
-                        }
-                    )
+                    monthly_access_gb = None
+                    if cloudwatch is not None:
+                        try:
+                            monthly_access_gb = _efs_access_signal(cloudwatch, fs_id)
+                            if monthly_access_gb is None:
+                                ctx.warn(
+                                    f"No EFS access metrics for {fs_id}; IA-lifecycle shown as advisory "
+                                    f"(no usage evidence).",
+                                    "efs",
+                                )
+                        except Exception as e:
+                            _report_aws_error(
+                                ctx, e, f"Could not read EFS access metrics for {fs_id}",
+                                "efs", "cloudwatch:GetMetricStatistics",
+                            )
+                            monthly_access_gb = None
+
+                    if monthly_access_gb is not None:
+                        ia_access_rate = _efs_ia_access_rate(ctx, pricing_multiplier)
+                        est = efs_lifecycle_net_savings(
+                            standard_gb, monthly_access_gb, std_rate, ia_rate, ia_access_rate
+                        )
+                        if est.net_savings > 0 and est.cold_gb >= EFS_MIN_LIFECYCLE_GB:
+                            counted.append(
+                                {
+                                    "FileSystemId": fs_id, "Name": name, "SizeGB": round(total_gb, 2),
+                                    "StorageClass": std_class, "HasIAPolicy": False,
+                                    "CheckCategory": "EFS No Lifecycle",
+                                    "Recommendation": "Enable IA lifecycle policy for infrequently accessed data",
+                                    "EstimatedSavings": f"${est.net_savings:.2f}/month",
+                                    "_savings": est.net_savings, "Counted": True,
+                                    "AuditBasis": {
+                                        "metric": f"DataReadIOBytes+DataWriteIOBytes over {EFS_METRIC_WINDOW_DAYS}d",
+                                        "region": region, "standard_gb": round(standard_gb, 2),
+                                        "monthly_access_gb": round(monthly_access_gb, 2),
+                                        "cold_gb": round(est.cold_gb, 2),
+                                        "standard_rate_per_gb_month": round(std_rate, 6),
+                                        "ia_rate_per_gb_month": round(ia_rate, 6),
+                                        "ia_access_rate_per_gb": round(ia_access_rate, 6),
+                                        "gross_savings": round(est.gross_savings, 2),
+                                        "ia_access_charge": round(est.access_charge, 2),
+                                        "basis": (
+                                            "cold_gb = Standard - bytes accessed in window; "
+                                            "net = cold_gb x (Standard-IA) - accessed x IA-access rate"
+                                        ),
+                                    },
+                                }
+                            )
+                        else:
+                            advisory.append(
+                                {
+                                    "FileSystemId": fs_id, "Name": name, "SizeGB": round(total_gb, 2),
+                                    "StorageClass": std_class, "HasIAPolicy": False,
+                                    "CheckCategory": "EFS No Lifecycle", "Counted": False,
+                                    "Recommendation": "Enable IA lifecycle policy for infrequently accessed data",
+                                    "EstimatedSavings": (
+                                        f"not cost-effective: {est.cold_gb:.0f} GB cold but net "
+                                        f"${est.net_savings:.2f}/month after IA access charges "
+                                        f"(over {EFS_METRIC_WINDOW_DAYS}d)"
+                                    ),
+                                    "AuditBasis": {
+                                        "metric": f"DataReadIOBytes+DataWriteIOBytes over {EFS_METRIC_WINDOW_DAYS}d",
+                                        "region": region, "standard_gb": round(standard_gb, 2),
+                                        "monthly_access_gb": round(monthly_access_gb, 2),
+                                        "cold_gb": round(est.cold_gb, 2),
+                                        "net_savings": round(est.net_savings, 2),
+                                        "basis": "net <= $0 after IA access charges; not counted",
+                                    },
+                                }
+                            )
+                    else:
+                        # No evidence (fast mode, no CloudWatch client, or no
+                        # datapoints): indicative GROSS only, never counted.
+                        gross = efs_lifecycle_savings(standard_gb, std_rate, ia_rate)
+                        if gross > 0:
+                            advisory.append(
+                                {
+                                    "FileSystemId": fs_id, "Name": name, "SizeGB": round(total_gb, 2),
+                                    "StorageClass": std_class, "HasIAPolicy": False,
+                                    "CheckCategory": "EFS No Lifecycle", "Counted": False,
+                                    "Recommendation": "Enable IA lifecycle policy for infrequently accessed data",
+                                    "EstimatedSavings": (
+                                        f"up to ~${gross:.2f}/month gross before IA read-access charges "
+                                        f"(net depends on access patterns; enable CloudWatch metrics to quantify)"
+                                    ),
+                                    "AuditBasis": {
+                                        "metric": "measured Standard-class bytes x (Standard-IA rate) x transition fraction",
+                                        "region": region, "standard_gb": round(standard_gb, 2),
+                                        "standard_rate_per_gb_month": round(std_rate, 6),
+                                        "ia_rate_per_gb_month": round(ia_rate, 6),
+                                        "transition_fraction": EFS_IA_TRANSITION_FRACTION,
+                                        "basis": (
+                                            "indicative gross only; assumes ~50% of Standard data is infrequently "
+                                            "accessed and does NOT subtract the $0.01/GB IA access charge — "
+                                            "not counted toward savings"
+                                        ),
+                                    },
+                                }
+                            )
 
                 # One Zone migration — a DURABILITY tradeoff (single AZ), so it is
                 # advisory rather than a counted saving even though the price delta
@@ -294,7 +474,7 @@ def get_efs_findings(ctx: ScanContext, pricing_multiplier: float) -> dict[str, l
                         }
                     )
     except Exception as e:
-        ctx.warn(f"Could not analyze EFS file systems: {e}", "efs")
+        _report_aws_error(ctx, e, "Could not analyze EFS file systems", "efs", "elasticfilesystem:DescribeFileSystems")
     return {"counted": counted, "advisory": advisory}
 
 
@@ -323,7 +503,11 @@ def get_fsx_findings(ctx: ScanContext, pricing_multiplier: float) -> dict[str, l
             deployment = _fsx_deployment_option(fs)
 
             # Counted: SSD -> HDD storage swap (deterministic price delta).
-            if storage_type == "SSD" and fs_type in _FSX_HDD_ELIGIBLE and capacity >= FSX_SSD_TO_HDD_MIN_GB:
+            # Windows ONLY: Single-AZ ($0.130->$0.013) and Multi-AZ ($0.230->
+            # $0.025) are clean, like-for-like, region-correct SKUs. ONTAP has no
+            # HDD; Lustre HDD is Persistent-only at a different throughput tier
+            # (handled as advisory) — neither yields a defensible counted delta.
+            if storage_type == "SSD" and fs_type in _FSX_HDD_COUNTED_ELIGIBLE and capacity >= FSX_SSD_TO_HDD_MIN_GB:
                 ssd_rate = _fsx_rate(ctx, fs_type, "SSD", deployment, pricing_multiplier)
                 hdd_rate = _fsx_rate(ctx, fs_type, "HDD", deployment, pricing_multiplier)
                 savings = fsx_ssd_to_hdd_savings(capacity, ssd_rate, hdd_rate)
@@ -344,6 +528,14 @@ def get_fsx_findings(ctx: ScanContext, pricing_multiplier: float) -> dict[str, l
                     )
 
             # Advisory FSx opportunities (no account-specific $ without usage/backup data).
+            # Lustre SSD: HDD exists only on Persistent at a different throughput
+            # tier, and Scratch suits transient workloads — surfaced as advisory
+            # because there is no like-for-like, deterministic price delta.
+            if fs_type == "LUSTRE" and storage_type == "SSD":
+                advisory.append(_fsx_advisory(
+                    fs_id, fs_type, capacity, "FSx Lustre Storage Optimization",
+                    "Consider Persistent HDD for throughput-insensitive data, or Scratch for transient workloads",
+                ))
             if fs_type in ("LUSTRE", "OPENZFS") and storage_type not in ("INT", "INTELLIGENT_TIERING"):
                 advisory.append(_fsx_advisory(fs_id, fs_type, capacity, "FSx Intelligent-Tiering",
                                                "Enable Intelligent-Tiering for automatically tiered cold data"))
@@ -354,8 +546,12 @@ def get_fsx_findings(ctx: ScanContext, pricing_multiplier: float) -> dict[str, l
                     advisory.append(_fsx_advisory(fs_id, fs_type, capacity, "FSx Single-AZ Migration",
                                                    "Use Single-AZ for non-production workloads"))
             if fs_type == "ONTAP":
+                # Capacity-pool tiering moves cold data from SSD (~$0.125/GB-mo)
+                # to the capacity pool (~$0.0219/GB-mo). Quantifying it requires
+                # per-volume cold-byte data (DescribeVolumes/SVMs), which this
+                # adapter does not read — so it stays advisory (known limitation).
                 advisory.append(_fsx_advisory(fs_id, fs_type, capacity, "FSx ONTAP Data Efficiency",
-                                               "Enable deduplication/compression and capacity-pool tiering"))
+                                               "Enable deduplication/compression and capacity-pool tiering for cold data"))
 
             backup_cfg = fs.get("WindowsConfiguration", {}) or fs.get("OntapConfiguration", {}) or {}
             retention = backup_cfg.get("AutomaticBackupRetentionDays", 0)
@@ -380,10 +576,10 @@ def get_fsx_findings(ctx: ScanContext, pricing_multiplier: float) -> dict[str, l
                         "EstimatedSavings": "Depends on cache hit rate / utilization (no metric data)",
                     }
                 )
-        except Exception:
-            pass
+        except Exception as e:
+            _report_aws_error(ctx, e, "Could not list FSx file caches", "fsx", "fsx:DescribeFileCaches")
     except Exception as e:
-        ctx.warn(f"Could not analyze FSx file systems: {e}", "fsx")
+        _report_aws_error(ctx, e, "Could not analyze FSx file systems", "fsx", "fsx:DescribeFileSystems")
     return {"counted": counted, "advisory": advisory}
 
 

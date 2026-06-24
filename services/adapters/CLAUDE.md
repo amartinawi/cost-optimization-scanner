@@ -19,7 +19,7 @@ Use `ctx.pricing_engine` (PricingEngine) for AWS Pricing API lookups. Fall back 
 | `dynamodb.py` | RCU/WCU hourly rates × 730 | Module constants |
 | `containers.py` | Fargate vCPU/mem hourly rates × 730 | Module constants |
 | `network.py` | `get_eip_monthly()`, `get_nat_hourly()`, etc. (5 methods) | AWS Pricing API |
-| `file_systems.py` | `get_s3_monthly_price_per_gb("STANDARD")` | AWS Pricing API |
+| `file_systems.py` | `get_efs_monthly_price_per_gb(class)` + `get_efs_ia_access_price_per_gb()` + `get_fsx_storage_price_per_gb(type, storage, deployment)`. Counted = EFS idle-delete, **CloudWatch-gated** EFS IA-lifecycle (cold_gb from `DataReadIOBytes`/`DataWriteIOBytes`, net of IA access charge; advisory if no metrics / fast_mode / net≤0), and **Windows-only** SSD→HDD. Lustre/ONTAP/OpenZFS, throughput, ONTAP tiering, backup are advisory. `requires_cloudwatch`/`reads_fast_mode`. No CoH/CO (neither service is covered). | AWS Pricing API + CloudWatch |
 | `workspaces.py` | `get_instance_monthly_price("AmazonWorkSpaces", ...)` | AWS Pricing API |
 | `glue.py` | `$0.44/DPU/hour × 160 hrs` | Module constant |
 | `lightsail.py` | `get_instance_monthly_price("AmazonLightsail", ...)` | AWS Pricing API |

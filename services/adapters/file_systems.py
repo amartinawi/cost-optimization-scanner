@@ -30,12 +30,14 @@ class FileSystemsModule(BaseServiceModule):
     """ServiceModule adapter for file systems (EFS, FSx)."""
 
     key: str = "file_systems"
-    cli_aliases: tuple[str, ...] = ("efs", "file_systems")
+    cli_aliases: tuple[str, ...] = ("efs", "fsx", "file_systems")
     display_name: str = "File Systems"
+    requires_cloudwatch: bool = True
+    reads_fast_mode: bool = True
 
     def required_clients(self) -> tuple[str, ...]:
         """Returns boto3 client names required for file system scanning."""
-        return ("efs", "fsx")
+        return ("efs", "fsx", "cloudwatch")
 
     def scan(self, ctx: Any) -> ServiceFindings:
         """Scan EFS and FSx file systems for cost optimization opportunities.
@@ -49,7 +51,7 @@ class FileSystemsModule(BaseServiceModule):
         efs_counts = get_efs_file_system_count(ctx)
         fsx_counts = get_fsx_file_system_count(ctx)
 
-        efs = get_efs_findings(ctx, ctx.pricing_multiplier)
+        efs = get_efs_findings(ctx, ctx.pricing_multiplier, getattr(ctx, "fast_mode", False))
         fsx = get_fsx_findings(ctx, ctx.pricing_multiplier)
 
         # One counted finding per file system (highest saving wins) — never stack

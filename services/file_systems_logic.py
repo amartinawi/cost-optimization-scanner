@@ -7,15 +7,18 @@ findings so one file system's savings is never stacked across checks.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, NamedTuple
 
-# Conservative, LABELED assumption: the share of an un-tiered EFS file system's
-# Standard data that is infrequently accessed and would transition to IA once a
-# lifecycle policy is enabled. The dollar figure is anchored to the file system's
-# ACTUAL measured Standard bytes (from DescribeFileSystems) and the real
-# Standard−IA rate delta; only this access-pattern fraction is assumed, and it is
-# recorded in every finding's AuditBasis.
+# Conservative, LABELED assumption used ONLY for the advisory (no-evidence)
+# indicative figure: the share of an un-tiered EFS file system's Standard data
+# that is infrequently accessed and would transition to IA once a lifecycle
+# policy is enabled. When CloudWatch access metrics ARE available the counted
+# path replaces this guess with measured cold bytes (see efs_lifecycle_net_savings).
 EFS_IA_TRANSITION_FRACTION: float = 0.5
+
+# Lookback window for the EFS access-metric read (matches the common
+# "Transition to IA after 30 days" lifecycle rule).
+EFS_METRIC_WINDOW_DAYS: int = 30
 
 # Below these sizes the optimization is not worth surfacing as a dollar finding.
 EFS_MIN_LIFECYCLE_GB: float = 1.0
@@ -42,6 +45,35 @@ def efs_lifecycle_savings(
     """
     delta = max(standard_rate - ia_rate, 0.0)
     return max(standard_gb, 0.0) * delta * max(fraction, 0.0)
+
+
+class EfsLifecycleEstimate(NamedTuple):
+    """Evidence-based EFS IA-lifecycle saving breakdown (all monthly $)."""
+
+    cold_gb: float          # Standard bytes not accessed in the metric window
+    gross_savings: float    # cold_gb x (Standard - IA) rate delta
+    access_charge: float    # monthly accessed bytes x IA per-GB access rate
+    net_savings: float      # gross_savings - access_charge
+
+
+def efs_lifecycle_net_savings(
+    standard_gb: float,
+    monthly_access_gb: float,
+    standard_rate: float,
+    ia_rate: float,
+    ia_access_rate: float,
+) -> EfsLifecycleEstimate:
+    """NET monthly saving from enabling EFS IA lifecycle, from measured access.
+
+    ``cold_gb`` is the measured Standard bytes MINUS the bytes actually read or
+    written over the metric window (anything touched in the window is treated as
+    hot and excluded — conservative). The IA per-GB access charge on the accessed
+    bytes is netted out, so the result is a defensible NET, not a gross figure.
+    """
+    cold_gb = max(standard_gb - max(monthly_access_gb, 0.0), 0.0)
+    gross = cold_gb * max(standard_rate - ia_rate, 0.0)
+    access_charge = max(monthly_access_gb, 0.0) * max(ia_access_rate, 0.0)
+    return EfsLifecycleEstimate(cold_gb, gross, access_charge, gross - access_charge)
 
 
 def efs_one_zone_savings(total_gb: float, regional_rate: float, one_zone_rate: float) -> float:

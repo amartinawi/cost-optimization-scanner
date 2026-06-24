@@ -237,8 +237,12 @@ FALLBACK_EFS_GB_MONTH_BY_CLASS: dict[str, float] = {
     "Infrequent Access": 0.025,
     "One Zone-General Purpose": 0.16,
     "One Zone-Infrequent Access": 0.0133,
-    "Archive": 0.005,
+    "Archive": 0.008,
 }
+# EFS Infrequent Access per-GB DATA ACCESS charge (read or write; same rate in a
+# region). Billed whenever IA-resident data is read/written — must be netted out
+# of any IA-lifecycle saving. us-east-1 On-Demand, verified via Pricing API 2026-06.
+FALLBACK_EFS_IA_ACCESS_GB: float = 0.01
 # Caller-facing storage-class aliases → AWS Pricing API `storageClass` value.
 _EFS_STORAGE_CLASS_LABELS: dict[str, str] = {
     "standard": "General Purpose",
@@ -252,14 +256,34 @@ _EFS_STORAGE_CLASS_LABELS: dict[str, str] = {
     "archive": "Archive",
 }
 # FSx $/GB-month by (fileSystemType, storageType) (us-east-1 Single-AZ On-Demand,
-# verified via Pricing API 2026-06; HDD only exists for Windows/Lustre/ONTAP).
+# verified via Pricing API 2026-06). HDD storage exists only for Windows and
+# Lustre (Persistent); ONTAP storage is SSD + capacity-pool, OpenZFS is SSD-only.
 FALLBACK_FSX_GB_MONTH: dict[tuple[str, str], float] = {
     ("WINDOWS", "SSD"): 0.130,
     ("WINDOWS", "HDD"): 0.013,
     ("LUSTRE", "SSD"): 0.145,
     ("LUSTRE", "HDD"): 0.025,
-    ("ONTAP", "SSD"): 0.144,
-    ("OPENZFS", "SSD"): 0.20,
+    ("ONTAP", "SSD"): 0.125,
+    ("OPENZFS", "SSD"): 0.09,
+}
+# Multi-AZ FSx $/GB-month (us-east-1 On-Demand, verified via Pricing API 2026-06).
+# Consulted on the fallback path when the deployment is Multi-AZ; the live lookup
+# already resolves the distinct Multi-AZ SKU (Multi-AZ is NOT a flat x2 of
+# Single-AZ). Lustre has no Multi-AZ deployment, so it is absent here.
+FALLBACK_FSX_MULTI_AZ_GB_MONTH: dict[tuple[str, str], float] = {
+    ("WINDOWS", "SSD"): 0.230,
+    ("WINDOWS", "HDD"): 0.025,
+    ("ONTAP", "SSD"): 0.250,
+    ("OPENZFS", "SSD"): 0.18,
+}
+# AWS Pricing API ``fileSystemType`` attribute values, keyed by the upper-cased
+# token the adapter passes. ``str.capitalize()`` mangles ONTAP -> "Ontap" and
+# OPENZFS -> "Openzfs", which never match, so the live lookup must use this map.
+_FSX_FILE_SYSTEM_TYPE_LABELS: dict[str, str] = {
+    "WINDOWS": "Windows",
+    "LUSTRE": "Lustre",
+    "ONTAP": "ONTAP",
+    "OPENZFS": "OpenZFS",
 }
 # Network fallback constants reconciled to us-east-1 AWS list prices
 # (verified via Pricing API 2026-05). Previous values reflected a
@@ -718,6 +742,24 @@ class PricingEngine:
         self._cache.set(key, price)
         return price
 
+    def get_efs_ia_access_price_per_gb(self) -> float:
+        """$/GB EFS Infrequent Access data-access charge (read/write) in self._region.
+
+        Used to net the IA read/write charge out of an IA-lifecycle saving so the
+        reported number is a NET, not a gross, saving.
+        """
+        key = ("efs_ia_access",)
+        if (cached := self._get_cached(key)) is not None:
+            return cached
+        price = self._fetch_efs_ia_access_price()
+        if price is None:
+            price = self._use_fallback(
+                FALLBACK_EFS_IA_ACCESS_GB * self._fallback_multiplier,
+                f"Pricing API unavailable for EFS IA access in {self._region}; using fallback",
+            )
+        self._cache.set(key, price)
+        return price
+
     def get_fsx_storage_price_per_gb(
         self, file_system_type: str, storage_type: str, deployment_option: str = "Single-AZ"
     ) -> float:
@@ -736,12 +778,17 @@ class PricingEngine:
             return cached
         price = self._fetch_fsx_storage_price(fs_type, st, deployment_option)
         if price is None:
-            fallback = FALLBACK_FSX_GB_MONTH.get((fs_type, st))
-            if fallback is None:
-                fallback = FALLBACK_FSX_GB_MONTH.get((fs_type, "SSD"), 0.15)
+            is_multi_az = "MULTI" in deployment_option.upper()
+            table = FALLBACK_FSX_MULTI_AZ_GB_MONTH if is_multi_az else FALLBACK_FSX_GB_MONTH
+            fallback = (
+                table.get((fs_type, st))
+                or table.get((fs_type, "SSD"))
+                or FALLBACK_FSX_GB_MONTH.get((fs_type, st))
+                or FALLBACK_FSX_GB_MONTH.get((fs_type, "SSD"), 0.15)
+            )
             price = self._use_fallback(
                 fallback * self._fallback_multiplier,
-                f"Pricing API unavailable for FSx {fs_type} {st} in {self._region}; using fallback",
+                f"Pricing API unavailable for FSx {fs_type} {st} ({deployment_option}) in {self._region}; using fallback",
             )
         self._cache.set(key, price)
         return price
@@ -1072,15 +1119,90 @@ class PricingEngine:
             {"Type": "TERM_MATCH", "Field": "storageClass", "Value": storage_class},
             {"Type": "TERM_MATCH", "Field": "productFamily", "Value": "Storage"},
         ]
-        return self._call_pricing_api("AmazonEFS", filters)
+        return self._select_efs_storage_rate(filters)
+
+    def _fetch_efs_ia_access_price(self) -> float | None:
+        # The IA DataAccess read/write SKUs share storageClass="Infrequent Access"
+        # with the IA storage SKU, so select the DataAccess row explicitly.
+        filters = [
+            {"Type": "TERM_MATCH", "Field": "location", "Value": self._display_name},
+            {"Type": "TERM_MATCH", "Field": "storageClass", "Value": "Infrequent Access"},
+            {"Type": "TERM_MATCH", "Field": "productFamily", "Value": "Storage"},
+        ]
+        return self._select_efs_access_rate(filters)
+
+    def _select_efs_access_rate(self, filters: list[dict]) -> float | None:
+        """Pick the IA per-GB DataAccess $/GB rate (read == write) from EFS results."""
+        key_fields = {f["Field"]: f["Value"] for f in filters if f["Field"] not in _LOG_SKIP_FIELDS}
+        try:
+            resp = self._pricing.get_products(
+                ServiceCode="AmazonEFS",
+                Filters=filters,
+                MaxResults=100,
+            )
+            self._stats["api_calls"] += 1
+            for raw in resp.get("PriceList", []):
+                item = json.loads(raw)
+                usagetype = item.get("product", {}).get("attributes", {}).get("usagetype", "")
+                if "DataAccess" not in usagetype:
+                    continue
+                price = _extract_usd(item)
+                if price is not None:
+                    logger.debug("pricing:GetProducts  AmazonEFS  %s  → IA access $%.6f", key_fields, price)
+                    return price
+            logger.debug("pricing:GetProducts  AmazonEFS  %s  → no DataAccess row", key_fields)
+            return None
+        except Exception as exc:
+            self._stats["api_errors"] += 1
+            logger.debug("pricing:GetProducts  AmazonEFS  %s  → FAILED: %s", key_fields, exc)
+            return None
+
+    def _select_efs_storage_rate(self, filters: list[dict]) -> float | None:
+        """Pick the timed-storage $/GB-month from EFS Pricing results.
+
+        For the IA and Archive classes the ``storageClass`` filter alone matches
+        THREE SKUs that share the class: the ``*TimedStorage*-ByteHrs`` storage
+        row AND the per-GB ``*DataAccess-Bytes`` read/write rows ($0.01 / $0.03).
+        ``MaxResults=1`` could therefore return the access rate as if it were the
+        storage rate. Keep only the ``TimedStorage`` storage SKU (skipping
+        DataAccess and the SmallFiles rounding overhead).
+        """
+        key_fields = {f["Field"]: f["Value"] for f in filters if f["Field"] not in _LOG_SKIP_FIELDS}
+        try:
+            resp = self._pricing.get_products(
+                ServiceCode="AmazonEFS",
+                Filters=filters,
+                MaxResults=100,
+            )
+            self._stats["api_calls"] += 1
+            for raw in resp.get("PriceList", []):
+                item = json.loads(raw)
+                usagetype = item.get("product", {}).get("attributes", {}).get("usagetype", "")
+                if "TimedStorage" not in usagetype or "SmallFiles" in usagetype:
+                    continue
+                price = _extract_usd(item)
+                if price is not None:
+                    logger.debug("pricing:GetProducts  AmazonEFS  %s  → $%.6f", key_fields, price)
+                    return price
+            logger.debug("pricing:GetProducts  AmazonEFS  %s  → no timed-storage row", key_fields)
+            return None
+        except Exception as exc:
+            self._stats["api_errors"] += 1
+            logger.debug("pricing:GetProducts  AmazonEFS  %s  → FAILED: %s", key_fields, exc)
+            return None
 
     def _fetch_fsx_storage_price(
         self, file_system_type: str, storage_type: str, deployment_option: str
     ) -> float | None:
+        # ``fileSystemType`` is a CASE-SENSITIVE attribute whose values are
+        # Windows / Lustre / ONTAP / OpenZFS. ``str.capitalize()`` produced
+        # "Ontap"/"Openzfs", which never matched, so ONTAP/OpenZFS silently fell
+        # back to constants. Pin the exact label instead.
+        fs_label = _FSX_FILE_SYSTEM_TYPE_LABELS.get(file_system_type.strip().upper(), file_system_type)
         filters = [
             {"Type": "TERM_MATCH", "Field": "location", "Value": self._display_name},
             {"Type": "TERM_MATCH", "Field": "productFamily", "Value": "Storage"},
-            {"Type": "TERM_MATCH", "Field": "fileSystemType", "Value": file_system_type.capitalize()},
+            {"Type": "TERM_MATCH", "Field": "fileSystemType", "Value": fs_label},
             {"Type": "TERM_MATCH", "Field": "storageType", "Value": storage_type},
             {"Type": "TERM_MATCH", "Field": "deploymentOption", "Value": deployment_option},
         ]

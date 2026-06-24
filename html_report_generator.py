@@ -357,6 +357,37 @@ def _extract_rds_resources(rec: Dict[str, Any], resource_groups: Dict[str, list]
     )
 
 
+def _fs_rec_savings(rec: Dict[str, Any]) -> float:
+    """Monthly saving for a file-system rec — uses the real ``_savings`` field.
+
+    Counted recs carry ``_savings`` (float); advisory recs have none and resolve
+    to 0. The previous implementation read ``EstimatedMonthlyCost`` (a field
+    these recs never set) and always produced 0.
+    """
+    val = rec.get("_savings")
+    return float(val) if isinstance(val, (int, float)) else 0.0
+
+
+def _counted_advisory_counts(sources: Dict[str, Any]) -> Tuple[int, int]:
+    """Split a service's recommendations into (counted, advisory).
+
+    A recommendation is advisory/uncounted when it carries ``Counted == False``
+    — the convention used by adapters (e.g. file_systems) that emit best-practice
+    opportunities with no account-specific dollar figure. Everything else counts.
+    Lets the tab header show "N (X counted, Y advisory)" so a $0.00 savings line
+    next to a non-zero recommendation count is no longer ambiguous.
+    """
+    counted = advisory = 0
+    for source in sources.values():
+        recs = source.get("recommendations", []) if isinstance(source, dict) else source
+        for rec in recs or []:
+            if isinstance(rec, dict) and rec.get("Counted") is False:
+                advisory += 1
+            else:
+                counted += 1
+    return counted, advisory
+
+
 def _extract_file_systems_resources(rec: Dict[str, Any], resource_groups: Dict[str, list]) -> None:
     """Extract EFS/FSx file-system resource IDs into grouped lists. Called by: _get_affected_resources_list."""
     if "FileSystemType" in rec:
@@ -367,7 +398,7 @@ def _extract_file_systems_resources(rec: Dict[str, Any], resource_groups: Dict[s
             {
                 "id": rec.get("FileSystemId", "N/A"),
                 "type": f"{rec.get('StorageCapacity', 0)} GB",
-                "savings": rec.get("EstimatedMonthlyCost", 0) * 0.3,
+                "savings": _fs_rec_savings(rec),
             }
         )
     else:
@@ -378,7 +409,7 @@ def _extract_file_systems_resources(rec: Dict[str, Any], resource_groups: Dict[s
                 {
                     "id": rec.get("Name", rec.get("FileSystemId", "N/A")),
                     "type": f"{rec.get('SizeGB', 0)} GB",
-                    "savings": rec.get("EstimatedMonthlyCost", 0) * 0.8,
+                    "savings": _fs_rec_savings(rec),
                 }
             )
 
@@ -3147,7 +3178,12 @@ class HTMLReportGenerator:
         content += '<h3 class="section-title"><svg class="icon icon-sm"><use href="#icon-lightbulb"/></svg> Optimization Recommendations</h3>'
         savings_value = filtered_service_data.get("total_monthly_savings", 0.0)
         savings_label = "Estimated Monthly Savings" if is_estimated else "Monthly Savings"
-        content += f'<div class="rec-summary"><strong>Total Recommendations:</strong> {filtered_service_data["total_recommendations"]} | '
+        total_recs = filtered_service_data["total_recommendations"]
+        counted_n, advisory_n = _counted_advisory_counts(filtered_service_data.get("sources", {}))
+        rec_count_html = (
+            f"{total_recs} ({counted_n} counted, {advisory_n} advisory)" if advisory_n > 0 else f"{total_recs}"
+        )
+        content += f'<div class="rec-summary"><strong>Total Recommendations:</strong> {rec_count_html} | '
         if savings_value > 0:
             content += f'<strong>{savings_label}:</strong> <span class="savings">${savings_value:.2f}</span></div>'
         else:
