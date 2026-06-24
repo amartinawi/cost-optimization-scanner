@@ -58,7 +58,11 @@ class ScanOrchestrator:
             "opensearch",
             "redshift",
             "s3",
-            "eks",
+            # EKS Cost Optimization Hub recs are consumed by EksCostModule,
+            # whose module key is "eks_cost" (NOT "eks"). The bucket name must
+            # match the module key, else the gate `bucket in selected` below is
+            # never satisfied and EksCluster recs are silently dropped.
+            "eks_cost",
             "dynamodb",
             # Catch ECS / EKS service-level recs and any cross-service CoH
             # findings that previously lived in the dedicated CoH tab.
@@ -89,7 +93,7 @@ class ScanOrchestrator:
             "OpenSearchDomain": "opensearch",
             "RedshiftCluster": "redshift",
             "S3Bucket": "s3",
-            "EksCluster": "eks",
+            "EksCluster": "eks_cost",
             "DynamoDBTable": "dynamodb",
             # ECS / container-level
             "EcsService": "containers",
