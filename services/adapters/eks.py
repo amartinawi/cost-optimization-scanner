@@ -49,7 +49,7 @@ class EksCostModule(BaseServiceModule):
     """
 
     key: str = "eks_cost"
-    cli_aliases: tuple[str, ...] = ("eks_cost", "eks_cost_visibility")
+    cli_aliases: tuple[str, ...] = ("eks_cost", "eks_cost_visibility", "eks")
     display_name: str = "EKS Cost Visibility"
 
     stat_cards: tuple[StatCardSpec, ...] = (
