@@ -114,29 +114,29 @@ python3 cli.py us-east-1 --scan-only file_systems
 
 | Service | CLI Alias | Adapter | Key Optimizations |
 |---------|-----------|---------|-------------------|
-| EC2 | `ec2`, `instances` | `ec2.py` | Idle instances (CloudWatch), rightsizing, previous-gen (t2→t3), burstable credits, stopped instances |
-| EBS | `ebs`, `volumes` | `ebs.py` | Unattached volumes, gp2→gp3, old snapshots, Compute Optimizer |
+| EC2 | `ec2` | `ec2.py` | Idle instances (CloudWatch), rightsizing, previous-gen (t2→t3), burstable credits, stopped instances |
+| EBS | `ebs` | `ebs.py` | Unattached volumes, gp2→gp3, old snapshots, Compute Optimizer |
 | RDS | `rds` | `rds.py` | Multi-AZ in non-prod, backup retention, gp2→gp3, Compute Optimizer |
 | S3 | `s3` | `s3.py` | Lifecycle policies, Intelligent-Tiering, multipart uploads, empty buckets |
 | Lambda | `lambda` | `lambda_svc.py` | Low invocations, memory sizing, ARM migration (metric-gated), provisioned concurrency |
 | DynamoDB | `dynamodb` | `dynamodb.py` | RCU/WCU capacity pricing, billing mode review, empty tables |
-| Containers | `containers`, `ecs`, `eks` | `containers.py` | Fargate vCPU/memory pricing, ECS unused clusters, EKS node groups, ECR lifecycle policies |
-| Network | `network`, `eip`, `nat` | `network.py` | Unused EIPs, NAT optimization, VPC endpoints, load balancer consolidation |
+| Containers | `containers`, `ecs`, `ecr` | `containers.py` | ECS Fargate rightsizing (metric-gated, valid-combo snapping, arch/OS-aware), ECR deduplicated-layer lifecycle savings. EKS is a separate tab (`eks`). |
+| Network | `network` | `network.py` | Unused EIPs, NAT optimization, VPC endpoints, load balancer consolidation |
 | File Systems | `file_systems`, `efs`, `fsx` | `file_systems.py` | EFS lifecycle/Archive, One Zone migration, FSx optimization |
 | ElastiCache | `elasticache` | `elasticache.py` | Graviton migration, reserved nodes, engine version review |
 | OpenSearch | `opensearch` | `opensearch.py` | Reserved instances, Graviton migration, gp2→gp3 |
-| CloudWatch | `monitoring`, `cloudwatch` | `monitoring.py` | Log retention, stale alarms, CloudTrail data events |
+| CloudWatch | `monitoring` | `monitoring.py` | Log retention, stale alarms, CloudTrail data events |
 | CloudFront | `cloudfront` | `cloudfront.py` | Price class (traffic-gated), disabled distributions |
 | API Gateway | `api_gateway` | `api_gateway.py` | REST→HTTP migration, caching opportunities |
 | Step Functions | `step_functions` | `step_functions.py` | CloudWatch execution pricing, Standard→Express migration |
-| AMI | `ami`, `amis` | `ami.py` | Unused AMIs, old snapshot cleanup |
+| AMI | `ami` | `ami.py` | Unused AMIs, old snapshot cleanup |
 | Lightsail | `lightsail` | `lightsail.py` | Live bundle pricing, stopped instances, unused static IPs |
 | Redshift | `redshift` | `redshift.py` | Reserved nodes, rightsizing, serverless |
 | DMS | `dms` | `dms.py` | Instance rightsizing, serverless review |
 | QuickSight | `quicksight` | `quicksight.py` | SPICE capacity pricing (tier-aware) |
 | App Runner | `apprunner` | `apprunner.py` | vCPU + memory hourly pricing |
 | Transfer Family | `transfer` | `transfer.py` | Per-protocol hourly pricing |
-| MSK | `msk`, `kafka` | `msk.py` | Cluster rightsizing, serverless review |
+| MSK | `msk` | `msk.py` | Cluster rightsizing, serverless review |
 | WorkSpaces | `workspaces` | `workspaces.py` | AlwaysOn→AutoStop with live bundle pricing |
 | MediaStore | `mediastore` | `mediastore.py` | S3-equivalent storage pricing |
 | Glue | `glue` | `glue.py` | DPU-based pricing ($0.44/DPU/hour), dev endpoints, crawler schedules |
@@ -146,8 +146,8 @@ python3 cli.py us-east-1 --scan-only file_systems
 | Commitment Analysis | `commitment_analysis`, `commitments`, `savings_plans`, `ri` | `commitment_analysis.py` | Savings Plans utilization/coverage, RI utilization/coverage, full (term × payment) purchase-recommendation matrix: 1yr / 3yr × No Upfront / Partial Upfront / All Upfront; absorbs Cost Optimization Hub RI / SP findings via `ctx.cost_hub_splits` |
 | Bedrock | `bedrock` | `bedrock.py` | Provisioned throughput idle analysis, knowledge base optimization, agent utilization |
 | SageMaker | `sagemaker` | `sagemaker.py` | Idle endpoints/notebooks, spot training adoption, multi-model consolidation |
-| Network Cost | `network_cost` | `network_cost.py` | Cross-region/AZ transfer analysis, internet egress, TGW vs peering |
-| EKS Cost Visibility | `eks_cost`, `eks_visibility` | `eks_cost.py` | Control plane costs, node group optimization, Fargate vs EC2 comparison, Container Insights coverage |
+| Network Cost | `network_cost`, `data_transfer` | `network_cost.py` | Cross-region/AZ transfer analysis, internet egress, TGW vs peering |
+| EKS Cost Visibility | `eks_cost`, `eks_cost_visibility`, `eks` | `eks.py` | Control-plane cost, Extended Support surcharge (~$365/mo/cluster), idle-cluster control plane; node groups + Fargate advisory (EC2-domain), Cost Hub |
 
 > **Cost Optimization Hub routing.** AWS Cost Optimization Hub no longer has a dedicated tab. The orchestrator (`core/scan_orchestrator.py`) fetches CoH recommendations once per scan and buckets them by `currentResourceType` into the matching service: `Ec2Instance` → EC2, `RdsDbInstance` / `RdsDbCluster` → RDS, `EbsVolume` → EBS, `LambdaFunction` → Lambda, `S3Bucket` → S3, `ElastiCacheCluster` → ElastiCache, `OpenSearchDomain` → OpenSearch, `RedshiftCluster` → Redshift, `EksCluster` → EKS Cost Visibility, `EcsService` / `EcsTask` / `EcsCluster` → Containers, and every `*ReservedInstances` / `*SavingsPlans` → Commitment Analysis. Each rec-item in the report renders with a `COST HUB ·` typographic prefix on the title so the source-of-evidence stays visible inline.
 >
