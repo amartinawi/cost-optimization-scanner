@@ -5,15 +5,28 @@ Extracted from CostOptimizer as free functions taking ScanContext.
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from core.scan_context import ScanContext
+from services.containers_logic import compute_untagged_reclaimable_bytes
 
 logger = logging.getLogger(__name__)
 
 HIGH_IMAGE_COUNT_THRESHOLD: int = 10
+# Skip per-image manifest analysis above this repo size (cost guard); emit a
+# Counted=False advisory instead so we never silently miss a huge repo.
+ECR_MANIFEST_ANALYSIS_MAX_IMAGES: int = 600
+# Accept every manifest media type so batch_get_image returns the raw manifest.
+_ECR_ACCEPTED_MEDIA_TYPES: list[str] = [
+    "application/vnd.docker.distribution.manifest.v2+json",
+    "application/vnd.docker.distribution.manifest.list.v2+json",
+    "application/vnd.oci.image.manifest.v1+json",
+    "application/vnd.oci.image.index.v1+json",
+    "application/vnd.docker.distribution.manifest.v1+json",
+]
 
 CONTAINER_OPTIMIZATION_DESCRIPTIONS: dict[str, dict[str, str]] = {
     "ecs_rightsizing": {
@@ -267,368 +280,351 @@ def get_container_services_analysis(ctx: ScanContext) -> dict[str, Any]:
     }
 
 
+def _fargate_launch_type(service: dict[str, Any], task_def: dict[str, Any]) -> str | None:
+    """Return "FARGATE" if the service runs on Fargate, "EC2" if on EC2, else None.
+
+    Checks the service launchType, its capacityProviderStrategy, and the task
+    definition's requiresCompatibilities. EC2-launch-type tasks belong to the
+    EC2 adapter and must not be Fargate-priced here.
+    """
+    launch = service.get("launchType", "")
+    if launch == "FARGATE":
+        return "FARGATE"
+    if launch == "EC2":
+        return "EC2"
+    providers = [p.get("capacityProvider", "") for p in service.get("capacityProviderStrategy", [])]
+    if any(p.startswith("FARGATE") for p in providers):
+        return "FARGATE"
+    if providers:  # named EC2 capacity provider
+        return "EC2"
+    compat = task_def.get("requiresCompatibilities", [])
+    if "FARGATE" in compat:
+        return "FARGATE"
+    if "EC2" in compat:
+        return "EC2"
+    return None
+
+
+def _arch_os(task_def: dict[str, Any]) -> tuple[str, str]:
+    """Map a task definition's runtimePlatform to (architecture, os) labels."""
+    rp = task_def.get("runtimePlatform", {}) or {}
+    cpu_arch = str(rp.get("cpuArchitecture", "X86_64")).upper()
+    os_family = str(rp.get("operatingSystemFamily", "LINUX")).upper()
+    arch = "arm" if "ARM" in cpu_arch else "x86"
+    os = "windows" if "WINDOWS" in os_family else "linux"
+    return arch, os
+
+
 def get_enhanced_container_checks(ctx: ScanContext) -> dict[str, Any]:
-    """Get enhanced Container Services (ECS/EKS/ECR) cost optimization checks."""
+    """Get enhanced ECS/ECR cost optimization checks.
+
+    EKS is owned by the dedicated ``eks_cost`` adapter and is intentionally NOT
+    analyzed here (avoids cross-adapter double display of EKS node groups).
+
+    ECS rightsizing is metric-gated (Container Insights, 7-day window) and
+    carries the task's real Cpu/Memory/TaskCount + launch type + architecture/OS
+    so the adapter can compute a Fargate-priced saving snapped to a valid combo.
+    ECR findings are advisory (no deduplicated-layer-storage data to quantify).
+    """
     checks: dict[str, list[dict[str, Any]]] = {
         "ecs_rightsizing": [],
-        "eks_rightsizing": [],
         "ecr_lifecycle": [],
-        "unused_clusters": [],
-        "over_provisioned_services": [],
         "old_images": [],
     }
 
+    # ECS checks ---------------------------------------------------------------
     try:
         ecs = ctx.client("ecs")
 
-        # ECS Checks
-        paginator = ecs.get_paginator("list_clusters")
         cluster_arns: list[str] = []
-        for page in paginator.paginate():
-            cluster_arns.extend(page.get("clusterArns", []))
-
+        try:
+            paginator = ecs.get_paginator("list_clusters")
+            for page in paginator.paginate():
+                cluster_arns.extend(page.get("clusterArns", []))
+        except Exception as e:
+            _ecs_failure(ctx, "list_clusters", e)
+            cluster_arns = []
         cluster_arns = list(set(cluster_arns))
+
+        if ctx.fast_mode and cluster_arns:
+            ctx.warn(
+                "fast mode: skipping ECS Container Insights utilization reads; "
+                "Fargate rightsizing savings not quantified",
+                "containers",
+            )
 
         for cluster_arn in cluster_arns:
             cluster_name = cluster_arn.split("/")[-1]
 
-            cluster_details = ecs.describe_clusters(clusters=[cluster_arn])
-            cluster = cluster_details["clusters"][0] if cluster_details["clusters"] else {}
-
-            active_services = cluster.get("activeServicesCount", 0)
-            running_tasks = cluster.get("runningTasksCount", 0)
-
-            logger.debug(
-                "Cluster %s active services=%d running tasks=%d",
-                cluster_name,
-                active_services,
-                running_tasks,
-            )
-
-            if active_services == 0 and running_tasks == 0:
-                checks["unused_clusters"].append(
-                    {
-                        "ClusterName": cluster_name,
-                        "ClusterArn": cluster_arn,
-                        "ActiveServices": active_services,
-                        "RunningTasks": running_tasks,
-                        "Recommendation": "Empty ECS cluster - consider deletion",
-                        "EstimatedSavings": "100% of cluster overhead costs",
-                        "CheckCategory": "Unused ECS Clusters",
-                    }
-                )
-            elif running_tasks > 0 or active_services > 0:
-                checks["ecs_rightsizing"].append(
-                    {
-                        "ClusterName": cluster_name,
-                        "ClusterArn": cluster_arn,
-                        "ActiveServices": active_services,
-                        "RunningTasks": running_tasks,
-                        "Recommendation": (
-                            f"Active ECS cluster with {running_tasks} running tasks and {active_services} services"
-                        ),
-                        "EstimatedSavings": "Review for rightsizing opportunities",
-                        "CheckCategory": "Active ECS Clusters",
-                    }
-                )
+            if ctx.fast_mode:
+                continue  # no per-service metric reads in fast mode
 
             try:
+                service_arns = []
                 paginator = ecs.get_paginator("list_services")
-                service_arns: list[str] = []
                 for page in paginator.paginate(cluster=cluster_arn):
                     service_arns.extend(page.get("serviceArns", []))
-
-                if service_arns:
-                    for i in range(0, len(service_arns), 10):
-                        batch_arns = service_arns[i : i + 10]
-                        services_details = ecs.describe_services(cluster=cluster_arn, services=batch_arns)
-
-                        service_name = ""
-                        for service in services_details.get("services", []):
-                            service_name = service.get("serviceName", "")
-                            desired_count = service.get("desiredCount", 0)
-                            running_count = service.get("runningCount", 0)
-
-                            if desired_count > running_count and desired_count > 1:
-                                checks["over_provisioned_services"].append(
-                                    {
-                                        "ClusterName": cluster_name,
-                                        "ServiceName": service_name,
-                                        "DesiredCount": desired_count,
-                                        "RunningCount": running_count,
-                                        "Recommendation": "Service desired count exceeds running count",
-                                        "EstimatedSavings": "Reduce desired count to match actual needs",
-                                        "CheckCategory": "ECS Over-Provisioned Services",
-                                    }
-                                )
-
-                        if not service_name:
-                            continue
-
-                        try:
-                            cluster_details = ecs.describe_clusters(clusters=[cluster_name], include=["SETTINGS"])
-                            cluster = cluster_details["clusters"][0] if cluster_details["clusters"] else {}
-                            settings = cluster.get("settings", [])
-
-                            container_insights_enabled = False
-                            for setting in settings:
-                                if setting.get("name") == "containerInsights" and setting.get("value") in (
-                                    "enabled",
-                                    "enhanced",
-                                ):
-                                    container_insights_enabled = True
-                                    break
-
-                            if container_insights_enabled:
-                                cloudwatch = ctx.client("cloudwatch")
-                                end_time = datetime.now(UTC)
-                                start_time = end_time - timedelta(days=7)
-
-                                cpu_response = cloudwatch.get_metric_statistics(
-                                    Namespace="AWS/ECS",
-                                    MetricName="CPUUtilization",
-                                    Dimensions=[
-                                        {"Name": "ServiceName", "Value": service_name},
-                                        {"Name": "ClusterName", "Value": cluster_name},
-                                    ],
-                                    StartTime=start_time,
-                                    EndTime=end_time,
-                                    Period=3600,
-                                    Statistics=["Average", "Maximum"],
-                                )
-
-                                memory_response = cloudwatch.get_metric_statistics(
-                                    Namespace="AWS/ECS",
-                                    MetricName="MemoryUtilization",
-                                    Dimensions=[
-                                        {"Name": "ServiceName", "Value": service_name},
-                                        {"Name": "ClusterName", "Value": cluster_name},
-                                    ],
-                                    StartTime=start_time,
-                                    EndTime=end_time,
-                                    Period=3600,
-                                    Statistics=["Average", "Maximum"],
-                                )
-
-                                cpu_datapoints = cpu_response.get("Datapoints", [])
-                                memory_datapoints = memory_response.get("Datapoints", [])
-
-                                if cpu_datapoints and memory_datapoints:
-                                    avg_cpu = sum(dp["Average"] for dp in cpu_datapoints) / len(cpu_datapoints)
-                                    avg_memory = sum(dp["Average"] for dp in memory_datapoints) / len(memory_datapoints)
-                                    max_cpu = max(dp["Maximum"] for dp in cpu_datapoints)
-                                    max_memory = max(dp["Maximum"] for dp in memory_datapoints)
-
-                                    if avg_cpu < 20 and avg_memory < 30:
-                                        checks["ecs_rightsizing"].append(
-                                            {
-                                                "ClusterName": cluster_name,
-                                                "ServiceName": service_name,
-                                                "Recommendation": (
-                                                    f"Measured low utilization over 7 days "
-                                                    f"(CPU: {avg_cpu:.1f}%, Memory: {avg_memory:.1f}%) "
-                                                    "- consider downsizing task definition"
-                                                ),
-                                                "EstimatedSavings": (
-                                                    "20-50% cost reduction based on measured over-provisioning"
-                                                ),
-                                                "CheckCategory": "ECS Rightsizing - Metric-Backed",
-                                                "MetricsPeriod": "7 days",
-                                                "AvgCPU": f"{avg_cpu:.1f}%",
-                                                "AvgMemory": f"{avg_memory:.1f}%",
-                                            }
-                                        )
-                                    elif max_cpu > 80 or max_memory > 80:
-                                        pass
-                            # No metrics available branch removed: "Enable Container Insights
-                            # first" is a monitoring-enablement nudge, not a cost saving.
-
-                        except Exception as e:
-                            logger.warning(f"Warning: Could not check Container Insights for ECS cluster {cluster_name}: {e}")
-
             except Exception as e:
-                logger.warning(f"Warning: Could not analyze ECS services for {cluster_name}: {e}")
+                _ecs_failure(ctx, f"list_services({cluster_name})", e)
+                continue
 
-        # EKS Checks
-        try:
-            eks = ctx.client("eks")
+            if not service_arns:
+                continue
 
-            paginator = eks.get_paginator("list_clusters")
-            eks_cluster_names: list[str] = []
-            for page in paginator.paginate():
-                eks_cluster_names.extend(page.get("clusters", []))
+            container_insights_enabled = _container_insights_enabled(ctx, ecs, cluster_name)
 
-            for cluster_name in eks_cluster_names:
+            for i in range(0, len(service_arns), 10):
+                batch = service_arns[i : i + 10]
                 try:
-                    cluster_response = eks.describe_cluster(name=cluster_name)
-                    cluster = cluster_response.get("cluster", {})
-
-                    container_insights_enabled = False
-                    try:
-                        try:
-                            addons_response = eks.list_addons(clusterName=cluster_name)
-                            addons = addons_response.get("addons", [])
-                            container_insights_enabled = "amazon-cloudwatch-observability" in addons
-                        except Exception:
-                            pass
-
-                        if not container_insights_enabled:
-                            cloudwatch = ctx.client("cloudwatch")
-                            end_time = datetime.now(UTC)
-                            start_time = end_time - timedelta(days=1)
-
-                            test_response = cloudwatch.get_metric_statistics(
-                                Namespace="ContainerInsights",
-                                MetricName="cluster_node_cpu_utilization",
-                                Dimensions=[{"Name": "ClusterName", "Value": cluster_name}],
-                                StartTime=start_time,
-                                EndTime=end_time,
-                                Period=3600,
-                                Statistics=["Average"],
-                            )
-                            container_insights_enabled = len(test_response.get("Datapoints", [])) > 0
-
-                    except Exception:
-                        container_insights_enabled = False
-
-                    cluster_metrics_available = False
-                    avg_cpu = max_cpu = avg_memory = max_memory = 0
-
-                    if container_insights_enabled:
-                        try:
-                            cloudwatch = ctx.client("cloudwatch")
-                            end_time = datetime.now(UTC)
-                            start_time = end_time - timedelta(days=7)
-
-                            cpu_response = cloudwatch.get_metric_statistics(
-                                Namespace="ContainerInsights",
-                                MetricName="cluster_node_cpu_utilization",
-                                Dimensions=[{"Name": "ClusterName", "Value": cluster_name}],
-                                StartTime=start_time,
-                                EndTime=end_time,
-                                Period=3600,
-                                Statistics=["Average", "Maximum"],
-                            )
-
-                            memory_response = cloudwatch.get_metric_statistics(
-                                Namespace="ContainerInsights",
-                                MetricName="cluster_node_memory_utilization",
-                                Dimensions=[{"Name": "ClusterName", "Value": cluster_name}],
-                                StartTime=start_time,
-                                EndTime=end_time,
-                                Period=3600,
-                                Statistics=["Average", "Maximum"],
-                            )
-
-                            cpu_datapoints = cpu_response.get("Datapoints", [])
-                            memory_datapoints = memory_response.get("Datapoints", [])
-
-                            if cpu_datapoints and memory_datapoints:
-                                cluster_metrics_available = True
-                                avg_cpu = sum(dp["Average"] for dp in cpu_datapoints) / len(cpu_datapoints)
-                                avg_memory = sum(dp["Average"] for dp in memory_datapoints) / len(memory_datapoints)
-                                max_cpu = max(dp["Maximum"] for dp in cpu_datapoints)
-                                max_memory = max(dp["Maximum"] for dp in memory_datapoints)
-
-                        except Exception:
-                            pass
-
-                    paginator = eks.get_paginator("list_nodegroups")
-                    nodegroup_names: list[str] = []
-                    for page in paginator.paginate(clusterName=cluster_name):
-                        nodegroup_names.extend(page.get("nodegroups", []))
-
-                    if cluster_metrics_available:
-                        if avg_cpu < 25 and avg_memory < 35:
-                            checks["eks_rightsizing"].append(
-                                {
-                                    "ClusterName": cluster_name,
-                                    "Recommendation": (
-                                        f"Measured low cluster utilization over 7 days "
-                                        f"(CPU: {avg_cpu:.1f}%, Memory: {avg_memory:.1f}%) "
-                                        "- consider smaller instance types"
-                                    ),
-                                    "EstimatedSavings": ("30-60% cost reduction based on measured over-provisioning"),
-                                    "CheckCategory": "EKS Rightsizing - Metric-Backed",
-                                    "MetricsPeriod": "7 days",
-                                    "AvgCPU": f"{avg_cpu:.1f}%",
-                                    "AvgMemory": f"{avg_memory:.1f}%",
-                                }
-                            )
-                        # EKS Performance Optimization (peak usage scale-up suggestion):
-                        # removed — explicitly "potential cost increase", not a saving.
-                    # No-metrics fallback removed: "Enable Container Insights" is monitoring
-                    # enablement, not a cost saving.
-
-                    for nodegroup_name in nodegroup_names:
-                        try:
-                            ng_response = eks.describe_nodegroup(clusterName=cluster_name, nodegroupName=nodegroup_name)
-                            nodegroup = ng_response.get("nodegroup", {})
-
-                            instance_types = nodegroup.get("instanceTypes", [])
-                            scaling_config = nodegroup.get("scalingConfig", {})
-
-                            desired_size = scaling_config.get("desiredSize", 0)
-
-                            if instance_types and any("xlarge" in inst_type for inst_type in instance_types):
-                                checks["eks_rightsizing"].append(
-                                    {
-                                        "ClusterName": cluster_name,
-                                        "NodeGroupName": nodegroup_name,
-                                        "InstanceTypes": instance_types,
-                                        "DesiredSize": desired_size,
-                                        "Recommendation": "Large instance types - verify rightsizing",
-                                        "EstimatedSavings": "Potential 20-50% savings",
-                                        "CheckCategory": "EKS Instance Rightsizing",
-                                    }
-                                )
-
-                        except Exception as e:
-                            logger.warning(f"Warning: Could not analyze EKS nodegroup {nodegroup_name}: {e}")
-
+                    services_details = ecs.describe_services(cluster=cluster_arn, services=batch)
                 except Exception as e:
-                    logger.warning(f"Warning: Could not analyze EKS cluster {cluster_name}: {e}")
+                    _ecs_failure(ctx, f"describe_services({cluster_name})", e)
+                    continue
 
-        except Exception as e:
-            logger.warning(f"Warning: Could not perform EKS checks: {e}")
-
-        # ECR Checks
-        try:
-            ecr = ctx.client("ecr")
-            ecr_repos_response = ecr.describe_repositories()
-            repositories = ecr_repos_response.get("repositories", [])
-
-            for repo in repositories:
-                repo_name = repo.get("repositoryName")
-
-                try:
-                    paginator = ecr.get_paginator("list_images")
-                    images: list[dict[str, Any]] = []
-                    for page in paginator.paginate(repositoryName=repo_name):
-                        images.extend(page.get("imageIds", []))
-
-                    if len(images) > HIGH_IMAGE_COUNT_THRESHOLD:
-                        checks["old_images"].append(
-                            {
-                                "RepositoryName": repo_name,
-                                "ImageCount": len(images),
-                                "Recommendation": f"Repository has {len(images)} images - implement lifecycle policy",
-                                "EstimatedSavings": "Reduce storage costs by cleaning old images",
-                                "CheckCategory": "ECR Lifecycle Management",
-                            }
-                        )
-
-                except Exception as e:
-                    logger.warning(f"Warning: Could not analyze ECR repository {repo_name}: {e}")
-
-        except Exception as e:
-            logger.warning(f"Warning: Could not perform ECR checks: {e}")
+                for service in services_details.get("services", []):
+                    service_name = service.get("serviceName", "")
+                    if not service_name or not container_insights_enabled:
+                        continue
+                    rec = _ecs_service_rightsizing(ctx, ecs, cluster_name, service)
+                    if rec:
+                        checks["ecs_rightsizing"].append(rec)
 
     except Exception as e:
-        logger.warning(f"Warning: Could not perform enhanced Container checks: {e}")
+        _ecs_failure(ctx, "enhanced ECS checks", e)
+
+    # ECR checks — realizable saving = deduplicated layer storage freed by
+    # expiring untagged images (NOT the sum of imageSizeInBytes).
+    try:
+        ecr = ctx.client("ecr")
+        try:
+            repos: list[dict[str, Any]] = []
+            paginator = ecr.get_paginator("describe_repositories")
+            for page in paginator.paginate():
+                repos.extend(page.get("repositories", []))
+        except Exception:
+            repos = ecr.describe_repositories().get("repositories", [])
+
+        if ctx.fast_mode and repos:
+            ctx.warn(
+                "fast mode: skipping ECR image-manifest analysis; deduplicated "
+                "layer-storage savings not quantified",
+                "containers",
+            )
+
+        for repo in [] if ctx.fast_mode else repos:
+            repo_name = repo.get("repositoryName")
+            rec = _ecr_repo_reclaimable(ctx, ecr, repo_name)
+            if rec:
+                checks["old_images"].append(rec)
+    except Exception as e:
+        _ecr_failure(ctx, "describe_repositories", e)
 
     recommendations: list[dict[str, Any]] = []
     for _category, items in checks.items():
         recommendations.extend(items)
 
     return {"recommendations": recommendations, **checks}
+
+
+def _ecs_failure(ctx: ScanContext, op: str, exc: Exception) -> None:
+    """Record an ECS API failure via ctx (permission vs transient)."""
+    if "AccessDenied" in str(exc) or "not authorized" in str(exc):
+        ctx.permission_issue(f"ECS {op} denied", "containers", "ecs")
+    else:
+        ctx.warn(f"ECS {op} failed: {exc}", "containers")
+
+
+def _ecr_failure(ctx: ScanContext, op: str, exc: Exception) -> None:
+    """Record an ECR API failure via ctx (permission vs transient)."""
+    if "AccessDenied" in str(exc) or "not authorized" in str(exc):
+        ctx.permission_issue(f"ECR {op} denied", "containers", "ecr")
+    else:
+        ctx.warn(f"ECR {op} failed: {exc}", "containers")
+
+
+def _ecr_manifest_fetcher(ctx: ScanContext, ecr: Any, repo_name: str) -> Any:
+    """Return a memoized callable(digest) -> parsed manifest dict (or None).
+
+    Uses batch_get_image to retrieve each image/child manifest by digest. Child
+    manifests of an image index are fetched on demand during the layer walk.
+    """
+    cache: dict[str, dict[str, Any] | None] = {}
+
+    def fetch(digest: str) -> dict[str, Any] | None:
+        if digest in cache:
+            return cache[digest]
+        result: dict[str, Any] | None = None
+        try:
+            resp = ecr.batch_get_image(
+                repositoryName=repo_name,
+                imageIds=[{"imageDigest": digest}],
+                acceptedMediaTypes=_ECR_ACCEPTED_MEDIA_TYPES,
+            )
+            images = resp.get("images", [])
+            if images:
+                raw = images[0].get("imageManifest", "")
+                result = json.loads(raw) if raw else None
+        except Exception as e:
+            _ecr_failure(ctx, f"batch_get_image({repo_name})", e)
+            result = None
+        cache[digest] = result
+        return result
+
+    return fetch
+
+
+def _ecr_repo_reclaimable(ctx: ScanContext, ecr: Any, repo_name: str) -> dict[str, Any] | None:
+    """Build a counted ECR rec from deduplicated layers freed by expiring untagged images.
+
+    Lists image digests + tags, then walks manifests to compute the bytes of
+    layers referenced ONLY by untagged images. Returns None when there is no
+    untagged-only layer storage to reclaim (so a ~$0 finding is never emitted).
+    The dollar value is priced by the adapter from ``ReclaimableBytes``.
+    """
+    images: list[dict[str, Any]] = []
+    try:
+        paginator = ecr.get_paginator("describe_images")
+        for page in paginator.paginate(repositoryName=repo_name):
+            for d in page.get("imageDetails", []):
+                digest = d.get("imageDigest", "")
+                if digest:
+                    images.append({"digest": digest, "tagged": bool(d.get("imageTags"))})
+    except Exception as e:
+        _ecr_failure(ctx, f"describe_images({repo_name})", e)
+        return None
+
+    if not images:
+        return None
+
+    untagged = sum(1 for i in images if not i["tagged"])
+    if untagged == 0:
+        return None  # nothing a lifecycle "expire untagged" rule would remove
+
+    if len(images) > ECR_MANIFEST_ANALYSIS_MAX_IMAGES:
+        return {
+            "RepositoryName": repo_name,
+            "ImageCount": len(images),
+            "Recommendation": (
+                f"Repository has {len(images)} images ({untagged} untagged) - add a lifecycle "
+                "policy to expire untagged/old images"
+            ),
+            "EstimatedSavings": (
+                "Advisory: repo too large for per-image manifest analysis; savings not quantified"
+            ),
+            "CheckCategory": "ECR Lifecycle Management",
+            "Counted": False,
+        }
+
+    fetch = _ecr_manifest_fetcher(ctx, ecr, repo_name)
+    reclaimable_bytes = compute_untagged_reclaimable_bytes(images, fetch)
+    if reclaimable_bytes <= 0:
+        return None  # untagged images share all layers with tagged images → ~$0
+
+    return {
+        "RepositoryName": repo_name,
+        "ImageCount": len(images),
+        "UntaggedCount": untagged,
+        "ReclaimableBytes": int(reclaimable_bytes),
+        "Recommendation": (
+            f"{untagged} untagged image(s) hold {reclaimable_bytes / 1024**3:.2f} GiB of "
+            "layers not shared with tagged images - expire them via a lifecycle policy"
+        ),
+        "EstimatedSavings": "Computed from deduplicated layer storage freed",
+        "CheckCategory": "ECR Lifecycle Management",
+    }
+
+
+def _container_insights_enabled(ctx: ScanContext, ecs: Any, cluster_name: str) -> bool:
+    """Return True if Container Insights is enabled on the cluster."""
+    try:
+        details = ecs.describe_clusters(clusters=[cluster_name], include=["SETTINGS"])
+        cluster = details["clusters"][0] if details.get("clusters") else {}
+        for setting in cluster.get("settings", []):
+            if setting.get("name") == "containerInsights" and setting.get("value") in ("enabled", "enhanced"):
+                return True
+    except Exception as e:
+        _ecs_failure(ctx, f"describe_clusters({cluster_name})", e)
+    return False
+
+
+def _ecs_service_rightsizing(
+    ctx: ScanContext, ecs: Any, cluster_name: str, service: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Build a metric-backed Fargate rightsizing rec for an over-provisioned service.
+
+    Reads AWS/ECS CPU/Memory utilization over 7 days; only emits when measured
+    avg CPU < 20% and avg memory < 30%. Attaches the task's real Cpu/Memory/
+    TaskCount + launch type + architecture/OS so the adapter can price it.
+    Returns None when not over-provisioned or data is unavailable.
+    """
+    service_name = service.get("serviceName", "")
+    running_count = service.get("runningCount", 0)
+    desired_count = service.get("desiredCount", 0)
+    task_count = running_count or desired_count
+
+    try:
+        cloudwatch = ctx.client("cloudwatch")
+        end_time = datetime.now(UTC)
+        start_time = end_time - timedelta(days=7)
+        dims = [
+            {"Name": "ServiceName", "Value": service_name},
+            {"Name": "ClusterName", "Value": cluster_name},
+        ]
+        cpu = cloudwatch.get_metric_statistics(
+            Namespace="AWS/ECS", MetricName="CPUUtilization", Dimensions=dims,
+            StartTime=start_time, EndTime=end_time, Period=3600, Statistics=["Average", "Maximum"],
+        )
+        mem = cloudwatch.get_metric_statistics(
+            Namespace="AWS/ECS", MetricName="MemoryUtilization", Dimensions=dims,
+            StartTime=start_time, EndTime=end_time, Period=3600, Statistics=["Average", "Maximum"],
+        )
+    except Exception as e:
+        _ecs_failure(ctx, f"CloudWatch metrics({service_name})", e)
+        return None
+
+    cpu_dp = cpu.get("Datapoints", [])
+    mem_dp = mem.get("Datapoints", [])
+    if not cpu_dp or not mem_dp:
+        return None  # no utilization evidence → do not fabricate a saving
+
+    avg_cpu = sum(d["Average"] for d in cpu_dp) / len(cpu_dp)
+    avg_mem = sum(d["Average"] for d in mem_dp) / len(mem_dp)
+    if not (avg_cpu < 20 and avg_mem < 30):
+        return None
+
+    # Resolve the task definition for real Cpu/Memory + launch type + platform.
+    task_def_arn = service.get("taskDefinition", "")
+    try:
+        td_resp = ecs.describe_task_definition(taskDefinition=task_def_arn)
+        task_def = td_resp.get("taskDefinition", {})
+    except Exception as e:
+        _ecs_failure(ctx, f"describe_task_definition({service_name})", e)
+        return None
+
+    launch_type = _fargate_launch_type(service, task_def)
+    arch, os = _arch_os(task_def)
+    try:
+        cpu_units = int(task_def.get("cpu", 0))
+        mem_mb = int(task_def.get("memory", 0))
+    except (TypeError, ValueError):
+        cpu_units = mem_mb = 0
+
+    return {
+        "ClusterName": cluster_name,
+        "ServiceName": service_name,
+        "Cpu": cpu_units,
+        "Memory": mem_mb,
+        "TaskCount": int(task_count),
+        "LaunchType": launch_type or "UNKNOWN",
+        "Architecture": arch,
+        "OperatingSystem": os,
+        "Recommendation": (
+            f"Measured low utilization over 7 days (CPU {avg_cpu:.1f}%, Memory {avg_mem:.1f}%) "
+            "- downsize the Fargate task to the next valid size"
+        ),
+        "EstimatedSavings": "Computed from task config snapped to a valid Fargate combo",
+        "CheckCategory": "ECS Rightsizing - Metric-Backed",
+        "MetricsPeriod": "7 days",
+        "AvgCPU": f"{avg_cpu:.1f}%",
+        "AvgMemory": f"{avg_mem:.1f}%",
+    }

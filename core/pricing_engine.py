@@ -298,6 +298,34 @@ FALLBACK_ALB_MONTH: float = 16.43      # $0.0225/hr × 730 = $16.43/mo
 FALLBACK_AURORA_ACU_HOURLY: float = 0.06
 SAGEMAKER_OVER_EC2: float = 1.15
 
+# AWS Fargate compute rates (us-east-1, verified via Pricing API 2026-06).
+# Keyed by (architecture, os). ARM is ~20% cheaper than x86; Windows adds a
+# higher vCPU/GB rate plus a separate per-vCPU OS license fee. These are
+# fallbacks only — the live API value is region-correct and preferred.
+FALLBACK_FARGATE_VCPU_HOURLY: dict[tuple[str, str], float] = {
+    ("x86", "linux"): 0.04048,
+    ("arm", "linux"): 0.03238,
+    ("x86", "windows"): 0.046552,
+}
+FALLBACK_FARGATE_GB_HOURLY: dict[tuple[str, str], float] = {
+    ("x86", "linux"): 0.004445,
+    ("arm", "linux"): 0.00356,
+    ("x86", "windows"): 0.0051117,
+}
+# Per-vCPU Windows OS license fee (USE1-Fargate-Windows-OS-Hours:perCPU).
+FALLBACK_FARGATE_WINDOWS_OS_HOURLY: float = 0.046
+# Ephemeral storage above the 20 GB free allotment.
+FALLBACK_FARGATE_EPHEMERAL_GB_HOURLY: float = 0.000111
+
+# AWS EKS control-plane and Extended Support rates (us-east-1, Pricing API
+# 2026-06). Extended Support is a SURCHARGE billed *in addition* to the base
+# per-cluster fee once a cluster's Kubernetes version exits standard support.
+FALLBACK_EKS_CONTROL_PLANE_HOURLY: float = 0.10
+FALLBACK_EKS_EXTENDED_SUPPORT_HOURLY: float = 0.50
+
+# AWS ECR standard (non-archive) image storage, $/GB-month (Pricing API 2026-06).
+FALLBACK_ECR_GB_MONTH: float = 0.10
+
 # Fields excluded from the debug log key summary (too noisy / always the same).
 _LOG_SKIP_FIELDS = frozenset({"location", "productFamily", "tenancy", "capacityStatus", "preInstalledSw"})
 
@@ -878,6 +906,113 @@ class PricingEngine:
         self._cache.set(key, price)
         return price
 
+    def get_fargate_vcpu_hourly(self, *, architecture: str = "x86", os: str = "linux") -> float:
+        """$/vCPU-hour for Fargate in self._region, by architecture and OS.
+
+        Args:
+            architecture: "x86" or "arm" (Graviton). ARM is ~20% cheaper.
+            os: "linux" or "windows". Windows is billed at a higher rate and
+                additionally incurs a per-vCPU OS license fee (see
+                :meth:`get_fargate_windows_os_hourly`).
+        """
+        arch = "arm" if str(architecture).lower() in ("arm", "arm64", "graviton") else "x86"
+        os_key = "windows" if str(os).lower().startswith("win") else "linux"
+        key = ("fargate_vcpu", arch, os_key)
+        if (cached := self._get_cached(key)) is not None:
+            return cached
+        price = self._fetch_fargate_rate("vcpu", arch, os_key)
+        if price is None:
+            fb = FALLBACK_FARGATE_VCPU_HOURLY.get((arch, os_key)) or FALLBACK_FARGATE_VCPU_HOURLY[("x86", "linux")]
+            price = self._use_fallback(
+                fb * self._fallback_multiplier,
+                f"Pricing API unavailable for Fargate {arch}/{os_key} vCPU in {self._region}; using fallback",
+            )
+        self._cache.set(key, price)
+        return price
+
+    def get_fargate_gb_hourly(self, *, architecture: str = "x86", os: str = "linux") -> float:
+        """$/GB-hour of memory for Fargate in self._region, by architecture and OS."""
+        arch = "arm" if str(architecture).lower() in ("arm", "arm64", "graviton") else "x86"
+        os_key = "windows" if str(os).lower().startswith("win") else "linux"
+        key = ("fargate_gb", arch, os_key)
+        if (cached := self._get_cached(key)) is not None:
+            return cached
+        price = self._fetch_fargate_rate("gb", arch, os_key)
+        if price is None:
+            fb = FALLBACK_FARGATE_GB_HOURLY.get((arch, os_key)) or FALLBACK_FARGATE_GB_HOURLY[("x86", "linux")]
+            price = self._use_fallback(
+                fb * self._fallback_multiplier,
+                f"Pricing API unavailable for Fargate {arch}/{os_key} memory in {self._region}; using fallback",
+            )
+        self._cache.set(key, price)
+        return price
+
+    def get_fargate_windows_os_hourly(self) -> float:
+        """Per-vCPU Windows OS license fee for Fargate in self._region."""
+        key = ("fargate_win_os",)
+        if (cached := self._get_cached(key)) is not None:
+            return cached
+        price = self._fetch_fargate_rate("win_os", "x86", "windows")
+        if price is None:
+            price = self._use_fallback(
+                FALLBACK_FARGATE_WINDOWS_OS_HOURLY * self._fallback_multiplier,
+                f"Pricing API unavailable for Fargate Windows OS license in {self._region}; using fallback",
+            )
+        self._cache.set(key, price)
+        return price
+
+    def get_eks_control_plane_hourly(self) -> float:
+        """$/hour for an EKS cluster control plane in self._region."""
+        key = ("eks_control_plane",)
+        if (cached := self._get_cached(key)) is not None:
+            return cached
+        price = self._fetch_eks_rate("perCluster")
+        if price is None:
+            price = self._use_fallback(
+                FALLBACK_EKS_CONTROL_PLANE_HOURLY * self._fallback_multiplier,
+                f"Pricing API unavailable for EKS control plane in {self._region}; using fallback",
+            )
+        self._cache.set(key, price)
+        return price
+
+    def get_eks_extended_support_hourly(self) -> float:
+        """$/hour EKS Extended Support surcharge in self._region.
+
+        This is billed *in addition* to :meth:`get_eks_control_plane_hourly`
+        once a cluster's Kubernetes version exits standard support, so it is
+        also the realizable saving from upgrading off an extended-support
+        version.
+        """
+        key = ("eks_extended_support",)
+        if (cached := self._get_cached(key)) is not None:
+            return cached
+        price = self._fetch_eks_rate("extendedSupport")
+        if price is None:
+            price = self._use_fallback(
+                FALLBACK_EKS_EXTENDED_SUPPORT_HOURLY * self._fallback_multiplier,
+                f"Pricing API unavailable for EKS Extended Support in {self._region}; using fallback",
+            )
+        self._cache.set(key, price)
+        return price
+
+    def get_ecr_storage_gb_month(self) -> float:
+        """$/GB-month for ECR standard (non-archive) image storage in self._region."""
+        key = ("ecr_storage_gb",)
+        if (cached := self._get_cached(key)) is not None:
+            return cached
+        price = self._select_by_usagetype_suffix(
+            "AmazonECR",
+            [{"Type": "TERM_MATCH", "Field": "location", "Value": self._display_name}],
+            "TimedStorage-ByteHrs",
+        )
+        if price is None:
+            price = self._use_fallback(
+                FALLBACK_ECR_GB_MONTH * self._fallback_multiplier,
+                f"Pricing API unavailable for ECR storage in {self._region}; using fallback",
+            )
+        self._cache.set(key, price)
+        return price
+
     # ── Private fetch methods ─────────────────────────────────────────────────
 
     def _fetch_ec2_price(
@@ -1256,6 +1391,75 @@ class PricingEngine:
             {"Type": "TERM_MATCH", "Field": "usagetype", "Value": "ACU-Hour"},
         ]
         return self._call_pricing_api_hourly("AmazonRDS", filters)
+
+    # Maps a logical Fargate rate to the usagetype suffix AWS publishes for it.
+    # Region prefixes (USE1-, EUW1-, …) vary, so we match on the suffix.
+    _FARGATE_USAGETYPE_SUFFIX: dict[tuple[str, str, str], str] = {
+        ("vcpu", "x86", "linux"): "Fargate-vCPU-Hours:perCPU",
+        ("gb", "x86", "linux"): "Fargate-GB-Hours",
+        ("vcpu", "arm", "linux"): "Fargate-ARM-vCPU-Hours:perCPU",
+        ("gb", "arm", "linux"): "Fargate-ARM-GB-Hours",
+        ("vcpu", "x86", "windows"): "Fargate-Windows-vCPU-Hours:perCPU",
+        ("gb", "x86", "windows"): "Fargate-Windows-GB-Hours",
+        ("win_os", "x86", "windows"): "Fargate-Windows-OS-Hours:perCPU",
+    }
+
+    def _fetch_fargate_rate(self, leg: str, arch: str, os_key: str) -> float | None:
+        """Fetch a Fargate $/hour rate by selecting the row whose usagetype suffix matches.
+
+        AmazonECS returns many SKUs (Fargate vCPU/GB across arch/OS, ephemeral
+        storage, managed instances) for one location, so we cannot rely on
+        MaxResults=1. Match the exact usagetype suffix instead.
+        """
+        suffix = self._FARGATE_USAGETYPE_SUFFIX.get((leg, arch, os_key))
+        if suffix is None:
+            return None
+        # AmazonECS returns hundreds of SKUs at one location (Fargate + ECS
+        # Managed Instances), so narrow with a leg-specific attribute before
+        # selecting the exact usagetype suffix — otherwise the Fargate rows can
+        # fall outside the first page of results.
+        filters = [
+            {"Type": "TERM_MATCH", "Field": "location", "Value": self._display_name},
+        ]
+        if leg == "vcpu":
+            filters.append({"Type": "TERM_MATCH", "Field": "cputype", "Value": "perCPU"})
+        elif leg == "gb":
+            filters.append({"Type": "TERM_MATCH", "Field": "memorytype", "Value": "perGB"})
+        elif leg == "win_os":
+            filters.append({"Type": "TERM_MATCH", "Field": "cputype", "Value": "perCPU OS License Fee"})
+        return self._select_by_usagetype_suffix("AmazonECS", filters, suffix)
+
+    def _fetch_eks_rate(self, suffix_tail: str) -> float | None:
+        """Fetch an EKS $/hour rate (perCluster or extendedSupport) by usagetype suffix."""
+        operation = {"perCluster": "CreateOperation", "extendedSupport": "ExtendedSupport"}.get(suffix_tail)
+        filters = [
+            {"Type": "TERM_MATCH", "Field": "location", "Value": self._display_name},
+        ]
+        if operation:
+            filters.append({"Type": "TERM_MATCH", "Field": "operation", "Value": operation})
+        return self._select_by_usagetype_suffix("AmazonEKS", filters, f"AmazonEKS-Hours:{suffix_tail}")
+
+    def _select_by_usagetype_suffix(self, service_code: str, filters: list[dict], suffix: str) -> float | None:
+        """Return the USD/unit price of the first result whose usagetype ends with `suffix`."""
+        key_fields = {f["Field"]: f["Value"] for f in filters if f["Field"] not in _LOG_SKIP_FIELDS}
+        try:
+            resp = self._pricing.get_products(ServiceCode=service_code, Filters=filters, MaxResults=100)
+            self._stats["api_calls"] += 1
+            for raw in resp.get("PriceList", []):
+                item = json.loads(raw)
+                usagetype = item.get("product", {}).get("attributes", {}).get("usagetype", "")
+                if not usagetype.endswith(suffix):
+                    continue
+                price = _extract_usd(item)
+                if price is not None:
+                    logger.debug("pricing:GetProducts  %s  %s~%s  → $%.6f", service_code, key_fields, suffix, price)
+                    return price
+            logger.debug("pricing:GetProducts  %s  %s~%s  → no match", service_code, key_fields, suffix)
+            return None
+        except Exception as exc:
+            self._stats["api_errors"] += 1
+            logger.debug("pricing:GetProducts  %s  %s~%s  → FAILED: %s", service_code, key_fields, suffix, exc)
+            return None
 
     def _call_pricing_api_hourly(self, service_code: str, filters: list[dict]) -> float | None:
         """Like _call_pricing_api but returns the price from the first result whose unit is 'Hrs'.

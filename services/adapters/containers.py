@@ -8,25 +8,22 @@ from core.contracts import ServiceFindings, SourceBlock
 from services._base import BaseServiceModule
 from services.advisor import get_ecs_compute_optimizer_recommendations
 from services.containers import get_container_services_analysis, get_enhanced_container_checks
+from services.containers_logic import (
+    HOURS_PER_MONTH,
+    dedupe_by_authority,
+    fargate_task_hourly,
+    normalize_resource_name,
+    snap_down_fargate,
+)
 
-# AWS Fargate pricing (us-east-1, verified via Pricing API 2026-05).
-# x86 vCPU/hr: SKU 8CESGAFWKAJ98PME ($0.04048/hr).
-# x86 GB/hr:   SKU PBZNQUSEXZUC34C9 ($0.004445/GB-hr).
-# Region-scaled via pricing_multiplier at the per-rec emit site.
-FARGATE_VCPU_HOURLY: float = 0.04048
-FARGATE_MEM_GB_HOURLY: float = 0.004445
+# Spot capacity-provider savings factor (60-70% AWS-published). Applied to the
+# rightsized on-demand base when a rec is explicitly a Fargate→Spot move.
+SPOT_SAVINGS_FACTOR: float = 0.70
 
-# Per-CheckCategory savings factors. AWS-documented midpoints, not arbitrary.
-#   Spot: 60-70% AWS-published Spot capacity provider savings.
-#   ECR lifecycle savings depend on actual image storage (cleaned per
-#   repository via ecr.describe_repository_storage); without that data we
-#   skip rather than fabricate a flat $25.
-CONTAINERS_SAVINGS_FACTORS: dict[str, float] = {
-    "spot": 0.70,
-    "rightsize": 0.30,
-    "unused": 1.00,
-    "default": 0.30,
-}
+
+def _co_placeholder(rec: dict[str, Any]) -> bool:
+    """True for the synthetic 'enable Compute Optimizer' placeholder rec."""
+    return rec.get("ResourceId") == "compute-optimizer-service"
 
 
 class ContainersModule(BaseServiceModule):
@@ -35,22 +32,24 @@ class ContainersModule(BaseServiceModule):
     key: str = "containers"
     cli_aliases: tuple[str, ...] = ("containers",)
     display_name: str = "Containers"
-    # Shim hits cloudwatch.get_metric_statistics extensively for ECS/EKS
-    # CPU/memory utilization measurement (services/containers.py:385+).
+    # The shim reads CloudWatch / Container Insights for ECS utilization; honor
+    # --fast by skipping those per-resource reads (services/containers.py).
     requires_cloudwatch: bool = True
+    reads_fast_mode: bool = True
 
     def required_clients(self) -> tuple[str, ...]:
         """Returns boto3 client names required for container infrastructure scanning."""
         return ("ecs", "eks", "ecr", "compute-optimizer", "cloudwatch")
 
     def scan(self, ctx: Any) -> ServiceFindings:
-        """Scan container infrastructure (ECS, EKS, ECR) for cost optimization.
+        """Scan container infrastructure (ECS, ECR) for cost optimization.
 
-        Consults the containers service module for cluster analysis and enhanced
-        checks. Savings dispatch on canonical CheckCategory (not fragile
-        substring matching on display strings) and apply documented factors
-        from CONTAINERS_SAVINGS_FACTORS. Cost-Hub and Compute-Optimizer
-        savings come from AWS APIs (already region-correct).
+        EKS is owned by the dedicated ``eks_cost`` adapter; this adapter counts
+        only ECS (Fargate) and ECR. Fargate rightsizing savings are computed
+        from the task's real Cpu/Memory snapped to a valid Fargate combo, priced
+        per architecture/OS via the live Pricing API. Compute Optimizer and Cost
+        Hub savings (region-correct upstream) are deduped against the heuristics
+        by normalized service name (authority CoH > CO > heuristic).
 
         Args:
             ctx: ScanContext with region, clients, and pricing data.
@@ -71,93 +70,45 @@ class ContainersModule(BaseServiceModule):
         except Exception as e:
             ctx.warn(f"enhanced checks failed: {e}", "containers")
             enhanced_result = {}
-        enhanced_recs = enhanced_result.get("recommendations", [])
+        enhanced_recs = list(enhanced_result.get("recommendations", []))
 
-        # Dedupe ECS service names across the three sources so a single
-        # opportunity doesn't contribute savings via multiple paths.
-        cost_hub_recs = ctx.cost_hub_splits.get("containers", [])
-        co_recs = get_ecs_compute_optimizer_recommendations(ctx)
-
-        seen_resources: set[str] = set()
-        for rec in cost_hub_recs:
-            arn = rec.get("resourceArn") or rec.get("ResourceArn") or ""
-            if arn:
-                seen_resources.add(arn.split("/")[-1])
-        for rec in co_recs:
-            rid = rec.get("resource_id") or ""
-            if rid:
-                seen_resources.add(rid.split("/")[-1])
-
-        savings = 0.0
-        multiplier = ctx.pricing_multiplier
-
-        for rec in enhanced_recs:
-            check_category = (rec.get("CheckCategory") or "").lower()
-
-            # Skip if this resource is already covered by Cost Hub or CO
-            # (higher-fidelity savings come from those AWS-native sources).
-            for marker in ("ServiceName", "TaskDefinitionArn", "ClusterName", "RepositoryName"):
-                marker_val = rec.get(marker)
-                if marker_val and str(marker_val).split("/")[-1] in seen_resources:
-                    break
-            else:
-                marker_val = None
-
-            cpu_units = rec.get("Cpu", 0)
-            mem_mb = rec.get("Memory", 0)
-            task_count = rec.get("TaskCount", 0)
-
-            try:
-                task_vcpu = float(cpu_units) / 1024.0
-            except (TypeError, ValueError):
-                task_vcpu = 0.0
-            try:
-                task_mem_gb = float(mem_mb) / 1024.0
-            except (TypeError, ValueError):
-                task_mem_gb = 0.0
-            try:
-                task_count = int(task_count)
-            except (TypeError, ValueError):
-                task_count = 0
-
-            # Compute baseline Fargate cost only when we have real config data.
-            # Previously the adapter substituted defaults (0.25 vCPU, 0.5 GB,
-            # 1 task) and fabricated $150/$75/$25/$100/$60 fallbacks when
-            # data was missing. We now skip the quantification cleanly and
-            # rely on cost_hub / compute_optimizer sources to supply real $.
-            if task_vcpu <= 0 or task_mem_gb <= 0 or task_count <= 0:
-                rec["EstimatedMonthlySavings"] = 0.0
-                rec["PricingWarning"] = "task config (Cpu/Memory/TaskCount) unavailable"
-                continue
-
-            monthly_ondemand = (
-                (task_vcpu * FARGATE_VCPU_HOURLY + task_mem_gb * FARGATE_MEM_GB_HOURLY)
-                * 730
-                * task_count
-                * multiplier
+        cost_hub_recs = ctx.cost_hub_splits.get("containers", []) if hasattr(ctx, "cost_hub_splits") else []
+        co_raw = get_ecs_compute_optimizer_recommendations(ctx)
+        # Opt-in placeholder ($0 "enable Compute Optimizer") is an informational
+        # signal, not a recommendation — surface it as a warning and drop it so
+        # it never inflates the count (mirrors EC2Module).
+        if any(_co_placeholder(r) for r in co_raw):
+            ctx.warn(
+                "AWS Compute Optimizer is not enabled — ECS Fargate task rightsizing "
+                "recommendations from Compute Optimizer are unavailable (enable it for "
+                "additional savings detection).",
+                service="containers",
             )
+        co_recs = [r for r in co_raw if not _co_placeholder(r)]
 
-            # Dispatch on CheckCategory; fall back to recommendation-string
-            # tokens only for legacy shim recs without a structured category.
-            if "spot" in check_category:
-                factor = CONTAINERS_SAVINGS_FACTORS["spot"]
-            elif "rightsize" in check_category or "over-provisioned" in check_category:
-                factor = CONTAINERS_SAVINGS_FACTORS["rightsize"]
-            elif "unused" in check_category or "idle" in check_category:
-                factor = CONTAINERS_SAVINGS_FACTORS["unused"]
-            elif "lifecycle" in check_category or "ecr" in check_category:
-                # ECR lifecycle savings need image-storage GB. Without it,
-                # emit 0 + warn rather than fabricate $25.
-                rec["EstimatedMonthlySavings"] = 0.0
-                rec["PricingWarning"] = "ECR storage GB unavailable; quantify via describe_repositories"
-                continue
-            else:
-                factor = CONTAINERS_SAVINGS_FACTORS["default"]
+        # Cross-source dedup by normalized service name (authority CoH > CO >
+        # heuristic) so one Fargate service never contributes savings twice.
+        enhanced_recs = dedupe_by_authority(
+            cost_hub_recs,
+            co_recs,
+            enhanced_recs,
+            coh_key=lambda r: r.get("resourceArn") or r.get("ResourceArn") or "",
+            co_key=lambda r: r.get("resource_id") or "",
+            heuristic_key=_heuristic_resource_key,
+        )
 
-            rec_savings = monthly_ondemand * factor
+        # Quantify each surviving heuristic rec. Fargate rightsizing uses real
+        # task config snapped to a valid combo; everything without quantifiable
+        # config is marked advisory (Counted=False, $0) rather than fabricated.
+        savings = 0.0
+        for rec in enhanced_recs:
+            rec_savings = self._quantify_rec(ctx, rec)
             rec["EstimatedMonthlySavings"] = round(rec_savings, 2)
-            if marker_val is None:
+            if rec_savings > 0:
+                rec["Counted"] = True
                 savings += rec_savings
+            else:
+                rec["Counted"] = False
 
         savings += sum(float(r.get("estimatedMonthlySavings", 0) or 0) for r in cost_hub_recs)
         savings += sum(float(r.get("estimatedMonthlySavings", 0.0) or 0.0) for r in co_recs)
@@ -167,7 +118,7 @@ class ContainersModule(BaseServiceModule):
         return ServiceFindings(
             service_name="Containers",
             total_recommendations=total_recs,
-            total_monthly_savings=savings,
+            total_monthly_savings=round(savings, 2),
             sources={
                 "enhanced_checks": SourceBlock(count=len(enhanced_recs), recommendations=tuple(enhanced_recs)),
                 "cost_optimization_hub": SourceBlock(
@@ -184,3 +135,94 @@ class ContainersModule(BaseServiceModule):
                 }
             },
         )
+
+    def _quantify_rec(self, ctx: Any, rec: dict[str, Any]) -> float:
+        """Return the monthly $ saving for one heuristic rec (0 if not quantifiable).
+
+        Only ECS Fargate rightsizing with real task config (Cpu/Memory/TaskCount
+        and FARGATE launch type) is quantified. ECR lifecycle, ECS desired-count,
+        and EC2-launch-type tasks have no Fargate-priced saving here and return 0
+        (the caller marks them advisory).
+        """
+        category = (rec.get("CheckCategory") or "").lower()
+
+        # ECR lifecycle: price the deduplicated layer storage the shim computed.
+        if "ecr" in category or "lifecycle" in category:
+            reclaimable = rec.get("ReclaimableBytes")
+            if not reclaimable or float(reclaimable) <= 0:
+                return 0.0
+            try:
+                gb_month_rate = ctx.pricing_engine.get_ecr_storage_gb_month()
+            except Exception as e:
+                ctx.warn(f"ECR storage pricing lookup failed for {rec.get('RepositoryName', '?')}: {e}", "containers")
+                return 0.0
+            if gb_month_rate <= 0:
+                return 0.0
+            gib = float(reclaimable) / (1024**3)
+            saving = gib * gb_month_rate
+            rec["AuditBasis"] = {
+                "reclaimable_gib": round(gib, 4),
+                "rate": gb_month_rate,
+                "unit": "USD/GB-month",
+                "basis": "deduplicated layers referenced only by untagged images",
+                "formula": "reclaimable_GiB x ECR $/GB-month",
+            }
+            return max(0.0, saving)
+
+        if "rightsizing" not in category or "metric" not in category:
+            return 0.0
+        if str(rec.get("LaunchType", "")).upper() != "FARGATE":
+            return 0.0  # EC2 launch type → cost is EC2 instances (EC2 adapter)
+
+        try:
+            cpu_units = float(rec.get("Cpu", 0))
+            mem_mb = float(rec.get("Memory", 0))
+            task_count = int(rec.get("TaskCount", 0))
+        except (TypeError, ValueError):
+            return 0.0
+        if cpu_units <= 0 or mem_mb <= 0 or task_count <= 0:
+            return 0.0
+
+        cur_vcpu = cpu_units / 1024.0
+        cur_mem_gb = mem_mb / 1024.0
+        target = snap_down_fargate(cur_vcpu, cur_mem_gb)
+        if target is None:
+            return 0.0  # already smallest Fargate size
+        tgt_vcpu, tgt_mem_gb = target
+
+        arch = rec.get("Architecture", "x86")
+        os = rec.get("OperatingSystem", "linux")
+        try:
+            vcpu_rate = ctx.pricing_engine.get_fargate_vcpu_hourly(architecture=arch, os=os)
+            gb_rate = ctx.pricing_engine.get_fargate_gb_hourly(architecture=arch, os=os)
+            win_os = ctx.pricing_engine.get_fargate_windows_os_hourly() if str(os).lower().startswith("win") else 0.0
+        except Exception as e:
+            ctx.warn(f"Fargate pricing lookup failed for {rec.get('ServiceName', '?')}: {e}", "containers")
+            return 0.0
+        if vcpu_rate <= 0 or gb_rate <= 0:
+            return 0.0
+
+        cur_hr = fargate_task_hourly(cur_vcpu, cur_mem_gb, vcpu_rate, gb_rate, windows_os_rate=win_os)
+        tgt_hr = fargate_task_hourly(tgt_vcpu, tgt_mem_gb, vcpu_rate, gb_rate, windows_os_rate=win_os)
+        monthly_saving = (cur_hr - tgt_hr) * HOURS_PER_MONTH * task_count
+        # Record the basis so the saving is defensible from the report alone.
+        rec["AuditBasis"] = {
+            "current": f"{cur_vcpu} vCPU / {cur_mem_gb} GB x{task_count}",
+            "target": f"{tgt_vcpu} vCPU / {tgt_mem_gb} GB",
+            "vcpu_rate": vcpu_rate,
+            "gb_rate": gb_rate,
+            "architecture": arch,
+            "os": os,
+            "launch_type": "FARGATE",
+            "formula": "(current_hourly - target_hourly) x 730 x task_count",
+        }
+        return max(0.0, monthly_saving)
+
+
+def _heuristic_resource_key(rec: dict[str, Any]) -> str:
+    """Normalized resource name for an enhanced-check rec, for dedup."""
+    for marker in ("ServiceName", "ClusterName", "TaskDefinitionArn", "RepositoryName"):
+        val = rec.get(marker)
+        if val:
+            return normalize_resource_name(str(val))
+    return ""
