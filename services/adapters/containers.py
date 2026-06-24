@@ -30,7 +30,9 @@ class ContainersModule(BaseServiceModule):
     """ServiceModule adapter for container services (ECS, EKS, ECR). Fargate CPU+memory pricing."""
 
     key: str = "containers"
-    cli_aliases: tuple[str, ...] = ("containers",)
+    # ECS and ECR are bundled in this adapter; accept the natural service names
+    # as aliases so `--scan-only ecs` / `ecr` resolve here (EKS → eks_cost).
+    cli_aliases: tuple[str, ...] = ("containers", "ecs", "ecr")
     display_name: str = "Containers"
     # The shim reads CloudWatch / Container Insights for ECS utilization; honor
     # --fast by skipping those per-resource reads (services/containers.py).

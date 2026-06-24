@@ -7,7 +7,7 @@ to coordinate module selection, Cost Hub prefetch, and parallel execution.
 from typing import Any
 
 from core.contracts import ServiceFindings, ServiceModule
-from core.filtering import resolve_cli_keys
+from core.filtering import resolve_cli_keys, unrecognized_tokens
 from core.scan_context import ScanContext
 from services.advisor import get_detailed_cost_hub_recommendations
 
@@ -157,6 +157,13 @@ class ScanOrchestrator:
         Returns:
             Dict mapping module key to its ServiceFindings.
         """
+        unknown = unrecognized_tokens(self.modules, scan_only) | unrecognized_tokens(self.modules, skip)
+        if unknown:
+            self.ctx.warn(
+                f"Ignored unrecognized service token(s): {', '.join(sorted(unknown))}. "
+                f"Run with no --scan-only to see all services, or check the spelling.",
+                service="cli",
+            )
         selected = resolve_cli_keys(self.modules, scan_only, skip)
         self._prefetch_advisor_data(selected)
         return {m.key: safe_scan(m, self.ctx) for m in self.modules if m.key in selected}

@@ -237,6 +237,21 @@ def test_fast_mode_sets_flag():
 
 
 # --------------------------------------------------------------------------- #
+# CLI alias resolution
+# --------------------------------------------------------------------------- #
+def test_cli_aliases_resolve_ecs_ecr_eks():
+    from core.filtering import resolve_cli_keys, unrecognized_tokens
+    from services import ALL_MODULES
+
+    assert resolve_cli_keys(ALL_MODULES, {"ecs"}, None) == {"containers"}
+    assert resolve_cli_keys(ALL_MODULES, {"ecr"}, None) == {"containers"}
+    assert resolve_cli_keys(ALL_MODULES, {"eks"}, None) == {"eks_cost"}
+    # Unknown tokens are reported (not silently scanned as nothing).
+    assert unrecognized_tokens(ALL_MODULES, {"ecs", "bogus"}) == {"bogus"}
+    assert unrecognized_tokens(ALL_MODULES, {"ecs"}) == set()
+
+
+# --------------------------------------------------------------------------- #
 # ECR deduplicated layer storage
 # --------------------------------------------------------------------------- #
 def test_parse_manifest_layers_image():

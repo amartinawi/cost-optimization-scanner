@@ -38,6 +38,20 @@ def _resolve_tokens(
     return keys
 
 
+def unrecognized_tokens(modules: list[ServiceModule], tokens: set[str] | None) -> set[str]:
+    """Return CLI tokens that match no module key or alias.
+
+    Lets callers warn the user instead of silently scanning nothing when a
+    ``--scan-only``/``--skip-service`` token is misspelled or unknown (e.g.
+    ``--scan-only ecs`` before ecs was registered as a containers alias).
+    """
+    if not tokens:
+        return set()
+    alias_index = _build_alias_index(modules)
+    keys = {m.key for m in modules}
+    return {t for t in tokens if t.lower() not in alias_index and t.lower() not in keys}
+
+
 def resolve_cli_keys(
     modules: list[ServiceModule],
     scan_only: set[str] | None,
