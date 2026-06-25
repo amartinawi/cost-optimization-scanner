@@ -74,6 +74,7 @@ def _ctx(eks, **kw):
     pe = MagicMock()
     pe.get_eks_control_plane_hourly.return_value = 0.10
     pe.get_eks_extended_support_hourly.return_value = 0.50
+    pe.get_ec2_hourly_price.return_value = 0.10  # node-group instance $/hr
     base = dict(
         cost_hub_splits={"eks_cost": []},
         pricing_multiplier=1.0,
@@ -154,18 +155,51 @@ def test_cluster_with_nodegroups_not_idle():
 # --------------------------------------------------------------------------- #
 # Node groups & Fargate are advisory (EC2 domain / no fabrication)
 # --------------------------------------------------------------------------- #
-def test_node_group_findings_are_advisory_not_counted():
+def test_node_group_estimate_advisory_not_counted():
     eks = _FakeEks({
         "prod": {
             "cluster": {"status": "ACTIVE", "version": "1.31"},
-            "nodegroups": {"ng1": {"instanceTypes": ["m4.large"], "capacityType": "ON_DEMAND"}},
+            "nodegroups": {"ng1": {
+                "instanceTypes": ["m5.large"], "capacityType": "ON_DEMAND",
+                "scalingConfig": {"desiredSize": 2},
+            }},
+        }
+    })
+    findings = EksCostModule().scan(_ctx(eks))  # ec2 price 0.10/hr -> $146/mo for 2 nodes
+    ng = _recs(findings, "node_group_optimization")
+    # ON_DEMAND + x86 -> both a Spot and a Graviton advisory line.
+    assert any("Spot" in r["recommended_value"] for r in ng)
+    assert any("Graviton" in r["recommended_value"] for r in ng)
+    spot = next(r for r in ng if "Spot" in r["recommended_value"])
+    grav = next(r for r in ng if "Graviton" in r["recommended_value"])
+    assert spot["monthly_savings"] == round(146.0 * 0.70, 2)   # ~102.20 advisory estimate
+    assert grav["monthly_savings"] == round(146.0 * 0.20, 2)   # ~29.20
+    # ALL advisory — never counted in the EKS tab total (EC2 domain).
+    assert all(r["Counted"] is False for r in ng)
+    assert findings.total_monthly_savings == 0.0
+
+
+def test_graviton_node_group_gets_no_graviton_estimate():
+    eks = _FakeEks({
+        "prod": {
+            "cluster": {"status": "ACTIVE", "version": "1.31"},
+            "nodegroups": {"ng1": {
+                "instanceTypes": ["m6g.large"], "capacityType": "SPOT",
+                "scalingConfig": {"desiredSize": 3},
+            }},
         }
     })
     findings = EksCostModule().scan(_ctx(eks))
     ng = _recs(findings, "node_group_optimization")
-    assert ng, "expected node-group advisory findings"
-    assert all(r["monthly_savings"] == 0.0 for r in ng)
-    assert all(r["Counted"] is False for r in ng)
+    # SPOT + already-Graviton → neither a Spot nor a Graviton line.
+    assert ng == []
+
+
+def test_is_graviton_detection():
+    from services.adapters.eks import _is_graviton
+    assert _is_graviton("m6g.large") and _is_graviton("c7g.xlarge") and _is_graviton("t4g.medium")
+    assert _is_graviton("m6gd.large") and _is_graviton("x2gd.metal") and _is_graviton("a1.large")
+    assert not _is_graviton("m5.large") and not _is_graviton("c6i.large") and not _is_graviton("t3.micro")
 
 
 def test_fargate_profile_advisory_no_fabricated_savings():

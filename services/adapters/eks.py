@@ -17,6 +17,7 @@ AWS API cost: All EKS API calls are free (no per-request charge).
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from core.contracts import GroupingSpec, ServiceFindings, SourceBlock, StatCardSpec
@@ -36,6 +37,16 @@ def _is_access_denied(exc: Exception) -> bool:
     """True when an exception looks like an IAM authorization failure."""
     text = str(exc)
     return "AccessDenied" in text or "UnauthorizedOperation" in text or "not authorized" in text
+
+
+def _is_graviton(instance_type: str) -> bool:
+    """True if the instance type is an ARM/Graviton family (e.g. m6g, c7g, t4g, a1)."""
+    family = str(instance_type).split(".")[0].lower()
+    if family == "a1":
+        return True
+    # ARM families have a generation digit immediately followed by 'g'
+    # (m6g, m6gd, c6gn, c7g, r7g, x2gd, im4gn, …).
+    return bool(re.search(r"[0-9]g", family))
 
 
 class EksCostModule(BaseServiceModule):
@@ -331,45 +342,54 @@ class EksCostModule(BaseServiceModule):
                 ng = resp.get("nodegroup", {})
                 instance_types = ng.get("instanceTypes", [])
                 capacity_type = ng.get("capacityType", "ON_DEMAND")
+                desired = int(ng.get("scalingConfig", {}).get("desiredSize", 0) or 0)
                 resource_id = f"{cluster_name}/{ng_name}"
 
-                has_prev_gen = any(
-                    any(it.startswith(prefix) for prefix in PREV_GEN_PREFIXES) for it in instance_types
-                )
-                if has_prev_gen:
+                # Advisory $ estimate: node-group monthly on-demand cost from the
+                # live EC2 price x desired node count. These are EC2 instances, so
+                # the estimate is ADVISORY (Counted=False) — the EC2 tab counts the
+                # real savings when Compute Optimizer / ASG CO is enabled. We
+                # surface the magnitude so it is not invisible when CO is off.
+                ng_monthly = self._node_group_monthly_cost(ctx, instance_types, desired)
+
+                # Spot opportunity (ON_DEMAND groups).
+                if capacity_type != "SPOT":
+                    spot_saving = round(ng_monthly * SPOT_SAVINGS_FACTOR, 2) if ng_monthly > 0 else 0.0
                     recs.append(
                         {
                             "resource_id": resource_id,
                             "check_type": "node_group",
                             "check_category": "Node Group Optimization",
-                            "current_value": f"Previous-gen instance types: {instance_types}",
-                            "recommended_value": (
-                                f"Migrate to Graviton (ARM) for ~{int(GRAVITON_SAVINGS_FACTOR * 100)}% list-price savings"
-                            ),
-                            "monthly_savings": 0.0,
+                            "current_value": f"{capacity_type} node group: {instance_types} x{desired}",
+                            "recommended_value": f"Use Spot for fault-tolerant workloads (~{int(SPOT_SAVINGS_FACTOR * 100)}%)",
+                            "monthly_savings": spot_saving,
                             "Counted": False,
-                            "severity": "MEDIUM",
+                            "severity": "LOW",
                             "reason": (
-                                f"Node group '{ng_name}' uses previous-generation instances; these are EC2 "
-                                f"instances — quantified rightsizing/Graviton savings are counted in the EC2 tab"
+                                f"Node group '{ng_name}' ({desired}x {instance_types}, ${ng_monthly:.2f}/mo on-demand): "
+                                f"~${spot_saving:.2f}/mo via Spot — advisory estimate; these are EC2 instances, "
+                                f"quantified/counted in the EC2 tab (needs Compute Optimizer or ASG CO enabled)"
                             ),
                         }
                     )
 
-                if capacity_type != "SPOT":
+                # Graviton opportunity (x86 node groups only).
+                if instance_types and not _is_graviton(instance_types[0]):
+                    grav_saving = round(ng_monthly * GRAVITON_SAVINGS_FACTOR, 2) if ng_monthly > 0 else 0.0
                     recs.append(
                         {
                             "resource_id": resource_id,
                             "check_type": "node_group",
                             "check_category": "Node Group Optimization",
-                            "current_value": f"{capacity_type} node group: {instance_types}",
-                            "recommended_value": "Use Spot for fault-tolerant workloads (60-90% savings)",
-                            "monthly_savings": 0.0,
+                            "current_value": f"x86 instance types: {instance_types} x{desired}",
+                            "recommended_value": f"Migrate to Graviton (ARM) for ~{int(GRAVITON_SAVINGS_FACTOR * 100)}% list-price savings",
+                            "monthly_savings": round(ng_monthly * GRAVITON_SAVINGS_FACTOR, 2) if ng_monthly > 0 else 0.0,
                             "Counted": False,
-                            "severity": "LOW",
+                            "severity": "MEDIUM",
                             "reason": (
-                                f"Node group '{ng_name}' uses {capacity_type} instances; Spot savings on these "
-                                f"EC2 instances are evaluated in the EC2 tab"
+                                f"Node group '{ng_name}' ({desired}x {instance_types}, ${ng_monthly:.2f}/mo on-demand): "
+                                f"~${grav_saving:.2f}/mo via Graviton (ARM) — advisory estimate, alternative to Spot; "
+                                f"these are EC2 instances, counted in the EC2 tab"
                             ),
                         }
                     )
@@ -385,6 +405,20 @@ class EksCostModule(BaseServiceModule):
                     ctx.warn(f"EKS describe_nodegroup({cluster_name}/{ng_name}) failed: {e}", "eks_cost")
 
         return recs, len(ng_names)
+
+    def _node_group_monthly_cost(self, ctx: Any, instance_types: list[str], desired: int) -> float:
+        """On-demand $/mo for a node group: live EC2 instance price x desired node count.
+
+        Uses the first instance type (node groups are typically single-type).
+        Returns 0.0 when pricing is unavailable or the group is scaled to zero.
+        """
+        if desired <= 0 or not instance_types:
+            return 0.0
+        try:
+            hourly = ctx.pricing_engine.get_ec2_hourly_price(instance_types[0], quiet=True)
+        except Exception:
+            return 0.0
+        return float(hourly or 0.0) * HOURS_PER_MONTH * desired
 
     def _analyze_fargate(
         self,

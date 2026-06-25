@@ -500,7 +500,13 @@ class CommitmentAnalysisModule(BaseServiceModule):
         ("ALL_UPFRONT", "All Upfront"),
     )
     _SP_TYPES: tuple[str, ...] = ("COMPUTE_SP",)
-    _RI_SERVICES: tuple[str, ...] = ("Amazon EC2",)
+    # (Cost Explorer API service value, display label). The RI purchase API
+    # rejects "Amazon EC2" — it requires the full "Amazon Elastic Compute Cloud
+    # - Compute" value (see the supported-values error), so all EC2 RI scenarios
+    # silently failed before.
+    _RI_SERVICES: tuple[tuple[str, str], ...] = (
+        ("Amazon Elastic Compute Cloud - Compute", "EC2"),
+    )
 
     def _fetch_sp_recommendations(self, ctx: Any, ce: Any) -> list[dict[str, Any]]:
         """Fetch Compute Savings Plans purchase recommendations across the
@@ -600,13 +606,13 @@ class CommitmentAnalysisModule(BaseServiceModule):
         """
         recs: list[dict[str, Any]] = []
 
-        for service in self._RI_SERVICES:
+        for service_api, service_label in self._RI_SERVICES:
             for term_api, term_label in self._SP_TERMS:
                 for payment_api, payment_label in self._SP_PAYMENTS:
                     scenario = f"({term_label}, {payment_label})"
                     try:
                         resp = ce.get_reservation_purchase_recommendation(
-                            Service=service,
+                            Service=service_api,
                             LookbackPeriodInDays="THIRTY_DAYS",
                             TermInYears=term_api,
                             PaymentOption=payment_api,
@@ -614,7 +620,7 @@ class CommitmentAnalysisModule(BaseServiceModule):
                     except Exception as e:
                         _route_ce_error(
                             ctx,
-                            f"ce:GetReservationPurchaseRecommendation[{service}/{scenario}]",
+                            f"ce:GetReservationPurchaseRecommendation[{service_label}/{scenario}]",
                             e,
                         )
                         continue
@@ -638,7 +644,7 @@ class CommitmentAnalysisModule(BaseServiceModule):
                         recs.append(
                             {
                                 "resource_id": (
-                                    f"{service.replace(' ', '')}_RI_{instance_type}_"
+                                    f"{service_label}_RI_{instance_type}_"
                                     f"{term_label}_{payment_label.lower().replace(' ', '_')}"
                                 ),
                                 "check_type": "purchase",
@@ -647,7 +653,7 @@ class CommitmentAnalysisModule(BaseServiceModule):
                                 ),
                                 "term": term_label,
                                 "payment_option": payment_label,
-                                "service": service,
+                                "service": service_label,
                                 "current_value": "On-Demand",
                                 "recommended_value": (
                                     f"Reserved Instance {instance_type} "
@@ -657,7 +663,7 @@ class CommitmentAnalysisModule(BaseServiceModule):
                                 "severity": "LOW",
                                 "Counted": False,  # mutually-exclusive alternative
                                 "reason": (
-                                    f"{service} RI {instance_type} "
+                                    f"{service_label} RI {instance_type} "
                                     f"{term_label} {payment_label}: "
                                     f"${monthly_savings:.2f}/mo savings, "
                                     f"upfront ${upfront_cost:,.2f}"
