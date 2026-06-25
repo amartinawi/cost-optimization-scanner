@@ -2192,6 +2192,62 @@ def _coh_ecs_size(resource_details: Dict) -> str:
     return f"{vcpu:g} vCPU / {mem_s}"
 
 
+def _render_fargate_savings_plan(recommendations: List[Rec], source_name: str, service_data: Dict) -> str:
+    """Render the Fargate-isolated Compute Savings Plan view.
+
+    Shows the SP-eligible Fargate baseline, the rightsizing reconciliation, and
+    the full 2x3 (term x payment) matrix with both the recommended saving (at the
+    estimated steady-baseline coverage) and the 100% ceiling. Called by:
+    HTMLReportGenerator._get_detailed_recommendations.
+    """
+    if not recommendations:
+        return ""
+    extras = (service_data.get("sources", {}).get("fargate_savings_plan", {}) or {}).get("extras", {}) or {}
+    eligible = float(extras.get("eligible_od", 0) or 0)
+    rightsized = float(extras.get("rightsized_od", eligible) or 0)
+    rightsizing = float(extras.get("rightsizing_monthly", 0) or 0)
+    coverage_pct = round(float(extras.get("coverage_ratio", 0.70) or 0.70) * 100)
+
+    content = '<div class="rec-item">'
+    content += "<h4>Fargate Compute Savings Plan Opportunity</h4>"
+    content += (
+        "<p><strong>Why this differs from the account Savings Plan recommendation:</strong> "
+        "AWS's aggregate Compute SP recommendation blends Fargate with EC2/Lambda at a lower combined "
+        "discount. Fargate's own Compute SP discount is higher; this view isolates it.</p>"
+    )
+    content += "<p><strong>Baseline:</strong></p><ul>"
+    content += f"<li>Fargate SP-eligible on-demand: <strong>${eligible:,.2f}/mo</strong> (currently 0% SP-covered)</li>"
+    if rightsizing > 0:
+        content += (
+            f"<li>Less Containers-tab rightsizing: &minus;${rightsizing:,.2f}/mo "
+            f"&rarr; rightsized baseline <strong>${rightsized:,.2f}/mo</strong></li>"
+        )
+    content += (
+        f"<li><strong>Rightsize first, then commit.</strong> Size the Savings Plan against the rightsized "
+        f"baseline (~{coverage_pct}% steady-baseline coverage) so you do not commit to usage you are about to remove.</li>"
+    )
+    content += "</ul>"
+
+    content += "<table class='rec-table'><thead><tr>"
+    content += "<th>Term</th><th>Payment</th><th>Fargate Discount</th>"
+    content += f"<th>Recommended (~{coverage_pct}% cov)</th><th>Ceiling (100%)</th>"
+    content += "</tr></thead><tbody>"
+    for rec in recommendations:
+        content += (
+            f"<tr><td>{rec.get('term', '')}</td><td>{rec.get('payment', '')}</td>"
+            f"<td>{rec.get('discount_pct', 0)}%</td>"
+            f"<td><strong>${float(rec.get('recommended_saving', 0) or 0):,.2f}/mo</strong></td>"
+            f"<td>${float(rec.get('ceiling_saving', 0) or 0):,.2f}/mo</td></tr>"
+        )
+    content += "</tbody></table>"
+    content += (
+        "<p class='muted'>Advisory — overlaps the account-level Savings Plan recommendation above and is "
+        "not added to the tab total. Discounts and rates are live from the AWS SavingsPlans offering API.</p>"
+    )
+    content += "</div>"
+    return content
+
+
 def _render_cost_hub_source(recommendations: List[Rec], source_name: str, service_data: Dict) -> str:
     """Renders Cost Optimization Hub recommendations as a human-readable table.
 
@@ -2393,6 +2449,7 @@ PHASE_B_HANDLERS: Dict[Tuple[str, str], Callable] = {
     # CoH recommendations the orchestrator routes into per-service tabs.
     ("containers", "cost_optimization_hub"): _render_cost_hub_source,
     ("commitment_analysis", "cost_optimization_hub"): _render_cost_hub_source,
+    ("commitment_analysis", "fargate_savings_plan"): _render_fargate_savings_plan,
     ("ec2", "enhanced_checks"): _render_ec2_enhanced_checks,
     ("ec2", "cost_optimization_hub"): _render_ec2_cost_hub,
     ("ec2", "compute_optimizer"): _render_ec2_compute_optimizer,
