@@ -165,9 +165,8 @@ def test_ec2_launch_type_not_fargate_priced(monkeypatch):
     }
     _patch_sources(monkeypatch, [rec])
     findings = ContainersModule().scan(_ctx())
-    out = findings.sources["enhanced_checks"].recommendations[0]
-    assert out["EstimatedMonthlySavings"] == 0.0
-    assert out["Counted"] is False
+    # EC2-launch-type tasks are EC2 domain → $0 here → dropped (not shown).
+    assert findings.sources["enhanced_checks"].count == 0
     assert findings.total_monthly_savings == 0.0
 
 
@@ -186,10 +185,22 @@ def test_arm_priced_below_x86(monkeypatch):
     assert 0 < arm_sav < x86_sav  # ARM rates are lower
 
 
-def test_ecr_lifecycle_is_advisory_not_counted(monkeypatch):
+def test_zero_savings_finding_is_dropped(monkeypatch):
+    # An ECR rec with no quantifiable reclaim (and no Advisory flag) is dropped,
+    # not rendered as $0 noise.
+    rec = {"RepositoryName": "myrepo", "ImageCount": 50, "CheckCategory": "ECR Lifecycle Management"}
+    _patch_sources(monkeypatch, [rec])
+    findings = ContainersModule().scan(_ctx())
+    assert findings.sources["enhanced_checks"].count == 0
+    assert findings.total_recommendations == 0
+    assert findings.total_monthly_savings == 0.0
+
+
+def test_explicit_advisory_finding_is_kept(monkeypatch):
+    # An oversized-repo advisory (Advisory=True) is kept as non-counted.
     rec = {
-        "RepositoryName": "myrepo", "ImageCount": 50,
-        "CheckCategory": "ECR Lifecycle Management", "Counted": False,
+        "RepositoryName": "huge", "ImageCount": 5000,
+        "CheckCategory": "ECR Lifecycle Management", "Advisory": True,
     }
     _patch_sources(monkeypatch, [rec])
     findings = ContainersModule().scan(_ctx())
@@ -215,6 +226,26 @@ def test_compute_optimizer_real_savings_counted(monkeypatch):
     findings = ContainersModule().scan(_ctx())
     assert findings.sources["compute_optimizer"].count == 1
     assert findings.total_monthly_savings == pytest.approx(42.5)
+
+
+def test_ecs_co_helper_filters_zero_savings(monkeypatch):
+    # The advisor drops "Optimized"/no-action CO findings ($0 savings).
+    import services.advisor as advisor
+
+    raw = {
+        "ecsServiceRecommendations": [
+            {"serviceArn": "arn:aws:ecs:::service/clu/web",
+             "serviceRecommendationOptions": [{"savingsOpportunity": {"estimatedMonthlySavings": {"value": 12.0}}}]},
+            {"serviceArn": "arn:aws:ecs:::service/clu/optimized",
+             "serviceRecommendationOptions": [{"savingsOpportunity": {"estimatedMonthlySavings": {"value": 0.0}}}]},
+        ]
+    }
+    co_client = MagicMock()
+    co_client.get_ecs_service_recommendations.return_value = raw
+    ctx = SimpleNamespace(pricing_multiplier=1.0)
+    ctx.client = lambda name, region=None: co_client if name == "compute-optimizer" else None
+    out = advisor.get_ecs_compute_optimizer_recommendations(ctx)
+    assert [r["resource_name"] for r in out] == ["web"]  # $0 'optimized' dropped
 
 
 def test_cost_hub_dedups_heuristic_for_same_service(monkeypatch):
@@ -297,6 +328,48 @@ def test_reclaimable_tagged_index_protects_untagged_child():
     }
     imgs = [{"digest": "idx", "tagged": True}, {"digest": "child", "tagged": False}]
     assert compute_untagged_reclaimable_bytes(imgs, lambda d: manifests.get(d)) == 0
+
+
+def test_ecr_repo_reclaimable_uses_batched_fetch():
+    """End-to-end shim test: batched batch_get_image + layer dedup → ReclaimableBytes."""
+    import json as _json
+    from types import SimpleNamespace as _NS
+    from services.containers import _ecr_repo_reclaimable
+
+    manifests = {
+        "sha-tag": {"layers": [{"digest": "L1", "size": 100}, {"digest": "L2", "size": 50}], "config": {"digest": "Ct", "size": 1}},
+        "sha-unt": {"layers": [{"digest": "L1", "size": 100}, {"digest": "L3", "size": 30}], "config": {"digest": "Cu", "size": 2}},
+    }
+    calls = {"batch": 0}
+
+    class _Pag:
+        def paginate(self, repositoryName):
+            return [{"imageDetails": [
+                {"imageDigest": "sha-tag", "imageTags": ["v1"]},
+                {"imageDigest": "sha-unt"},  # untagged
+            ]}]
+
+    class _Ecr:
+        def get_paginator(self, op):
+            assert op == "describe_images"
+            return _Pag()
+
+        def batch_get_image(self, repositoryName, imageIds, acceptedMediaTypes):
+            calls["batch"] += 1
+            return {"images": [
+                {"imageId": {"imageDigest": iid["imageDigest"]},
+                 "imageManifest": _json.dumps(manifests[iid["imageDigest"]])}
+                for iid in imageIds if iid["imageDigest"] in manifests
+            ]}
+
+    ctx = _NS(fast_mode=False)
+    ctx.warn = MagicMock()
+    ctx.permission_issue = MagicMock()
+    rec = _ecr_repo_reclaimable(ctx, _Ecr(), "myrepo")
+    assert rec["ReclaimableBytes"] == 32  # L3 + Cu; L1 shared with tagged excluded
+    assert rec["UntaggedCount"] == 1
+    # All top-level manifests fetched in ONE batched call (not one per image).
+    assert calls["batch"] == 1
 
 
 def test_adapter_prices_ecr_reclaimable_bytes(monkeypatch):

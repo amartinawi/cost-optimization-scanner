@@ -99,18 +99,26 @@ class ContainersModule(BaseServiceModule):
             heuristic_key=_heuristic_resource_key,
         )
 
-        # Quantify each surviving heuristic rec. Fargate rightsizing uses real
-        # task config snapped to a valid combo; everything without quantifiable
-        # config is marked advisory (Counted=False, $0) rather than fabricated.
+        # Quantify each surviving heuristic rec. A rec that quantifies to a real
+        # saving is counted; one that quantifies to $0 (already-smallest task,
+        # 0 running tasks, ~$0 ECR reclaim) is DROPPED — not shown as $0 noise.
+        # Only recs the shim explicitly flags Advisory=True (e.g. an oversized
+        # ECR repo it could not analyze) are kept as non-counted advisories.
         savings = 0.0
+        kept: list[dict[str, Any]] = []
         for rec in enhanced_recs:
-            rec_savings = self._quantify_rec(ctx, rec)
-            rec["EstimatedMonthlySavings"] = round(rec_savings, 2)
+            rec_savings = round(self._quantify_rec(ctx, rec), 2)
             if rec_savings > 0:
+                rec["EstimatedMonthlySavings"] = rec_savings
                 rec["Counted"] = True
                 savings += rec_savings
-            else:
+                kept.append(rec)
+            elif rec.get("Advisory"):
+                rec["EstimatedMonthlySavings"] = 0.0
                 rec["Counted"] = False
+                kept.append(rec)
+            # else: drop the $0 finding entirely (skip-it, don't render noise)
+        enhanced_recs = kept
 
         savings += sum(float(r.get("estimatedMonthlySavings", 0) or 0) for r in cost_hub_recs)
         savings += sum(float(r.get("estimatedMonthlySavings", 0.0) or 0.0) for r in co_recs)

@@ -328,7 +328,10 @@ def get_ecs_compute_optimizer_recommendations(
         if "OptInRequiredException" in str(e) or "not registered" in str(e):
             return [_compute_optimizer_opt_in_rec("ECS", "task-rightsizing")]
         return []
-    return [_normalize_ecs_co_rec(r, ctx.pricing_multiplier) for r in raw]
+    # Drop "Optimized"/no-action findings ($0 savings): they are not cost
+    # recommendations and would inflate the count (mirrors EC2/RDS CO helpers).
+    normalized = [_normalize_ecs_co_rec(r, ctx.pricing_multiplier) for r in raw]
+    return [r for r in normalized if float(r.get("estimatedMonthlySavings", 0) or 0) > 0]
 
 
 def get_asg_compute_optimizer_recommendations(
