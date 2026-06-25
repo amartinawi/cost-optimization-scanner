@@ -120,6 +120,23 @@ class ContainersModule(BaseServiceModule):
             # else: drop the $0 finding entirely (skip-it, don't render noise)
         enhanced_recs = kept
 
+        # Hand the ECS Fargate rightsizing total to the commitment_analysis
+        # adapter (runs later) so its Fargate Savings Plan view can model the
+        # commitment against the *rightsized* baseline. Only counted Fargate
+        # rightsizing $ — not ECR — reduce the Fargate compute baseline.
+        try:
+            ctx.fargate_rightsizing_monthly = round(
+                sum(
+                    float(r.get("EstimatedMonthlySavings", 0) or 0)
+                    for r in enhanced_recs
+                    if "rightsizing" in str(r.get("CheckCategory", "")).lower()
+                    and str(r.get("LaunchType", "")).upper() == "FARGATE"
+                ),
+                2,
+            )
+        except Exception:
+            ctx.fargate_rightsizing_monthly = 0.0
+
         savings += sum(float(r.get("estimatedMonthlySavings", 0) or 0) for r in cost_hub_recs)
         savings += sum(float(r.get("estimatedMonthlySavings", 0.0) or 0.0) for r in co_recs)
 

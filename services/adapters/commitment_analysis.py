@@ -24,6 +24,12 @@ from botocore.exceptions import ClientError  # type: ignore[import-untyped]
 
 from core.contracts import GroupingSpec, ServiceFindings, SourceBlock, StatCardSpec
 from services._base import BaseServiceModule
+from services.commitment_logic import DEFAULT_COVERAGE_RATIO, fargate_sp_analysis
+
+# Compute Savings Plans cover Fargate (ECS + EKS); ECS-on-EC2 bills as EC2.
+# Ephemeral storage and data transfer are NOT SP-eligible.
+_SP_DURATION_TO_TERM: dict[int, str] = {31536000: "1yr", 94608000: "3yr"}
+_SP_PAYMENT_OPTIONS: tuple[str, ...] = ("No Upfront", "Partial Upfront", "All Upfront")
 
 
 def _route_ce_error(ctx: Any, action: str, exc: Exception) -> None:
@@ -83,8 +89,8 @@ class CommitmentAnalysisModule(BaseServiceModule):
     requires_cloudwatch: bool = False
 
     def required_clients(self) -> tuple[str, ...]:
-        """Returns Cost Explorer client name."""
-        return ("ce",)
+        """Returns Cost Explorer and SavingsPlans client names."""
+        return ("ce", "savingsplans")
 
     def scan(self, ctx: Any) -> ServiceFindings:
         """Scan Savings Plans and Reserved Instance utilization and coverage.
@@ -113,9 +119,17 @@ class CommitmentAnalysisModule(BaseServiceModule):
         ri_cov_recs, ri_cov_rate = self._check_ri_coverage(ctx, ce, tp)
         expiry_recs = self._check_expiring(ctx, ce, tp)
         purchase_recs = self._check_purchase_recommendations(ctx, ce)
+        fargate_sp_recs, fargate_sp_extras = self._check_fargate_savings_plan(ctx, ce, tp)
 
         all_recs = sp_util_recs + sp_cov_recs + ri_util_recs + ri_cov_recs + expiry_recs + purchase_recs
-        total_savings = sum(r.get("monthly_savings", 0.0) for r in all_recs)
+        # Purchase recommendations (and the Fargate SP cells) are mutually-
+        # exclusive decision alternatives — you buy ONE term/payment, not all
+        # six — so they are advisory (Counted=False) and excluded from the tab
+        # total. Summing them would overcount ~6x. Utilization / coverage /
+        # expiry recs reflect actual waste and remain counted.
+        total_savings = sum(
+            r.get("monthly_savings", 0.0) for r in all_recs if r.get("Counted", True)
+        )
 
         # Cost Optimization Hub RI / Savings Plans purchase recommendations
         # the orchestrator routed here after the standalone CoH tab retired.
@@ -164,6 +178,11 @@ class CommitmentAnalysisModule(BaseServiceModule):
                 "purchase_recommendations": SourceBlock(
                     count=len(purchase_recs),
                     recommendations=tuple(purchase_recs),
+                ),
+                "fargate_savings_plan": SourceBlock(
+                    count=len(fargate_sp_recs),
+                    recommendations=tuple(fargate_sp_recs),
+                    extras=fargate_sp_extras,
                 ),
             },
             extras={
@@ -519,68 +538,49 @@ class CommitmentAnalysisModule(BaseServiceModule):
                         )
                         continue
 
-                    for rec in resp.get("SavingsPlansPurchaseRecommendation", []):
-                        savings_detail = rec.get("SavingsPlansPurchaseRecommendationSummary", {})
-                        monthly_savings = float(savings_detail.get("EstimatedMonthlySavings", "0"))
-                        hourly_commit = float(savings_detail.get("HourlyCommitment", "0"))
-                        upfront = float(savings_detail.get("EstimatedUpfrontCost", "0"))
+                    # AWS returns a single recommendation OBJECT (a dict), not a
+                    # list — its Summary holds the aggregate commitment/savings
+                    # for this (term, payment) scenario. (Iterating it as a list
+                    # yields key strings and crashes on .get; field names are the
+                    # …Amount / …ToPurchase variants.)
+                    spr = resp.get("SavingsPlansPurchaseRecommendation", {})
+                    if not isinstance(spr, dict):
+                        continue
+                    summary = spr.get("SavingsPlansPurchaseRecommendationSummary", {})
+                    details = spr.get("SavingsPlansPurchaseRecommendationDetails", [])
+                    monthly_savings = float(summary.get("EstimatedMonthlySavingsAmount", 0) or 0)
+                    hourly_commit = float(summary.get("HourlyCommitmentToPurchase", 0) or 0)
+                    savings_pct = float(summary.get("EstimatedSavingsPercentage", 0) or 0)
+                    upfront = 0.0
+                    if details and isinstance(details[0], dict):
+                        upfront = float(details[0].get("UpfrontCost", 0) or 0)
 
-                        if monthly_savings <= 0 and hourly_commit <= 0:
-                            continue
+                    if monthly_savings <= 0 and hourly_commit <= 0:
+                        continue
 
-                        recs.append(
-                            {
-                                "resource_id": f"{sp_type}_{term_label}_{payment_label.lower().replace(' ', '_')}",
-                                "check_type": "purchase",
-                                "check_category": f"SP Purchase Recommendation {scenario}",
-                                "term": term_label,
-                                "payment_option": payment_label,
-                                "sp_type": sp_type,
-                                "current_value": f"${hourly_commit:.4f}/hr commitment",
-                                "recommended_value": (
-                                    f"${hourly_commit:.4f}/hr Compute SP "
-                                    f"({term_label}, {payment_label})"
-                                ),
-                                "monthly_savings": round(monthly_savings, 2),
-                                "severity": "LOW",
-                                "reason": (
-                                    f"{term_label} {payment_label}: "
-                                    f"${monthly_savings:.2f}/mo at "
-                                    f"${hourly_commit:.4f}/hr commitment, "
-                                    f"upfront ${upfront:,.2f}"
-                                ),
-                                "upfront_cost": upfront,
-                            }
-                        )
-
-                    for rec_detail in resp.get("SavingsPlansPurchaseRecommendationDetail", []):
-                        monthly_savings = float(rec_detail.get("EstimatedMonthlySavings", "0"))
-                        hourly_commit = float(rec_detail.get("HourlyCommitment", "0"))
-                        if hourly_commit <= 0 and monthly_savings <= 0:
-                            continue
-
-                        recs.append(
-                            {
-                                "resource_id": rec_detail.get("AccountId", sp_type),
-                                "check_type": "purchase",
-                                "check_category": f"SP Purchase Recommendation {scenario}",
-                                "term": term_label,
-                                "payment_option": payment_label,
-                                "sp_type": sp_type,
-                                "current_value": "On-Demand",
-                                "recommended_value": (
-                                    f"${hourly_commit:.4f}/hr Compute SP "
-                                    f"({term_label}, {payment_label})"
-                                ),
-                                "monthly_savings": round(monthly_savings, 2),
-                                "severity": "LOW",
-                                "reason": (
-                                    f"Account {rec_detail.get('AccountId', 'N/A')} "
-                                    f"({term_label} {payment_label}): "
-                                    f"${monthly_savings:.2f}/mo savings"
-                                ),
-                            }
-                        )
+                    recs.append(
+                        {
+                            "resource_id": f"{sp_type}_{term_label}_{payment_label.lower().replace(' ', '_')}",
+                            "check_type": "purchase",
+                            "check_category": f"SP Purchase Recommendation {scenario}",
+                            "term": term_label,
+                            "payment_option": payment_label,
+                            "sp_type": sp_type,
+                            "current_value": f"${hourly_commit:.4f}/hr commitment",
+                            "recommended_value": (
+                                f"${hourly_commit:.4f}/hr Compute SP ({term_label}, {payment_label})"
+                            ),
+                            "monthly_savings": round(monthly_savings, 2),
+                            "severity": "LOW",
+                            "Counted": False,  # mutually-exclusive alternative
+                            "reason": (
+                                f"{term_label} {payment_label}: ${monthly_savings:.2f}/mo "
+                                f"({savings_pct:.1f}% off) at ${hourly_commit:.4f}/hr commitment, "
+                                f"upfront ${upfront:,.2f}"
+                            ),
+                            "upfront_cost": upfront,
+                        }
+                    )
 
         return recs
 
@@ -655,6 +655,7 @@ class CommitmentAnalysisModule(BaseServiceModule):
                                 ),
                                 "monthly_savings": round(monthly_savings, 2),
                                 "severity": "LOW",
+                                "Counted": False,  # mutually-exclusive alternative
                                 "reason": (
                                     f"{service} RI {instance_type} "
                                     f"{term_label} {payment_label}: "
@@ -666,6 +667,163 @@ class CommitmentAnalysisModule(BaseServiceModule):
                         )
 
         return recs
+
+    # ── Fargate Savings Plan view ──────────────────────────────────────────────
+
+    def _check_fargate_savings_plan(
+        self, ctx: Any, ce: Any, tp: dict[str, str]
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Build the Fargate-isolated Compute Savings Plan analysis.
+
+        Isolates Fargate's SP-eligible on-demand spend (which AWS's aggregate
+        purchase recommendation does not break out), reconciles it against the
+        Containers tab's rightsizing total, and prices the full 2x3 (term x
+        payment) matrix from the live SavingsPlans offering rates.
+
+        Returns:
+            Tuple of (per-cell advisory recs, source extras with baseline figures).
+        """
+        legs = self._fargate_legs(ctx, ce, tp)
+        if not legs:
+            return [], {}
+
+        sp_client = ctx.client("savingsplans", region="us-east-1")
+        if not sp_client:
+            ctx.warn("SavingsPlans client unavailable; skipping Fargate SP view", "commitment_analysis")
+            return [], {}
+        rate_matrix = self._fargate_sp_rates(ctx, sp_client)
+        if not rate_matrix:
+            return [], {}
+
+        rightsizing = float(getattr(ctx, "fargate_rightsizing_monthly", 0.0) or 0.0)
+        coverage = self._account_coverage_ratio(ctx, ce)
+        analysis = fargate_sp_analysis(
+            legs, rate_matrix, rightsizing_monthly=rightsizing, coverage_ratio=coverage
+        )
+
+        recs: list[dict[str, Any]] = []
+        for c in analysis["cells"]:
+            recs.append(
+                {
+                    "resource_id": f"fargate-compute-sp-{c['term']}-{c['payment'].replace(' ', '-').lower()}",
+                    "check_category": "Fargate Savings Plan",
+                    "term": c["term"],
+                    "payment": c["payment"],
+                    "discount_pct": c["discount_pct"],
+                    "ceiling_saving": c["ceiling_saving"],
+                    "recommended_saving": c["recommended_saving"],
+                    "monthly_savings": 0.0,  # advisory: overlaps account SP rec
+                    "Counted": False,
+                    "severity": "MEDIUM",
+                    "reason": (
+                        f"Compute SP ({c['term']} {c['payment']}) on Fargate: {c['discount_pct']}% off; "
+                        f"~${c['recommended_saving']:.2f}/mo at {round(analysis['coverage_ratio'] * 100)}% coverage "
+                        f"of the rightsized baseline (ceiling ${c['ceiling_saving']:.2f}/mo)"
+                    ),
+                }
+            )
+
+        extras = {
+            "eligible_od": analysis["eligible_od"],
+            "rightsized_od": analysis["rightsized_od"],
+            "rightsizing_monthly": analysis["rightsizing_monthly"],
+            "coverage_ratio": analysis["coverage_ratio"],
+        }
+        return recs, extras
+
+    def _fargate_legs(self, ctx: Any, ce: Any, tp: dict[str, str]) -> dict[str, dict[str, float]]:
+        """Fetch SP-eligible Fargate on-demand cost + usage per usage type, for ctx.region."""
+        legs: dict[str, dict[str, float]] = {}
+        try:
+            resp = ce.get_cost_and_usage(
+                TimePeriod=tp,
+                Granularity="MONTHLY",
+                Metrics=["UnblendedCost", "UsageQuantity"],
+                Filter={
+                    "And": [
+                        {"Dimensions": {"Key": "SERVICE", "Values": ["Amazon Elastic Container Service"]}},
+                        {"Dimensions": {"Key": "REGION", "Values": [ctx.region]}},
+                    ]
+                },
+                GroupBy=[{"Type": "DIMENSION", "Key": "USAGE_TYPE"}],
+            )
+        except Exception as e:
+            _route_ce_error(ctx, "ce:GetCostAndUsage", e)
+            return {}
+
+        for period in resp.get("ResultsByTime", []):
+            for g in period.get("Groups", []):
+                ut = g["Keys"][0]
+                # SP-eligible Fargate = vCPU-Hours + GB-Hours legs; exclude
+                # ephemeral storage (…EphemeralStorage-GB-Hours) and transfer.
+                if "Fargate" not in ut or "Ephemeral" in ut:
+                    continue
+                if "vCPU-Hours" not in ut and "GB-Hours" not in ut:
+                    continue
+                try:
+                    od = float(g["Metrics"]["UnblendedCost"]["Amount"])
+                    qty = float(g["Metrics"]["UsageQuantity"]["Amount"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if od <= 0:
+                    continue
+                entry = legs.setdefault(ut, {"od": 0.0, "qty": 0.0})
+                entry["od"] += od
+                entry["qty"] += qty
+        return legs
+
+    def _fargate_sp_rates(self, ctx: Any, sp_client: Any) -> dict[tuple[str, str], dict[str, float]]:
+        """Build {(term, payment): {usage_type: sp_rate}} from live SavingsPlans offering rates."""
+        matrix: dict[tuple[str, str], dict[str, float]] = {}
+        for payment in _SP_PAYMENT_OPTIONS:
+            try:
+                results = sp_client.describe_savings_plans_offering_rates(
+                    savingsPlanPaymentOptions=[payment],
+                    savingsPlanTypes=["Compute"],
+                    products=["Fargate"],
+                    serviceCodes=["AmazonECS"],
+                    filters=[{"name": "region", "values": [ctx.region]}],
+                ).get("searchResults", [])
+            except Exception as e:
+                ctx.warn(f"SavingsPlans offering rates failed ({payment}): {e}", "commitment_analysis")
+                continue
+            for x in results:
+                dur = x.get("savingsPlanOffering", {}).get("durationSeconds")
+                term = _SP_DURATION_TO_TERM.get(dur)
+                if not term:
+                    continue
+                try:
+                    rate = float(x.get("rate", 0) or 0)
+                except (TypeError, ValueError):
+                    continue
+                matrix.setdefault((term, payment), {})[x.get("usageType", "")] = rate
+        return matrix
+
+    def _account_coverage_ratio(self, ctx: Any, ce: Any) -> float:
+        """Estimate the steady-baseline coverage ratio from the account's aggregate SP rec.
+
+        Uses HourlyCommitmentToPurchase / average-hourly-on-demand from the
+        account-wide Compute SP recommendation as a proxy for how much of the
+        Fargate baseline is worth committing. Falls back to the default on error.
+        """
+        try:
+            rec = ce.get_savings_plans_purchase_recommendation(
+                SavingsPlansType="COMPUTE_SP",
+                TermInYears="ONE_YEAR",
+                PaymentOption="NO_UPFRONT",
+                LookbackPeriodInDays="THIRTY_DAYS",
+            )
+            summ = (
+                rec.get("SavingsPlansPurchaseRecommendation", {})
+                .get("SavingsPlansPurchaseRecommendationSummary", {})
+            )
+            hourly_commit = float(summ.get("HourlyCommitmentToPurchase", 0) or 0)
+            avg_hourly_od = float(summ.get("CurrentOnDemandSpend", 0) or 0) / (30 * 24)
+            if avg_hourly_od <= 0:
+                return DEFAULT_COVERAGE_RATIO
+            return min(1.0, max(0.1, hourly_commit / avg_hourly_od))
+        except Exception:
+            return DEFAULT_COVERAGE_RATIO
 
     @staticmethod
     def _parse_pct(value: Any) -> float:
@@ -704,6 +862,7 @@ class CommitmentAnalysisModule(BaseServiceModule):
                     extras={"expiring_30d": 0, "expiring_60d": 0, "expiring_90d": 0},
                 ),
                 "purchase_recommendations": SourceBlock(count=0, recommendations=()),
+                "fargate_savings_plan": SourceBlock(count=0, recommendations=(), extras={}),
             },
             extras={
                 "sp_utilization_rate": 0.0,
