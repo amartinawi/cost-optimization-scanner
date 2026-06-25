@@ -221,7 +221,14 @@ class ContainersModule(BaseServiceModule):
         vcpu_rate, gb_rate, win_os = rates
 
         q = quantify_fargate_rightsizing(
-            cpu_units, mem_mb, task_count, vcpu_rate, gb_rate, windows_os_rate=win_os
+            cpu_units,
+            mem_mb,
+            task_count,
+            vcpu_rate,
+            gb_rate,
+            windows_os_rate=win_os,
+            peak_cpu_pct=rec.get("PeakCPUPct"),
+            peak_mem_pct=rec.get("PeakMemoryPct"),
         )
         if q is None:
             return 0.0

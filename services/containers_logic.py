@@ -187,6 +187,37 @@ def compute_untagged_reclaimable_bytes(
     return max(0, reclaimable)
 
 
+# Safety headroom over measured peak utilization when sizing a rightsize target.
+FARGATE_RIGHTSIZE_HEADROOM: float = 1.2
+
+
+def rightsize_fargate_target(
+    cur_vcpu: float,
+    cur_mem_gb: float,
+    peak_cpu_pct: float,
+    peak_mem_pct: float,
+    *,
+    headroom: float = FARGATE_RIGHTSIZE_HEADROOM,
+) -> tuple[float, float] | None:
+    """Peak-aware Fargate target: smallest valid combo covering peak usage + headroom.
+
+    ``peak_*_pct`` are the measured maximum utilizations as a percentage of the
+    task's CURRENT reservation (AWS/ECS CPU/MemoryUtilization). The required
+    resource is ``current x peak% x headroom``; the target is the smallest valid
+    Fargate combo that covers BOTH legs. Returns None when that combo is not
+    strictly smaller than the current size (nothing safe to reclaim).
+    """
+    req_vcpu = cur_vcpu * max(0.0, peak_cpu_pct) / 100.0 * headroom
+    req_mem_gb = cur_mem_gb * max(0.0, peak_mem_pct) / 100.0 * headroom
+    tgt_vcpu, tgt_mem_gb = snap_to_valid_fargate(req_vcpu, req_mem_gb)
+    # Only a real downsize if at least one leg shrinks and neither grows.
+    if tgt_vcpu > cur_vcpu or tgt_mem_gb > cur_mem_gb:
+        return None
+    if tgt_vcpu == cur_vcpu and tgt_mem_gb == cur_mem_gb:
+        return None
+    return tgt_vcpu, tgt_mem_gb
+
+
 def quantify_fargate_rightsizing(
     cpu_units: float,
     mem_mb: float,
@@ -195,13 +226,16 @@ def quantify_fargate_rightsizing(
     gb_rate: float,
     *,
     windows_os_rate: float = 0.0,
+    peak_cpu_pct: float | None = None,
+    peak_mem_pct: float | None = None,
 ) -> dict[str, Any] | None:
     """Monthly saving + target for downsizing one over-provisioned Fargate task.
 
-    Snaps the current (cpu_units, mem_mb) task to the next-smaller valid Fargate
-    combo and prices the delta with the supplied (already region/arch/OS
-    resolved) rates. Returns None when the inputs are unusable or the task is
-    already at the smallest Fargate size (no realizable saving).
+    When ``peak_cpu_pct``/``peak_mem_pct`` are supplied, the target is sized to
+    cover measured PEAK usage + headroom (safer); otherwise it falls back to the
+    next-smaller valid combo (tier-minimum memory). Prices the delta with the
+    supplied (already region/arch/OS resolved) rates. Returns None when inputs
+    are unusable or there is no safe, cheaper target.
 
     Returns:
         ``{"saving", "current_vcpu", "current_mem_gb", "target_vcpu",
@@ -211,7 +245,10 @@ def quantify_fargate_rightsizing(
         return None
     cur_vcpu = cpu_units / 1024.0
     cur_mem_gb = mem_mb / 1024.0
-    target = snap_down_fargate(cur_vcpu, cur_mem_gb)
+    if peak_cpu_pct is not None and peak_mem_pct is not None:
+        target = rightsize_fargate_target(cur_vcpu, cur_mem_gb, peak_cpu_pct, peak_mem_pct)
+    else:
+        target = snap_down_fargate(cur_vcpu, cur_mem_gb)
     if target is None:
         return None
     tgt_vcpu, tgt_mem_gb = target

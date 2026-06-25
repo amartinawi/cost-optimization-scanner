@@ -465,7 +465,16 @@ def estimate_fargate_rightsizing_monthly(ctx: ScanContext) -> float:
             task_count = int(rec.get("TaskCount", 0))
         except (TypeError, ValueError):
             continue
-        q = quantify_fargate_rightsizing(cpu_units, mem_mb, task_count, vcpu_rate, gb_rate, windows_os_rate=win_os)
+        q = quantify_fargate_rightsizing(
+            cpu_units,
+            mem_mb,
+            task_count,
+            vcpu_rate,
+            gb_rate,
+            windows_os_rate=win_os,
+            peak_cpu_pct=rec.get("PeakCPUPct"),
+            peak_mem_pct=rec.get("PeakMemoryPct"),
+        )
         if q:
             total += q["saving"]
     return round(total, 2)
@@ -658,6 +667,11 @@ def _ecs_service_rightsizing(
     avg_mem = sum(d["Average"] for d in mem_dp) / len(mem_dp)
     if not (avg_cpu < 20 and avg_mem < 30):
         return None
+    # Peak utilization gates how far we can safely downsize: the target must
+    # still cover the measured peak (plus headroom), so a spiky task is not
+    # cut to the tier minimum.
+    max_cpu = max(d["Maximum"] for d in cpu_dp)
+    max_mem = max(d["Maximum"] for d in mem_dp)
 
     # Resolve the task definition for real Cpu/Memory + launch type + platform.
     task_def_arn = service.get("taskDefinition", "")
@@ -694,4 +708,6 @@ def _ecs_service_rightsizing(
         "MetricsPeriod": "7 days",
         "AvgCPU": f"{avg_cpu:.1f}%",
         "AvgMemory": f"{avg_mem:.1f}%",
+        "PeakCPUPct": round(max_cpu, 1),
+        "PeakMemoryPct": round(max_mem, 1),
     }

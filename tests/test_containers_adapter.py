@@ -56,6 +56,29 @@ def test_snap_down_fargate_smallest_returns_none():
     assert snap_down_fargate(0.25, 0.5) is None
 
 
+def test_rightsize_fargate_target_peak_aware():
+    from services.containers_logic import rightsize_fargate_target
+    # 1 vCPU / 4 GB, peak CPU 40% / mem 61% -> covers 2.4GB peak +headroom -> 0.5 vCPU / 3 GB.
+    assert rightsize_fargate_target(1.0, 4.0, 40.0, 61.0) == (0.5, 3.0)
+
+
+def test_rightsize_fargate_target_spiky_returns_none():
+    from services.containers_logic import rightsize_fargate_target
+    # A task peaking near its limit must not be downsized.
+    assert rightsize_fargate_target(1.0, 4.0, 95.0, 95.0) is None
+    # Memory spike alone keeps memory high -> no safe downsize.
+    assert rightsize_fargate_target(1.0, 4.0, 40.0, 90.0) is None
+
+
+def test_quantify_peak_aware_safer_than_tier_min():
+    from services.containers_logic import quantify_fargate_rightsizing
+    peak = quantify_fargate_rightsizing(1024, 4096, 1, 0.04048, 0.004445, peak_cpu_pct=40.0, peak_mem_pct=61.0)
+    old = quantify_fargate_rightsizing(1024, 4096, 1, 0.04048, 0.004445)  # no peak -> tier-min fallback
+    assert (peak["target_vcpu"], peak["target_mem_gb"]) == (0.5, 3.0)
+    assert (old["target_vcpu"], old["target_mem_gb"]) == (0.5, 1.0)
+    assert 0 < peak["saving"] < old["saving"]  # safer target saves a bit less
+
+
 def test_fargate_task_hourly_legs():
     # vCPU leg + GB leg, no Windows fee.
     cost = fargate_task_hourly(1.0, 2.0, 0.04048, 0.004445)
@@ -160,6 +183,21 @@ def test_fargate_rightsizing_quantified_and_counted(monkeypatch):
     assert out["RecommendedConfig"] == {"cpu": 1024, "memory": 2048}
     assert "2 vCPU / 8 GB → 1 vCPU / 2 GB" in out["Recommendation"]
     assert "cpu=1024" in out["Recommendation"]
+
+
+def test_adapter_uses_peak_aware_target(monkeypatch):
+    rec = {
+        "ServiceName": "web", "ClusterName": "prod",
+        "Cpu": 1024, "Memory": 4096, "TaskCount": 1,
+        "LaunchType": "FARGATE", "Architecture": "x86", "OperatingSystem": "linux",
+        "CheckCategory": "ECS Rightsizing - Metric-Backed",
+        "PeakCPUPct": 40.0, "PeakMemoryPct": 61.0,
+    }
+    _patch_sources(monkeypatch, [rec])
+    out = ContainersModule().scan(_ctx()).sources["enhanced_checks"].recommendations[0]
+    # Peak-aware: covers the 61% memory peak + headroom rather than tier-min.
+    assert out["TargetSize"] == "0.5 vCPU / 3 GB"
+    assert out["RecommendedConfig"] == {"cpu": 512, "memory": 3072}
 
 
 def test_ec2_launch_type_not_fargate_priced(monkeypatch):
