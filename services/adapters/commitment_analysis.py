@@ -319,9 +319,12 @@ class CommitmentAnalysisModule(BaseServiceModule):
         overall_rate = 0.0
 
         try:
+            # GetReservationUtilization only supports SUBSCRIPTION_ID for a
+            # DIMENSION groupBy (SERVICE raises ValidationException), so group
+            # per-RI subscription to flag individual under-utilized reservations.
             params: dict[str, Any] = {
                 "TimePeriod": tp,
-                "GroupBy": [{"Type": "DIMENSION", "Key": "SERVICE"}],
+                "GroupBy": [{"Type": "DIMENSION", "Key": "SUBSCRIPTION_ID"}],
             }
             while True:
                 resp = ce.get_reservation_utilization(**params)
@@ -331,21 +334,21 @@ class CommitmentAnalysisModule(BaseServiceModule):
                     for group in groups:
                         util = group.get("Utilization", {})
                         rate = self._parse_pct(util.get("UtilizationPercentage", "0"))
-                        svc = group.get("Attributes", {}).get("service", "Unknown")
+                        attrs = group.get("Attributes", {})
+                        rid = attrs.get("subscriptionId") or next(iter(attrs.values()), "Reserved Instance")
                         if rate < self.UTILIZATION_THRESHOLD:
                             total_cost = float(util.get("TotalAmortizedCost", "0"))
-                            used_cost = float(util.get("AmortizedUpfrontCost", "0"))
                             waste = total_cost * (1.0 - rate)
                             recs.append(
                                 {
-                                    "resource_id": svc,
+                                    "resource_id": str(rid),
                                     "check_type": "ri_utilization",
                                     "check_category": "RI Under-utilization",
                                     "current_value": f"{rate:.1%}",
                                     "recommended_value": f"{self.UTILIZATION_THRESHOLD:.0%}+",
                                     "monthly_savings": round(waste, 2),
                                     "severity": "HIGH" if rate < 0.50 else "MEDIUM",
-                                    "reason": f"{svc} RI utilized at {rate:.1%} (below {self.UTILIZATION_THRESHOLD:.0%} threshold)",
+                                    "reason": f"Reserved Instance {rid} utilized at {rate:.1%} (below {self.UTILIZATION_THRESHOLD:.0%} threshold)",
                                 }
                             )
 
@@ -375,40 +378,12 @@ class CommitmentAnalysisModule(BaseServiceModule):
         overall_rate = 0.0
 
         try:
-            params: dict[str, Any] = {
-                "TimePeriod": tp,
-                "GroupBy": [{"Type": "DIMENSION", "Key": "SERVICE"}],
-            }
-            while True:
-                resp = ce.get_reservation_coverage(**params)
-                coverages = resp.get("CoveragesByTime", [])
-                for entry in coverages:
-                    groups = entry.get("Groups", [])
-                    for group in groups:
-                        cov = group.get("Coverage", {})
-                        rate = self._parse_pct(cov.get("CoveragePercentage", "0"))
-                        svc = group.get("Attributes", {}).get("service", "Unknown")
-                        if rate < self.COVERAGE_GAP_THRESHOLD:
-                            od_cost = float(cov.get("OnDemandCost", "0"))
-                            potential = od_cost * (1.0 - rate) * self.AVG_SP_DISCOUNT_RATE
-                            recs.append(
-                                {
-                                    "resource_id": svc,
-                                    "check_type": "ri_coverage",
-                                    "check_category": "RI Coverage Gap",
-                                    "current_value": f"{rate:.1%}",
-                                    "recommended_value": f"{self.COVERAGE_GAP_THRESHOLD:.0%}+",
-                                    "monthly_savings": round(potential, 2),
-                                    "severity": "MEDIUM",
-                                    "reason": f"{svc} has {rate:.1%} RI coverage (below {self.COVERAGE_GAP_THRESHOLD:.0%} threshold)",
-                                }
-                            )
-
-                next_token = resp.get("NextToken")
-                if not next_token:
-                    break
-                params["NextToken"] = next_token
-
+            # GetReservationCoverage rejects a SERVICE DIMENSION groupBy (only
+            # AZ / INSTANCE_TYPE(_FAMILY) / REGION / PLATFORM / TENANCY etc. are
+            # valid). The per-service coverage-gap rec overlaps the purchase
+            # recommendations anyway, so we take the overall coverage rate only
+            # (used by the stat card) without a groupBy.
+            resp = ce.get_reservation_coverage(TimePeriod=tp)
             total = resp.get("Total", {})
             overall_rate = self._parse_pct(total.get("CoveragePercentage", "0"))
         except Exception as e:

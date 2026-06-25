@@ -196,6 +196,42 @@ def test_adapter_no_fargate_returns_empty():
 # --------------------------------------------------------------------------- #
 # Reporter
 # --------------------------------------------------------------------------- #
+def test_ri_utilization_uses_subscription_id_groupby():
+    ce = MagicMock()
+    captured = {}
+
+    def util(**kw):
+        captured.update(kw)
+        return {"UtilizationsByTime": [{"Groups": [
+            {"Attributes": {"subscriptionId": "ri-abc"},
+             "Utilization": {"UtilizationPercentage": "40", "TotalAmortizedCost": "100"}},
+        ]}], "Total": {"UtilizationPercentage": "40"}}
+
+    ce.get_reservation_utilization.side_effect = util
+    ctx = SimpleNamespace()
+    ctx.warn = MagicMock(); ctx.permission_issue = MagicMock()
+    recs, rate = CommitmentAnalysisModule()._check_ri_utilization(ctx, ce, {"Start": "x", "End": "y"})
+    assert captured["GroupBy"] == [{"Type": "DIMENSION", "Key": "SUBSCRIPTION_ID"}]
+    assert recs[0]["resource_id"] == "ri-abc" and recs[0]["monthly_savings"] == 60.0  # 100 * (1-0.4)
+    assert rate == 0.40
+
+
+def test_ri_coverage_no_groupby_returns_overall_rate():
+    ce = MagicMock()
+    captured = {}
+
+    def cov(**kw):
+        captured.update(kw)
+        return {"Total": {"CoveragePercentage": "85"}}
+
+    ce.get_reservation_coverage.side_effect = cov
+    ctx = SimpleNamespace()
+    ctx.warn = MagicMock(); ctx.permission_issue = MagicMock()
+    recs, rate = CommitmentAnalysisModule()._check_ri_coverage(ctx, ce, {"Start": "x", "End": "y"})
+    assert "GroupBy" not in captured  # SERVICE groupBy removed (API rejects it)
+    assert rate == 0.85 and recs == []
+
+
 def test_render_fargate_sp_matrix():
     from reporter_phase_b import _render_fargate_savings_plan
     recs = [

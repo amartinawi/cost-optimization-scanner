@@ -255,19 +255,10 @@ def get_cloudtrail_checks(ctx: ScanContext) -> dict[str, Any]:
             except Exception as e:
                 logger.warning(f"Warning: Could not analyze event selectors for {trail_name}: {e}")
 
-            try:
-                insights_response = cloudtrail.get_insight_selectors(TrailName=trail_name)
-                insight_selectors = insights_response.get("InsightSelectors", [])
-
-                # CloudTrail Insights finding removed: emitted a generic per-event AWS
-                # rate ($0.35/100K) without per-account event-volume math.
-                _ = insight_selectors
-
-            except ClientError as e:
-                if e.response["Error"]["Code"] != "TrailNotFoundException":
-                    logger.warning(f"Warning: Could not check insights for {trail_name}: {e}")
-            except Exception as e:
-                logger.warning(f"Warning: Could not check insights for {trail_name}: {e}")
+            # CloudTrail Insights check removed: the finding it fed (a generic
+            # $0.35/100K per-event rate without per-account event-volume math)
+            # was dropped, so get_insight_selectors did nothing but emit a noisy
+            # warning whenever Insights was not enabled (the common case).
 
         # Multiple CloudTrail Trails finding removed: emitted $0/month with a generic
         # "consolidate overlapping trails" suggestion — no concrete savings.

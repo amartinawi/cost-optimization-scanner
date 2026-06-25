@@ -295,7 +295,7 @@ FALLBACK_EIP_MONTH: float = 3.65       # $0.005/hr × 730 = $3.65/mo
 FALLBACK_NAT_MONTH: float = 32.85      # $0.045/hr × 730 = $32.85/mo
 FALLBACK_VPC_ENDPOINT_MONTH: float = 7.30   # $0.01/hr × 730 = $7.30/mo
 FALLBACK_ALB_MONTH: float = 16.43      # $0.0225/hr × 730 = $16.43/mo
-FALLBACK_AURORA_ACU_HOURLY: float = 0.06
+FALLBACK_AURORA_ACU_HOURLY: float = 0.12  # us-east-1 Aurora Serverless v2 ACU-Hr list rate
 SAGEMAKER_OVER_EC2: float = 1.15
 
 # AWS Fargate compute rates (us-east-1, verified via Pricing API 2026-06).
@@ -1083,13 +1083,15 @@ class PricingEngine:
         return self._call_pricing_api("AmazonEC2", filters)
 
     def _fetch_ebs_snapshot_price(self, *, archive_tier: bool = False) -> float | None:
-        usagetype_value = "EBS:SnapshotArchiveStorage" if archive_tier else "EBS:SnapshotUsage"
+        # The usagetype is region-prefixed outside us-east-1 (e.g.
+        # EU-EBS:SnapshotUsage), so an exact match misses every other region.
+        # Match the suffix instead, and skip the .outposts variant.
+        suffix = "EBS:SnapshotArchiveStorage" if archive_tier else "EBS:SnapshotUsage"
         filters = [
             {"Type": "TERM_MATCH", "Field": "location", "Value": self._display_name},
             {"Type": "TERM_MATCH", "Field": "productFamily", "Value": "Storage Snapshot"},
-            {"Type": "TERM_MATCH", "Field": "usagetype", "Value": usagetype_value},
         ]
-        return self._call_pricing_api("AmazonEC2", filters)
+        return self._select_by_usagetype_suffix("AmazonEC2", filters, suffix)
 
     def _fetch_rds_instance_price(
         self,
@@ -1386,11 +1388,14 @@ class PricingEngine:
         return hourly * 730 if hourly is not None else None
 
     def _fetch_aurora_acu_price(self) -> float | None:
+        # The usagetype "ACU-Hour" does not exist; AWS publishes the Aurora
+        # Serverless v2 ACU rate as <region>-Aurora:ServerlessV2Usage (unit
+        # "ACU-Hr", e.g. EU-Aurora:ServerlessV2Usage @ $0.14). Match the suffix.
         filters = [
             {"Type": "TERM_MATCH", "Field": "location", "Value": self._display_name},
-            {"Type": "TERM_MATCH", "Field": "usagetype", "Value": "ACU-Hour"},
+            {"Type": "TERM_MATCH", "Field": "databaseEngine", "Value": "Aurora MySQL"},
         ]
-        return self._call_pricing_api_hourly("AmazonRDS", filters)
+        return self._select_by_usagetype_suffix("AmazonRDS", filters, "Aurora:ServerlessV2Usage")
 
     # Maps a logical Fargate rate to the usagetype suffix AWS publishes for it.
     # Region prefixes (USE1-, EUW1-, …) vary, so we match on the suffix.
@@ -1439,21 +1444,35 @@ class PricingEngine:
             filters.append({"Type": "TERM_MATCH", "Field": "operation", "Value": operation})
         return self._select_by_usagetype_suffix("AmazonEKS", filters, f"AmazonEKS-Hours:{suffix_tail}")
 
-    def _select_by_usagetype_suffix(self, service_code: str, filters: list[dict], suffix: str) -> float | None:
-        """Return the USD/unit price of the first result whose usagetype ends with `suffix`."""
+    def _select_by_usagetype_suffix(
+        self, service_code: str, filters: list[dict], suffix: str, *, max_pages: int = 20
+    ) -> float | None:
+        """Return the USD/unit price of the first result whose usagetype ends with `suffix`.
+
+        Paginates up to ``max_pages`` so the match is found even in large catalogs
+        (e.g. AmazonRDS) where the target SKU falls outside the first page.
+        """
         key_fields = {f["Field"]: f["Value"] for f in filters if f["Field"] not in _LOG_SKIP_FIELDS}
+        next_token: str | None = None
         try:
-            resp = self._pricing.get_products(ServiceCode=service_code, Filters=filters, MaxResults=100)
-            self._stats["api_calls"] += 1
-            for raw in resp.get("PriceList", []):
-                item = json.loads(raw)
-                usagetype = item.get("product", {}).get("attributes", {}).get("usagetype", "")
-                if not usagetype.endswith(suffix):
-                    continue
-                price = _extract_usd(item)
-                if price is not None:
-                    logger.debug("pricing:GetProducts  %s  %s~%s  → $%.6f", service_code, key_fields, suffix, price)
-                    return price
+            for _ in range(max_pages):
+                kwargs: dict[str, Any] = {"ServiceCode": service_code, "Filters": filters, "MaxResults": 100}
+                if next_token:
+                    kwargs["NextToken"] = next_token
+                resp = self._pricing.get_products(**kwargs)
+                self._stats["api_calls"] += 1
+                for raw in resp.get("PriceList", []):
+                    item = json.loads(raw)
+                    usagetype = item.get("product", {}).get("attributes", {}).get("usagetype", "")
+                    if not usagetype.endswith(suffix):
+                        continue
+                    price = _extract_usd(item)
+                    if price is not None:
+                        logger.debug("pricing:GetProducts  %s  %s~%s  → $%.6f", service_code, key_fields, suffix, price)
+                        return price
+                next_token = resp.get("NextToken")
+                if not next_token:
+                    break
             logger.debug("pricing:GetProducts  %s  %s~%s  → no match", service_code, key_fields, suffix)
             return None
         except Exception as exc:
