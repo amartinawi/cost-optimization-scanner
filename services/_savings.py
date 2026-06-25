@@ -6,19 +6,32 @@ import re
 from typing import Any
 
 
-def parse_dollar_savings(savings_str: str) -> float:
-    """Extract dollar amount from savings strings like '$12.50/month' or 'Up to $12.50/month'.
+# Units that denote a quantified monthly total (or a bare dollar figure that
+# the codebase treats as monthly). Anything else after the slash — '/GB',
+# '/hour', '/request' — is a per-unit RATE, not a saving, and must not be
+# counted as a dollar total.
+_MONTHLY_UNITS: frozenset = frozenset({"", "month", "mo", "months", "monthly"})
 
-    Returns 0.0 when no explicit dollar amount is present. Percentage-only
+
+def parse_dollar_savings(savings_str: str) -> float:
+    """Extract the monthly dollar saving from strings like '$12.50/month'.
+
+    Returns the first dollar figure that is either bare ('$12.50') or carries a
+    monthly unit ('$12.50/month'). A dollar figure immediately followed by a
+    per-resource unit — '$0.01/GB', '$0.05/hour' — is a *rate*, not a quantified
+    saving, and is skipped so it never inflates the counted total.
+
+    Returns 0.0 when no monthly dollar amount is present. Percentage-only
     strings (e.g. '30-50% cost reduction') intentionally return 0.0 — callers
     that want a real number must compute it from live pricing rather than rely
     on an arbitrary constant fallback.
     """
     if not savings_str:
         return 0.0
-    match = re.search(r"\$(\d+[\d,]*\.?\d*)", savings_str)
-    if match:
-        return float(match.group(1).replace(",", ""))
+    for match in re.finditer(r"\$(\d+[\d,]*\.?\d*)\s*(?:/\s*([A-Za-z][A-Za-z\-]*))?", savings_str):
+        unit = (match.group(2) or "").lower()
+        if unit in _MONTHLY_UNITS:
+            return float(match.group(1).replace(",", ""))
     return 0.0
 
 
