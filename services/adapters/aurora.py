@@ -119,6 +119,164 @@ def _get_cloudwatch_sum(
     return None
 
 
+def _get_cloudwatch_avg_max(
+    cw: Any, metric: str, instance_id: str, days: int = 14
+) -> tuple[float, float] | None:
+    """Return (avg, peak) of a per-instance RDS metric, or None when unavailable."""
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(days=days)
+    try:
+        resp = cw.get_metric_statistics(
+            Namespace="AWS/RDS",
+            MetricName=metric,
+            Dimensions=[{"Name": "DBInstanceIdentifier", "Value": instance_id}],
+            StartTime=start,
+            EndTime=now,
+            Period=3600,
+            Statistics=["Average", "Maximum"],
+        )
+        dps = resp.get("Datapoints", [])
+        if dps:
+            avg = sum(d["Average"] for d in dps) / len(dps)
+            peak = max(d["Maximum"] for d in dps)
+            return avg, peak
+    except Exception:
+        pass
+    return None
+
+
+def _check_provisioned_instances(ctx: Any, rds: Any, cw: Any, fast_mode: bool) -> list[dict[str, Any]]:
+    """Rightsizing (peak-aware) + Graviton recs for provisioned Aurora instances.
+
+    Aurora Serverless v2 and the cluster control plane are handled elsewhere;
+    this covers the provisioned member instances the cluster checks miss. Both
+    levers price the live current→target delta and compound without overlap:
+    rightsizing moves to a smaller same-arch class, Graviton then prices the
+    x86→ARM delta on that (possibly rightsized) class. Graviton on Aurora is a
+    managed-engine class change (no app rebuild), so it is low-risk.
+    """
+    from services.aurora_logic import (
+        graviton_equivalent,
+        is_graviton_family,
+        parse_instance_class,
+        rightsize_target_size,
+    )
+
+    recs: list[dict[str, Any]] = []
+    try:
+        instances: list[dict[str, Any]] = []
+        paginator = rds.get_paginator("describe_db_instances")
+        for page in paginator.paginate():
+            instances.extend(page.get("DBInstances", []))
+    except Exception as e:
+        ctx.warn(f"[aurora] describe_db_instances failed: {e}", "aurora")
+        return recs
+
+    if fast_mode:
+        # Graviton needs no metrics, but rightsizing does; warn once and still
+        # surface Graviton below using the non-metric path.
+        ctx.warn("fast mode: skipping Aurora instance rightsizing metric reads", "aurora")
+
+    pe = ctx.pricing_engine
+    for inst in instances:
+        engine = (inst.get("Engine") or "").lower()
+        if not engine.startswith("aurora"):
+            continue
+        if inst.get("DBInstanceStatus") != "available":
+            continue
+        instance_id = inst.get("DBInstanceIdentifier", "")
+        cls = inst.get("DBInstanceClass", "")
+        parsed = parse_instance_class(cls)
+        if not parsed:
+            continue
+        family, size, vcpu = parsed
+
+        try:
+            cur_price = pe.get_rds_instance_monthly_price(engine, cls)
+        except Exception:
+            cur_price = 0.0
+        if not cur_price or cur_price <= 0:
+            continue
+
+        # --- Rightsizing (peak-aware, metric-gated) ---------------------------
+        rightsized_size = size
+        rightsized_class = cls
+        if not fast_mode:
+            metrics = _get_cloudwatch_avg_max(cw, "CPUUtilization", instance_id)
+            if metrics is None:
+                ctx.warn(
+                    f"[aurora] no CPUUtilization data for {instance_id}; skipping rightsizing",
+                    "aurora",
+                )
+            else:
+                avg_cpu, peak_cpu = metrics
+                target_size = rightsize_target_size(vcpu, peak_cpu)
+                if target_size and avg_cpu < 50:
+                    cand_class = f"{family}.{target_size}"
+                    try:
+                        cand_price = pe.get_rds_instance_monthly_price(engine, cand_class)
+                    except Exception:
+                        cand_price = 0.0
+                    if cand_price and 0 < cand_price < cur_price:
+                        rightsized_size, rightsized_class = target_size, cand_class
+                        recs.append(
+                            {
+                                "cluster_id": instance_id,
+                                "DBInstanceIdentifier": instance_id,
+                                "resource_id": instance_id,
+                                "engine": engine,
+                                "check_type": "instance_rightsizing",
+                                "CheckCategory": "Aurora Instance Rightsizing",
+                                "CurrentSize": cls,
+                                "TargetSize": cand_class,
+                                "current_value": f"{cls} (avg CPU {avg_cpu:.0f}%, peak {peak_cpu:.0f}% / 14d)",
+                                "recommended_value": f"Downsize to {cand_class}",
+                                "monthly_savings": round(cur_price - cand_price, 2),
+                                "Recommendation": f"Downsize {cls} → {cand_class} (peak-aware)",
+                                "EstimatedSavings": f"${cur_price - cand_price:.2f}/mo",
+                                "reason": (
+                                    f"{instance_id} averages {avg_cpu:.0f}% CPU (peak {peak_cpu:.0f}%) over 14d; "
+                                    f"{cand_class} covers the peak with headroom — saves ${cur_price - cand_price:.2f}/mo"
+                                ),
+                            }
+                        )
+
+        # --- Graviton migration (on the possibly-rightsized class) ------------
+        if not is_graviton_family(family):
+            grav_family = graviton_equivalent(family)
+            if grav_family:
+                grav_class = f"{grav_family}.{rightsized_size}"
+                try:
+                    base_price = pe.get_rds_instance_monthly_price(engine, rightsized_class)
+                    grav_price = pe.get_rds_instance_monthly_price(engine, grav_class)
+                except Exception:
+                    base_price = grav_price = 0.0
+                if grav_price and 0 < grav_price < base_price:
+                    recs.append(
+                        {
+                            "cluster_id": instance_id,
+                            "DBInstanceIdentifier": instance_id,
+                            "resource_id": instance_id,
+                            "engine": engine,
+                            "check_type": "instance_graviton",
+                            "CheckCategory": "Aurora Graviton Migration",
+                            "CurrentSize": rightsized_class,
+                            "TargetSize": grav_class,
+                            "current_value": f"x86 {rightsized_class}",
+                            "recommended_value": f"Migrate to Graviton {grav_class}",
+                            "monthly_savings": round(base_price - grav_price, 2),
+                            "Recommendation": f"Migrate {rightsized_class} → {grav_class} (Graviton/ARM)",
+                            "EstimatedSavings": f"${base_price - grav_price:.2f}/mo",
+                            "reason": (
+                                f"{instance_id}: Aurora Graviton ({grav_class}) is a managed-engine class change "
+                                f"(no app rebuild) — saves ${base_price - grav_price:.2f}/mo vs {rightsized_class}"
+                            ),
+                        }
+                    )
+
+    return recs
+
+
 def _check_serverless_v2(
     cluster: dict[str, Any],
     rds: Any,
@@ -294,7 +452,11 @@ class AuroraModule(BaseServiceModule):
                 logger.warning(f"[aurora] cluster check failed: {e}")
                 continue
 
-        all_recs = serverless_recs + io_recs
+        # Provisioned member instances (rightsizing + Graviton) — the cluster
+        # checks above only cover Serverless v2 and the I/O tier.
+        instance_recs = _check_provisioned_instances(ctx, rds, cw, fast_mode)
+
+        all_recs = serverless_recs + io_recs + instance_recs
         total_savings = sum(r.get("monthly_savings", 0.0) for r in all_recs)
 
         return ServiceFindings(
@@ -310,6 +472,10 @@ class AuroraModule(BaseServiceModule):
                     count=len(io_recs),
                     recommendations=tuple(io_recs),
                 ),
+                "instance_optimization": SourceBlock(
+                    count=len(instance_recs),
+                    recommendations=tuple(instance_recs),
+                ),
             },
             extras={
                 "cluster_count": len(clusters),
@@ -324,6 +490,10 @@ class AuroraModule(BaseServiceModule):
                 "io_tier_analysis": {
                     "title": "I/O Tier Analysis",
                     "description": "Compare Standard vs I/O-Optimized storage tier costs",
+                },
+                "instance_optimization": {
+                    "title": "Instance Rightsizing & Graviton",
+                    "description": "Peak-aware downsizing and Graviton migration for provisioned Aurora instances",
                 },
             },
         )
