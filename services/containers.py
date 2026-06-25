@@ -442,33 +442,50 @@ def _ecr_failure(ctx: ScanContext, op: str, exc: Exception) -> None:
         ctx.warn(f"ECR {op} failed: {exc}", "containers")
 
 
-def _ecr_manifest_fetcher(ctx: ScanContext, ecr: Any, repo_name: str) -> Any:
+def _ecr_batch_get_manifests(
+    ctx: ScanContext, ecr: Any, repo_name: str, digests: list[str]
+) -> dict[str, dict[str, Any] | None]:
+    """Fetch many image manifests in batched batch_get_image calls (<=100/call).
+
+    Batching is essential for performance: one call per ~100 digests instead of
+    one call per image (a 90-repo account otherwise issues thousands of calls).
+    """
+    out: dict[str, dict[str, Any] | None] = {}
+    for i in range(0, len(digests), 100):
+        chunk = digests[i : i + 100]
+        try:
+            resp = ecr.batch_get_image(
+                repositoryName=repo_name,
+                imageIds=[{"imageDigest": d} for d in chunk],
+                acceptedMediaTypes=_ECR_ACCEPTED_MEDIA_TYPES,
+            )
+            for img in resp.get("images", []):
+                digest = img.get("imageId", {}).get("imageDigest", "")
+                raw = img.get("imageManifest", "")
+                if digest:
+                    try:
+                        out[digest] = json.loads(raw) if raw else None
+                    except (ValueError, TypeError):
+                        out[digest] = None
+        except Exception as e:
+            _ecr_failure(ctx, f"batch_get_image({repo_name})", e)
+    return out
+
+
+def _ecr_manifest_fetcher(ctx: ScanContext, ecr: Any, repo_name: str, seed: dict[str, dict[str, Any] | None]) -> Any:
     """Return a memoized callable(digest) -> parsed manifest dict (or None).
 
-    Uses batch_get_image to retrieve each image/child manifest by digest. Child
-    manifests of an image index are fetched on demand during the layer walk.
+    Seeded with the prefetched top-level manifests; child manifests of an image
+    index that were not in the seed are fetched (batched) on first miss.
     """
-    cache: dict[str, dict[str, Any] | None] = {}
+    cache: dict[str, dict[str, Any] | None] = dict(seed)
 
     def fetch(digest: str) -> dict[str, Any] | None:
         if digest in cache:
             return cache[digest]
-        result: dict[str, Any] | None = None
-        try:
-            resp = ecr.batch_get_image(
-                repositoryName=repo_name,
-                imageIds=[{"imageDigest": digest}],
-                acceptedMediaTypes=_ECR_ACCEPTED_MEDIA_TYPES,
-            )
-            images = resp.get("images", [])
-            if images:
-                raw = images[0].get("imageManifest", "")
-                result = json.loads(raw) if raw else None
-        except Exception as e:
-            _ecr_failure(ctx, f"batch_get_image({repo_name})", e)
-            result = None
-        cache[digest] = result
-        return result
+        fetched = _ecr_batch_get_manifests(ctx, ecr, repo_name, [digest])
+        cache[digest] = fetched.get(digest)
+        return cache[digest]
 
     return fetch
 
@@ -513,9 +530,12 @@ def _ecr_repo_reclaimable(ctx: ScanContext, ecr: Any, repo_name: str) -> dict[st
             ),
             "CheckCategory": "ECR Lifecycle Management",
             "Counted": False,
+            "Advisory": True,
         }
 
-    fetch = _ecr_manifest_fetcher(ctx, ecr, repo_name)
+    # Prefetch every top-level image manifest in one batched pass, then walk.
+    seed = _ecr_batch_get_manifests(ctx, ecr, repo_name, [i["digest"] for i in images])
+    fetch = _ecr_manifest_fetcher(ctx, ecr, repo_name, seed)
     reclaimable_bytes = compute_untagged_reclaimable_bytes(images, fetch)
     if reclaimable_bytes <= 0:
         return None  # untagged images share all layers with tagged images → ~$0
@@ -561,6 +581,8 @@ def _ecs_service_rightsizing(
     running_count = service.get("runningCount", 0)
     desired_count = service.get("desiredCount", 0)
     task_count = running_count or desired_count
+    if task_count <= 0:
+        return None  # no running/desired tasks → no Fargate cost → no saving
 
     try:
         cloudwatch = ctx.client("cloudwatch")
