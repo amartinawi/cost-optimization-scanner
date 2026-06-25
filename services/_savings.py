@@ -54,3 +54,23 @@ def compute_optimizer_savings(rec: dict[str, Any]) -> float:
         except (TypeError, ValueError):
             continue
     return total
+
+
+def mark_zero_savings_advisory(recs: list, savings_fn) -> None:
+    """Mark recommendations with no concrete $ saving as advisory (in place).
+
+    Sets ``rec["Counted"] = False`` on any rec whose ``savings_fn(rec)`` is <= 0
+    (and that is not already flagged), so best-practice / metric-gated nudges
+    with $0 savings are shown but excluded from the counted total. Every counted
+    finding must carry a concrete account-specific dollar saving.
+    """
+    for rec in recs:
+        if not isinstance(rec, dict):
+            continue
+        if rec.get("Counted") is False:
+            continue
+        try:
+            if float(savings_fn(rec) or 0.0) <= 0:
+                rec["Counted"] = False
+        except (TypeError, ValueError):
+            rec["Counted"] = False

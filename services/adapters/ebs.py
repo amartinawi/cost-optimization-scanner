@@ -58,6 +58,48 @@ def _coh_is_renderable(rec: dict[str, Any]) -> bool:
     return str(rec.get("finding", "")).lower() != "optimized"
 
 
+def _drop_stale_delete_recs(ctx: Any, coh_recs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop Cost-Hub 'delete' recs whose volume is no longer unattached.
+
+    Cost Optimization Hub data lags live state, so it can recommend deleting a
+    volume that has since been re-attached. Acting on that would destroy a live
+    instance's storage. For deletion actions we re-check the live volume state
+    and keep only volumes that are actually ``available`` (unattached). Non-delete
+    actions (e.g. rightsizing an attached volume) are left untouched. On any
+    error (e.g. ec2 permission) the recs pass through unchanged.
+    """
+    delete_recs = [r for r in coh_recs if "delete" in str(r.get("actionType", "")).lower()]
+    if not delete_recs:
+        return coh_recs
+    vol_ids = [str(r.get("resourceId", "")) for r in delete_recs if str(r.get("resourceId", "")).startswith("vol-")]
+    if not vol_ids:
+        return coh_recs
+    try:
+        ec2 = ctx.client("ec2")
+        available: set[str] = set()
+        paginator = ec2.get_paginator("describe_volumes")
+        for page in paginator.paginate(VolumeIds=vol_ids):
+            for v in page.get("Volumes", []):
+                if v.get("State") == "available":
+                    available.add(v.get("VolumeId", ""))
+    except Exception as e:
+        ctx.warn(f"could not verify EBS volume state for CoH delete recs: {e}", "ebs")
+        return coh_recs
+
+    kept: list[dict[str, Any]] = []
+    for r in coh_recs:
+        vid = str(r.get("resourceId", ""))
+        if "delete" in str(r.get("actionType", "")).lower() and vid.startswith("vol-") and vid not in available:
+            ctx.warn(
+                f"Cost Hub recommends deleting {vid} but it is currently attached/in-use — "
+                "dropping the stale recommendation.",
+                "ebs",
+            )
+            continue
+        kept.append(r)
+    return kept
+
+
 class EbsModule(BaseServiceModule):
     """ServiceModule adapter for EBS. Multi-source savings strategy."""
 
@@ -97,6 +139,8 @@ class EbsModule(BaseServiceModule):
 
         # --- Gather raw recommendations from every source ----------------------
         coh_recs = [r for r in getattr(ctx, "cost_hub_splits", {}).get("ebs", []) if _coh_is_renderable(r)]
+        # Drop stale CoH delete recs on volumes that are now attached (live check).
+        coh_recs = _drop_stale_delete_recs(ctx, coh_recs)
 
         co_raw = get_ebs_compute_optimizer_recs(ctx)
         # The advisor returns a synthetic $0 "enable Compute Optimizer" placeholder
@@ -117,6 +161,10 @@ class EbsModule(BaseServiceModule):
         unattached_volumes = get_unattached_volumes(ctx, ctx.pricing_multiplier)
 
         gp2_recs, snapshot_recs, other_recs = partition_enhanced_recs(enhanced_recs)
+
+        # Drop $0 "NotOptimized"/no-action Compute Optimizer recs — they carry no
+        # savings and only inflate the count (mirrors the EC2/ECS CO helpers).
+        co_recs_all = [r for r in co_recs_all if compute_optimizer_savings(r) > 0]
 
         # --- Cross-source de-duplication by volume id --------------------------
         co_recs, (unattached_kept, gp2_kept, other_kept) = dedupe_by_authority(

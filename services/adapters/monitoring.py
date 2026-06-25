@@ -55,15 +55,18 @@ class MonitoringModule(BaseServiceModule):
         # Prefer the numeric `EstimatedMonthlySavings` field when present
         # (shim now emits it on quantified recs); fall back to string parse
         # for sub-shims that haven't been migrated yet.
-        from services._savings import parse_dollar_savings
+        from services._savings import mark_zero_savings_advisory, parse_dollar_savings
 
-        savings = 0.0
-        for rec in all_recs:
+        def _rec_savings(rec: dict) -> float:
             numeric = rec.get("EstimatedMonthlySavings")
-            if isinstance(numeric, (int, float)) and numeric > 0:
-                savings += float(numeric)
-                continue
-            savings += parse_dollar_savings(rec.get("EstimatedSavings", ""))
+            if isinstance(numeric, (int, float)):
+                return float(numeric)
+            return parse_dollar_savings(rec.get("EstimatedSavings", ""))
+
+        # Best-practice nudges with no measured volume (never-expiring zero-byte
+        # log groups, backup-frequency advice) parse to $0 → advisory, not counted.
+        mark_zero_savings_advisory(all_recs, _rec_savings)
+        savings = sum(_rec_savings(rec) for rec in all_recs if rec.get("Counted", True))
 
         total_recs = len(all_recs)
 

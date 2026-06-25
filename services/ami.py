@@ -105,7 +105,15 @@ def compute_ami_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> dic
                         try:
                             snapshot_response = ec2.describe_snapshots(SnapshotIds=[snapshot_id])
                             for snapshot in snapshot_response.get("Snapshots", []):
-                                total_snapshot_size_gb += snapshot.get("VolumeSize", 0)
+                                # Prefer actual stored bytes (FullSnapshotSizeInBytes)
+                                # over the provisioned VolumeSize — snapshots bill on
+                                # stored blocks, which are typically ~half the volume
+                                # size, so VolumeSize overstates ~2x.
+                                full_bytes = snapshot.get("FullSnapshotSizeInBytes")
+                                if full_bytes:
+                                    total_snapshot_size_gb += float(full_bytes) / (1024**3)
+                                else:
+                                    total_snapshot_size_gb += snapshot.get("VolumeSize", 0)
                         except Exception as e:
                             logger.warning(f"⚠️ Error getting snapshot details for {snapshot_id}: {str(e)}")
                             total_snapshot_size_gb += block_device["Ebs"].get("VolumeSize", 8)
