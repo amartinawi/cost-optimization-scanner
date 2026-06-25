@@ -187,6 +187,48 @@ def compute_untagged_reclaimable_bytes(
     return max(0, reclaimable)
 
 
+def quantify_fargate_rightsizing(
+    cpu_units: float,
+    mem_mb: float,
+    task_count: int,
+    vcpu_rate: float,
+    gb_rate: float,
+    *,
+    windows_os_rate: float = 0.0,
+) -> dict[str, Any] | None:
+    """Monthly saving + target for downsizing one over-provisioned Fargate task.
+
+    Snaps the current (cpu_units, mem_mb) task to the next-smaller valid Fargate
+    combo and prices the delta with the supplied (already region/arch/OS
+    resolved) rates. Returns None when the inputs are unusable or the task is
+    already at the smallest Fargate size (no realizable saving).
+
+    Returns:
+        ``{"saving", "current_vcpu", "current_mem_gb", "target_vcpu",
+        "target_mem_gb", "target_cpu_units", "target_mem_mb"}`` or None.
+    """
+    if cpu_units <= 0 or mem_mb <= 0 or task_count <= 0 or vcpu_rate <= 0 or gb_rate <= 0:
+        return None
+    cur_vcpu = cpu_units / 1024.0
+    cur_mem_gb = mem_mb / 1024.0
+    target = snap_down_fargate(cur_vcpu, cur_mem_gb)
+    if target is None:
+        return None
+    tgt_vcpu, tgt_mem_gb = target
+    cur_hr = fargate_task_hourly(cur_vcpu, cur_mem_gb, vcpu_rate, gb_rate, windows_os_rate=windows_os_rate)
+    tgt_hr = fargate_task_hourly(tgt_vcpu, tgt_mem_gb, vcpu_rate, gb_rate, windows_os_rate=windows_os_rate)
+    saving = max(0.0, (cur_hr - tgt_hr) * HOURS_PER_MONTH * task_count)
+    return {
+        "saving": saving,
+        "current_vcpu": cur_vcpu,
+        "current_mem_gb": cur_mem_gb,
+        "target_vcpu": tgt_vcpu,
+        "target_mem_gb": tgt_mem_gb,
+        "target_cpu_units": int(tgt_vcpu * 1024),
+        "target_mem_mb": int(tgt_mem_gb * 1024),
+    }
+
+
 def normalize_resource_name(value: str) -> str:
     """Reduce an ARN or path to its final resource name segment.
 

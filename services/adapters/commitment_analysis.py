@@ -695,7 +695,19 @@ class CommitmentAnalysisModule(BaseServiceModule):
         if not rate_matrix:
             return [], {}
 
-        rightsizing = float(getattr(ctx, "fargate_rightsizing_monthly", 0.0) or 0.0)
+        # Prefer the Containers adapter's hand-off (full scan); otherwise compute
+        # a lightweight ECS-only estimate so an isolated --scan-only
+        # commitment_analysis still models the SP against the rightsized baseline.
+        handoff = getattr(ctx, "fargate_rightsizing_monthly", None)
+        if handoff is None:
+            try:
+                from services.containers import estimate_fargate_rightsizing_monthly
+
+                handoff = estimate_fargate_rightsizing_monthly(ctx)
+            except Exception as e:
+                ctx.warn(f"Fargate rightsizing estimate failed: {e}", "commitment_analysis")
+                handoff = 0.0
+        rightsizing = float(handoff or 0.0)
         coverage = self._account_coverage_ratio(ctx, ce)
         analysis = fargate_sp_analysis(
             legs, rate_matrix, rightsizing_monthly=rightsizing, coverage_ratio=coverage

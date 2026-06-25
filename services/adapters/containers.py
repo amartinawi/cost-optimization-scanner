@@ -9,11 +9,9 @@ from services._base import BaseServiceModule
 from services.advisor import get_ecs_compute_optimizer_recommendations
 from services.containers import get_container_services_analysis, get_enhanced_container_checks
 from services.containers_logic import (
-    HOURS_PER_MONTH,
     dedupe_by_authority,
-    fargate_task_hourly,
     normalize_resource_name,
-    snap_down_fargate,
+    quantify_fargate_rightsizing,
 )
 
 # Spot capacity-provider savings factor (60-70% AWS-published). Applied to the
@@ -214,46 +212,34 @@ class ContainersModule(BaseServiceModule):
             task_count = int(rec.get("TaskCount", 0))
         except (TypeError, ValueError):
             return 0.0
-        if cpu_units <= 0 or mem_mb <= 0 or task_count <= 0:
-            return 0.0
-
-        cur_vcpu = cpu_units / 1024.0
-        cur_mem_gb = mem_mb / 1024.0
-        target = snap_down_fargate(cur_vcpu, cur_mem_gb)
-        if target is None:
-            return 0.0  # already smallest Fargate size
-        tgt_vcpu, tgt_mem_gb = target
 
         arch = rec.get("Architecture", "x86")
         os = rec.get("OperatingSystem", "linux")
-        try:
-            vcpu_rate = ctx.pricing_engine.get_fargate_vcpu_hourly(architecture=arch, os=os)
-            gb_rate = ctx.pricing_engine.get_fargate_gb_hourly(architecture=arch, os=os)
-            win_os = ctx.pricing_engine.get_fargate_windows_os_hourly() if str(os).lower().startswith("win") else 0.0
-        except Exception as e:
-            ctx.warn(f"Fargate pricing lookup failed for {rec.get('ServiceName', '?')}: {e}", "containers")
+        rates = fargate_rates(ctx, arch, os)
+        if rates is None:
             return 0.0
-        if vcpu_rate <= 0 or gb_rate <= 0:
-            return 0.0
+        vcpu_rate, gb_rate, win_os = rates
 
-        cur_hr = fargate_task_hourly(cur_vcpu, cur_mem_gb, vcpu_rate, gb_rate, windows_os_rate=win_os)
-        tgt_hr = fargate_task_hourly(tgt_vcpu, tgt_mem_gb, vcpu_rate, gb_rate, windows_os_rate=win_os)
-        monthly_saving = (cur_hr - tgt_hr) * HOURS_PER_MONTH * task_count
+        q = quantify_fargate_rightsizing(
+            cpu_units, mem_mb, task_count, vcpu_rate, gb_rate, windows_os_rate=win_os
+        )
+        if q is None:
+            return 0.0
 
         # Name the concrete target so the recommendation is actionable: the
         # human-readable size, the exact task-definition values to set, and the
         # measured utilization that justifies the downsize.
-        cur_label = _fmt_fargate_size(cur_vcpu, cur_mem_gb)
-        tgt_label = _fmt_fargate_size(tgt_vcpu, tgt_mem_gb)
+        cur_label = _fmt_fargate_size(q["current_vcpu"], q["current_mem_gb"])
+        tgt_label = _fmt_fargate_size(q["target_vcpu"], q["target_mem_gb"])
         util = ""
         if rec.get("AvgCPU") and rec.get("AvgMemory"):
             util = f" — measured CPU {rec['AvgCPU']}, Memory {rec['AvgMemory']} over 7d"
         rec["CurrentSize"] = cur_label
         rec["TargetSize"] = tgt_label
-        rec["RecommendedConfig"] = {"cpu": int(tgt_vcpu * 1024), "memory": int(tgt_mem_gb * 1024)}
+        rec["RecommendedConfig"] = {"cpu": q["target_cpu_units"], "memory": q["target_mem_mb"]}
         rec["Recommendation"] = (
             f"Downsize Fargate task {cur_label} → {tgt_label} "
-            f"(set cpu={int(tgt_vcpu * 1024)}, memory={int(tgt_mem_gb * 1024)})"
+            f"(set cpu={q['target_cpu_units']}, memory={q['target_mem_mb']})"
             f" across {task_count} task(s){util}"
         )
         rec["AuditBasis"] = {
@@ -266,7 +252,25 @@ class ContainersModule(BaseServiceModule):
             "launch_type": "FARGATE",
             "formula": "(current_hourly - target_hourly) x 730 x task_count",
         }
-        return max(0.0, monthly_saving)
+        return q["saving"]
+
+
+def fargate_rates(ctx: Any, arch: str, os: str) -> tuple[float, float, float] | None:
+    """Resolve (vcpu_rate, gb_rate, windows_os_rate) from the pricing engine.
+
+    Shared by the adapter and the commitment_analysis Fargate-rightsizing
+    estimator. Returns None on pricing failure or a zero rate.
+    """
+    try:
+        vcpu_rate = ctx.pricing_engine.get_fargate_vcpu_hourly(architecture=arch, os=os)
+        gb_rate = ctx.pricing_engine.get_fargate_gb_hourly(architecture=arch, os=os)
+        win_os = ctx.pricing_engine.get_fargate_windows_os_hourly() if str(os).lower().startswith("win") else 0.0
+    except Exception as e:
+        ctx.warn(f"Fargate pricing lookup failed ({arch}/{os}): {e}", "containers")
+        return None
+    if vcpu_rate <= 0 or gb_rate <= 0:
+        return None
+    return vcpu_rate, gb_rate, win_os
 
 
 def _fmt_fargate_size(vcpu: float, mem_gb: float) -> str:

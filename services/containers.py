@@ -11,7 +11,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from core.scan_context import ScanContext
-from services.containers_logic import compute_untagged_reclaimable_bytes
+from services.containers_logic import compute_untagged_reclaimable_bytes, quantify_fargate_rightsizing
 
 logger = logging.getLogger(__name__)
 
@@ -333,64 +333,7 @@ def get_enhanced_container_checks(ctx: ScanContext) -> dict[str, Any]:
     }
 
     # ECS checks ---------------------------------------------------------------
-    try:
-        ecs = ctx.client("ecs")
-
-        cluster_arns: list[str] = []
-        try:
-            paginator = ecs.get_paginator("list_clusters")
-            for page in paginator.paginate():
-                cluster_arns.extend(page.get("clusterArns", []))
-        except Exception as e:
-            _ecs_failure(ctx, "list_clusters", e)
-            cluster_arns = []
-        cluster_arns = list(set(cluster_arns))
-
-        if ctx.fast_mode and cluster_arns:
-            ctx.warn(
-                "fast mode: skipping ECS Container Insights utilization reads; "
-                "Fargate rightsizing savings not quantified",
-                "containers",
-            )
-
-        for cluster_arn in cluster_arns:
-            cluster_name = cluster_arn.split("/")[-1]
-
-            if ctx.fast_mode:
-                continue  # no per-service metric reads in fast mode
-
-            try:
-                service_arns = []
-                paginator = ecs.get_paginator("list_services")
-                for page in paginator.paginate(cluster=cluster_arn):
-                    service_arns.extend(page.get("serviceArns", []))
-            except Exception as e:
-                _ecs_failure(ctx, f"list_services({cluster_name})", e)
-                continue
-
-            if not service_arns:
-                continue
-
-            container_insights_enabled = _container_insights_enabled(ctx, ecs, cluster_name)
-
-            for i in range(0, len(service_arns), 10):
-                batch = service_arns[i : i + 10]
-                try:
-                    services_details = ecs.describe_services(cluster=cluster_arn, services=batch)
-                except Exception as e:
-                    _ecs_failure(ctx, f"describe_services({cluster_name})", e)
-                    continue
-
-                for service in services_details.get("services", []):
-                    service_name = service.get("serviceName", "")
-                    if not service_name or not container_insights_enabled:
-                        continue
-                    rec = _ecs_service_rightsizing(ctx, ecs, cluster_name, service)
-                    if rec:
-                        checks["ecs_rightsizing"].append(rec)
-
-    except Exception as e:
-        _ecs_failure(ctx, "enhanced ECS checks", e)
+    checks["ecs_rightsizing"] = collect_ecs_fargate_rightsizing_recs(ctx)
 
     # ECR checks — realizable saving = deduplicated layer storage freed by
     # expiring untagged images (NOT the sum of imageSizeInBytes).
@@ -424,6 +367,108 @@ def get_enhanced_container_checks(ctx: ScanContext) -> dict[str, Any]:
         recommendations.extend(items)
 
     return {"recommendations": recommendations, **checks}
+
+
+def collect_ecs_fargate_rightsizing_recs(ctx: ScanContext) -> list[dict[str, Any]]:
+    """Return metric-backed ECS Fargate rightsizing recs across all clusters/services.
+
+    Shared by ``get_enhanced_container_checks`` (containers tab) and
+    ``estimate_fargate_rightsizing_monthly`` (commitment_analysis reconciliation)
+    so the ECS/CloudWatch scan happens once per consumer. Respects fast_mode.
+    """
+    recs: list[dict[str, Any]] = []
+    try:
+        ecs = ctx.client("ecs")
+
+        cluster_arns: list[str] = []
+        try:
+            paginator = ecs.get_paginator("list_clusters")
+            for page in paginator.paginate():
+                cluster_arns.extend(page.get("clusterArns", []))
+        except Exception as e:
+            _ecs_failure(ctx, "list_clusters", e)
+            cluster_arns = []
+        cluster_arns = list(set(cluster_arns))
+
+        if ctx.fast_mode and cluster_arns:
+            ctx.warn(
+                "fast mode: skipping ECS Container Insights utilization reads; "
+                "Fargate rightsizing savings not quantified",
+                "containers",
+            )
+
+        for cluster_arn in cluster_arns:
+            cluster_name = cluster_arn.split("/")[-1]
+            if ctx.fast_mode:
+                continue  # no per-service metric reads in fast mode
+
+            try:
+                service_arns: list[str] = []
+                paginator = ecs.get_paginator("list_services")
+                for page in paginator.paginate(cluster=cluster_arn):
+                    service_arns.extend(page.get("serviceArns", []))
+            except Exception as e:
+                _ecs_failure(ctx, f"list_services({cluster_name})", e)
+                continue
+            if not service_arns:
+                continue
+
+            container_insights_enabled = _container_insights_enabled(ctx, ecs, cluster_name)
+            for i in range(0, len(service_arns), 10):
+                batch = service_arns[i : i + 10]
+                try:
+                    services_details = ecs.describe_services(cluster=cluster_arn, services=batch)
+                except Exception as e:
+                    _ecs_failure(ctx, f"describe_services({cluster_name})", e)
+                    continue
+                for service in services_details.get("services", []):
+                    if not service.get("serviceName") or not container_insights_enabled:
+                        continue
+                    rec = _ecs_service_rightsizing(ctx, ecs, cluster_name, service)
+                    if rec:
+                        recs.append(rec)
+    except Exception as e:
+        _ecs_failure(ctx, "enhanced ECS checks", e)
+    return recs
+
+
+def estimate_fargate_rightsizing_monthly(ctx: ScanContext) -> float:
+    """Total $/mo of ECS Fargate rightsizing — a lightweight, ECR-free estimate.
+
+    Lets the commitment_analysis adapter model the Savings Plan against the
+    rightsized Fargate baseline even when the Containers adapter did not run in
+    the same scan (e.g. ``--scan-only commitment_analysis``). Returns 0.0 in
+    fast mode or when nothing is over-provisioned. Mirrors the Containers
+    adapter's quantification (valid-combo snapping, arch/OS-aware pricing).
+    """
+    if getattr(ctx, "fast_mode", False):
+        return 0.0
+    total = 0.0
+    for rec in collect_ecs_fargate_rightsizing_recs(ctx):
+        if str(rec.get("LaunchType", "")).upper() != "FARGATE":
+            continue
+        arch = rec.get("Architecture", "x86")
+        os = rec.get("OperatingSystem", "linux")
+        try:
+            vcpu_rate = ctx.pricing_engine.get_fargate_vcpu_hourly(architecture=arch, os=os)
+            gb_rate = ctx.pricing_engine.get_fargate_gb_hourly(architecture=arch, os=os)
+            win_os = (
+                ctx.pricing_engine.get_fargate_windows_os_hourly()
+                if str(os).lower().startswith("win")
+                else 0.0
+            )
+        except Exception:
+            continue
+        try:
+            cpu_units = float(rec.get("Cpu", 0))
+            mem_mb = float(rec.get("Memory", 0))
+            task_count = int(rec.get("TaskCount", 0))
+        except (TypeError, ValueError):
+            continue
+        q = quantify_fargate_rightsizing(cpu_units, mem_mb, task_count, vcpu_rate, gb_rate, windows_os_rate=win_os)
+        if q:
+            total += q["saving"]
+    return round(total, 2)
 
 
 def _ecs_failure(ctx: ScanContext, op: str, exc: Exception) -> None:
