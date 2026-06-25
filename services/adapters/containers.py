@@ -170,6 +170,13 @@ class ContainersModule(BaseServiceModule):
                 return 0.0
             gib = float(reclaimable) / (1024**3)
             saving = gib * gb_month_rate
+            untagged = rec.get("UntaggedCount")
+            rec["TargetAction"] = "Expire untagged images via lifecycle policy"
+            rec["ReclaimableGiB"] = round(gib, 2)
+            rec["Recommendation"] = (
+                f"Add a lifecycle policy to expire {untagged} untagged image(s), freeing "
+                f"{gib:.2f} GiB of deduplicated layers (${saving:.2f}/mo)"
+            )
             rec["AuditBasis"] = {
                 "reclaimable_gib": round(gib, 4),
                 "rate": gb_month_rate,
@@ -215,10 +222,26 @@ class ContainersModule(BaseServiceModule):
         cur_hr = fargate_task_hourly(cur_vcpu, cur_mem_gb, vcpu_rate, gb_rate, windows_os_rate=win_os)
         tgt_hr = fargate_task_hourly(tgt_vcpu, tgt_mem_gb, vcpu_rate, gb_rate, windows_os_rate=win_os)
         monthly_saving = (cur_hr - tgt_hr) * HOURS_PER_MONTH * task_count
-        # Record the basis so the saving is defensible from the report alone.
+
+        # Name the concrete target so the recommendation is actionable: the
+        # human-readable size, the exact task-definition values to set, and the
+        # measured utilization that justifies the downsize.
+        cur_label = _fmt_fargate_size(cur_vcpu, cur_mem_gb)
+        tgt_label = _fmt_fargate_size(tgt_vcpu, tgt_mem_gb)
+        util = ""
+        if rec.get("AvgCPU") and rec.get("AvgMemory"):
+            util = f" — measured CPU {rec['AvgCPU']}, Memory {rec['AvgMemory']} over 7d"
+        rec["CurrentSize"] = cur_label
+        rec["TargetSize"] = tgt_label
+        rec["RecommendedConfig"] = {"cpu": int(tgt_vcpu * 1024), "memory": int(tgt_mem_gb * 1024)}
+        rec["Recommendation"] = (
+            f"Downsize Fargate task {cur_label} → {tgt_label} "
+            f"(set cpu={int(tgt_vcpu * 1024)}, memory={int(tgt_mem_gb * 1024)})"
+            f" across {task_count} task(s){util}"
+        )
         rec["AuditBasis"] = {
-            "current": f"{cur_vcpu} vCPU / {cur_mem_gb} GB x{task_count}",
-            "target": f"{tgt_vcpu} vCPU / {tgt_mem_gb} GB",
+            "current": f"{cur_label} x{task_count}",
+            "target": tgt_label,
             "vcpu_rate": vcpu_rate,
             "gb_rate": gb_rate,
             "architecture": arch,
@@ -227,6 +250,13 @@ class ContainersModule(BaseServiceModule):
             "formula": "(current_hourly - target_hourly) x 730 x task_count",
         }
         return max(0.0, monthly_saving)
+
+
+def _fmt_fargate_size(vcpu: float, mem_gb: float) -> str:
+    """Human-readable Fargate task size, e.g. '0.5 vCPU / 1 GB' or '0.25 vCPU / 512 MB'."""
+    vcpu_s = f"{vcpu:g}"
+    mem_s = f"{int(mem_gb * 1024)} MB" if mem_gb < 1 else f"{mem_gb:g} GB"
+    return f"{vcpu_s} vCPU / {mem_s}"
 
 
 def _heuristic_resource_key(rec: dict[str, Any]) -> str:

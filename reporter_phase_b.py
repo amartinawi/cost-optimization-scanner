@@ -1000,18 +1000,41 @@ def _render_containers_enhanced_checks(recommendations: List[Rec], source_name: 
         for res in resources:
             if "ClusterName" in res:
                 if "ServiceName" in res:
-                    content += (
-                        f"<li>{res.get('ServiceName', 'Unknown')} (Cluster: {res.get('ClusterName', 'Unknown')})</li>"
-                    )
+                    label = f"{res.get('ServiceName', 'Unknown')} (Cluster: {res.get('ClusterName', 'Unknown')})"
+                    content += f"<li>{label}{_containers_target_suffix(res)}</li>"
                 else:
                     cluster_name = res.get("ClusterName", "Unknown")
                     if cluster_name not in cluster_names:
-                        content += f"<li>{cluster_name}</li>"
+                        content += f"<li>{cluster_name}{_containers_target_suffix(res)}</li>"
                         cluster_names.add(cluster_name)
             elif "RepositoryName" in res:
-                content += f"<li>{res.get('RepositoryName', 'Unknown')} ({res.get('ImageCount', 0)} images)</li>"
+                label = f"{res.get('RepositoryName', 'Unknown')} ({res.get('ImageCount', 0)} images)"
+                content += f"<li>{label}{_containers_target_suffix(res)}</li>"
         content += "</ul></div>"
     return content
+
+
+def _containers_target_suffix(res: Rec) -> str:
+    """Render the concrete target + monthly saving for a container rec, when known.
+
+    Surfaces the rightsizing target (current → target size) or ECR reclaim so the
+    recommendation names what to change, not just which resource. Returns "" when
+    the rec carries no quantified target (keeps advisory rows unchanged).
+    """
+    parts: List[str] = []
+    if res.get("CurrentSize") and res.get("TargetSize"):
+        parts.append(f"<strong>{res['CurrentSize']} &rarr; {res['TargetSize']}</strong>")
+    elif res.get("TargetAction"):
+        parts.append(str(res["TargetAction"]))
+    if res.get("ReclaimableGiB"):
+        parts.append(f"free {res['ReclaimableGiB']} GiB")
+    saving = res.get("EstimatedMonthlySavings")
+    try:
+        if saving and float(saving) > 0:
+            parts.append(f"save ${float(saving):.2f}/mo")
+    except (TypeError, ValueError):
+        pass
+    return f" — {' · '.join(parts)}" if parts else ""
 
 
 def _render_elasticache_enhanced_checks(recommendations: List[Rec], source_name: str, service_data: Dict) -> str:

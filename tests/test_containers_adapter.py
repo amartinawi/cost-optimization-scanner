@@ -154,6 +154,12 @@ def test_fargate_rightsizing_quantified_and_counted(monkeypatch):
     assert out["Counted"] is True
     assert findings.total_monthly_savings == pytest.approx(round(expected, 2))
     assert "AuditBasis" in out
+    # The recommendation names the concrete target size + task-def values.
+    assert out["CurrentSize"] == "2 vCPU / 8 GB"
+    assert out["TargetSize"] == "1 vCPU / 2 GB"
+    assert out["RecommendedConfig"] == {"cpu": 1024, "memory": 2048}
+    assert "2 vCPU / 8 GB → 1 vCPU / 2 GB" in out["Recommendation"]
+    assert "cpu=1024" in out["Recommendation"]
 
 
 def test_ec2_launch_type_not_fargate_priced(monkeypatch):
@@ -261,6 +267,40 @@ def test_cost_hub_dedups_heuristic_for_same_service(monkeypatch):
     # The heuristic for 'web' is dropped (covered by CoH); only CoH's $100 counts.
     assert findings.sources["enhanced_checks"].count == 0
     assert findings.total_monthly_savings == pytest.approx(100.0)
+
+
+def test_fmt_fargate_size():
+    from services.adapters.containers import _fmt_fargate_size
+    assert _fmt_fargate_size(0.25, 0.5) == "0.25 vCPU / 512 MB"
+    assert _fmt_fargate_size(1.0, 2.0) == "1 vCPU / 2 GB"
+    assert _fmt_fargate_size(0.5, 1.0) == "0.5 vCPU / 1 GB"
+
+
+def test_render_target_suffix_shows_size_and_savings():
+    from reporter_phase_b import _containers_target_suffix
+    ecs = {"CurrentSize": "2 vCPU / 8 GB", "TargetSize": "1 vCPU / 2 GB", "EstimatedMonthlySavings": 94.66}
+    s = _containers_target_suffix(ecs)
+    assert "2 vCPU / 8 GB" in s and "1 vCPU / 2 GB" in s and "$94.66/mo" in s
+    ecr = {"TargetAction": "Expire untagged images via lifecycle policy", "ReclaimableGiB": 3.2, "EstimatedMonthlySavings": 0.32}
+    s2 = _containers_target_suffix(ecr)
+    assert "3.2 GiB" in s2 and "$0.32/mo" in s2
+    # No target fields → no suffix (advisory rows unchanged).
+    assert _containers_target_suffix({"ServiceName": "x"}) == ""
+
+
+def test_ecr_recommendation_names_reclaim(monkeypatch):
+    rec = {
+        "RepositoryName": "myrepo", "UntaggedCount": 12,
+        "ReclaimableBytes": int(3.0 * 1024**3),
+        "CheckCategory": "ECR Lifecycle Management",
+    }
+    _patch_sources(monkeypatch, [rec])
+    ctx = _ctx()
+    ctx.pricing_engine.get_ecr_storage_gb_month.return_value = 0.10
+    out = ContainersModule().scan(ctx).sources["enhanced_checks"].recommendations[0]
+    assert out["ReclaimableGiB"] == 3.0
+    assert "12 untagged" in out["Recommendation"]
+    assert "3.00 GiB" in out["Recommendation"]
 
 
 def test_fast_mode_sets_flag():
