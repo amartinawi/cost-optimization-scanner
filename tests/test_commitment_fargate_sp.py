@@ -232,6 +232,38 @@ def test_ri_coverage_no_groupby_returns_overall_rate():
     assert rate == 0.85 and recs == []
 
 
+def test_cost_hub_commitment_recs_are_advisory_not_counted():
+    # CoH RI/SP purchase recs overlap per-service rightsizing -> advisory, not
+    # summed into the commitment tab total (which then reflects realized waste).
+    coh = [
+        {"actionType": "PurchaseReservedInstances", "currentResourceType": "RdsReservedInstances",
+         "estimatedMonthlySavings": 4768.53, "region": "eu-west-1"},
+        {"actionType": "PurchaseReservedInstances", "currentResourceType": "ElastiCacheReservedInstances",
+         "estimatedMonthlySavings": 367.01, "region": "eu-west-1"},
+    ]
+    ce = MagicMock()
+    # No SP/RI utilization data, no purchase scenarios (DataUnavailable account).
+    ce.get_savings_plans_utilization.side_effect = Exception("DataUnavailable")
+    ce.get_savings_plans_utilization_details.side_effect = Exception("DataUnavailable")
+    ce.get_savings_plans_coverage.return_value = {"Total": {"CoveragePercentage": "0"}}
+    ce.get_reservation_utilization.return_value = {"UtilizationsByTime": [], "Total": {}}
+    ce.get_reservation_coverage.return_value = {"Total": {"CoveragePercentage": "0"}}
+    ce.get_savings_plans_purchase_recommendation.return_value = {"SavingsPlansPurchaseRecommendation": {}}
+    ce.get_reservation_purchase_recommendation.return_value = {"Recommendations": []}
+    sp = MagicMock()
+    sp.describe_savings_plans_offering_rates.return_value = {"searchResults": []}
+    ctx = SimpleNamespace(region="eu-west-1", pricing_multiplier=1.0, fast_mode=False,
+                          cost_hub_splits={"commitment_analysis": coh}, fargate_rightsizing_monthly=0.0)
+    ctx.client = lambda n, region=None: {"ce": ce, "savingsplans": sp}.get(n)
+    ctx.warn = MagicMock(); ctx.permission_issue = MagicMock()
+    ctx.pricing_engine = MagicMock()
+    f = CommitmentAnalysisModule().scan(ctx)
+    # CoH RI recs present and rendered, but advisory (excluded from the total).
+    assert f.sources["cost_optimization_hub"].count == 2
+    assert all(r.get("Counted") is False for r in f.sources["cost_optimization_hub"].recommendations)
+    assert f.total_monthly_savings == 0.0  # no existing-commitment waste on this account
+
+
 def test_render_fargate_sp_matrix():
     from reporter_phase_b import _render_fargate_savings_plan
     recs = [

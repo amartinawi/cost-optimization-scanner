@@ -121,23 +121,24 @@ class CommitmentAnalysisModule(BaseServiceModule):
         purchase_recs = self._check_purchase_recommendations(ctx, ce)
         fargate_sp_recs, fargate_sp_extras = self._check_fargate_savings_plan(ctx, ce, tp)
 
-        all_recs = sp_util_recs + sp_cov_recs + ri_util_recs + ri_cov_recs + expiry_recs + purchase_recs
-        # Purchase recommendations (and the Fargate SP cells) are mutually-
-        # exclusive decision alternatives — you buy ONE term/payment, not all
-        # six — so they are advisory (Counted=False) and excluded from the tab
-        # total. Summing them would overcount ~6x. Utilization / coverage /
-        # expiry recs reflect actual waste and remain counted.
-        total_savings = sum(
-            r.get("monthly_savings", 0.0) for r in all_recs if r.get("Counted", True)
-        )
-
         # Cost Optimization Hub RI / Savings Plans purchase recommendations
         # the orchestrator routed here after the standalone CoH tab retired.
-        # Render alongside the CE-API derived data so commitment_analysis is
-        # the single home for every reservation / SP signal.
         cost_hub_recs = ctx.cost_hub_splits.get("commitment_analysis", [])
-        cost_hub_savings = sum(
-            float(r.get("estimatedMonthlySavings", 0) or 0) for r in cost_hub_recs
+
+        # Commitment "buy" recommendations — purchase scenarios (CE matrix + CoH
+        # RI/SP recs) and coverage gaps — are a SEPARATE lever from rightsizing.
+        # Their savings overlap the per-service rightsizing/Graviton recs on the
+        # SAME resources (e.g. an RDS RI on db.r5.8xlarge vs downsizing it), so
+        # summing them into one headline double-counts. Mark them advisory
+        # (Counted=False): shown prominently, excluded from the summed total.
+        # Genuine waste on EXISTING commitments (under-utilization, expiring)
+        # stays counted — that is money already being spent.
+        for r in sp_cov_recs + ri_cov_recs + cost_hub_recs:
+            r["Counted"] = False
+
+        all_recs = sp_util_recs + sp_cov_recs + ri_util_recs + ri_cov_recs + expiry_recs + purchase_recs
+        total_savings = sum(
+            r.get("monthly_savings", 0.0) for r in all_recs if r.get("Counted", True)
         )
 
         exp_30 = sum(1 for r in expiry_recs if r.get("severity") == "HIGH")
@@ -147,7 +148,7 @@ class CommitmentAnalysisModule(BaseServiceModule):
         return ServiceFindings(
             service_name="Commitment Analysis",
             total_recommendations=len(all_recs) + len(cost_hub_recs),
-            total_monthly_savings=round(total_savings + cost_hub_savings, 2),
+            total_monthly_savings=round(total_savings, 2),
             sources={
                 "cost_optimization_hub": SourceBlock(
                     count=len(cost_hub_recs), recommendations=tuple(cost_hub_recs)
