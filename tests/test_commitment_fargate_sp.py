@@ -144,6 +144,48 @@ def test_adapter_applies_rightsizing_handoff():
     assert extras["rightsized_od"] == pytest.approx(extras["eligible_od"] - 200.0, abs=0.01)
 
 
+def test_adapter_falls_back_to_estimator_when_no_handoff(monkeypatch):
+    # No ctx.fargate_rightsizing_monthly (isolated --scan-only commitment_analysis)
+    # → the adapter computes a live ECS-only estimate.
+    import services.containers as containers_shim
+
+    monkeypatch.setattr(containers_shim, "estimate_fargate_rightsizing_monthly", lambda ctx: 175.0)
+    ce = _fake_ce()
+    sp = _fake_sp()
+    ns = SimpleNamespace(region="ap-south-1")  # NOTE: no fargate_rightsizing_monthly attr
+    ns.client = lambda name, region=None: {"ce": ce, "savingsplans": sp}.get(name)
+    ns.warn = MagicMock()
+    ns.permission_issue = MagicMock()
+    _, extras = CommitmentAnalysisModule()._check_fargate_savings_plan(ns, ce, {"Start": "x", "End": "y"})
+    assert extras["rightsizing_monthly"] == 175.0
+    assert extras["rightsized_od"] == pytest.approx(extras["eligible_od"] - 175.0, abs=0.01)
+
+
+def test_handoff_takes_precedence_over_estimator(monkeypatch):
+    import services.containers as containers_shim
+
+    called = {"n": 0}
+    monkeypatch.setattr(containers_shim, "estimate_fargate_rightsizing_monthly",
+                        lambda ctx: called.__setitem__("n", called["n"] + 1) or 999.0)
+    ctx, ce, sp = _ctx(fargate_rightsizing=120.0)  # hand-off present
+    _, extras = CommitmentAnalysisModule()._check_fargate_savings_plan(ctx, ce, {"Start": "x", "End": "y"})
+    assert extras["rightsizing_monthly"] == 120.0
+    assert called["n"] == 0  # estimator NOT called when hand-off present
+
+
+def test_quantify_fargate_rightsizing_pure():
+    from services.containers_logic import quantify_fargate_rightsizing
+    # 2 vCPU / 8 GB (2048/8192) x2 → target 1 vCPU / 2 GB.
+    q = quantify_fargate_rightsizing(2048, 8192, 2, 0.04048, 0.004445)
+    assert q is not None
+    assert (q["target_cpu_units"], q["target_mem_mb"]) == (1024, 2048)
+    cur = 2 * 0.04048 + 8 * 0.004445
+    tgt = 1 * 0.04048 + 2 * 0.004445
+    assert q["saving"] == pytest.approx((cur - tgt) * 730 * 2)
+    # Already smallest size → None.
+    assert quantify_fargate_rightsizing(256, 512, 1, 0.04048, 0.004445) is None
+
+
 def test_adapter_no_fargate_returns_empty():
     ctx, ce, sp = _ctx()
     ce.get_cost_and_usage.return_value = {"ResultsByTime": [{"Groups": []}]}
