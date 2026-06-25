@@ -276,16 +276,56 @@ def test_fmt_fargate_size():
     assert _fmt_fargate_size(0.5, 1.0) == "0.5 vCPU / 1 GB"
 
 
-def test_render_target_suffix_shows_size_and_savings():
-    from reporter_phase_b import _containers_target_suffix
-    ecs = {"CurrentSize": "2 vCPU / 8 GB", "TargetSize": "1 vCPU / 2 GB", "EstimatedMonthlySavings": 94.66}
-    s = _containers_target_suffix(ecs)
-    assert "2 vCPU / 8 GB" in s and "1 vCPU / 2 GB" in s and "$94.66/mo" in s
-    ecr = {"TargetAction": "Expire untagged images via lifecycle policy", "ReclaimableGiB": 3.2, "EstimatedMonthlySavings": 0.32}
-    s2 = _containers_target_suffix(ecr)
-    assert "3.2 GiB" in s2 and "$0.32/mo" in s2
-    # No target fields → no suffix (advisory rows unchanged).
-    assert _containers_target_suffix({"ServiceName": "x"}) == ""
+def test_heuristic_renderer_emits_structured_target_table():
+    from reporter_phase_b import _render_containers_enhanced_checks
+    recs = [
+        {"CheckCategory": "ECS Rightsizing - Metric-Backed", "ServiceName": "web", "ClusterName": "prod",
+         "CurrentSize": "2 vCPU / 8 GB", "TargetSize": "1 vCPU / 2 GB", "EstimatedMonthlySavings": 94.66},
+        {"CheckCategory": "ECR Lifecycle Management", "RepositoryName": "img", "ImageCount": 98,
+         "TargetAction": "Expire untagged images via lifecycle policy", "ReclaimableGiB": 8.67,
+         "EstimatedMonthlySavings": 0.87},
+    ]
+    html = _render_containers_enhanced_checks(recs, "enhanced_checks", {})
+    assert "<table class='rec-table'>" in html
+    assert "Current &rarr; Target" in html
+    assert "2 vCPU / 8 GB" in html and "1 vCPU / 2 GB" in html and "$94.66/mo" in html
+    assert "free 8.67 GiB" in html and "$0.87/mo" in html
+
+
+def test_coh_ecs_size_from_resource_details():
+    from reporter_phase_b import _coh_ecs_size
+    details = {"ecsService": {"configuration": {"compute": {"vCpu": 256.0, "memorySizeInMB": 512}}}}
+    assert _coh_ecs_size(details) == "0.25 vCPU / 512 MB"
+    assert _coh_ecs_size({"ecsService": {"configuration": {"compute": {"vCpu": 1024, "memorySizeInMB": 2048}}}}) == "1 vCPU / 2 GB"
+    assert _coh_ecs_size({}) == ""
+
+
+def test_coh_renderer_adds_target_column_for_ecs():
+    from reporter_phase_b import _render_cost_hub_source
+    recs = [{
+        "actionType": "Rightsize", "resourceId": "arn:aws:ecs:::service/clu/web", "region": "ap-south-1",
+        "currentResourceType": "EcsService", "estimatedMonthlySavings": 60.67,
+        "currentResourceDetails": {"ecsService": {"configuration": {"compute": {"vCpu": 512, "memorySizeInMB": 1024}}}},
+        "recommendedResourceDetails": {"ecsService": {"configuration": {"compute": {"vCpu": 256, "memorySizeInMB": 512}}}},
+    }]
+    html = _render_cost_hub_source(recs, "cost_optimization_hub", {})
+    assert "Current &rarr; Target" in html
+    assert "0.5 vCPU / 1 GB" in html and "0.25 vCPU / 512 MB" in html
+
+
+def test_ecs_co_normalizer_sets_sizes():
+    from services.advisor import _normalize_ecs_co_rec
+    raw = {
+        "serviceArn": "arn:aws:ecs:::service/clu/web",
+        "currentServiceConfiguration": {"cpu": 512, "memory": 1024},
+        "serviceRecommendationOptions": [{
+            "savingsOpportunity": {"estimatedMonthlySavings": {"value": 30.0}},
+            "containerRecommendations": [{"containerName": "c", "cpu": 256, "memory": 512}],
+        }],
+    }
+    out = _normalize_ecs_co_rec(raw)
+    assert out["CurrentSize"] == "0.5 vCPU / 1 GB"
+    assert out["TargetSize"] == "0.25 vCPU / 512 MB"
 
 
 def test_ecr_recommendation_names_reclaim(monkeypatch):
