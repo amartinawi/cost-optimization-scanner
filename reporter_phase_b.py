@@ -995,46 +995,58 @@ def _render_containers_enhanced_checks(recommendations: List[Rec], source_name: 
         elif group_name == "Other Optimizations":
             content += "<p><strong>Recommendation:</strong> Optimize container resources through rightsizing, Spot instances, and efficient scheduling</p>"
 
-        content += "<p><strong>Resources:</strong></p><ul>"
-        cluster_names: set = set()
-        for res in resources:
-            if "ClusterName" in res:
-                if "ServiceName" in res:
-                    label = f"{res.get('ServiceName', 'Unknown')} (Cluster: {res.get('ClusterName', 'Unknown')})"
-                    content += f"<li>{label}{_containers_target_suffix(res)}</li>"
-                else:
-                    cluster_name = res.get("ClusterName", "Unknown")
-                    if cluster_name not in cluster_names:
-                        content += f"<li>{cluster_name}{_containers_target_suffix(res)}</li>"
-                        cluster_names.add(cluster_name)
-            elif "RepositoryName" in res:
-                label = f"{res.get('RepositoryName', 'Unknown')} ({res.get('ImageCount', 0)} images)"
-                content += f"<li>{label}{_containers_target_suffix(res)}</li>"
-        content += "</ul></div>"
+        # Structured two-column (current → target) table when the group carries
+        # quantified sizing/reclaim; otherwise a plain resource list.
+        has_targets = any(
+            r.get("TargetSize") or r.get("ReclaimableGiB") or r.get("TargetAction") for r in resources
+        )
+        if has_targets:
+            content += _containers_resource_table(resources)
+        else:
+            content += "<p><strong>Resources:</strong></p><ul>"
+            cluster_names: set = set()
+            for res in resources:
+                if "ClusterName" in res:
+                    if "ServiceName" in res:
+                        content += f"<li>{res.get('ServiceName', 'Unknown')} (Cluster: {res.get('ClusterName', 'Unknown')})</li>"
+                    else:
+                        cluster_name = res.get("ClusterName", "Unknown")
+                        if cluster_name not in cluster_names:
+                            content += f"<li>{cluster_name}</li>"
+                            cluster_names.add(cluster_name)
+                elif "RepositoryName" in res:
+                    content += f"<li>{res.get('RepositoryName', 'Unknown')} ({res.get('ImageCount', 0)} images)</li>"
+            content += "</ul>"
+        content += "</div>"
     return content
 
 
-def _containers_target_suffix(res: Rec) -> str:
-    """Render the concrete target + monthly saving for a container rec, when known.
-
-    Surfaces the rightsizing target (current → target size) or ECR reclaim so the
-    recommendation names what to change, not just which resource. Returns "" when
-    the rec carries no quantified target (keeps advisory rows unchanged).
-    """
-    parts: List[str] = []
-    if res.get("CurrentSize") and res.get("TargetSize"):
-        parts.append(f"<strong>{res['CurrentSize']} &rarr; {res['TargetSize']}</strong>")
-    elif res.get("TargetAction"):
-        parts.append(str(res["TargetAction"]))
-    if res.get("ReclaimableGiB"):
-        parts.append(f"free {res['ReclaimableGiB']} GiB")
-    saving = res.get("EstimatedMonthlySavings")
-    try:
-        if saving and float(saving) > 0:
-            parts.append(f"save ${float(saving):.2f}/mo")
-    except (TypeError, ValueError):
-        pass
-    return f" — {' · '.join(parts)}" if parts else ""
+def _containers_resource_table(resources: List[Rec]) -> str:
+    """Render container recs as a Resource | Current → Target | Saving table."""
+    rows = ""
+    for res in resources:
+        if "RepositoryName" in res:
+            name = f"{res.get('RepositoryName', 'Unknown')} ({res.get('ImageCount', 0)} images)"
+            change = res.get("TargetAction", "Optimize")
+            if res.get("ReclaimableGiB"):
+                change += f" · free {res['ReclaimableGiB']} GiB"
+        else:
+            name = f"{res.get('ServiceName', res.get('ClusterName', 'Unknown'))}"
+            if res.get("ServiceName") and res.get("ClusterName"):
+                name += f" <span class='muted'>(Cluster: {res['ClusterName']})</span>"
+            cur, tgt = res.get("CurrentSize"), res.get("TargetSize")
+            change = f"{cur} &rarr; <strong>{tgt}</strong>" if cur and tgt else (res.get("Recommendation", "") or "—")
+        saving = res.get("EstimatedMonthlySavings")
+        try:
+            saving_cell = f"${float(saving):.2f}/mo" if saving and float(saving) > 0 else "&mdash;"
+        except (TypeError, ValueError):
+            saving_cell = "&mdash;"
+        rows += f"<tr><td>{name}</td><td>{change}</td><td>{saving_cell}</td></tr>"
+    return (
+        "<table class='rec-table'><thead><tr>"
+        "<th>Resource</th><th>Current &rarr; Target</th><th>Monthly Saving</th>"
+        "</tr></thead><tbody>" + rows + "</tbody></table>"
+    )
 
 
 def _render_elasticache_enhanced_checks(recommendations: List[Rec], source_name: str, service_data: Dict) -> str:
@@ -1312,7 +1324,11 @@ def _render_compute_optimizer_source(recommendations: List[Rec], source_name: st
             savings = rec.get("estimatedMonthlySavings", 0)
 
             line = resource_name
-            if isinstance(current, dict) and isinstance(recommended, dict) and recommended:
+            # Prefer an explicit human-readable size delta (e.g. ECS Fargate
+            # task sizing set by the normalizer); fall back to config-key deltas.
+            if rec.get("CurrentSize") and rec.get("TargetSize"):
+                line += f": <strong>{rec['CurrentSize']} → {rec['TargetSize']}</strong>"
+            elif isinstance(current, dict) and isinstance(recommended, dict) and recommended:
                 cur_val = current.get("instanceType") or current.get("memorySize") or current.get("volumeType")
                 rec_val = (
                     recommended.get("instanceType") or recommended.get("memorySize") or recommended.get("volumeType")
@@ -2156,6 +2172,26 @@ def _render_coh_commitment_scenarios(rec: Rec) -> str:
     return out
 
 
+def _coh_ecs_size(resource_details: Dict) -> str:
+    """Format an ECS Fargate task size from a CoH resource-details block.
+
+    Reads ``ecsService.configuration.compute`` ({vCpu units, memorySizeInMB})
+    and renders e.g. '0.25 vCPU / 512 MB'. Returns '' when not present.
+    """
+    try:
+        compute = (resource_details or {}).get("ecsService", {}).get("configuration", {}).get("compute", {})
+        vcpu_units = float(compute.get("vCpu", 0) or 0)
+        mem_mb = float(compute.get("memorySizeInMB", 0) or 0)
+    except (TypeError, ValueError, AttributeError):
+        return ""
+    if vcpu_units <= 0 or mem_mb <= 0:
+        return ""
+    vcpu = vcpu_units / 1024.0
+    mem_gb = mem_mb / 1024.0
+    mem_s = f"{int(mem_mb)} MB" if mem_gb < 1 else f"{mem_gb:g} GB"
+    return f"{vcpu:g} vCPU / {mem_s}"
+
+
 def _render_cost_hub_source(recommendations: List[Rec], source_name: str, service_data: Dict) -> str:
     """Renders Cost Optimization Hub recommendations as a human-readable table.
 
@@ -2193,8 +2229,16 @@ def _render_cost_hub_source(recommendations: List[Rec], source_name: str, servic
         if effort:
             content += f"<p><strong>Implementation Effort:</strong> {effort}</p>"
 
+        # ECS rightsizing recs carry a current/recommended Fargate task size;
+        # surface it as extra columns (scoped to ECS so other CoH tables —
+        # RDS, commitments — keep their exact structure).
+        is_ecs = bool(recs) and all(str(r.get("currentResourceType", "")).startswith("Ecs") for r in recs)
+
         content += "<table class='rec-table'><thead><tr>"
-        content += "<th>Action</th><th>Resource</th><th>Region</th><th>Monthly Savings</th>"
+        content += "<th>Action</th><th>Resource</th>"
+        if is_ecs:
+            content += "<th>Current &rarr; Target</th>"
+        content += "<th>Region</th><th>Monthly Savings</th>"
         content += "</tr></thead><tbody>"
 
         for rec in recs:
@@ -2207,8 +2251,13 @@ def _render_cost_hub_source(recommendations: List[Rec], source_name: str, servic
                 resource_display = res_type
             region = rec.get("region", "N/A")
             savings = rec.get("estimatedMonthlySavings", 0)
-            content += f"<tr><td>{action}</td><td>{resource_display}</td><td>{region}</td>"
-            content += f"<td>${savings:.2f}</td></tr>"
+            content += f"<tr><td>{action}</td><td>{resource_display}</td>"
+            if is_ecs:
+                cur = _coh_ecs_size(rec.get("currentResourceDetails", {}))
+                tgt = _coh_ecs_size(rec.get("recommendedResourceDetails", {}))
+                cell = f"{cur} &rarr; <strong>{tgt}</strong>" if cur and tgt else (tgt or cur or "&mdash;")
+                content += f"<td>{cell}</td>"
+            content += f"<td>{region}</td><td>${savings:.2f}</td></tr>"
 
         content += "</tbody></table>"
 

@@ -413,16 +413,66 @@ def _normalize_ecs_co_rec(raw: dict[str, Any], pricing_multiplier: float = 1.0) 
 
     svc_id = raw.get("serviceArn", "").split(":service/")[-1] or raw.get("serviceArn", "")
     svc_name = svc_id.split("/")[-1] if "/" in svc_id else svc_id
-    return {
+
+    current_cfg = raw.get("currentServiceConfiguration", {})
+    container_recs = service_options[0].get("containerRecommendations", []) if service_options else []
+    current_size, target_size = _ecs_co_sizes(current_cfg, container_recs)
+
+    out = {
         "resource_id": svc_id,
         "resource_name": svc_name,
         "resource_type": "ECS Service",
         "finding": raw.get("finding", ""),
-        "current_config": raw.get("currentServiceConfiguration", {}),
-        "recommended_config": service_options[0].get("containerRecommendations", []) if service_options else [],
+        "current_config": current_cfg,
+        "recommended_config": container_recs,
         "estimatedMonthlySavings": round(savings, 2),
         "lookback_period_days": raw.get("lookBackPeriodInDays", 14),
     }
+    if current_size:
+        out["CurrentSize"] = current_size
+    if target_size:
+        out["TargetSize"] = target_size
+    return out
+
+
+def _ecs_co_sizes(
+    current_cfg: dict[str, Any], container_recs: list[dict[str, Any]]
+) -> tuple[str | None, str | None]:
+    """Derive human-readable current/target Fargate task sizes for an ECS CO rec.
+
+    Current size comes from the service's task-level cpu/memory. Target size is
+    the sum of the per-container recommendations, snapped UP to a valid Fargate
+    CPU/memory combination (CO recommends per container; the task size must be
+    a legal Fargate combo).
+    """
+    from services.containers_logic import snap_to_valid_fargate
+
+    def _fmt(cpu_units: float, mem_mb: float) -> str | None:
+        if cpu_units <= 0 or mem_mb <= 0:
+            return None
+        vcpu = cpu_units / 1024.0
+        mem_gb = mem_mb / 1024.0
+        mem_s = f"{int(mem_gb * 1024)} MB" if mem_gb < 1 else f"{mem_gb:g} GB"
+        return f"{vcpu:g} vCPU / {mem_s}"
+
+    try:
+        cur_cpu = float(current_cfg.get("cpu", 0) or 0)
+        cur_mem = float(current_cfg.get("memory", 0) or 0)
+    except (TypeError, ValueError):
+        cur_cpu = cur_mem = 0.0
+    current = _fmt(cur_cpu, cur_mem)
+
+    target = None
+    if container_recs:
+        try:
+            sum_cpu = sum(float(c.get("cpu", 0) or 0) for c in container_recs)
+            sum_mem = sum(float(c.get("memory", 0) or 0) for c in container_recs)
+        except (TypeError, ValueError):
+            sum_cpu = sum_mem = 0.0
+        if sum_cpu > 0 and sum_mem > 0:
+            tgt_vcpu, tgt_mem_gb = snap_to_valid_fargate(sum_cpu / 1024.0, sum_mem / 1024.0)
+            target = _fmt(tgt_vcpu * 1024.0, tgt_mem_gb * 1024.0)
+    return current, target
 
 
 def _normalize_asg_co_rec(raw: dict[str, Any], pricing_multiplier: float = 1.0) -> dict[str, Any]:
