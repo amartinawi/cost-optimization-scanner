@@ -7,7 +7,7 @@ from typing import Any, Callable
 
 from core.contracts import ServiceFindings, SourceBlock
 from services._base import BaseServiceModule
-from services._savings import parse_dollar_savings
+from services._savings import mark_zero_savings_advisory, parse_dollar_savings
 from services.ec2 import get_auto_scaling_checks
 from services.elastic_ip import get_elastic_ip_checks
 from services.load_balancer import get_load_balancer_checks
@@ -101,7 +101,10 @@ class NetworkModule(BaseServiceModule):
         asg_recs = _annotate_severity(_safe_collect("auto_scaling", get_auto_scaling_checks, ctx))
 
         all_recs = eip_recs + nat_recs + vpc_recs + lb_recs + asg_recs
-        total_savings = _sum_savings(all_recs)
+        # Best-practice nudges that parse to $0 (missing endpoints, metric-gated
+        # NAT/LB) are advisory — shown but not counted.
+        mark_zero_savings_advisory(all_recs, lambda r: parse_dollar_savings(r.get("EstimatedSavings", "")))
+        total_savings = _sum_savings([r for r in all_recs if r.get("Counted", True)])
 
         return ServiceFindings(
             service_name="Network & Infrastructure",

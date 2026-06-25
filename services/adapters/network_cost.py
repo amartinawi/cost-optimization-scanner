@@ -124,8 +124,13 @@ class NetworkCostModule(BaseServiceModule):
             peering_count, tgw_count = self._fetch_network_topology(ec2)
             tgw_recs = self._analyze_tgw_vs_peering(peering_count, tgw_count, usage_breakdown, multiplier)
 
+        from services._savings import mark_zero_savings_advisory
+
         all_recs = cross_region_recs + cross_az_recs + egress_recs + tgw_recs
-        total_savings = sum(r.get("monthly_savings", 0.0) for r in all_recs)
+        # Architectural advisories (e.g. TGW-vs-peering) with $0 concrete saving
+        # are advisory, not counted.
+        mark_zero_savings_advisory(all_recs, lambda r: r.get("monthly_savings", 0.0))
+        total_savings = sum(r.get("monthly_savings", 0.0) for r in all_recs if r.get("Counted", True))
 
         return ServiceFindings(
             service_name="Network Transfer Costs",

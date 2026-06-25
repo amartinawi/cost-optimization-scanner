@@ -302,7 +302,10 @@ def get_lambda_compute_optimizer_recommendations(
         if "OptInRequiredException" in str(e) or "not registered" in str(e):
             return [_compute_optimizer_opt_in_rec("Lambda", "memory-rightsizing")]
         return []
-    return [_normalize_lambda_co_rec(r, ctx.pricing_multiplier) for r in raw]
+    # Drop "Optimized"/no-action findings ($0 savings) — not cost recs, they
+    # only inflate the count (mirrors the ECS CO helper).
+    normalized = [_normalize_lambda_co_rec(r, ctx.pricing_multiplier) for r in raw]
+    return [r for r in normalized if float(r.get("estimatedMonthlySavings", 0) or 0) > 0]
 
 
 def get_ecs_compute_optimizer_recommendations(
