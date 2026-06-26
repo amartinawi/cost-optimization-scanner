@@ -6,6 +6,7 @@ from typing import Any
 
 from core.contracts import ServiceFindings, SourceBlock
 from services._base import BaseServiceModule
+from services._savings import mark_zero_savings_advisory
 from services.advisor import get_lambda_compute_optimizer_recommendations
 from services.lambda_svc import LAMBDA_OPTIMIZATION_DESCRIPTIONS, get_enhanced_lambda_checks
 
@@ -68,6 +69,20 @@ class LambdaModule(BaseServiceModule):
             if fn:
                 seen_functions.add(fn)
 
+        # Compute Optimizer is lower authority than Cost Hub. A function that
+        # appears in BOTH gets the same memory-rightsizing lever from each
+        # source — keep the Cost Hub version and drop the CO duplicate so the
+        # saving is never counted twice (mirrors EC2/EBS dedupe_by_authority).
+        deduped_co: list[dict[str, Any]] = []
+        for rec in co_recs:
+            fn = rec.get("resource_name", "") or rec.get("FunctionName", "")
+            if fn and fn in seen_functions:
+                continue
+            deduped_co.append(rec)
+            if fn:
+                seen_functions.add(fn)
+        co_recs = deduped_co
+
         deduped_enhanced: list[dict[str, Any]] = []
         for rec in enhanced_recs:
             fn = rec.get("FunctionName", "")
@@ -112,6 +127,14 @@ class LambdaModule(BaseServiceModule):
                 continue
 
         formula_savings *= ctx.pricing_multiplier
+
+        # Memory/ARM recs that could not be quantified (no CW Duration/GB-seconds)
+        # emit $0 — they are metric-gated nudges, not counted opportunities. Mark
+        # them advisory so they are shown but excluded from the counted total
+        # (mirrors the metric-gated NAT/monitoring advisories).
+        mark_zero_savings_advisory(
+            enhanced_recs, lambda r: float(r.get("EstimatedMonthlySavings", 0) or 0)
+        )
 
         # AWS Compute Optimizer returns region-priced savings; do NOT
         # multiply by pricing_multiplier here (the helper applies it once

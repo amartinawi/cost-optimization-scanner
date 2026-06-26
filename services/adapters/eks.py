@@ -352,6 +352,12 @@ class EksCostModule(BaseServiceModule):
                 # surface the magnitude so it is not invisible when CO is off.
                 ng_monthly = self._node_group_monthly_cost(ctx, instance_types, desired)
 
+                # A node group scaled to 0 nodes (or one whose instance price could
+                # not be resolved) has no on-demand cost basis, so Spot/Graviton
+                # savings are definitionally $0 — skip it rather than emit $0 noise.
+                if ng_monthly <= 0:
+                    continue
+
                 # Spot opportunity (ON_DEMAND groups).
                 if capacity_type != "SPOT":
                     spot_saving = round(ng_monthly * SPOT_SAVINGS_FACTOR, 2) if ng_monthly > 0 else 0.0
