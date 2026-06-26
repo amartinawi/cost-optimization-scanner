@@ -294,7 +294,10 @@ _FSX_FILE_SYSTEM_TYPE_LABELS: dict[str, str] = {
 FALLBACK_EIP_MONTH: float = 3.65       # $0.005/hr × 730 = $3.65/mo
 FALLBACK_NAT_MONTH: float = 32.85      # $0.045/hr × 730 = $32.85/mo
 FALLBACK_VPC_ENDPOINT_MONTH: float = 7.30   # $0.01/hr × 730 = $7.30/mo
-FALLBACK_ALB_MONTH: float = 16.43      # $0.0225/hr × 730 = $16.43/mo
+FALLBACK_ALB_MONTH: float = 16.43      # $0.0225/hr × 730 = $16.43/mo (Load Balancer-Application)
+FALLBACK_NLB_MONTH: float = 16.43      # $0.0225/hr × 730 = $16.43/mo (Load Balancer-Network, same base as ALB)
+FALLBACK_GWLB_MONTH: float = 9.13      # $0.0125/hr × 730 = $9.13/mo (Load Balancer-Gateway)
+FALLBACK_CLB_MONTH: float = 18.25      # $0.025/hr × 730 = $18.25/mo (Classic Load Balancer)
 FALLBACK_AURORA_ACU_HOURLY: float = 0.12  # us-east-1 Aurora Serverless v2 ACU-Hr list rate
 SAGEMAKER_OVER_EC2: float = 1.15
 
@@ -861,14 +864,60 @@ class PricingEngine:
         return price
 
     def get_alb_monthly_price(self) -> float:
-        key = ("alb_month",)
+        return self._lb_monthly_price(
+            key=("alb_month",),
+            product_family="Load Balancer-Application",
+            operation="LoadBalancing:Application",
+            fallback=FALLBACK_ALB_MONTH,
+            label="ALB",
+        )
+
+    def get_nlb_monthly_price(self) -> float:
+        return self._lb_monthly_price(
+            key=("nlb_month",),
+            product_family="Load Balancer-Network",
+            operation="LoadBalancing:Network",
+            fallback=FALLBACK_NLB_MONTH,
+            label="NLB",
+        )
+
+    def get_gwlb_monthly_price(self) -> float:
+        return self._lb_monthly_price(
+            key=("gwlb_month",),
+            product_family="Load Balancer-Gateway",
+            operation="LoadBalancing:Gateway",
+            fallback=FALLBACK_GWLB_MONTH,
+            label="GWLB",
+        )
+
+    def get_clb_monthly_price(self) -> float:
+        return self._lb_monthly_price(
+            key=("clb_month",),
+            product_family="Load Balancer",
+            operation="LoadBalancing",
+            fallback=FALLBACK_CLB_MONTH,
+            label="Classic LB",
+        )
+
+    def _lb_monthly_price(
+        self, *, key: tuple, product_family: str, operation: str, fallback: float, label: str
+    ) -> float:
+        """Shared monthly-price lookup for the four ELB types.
+
+        Each ELB type has its own ``productFamily`` ("Load Balancer-Application"
+        for ALB, "-Network" for NLB, "-Gateway" for GWLB, bare "Load Balancer"
+        for Classic). The previous ALB lookup filtered ``productFamily="Load
+        Balancer"`` which matches ONLY the Classic LB SKU ($0.025/hr), so it
+        silently returned the Classic rate instead of the ALB rate.
+        """
         if (cached := self._get_cached(key)) is not None:
             return cached
-        price = self._fetch_alb_price()
+        hourly = self._fetch_lb_base_hourly(product_family, operation)
+        price = hourly * 730 if hourly is not None else None
         if price is None:
             price = self._use_fallback(
-                FALLBACK_ALB_MONTH * self._fallback_multiplier,
-                f"Pricing API unavailable for ALB in {self._region}; using fallback",
+                fallback * self._fallback_multiplier,
+                f"Pricing API unavailable for {label} in {self._region}; using fallback",
             )
         self._cache.set(key, price)
         return price
@@ -1379,13 +1428,40 @@ class PricingEngine:
         hourly = self._call_pricing_api("AmazonVPC", filters)
         return hourly * 730 if hourly is not None else None
 
-    def _fetch_alb_price(self) -> float | None:
+    def _fetch_lb_base_hourly(self, product_family: str, operation: str) -> float | None:
+        """Return the base hourly $/hr for a load-balancer type.
+
+        Filters AWSELB by ``productFamily`` + ``operation`` (region-independent,
+        unlike the region-prefixed ``usagetype``) and selects the standard
+        ``LoadBalancerUsage`` Hrs row — excluding the Trust Store (``TS-``) and
+        ``Outposts-`` variants that share the same productFamily/operation.
+        """
         filters = [
             {"Type": "TERM_MATCH", "Field": "location", "Value": self._display_name},
-            {"Type": "TERM_MATCH", "Field": "productFamily", "Value": "Load Balancer"},
+            {"Type": "TERM_MATCH", "Field": "productFamily", "Value": product_family},
+            {"Type": "TERM_MATCH", "Field": "operation", "Value": operation},
         ]
-        hourly = self._call_pricing_api("AWSELB", filters)
-        return hourly * 730 if hourly is not None else None
+        key_fields = {f["Field"]: f["Value"] for f in filters if f["Field"] not in _LOG_SKIP_FIELDS}
+        try:
+            resp = self._pricing.get_products(ServiceCode="AWSELB", Filters=filters, MaxResults=100)
+            self._stats["api_calls"] += 1
+            for raw in resp.get("PriceList", []):
+                item = json.loads(raw)
+                usagetype = item.get("product", {}).get("attributes", {}).get("usagetype", "")
+                if not usagetype.endswith("LoadBalancerUsage"):
+                    continue
+                if "TS-" in usagetype or "Outposts" in usagetype:
+                    continue
+                price, unit = _extract_usd_with_unit(item)
+                if unit == "Hrs" and price is not None:
+                    logger.debug("pricing:GetProducts  AWSELB  %s  → $%.6f/hr", key_fields, price)
+                    return price
+            logger.debug("pricing:GetProducts  AWSELB  %s  → no base LoadBalancerUsage row", key_fields)
+            return None
+        except Exception as exc:
+            self._stats["api_errors"] += 1
+            logger.debug("pricing:GetProducts  AWSELB  %s  → FAILED: %s", key_fields, exc)
+            return None
 
     def _fetch_aurora_acu_price(self) -> float | None:
         # The usagetype "ACU-Hour" does not exist; AWS publishes the Aurora

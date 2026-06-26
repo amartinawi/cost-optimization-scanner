@@ -2365,6 +2365,13 @@ SOURCE_TYPE_MAP: Dict[Tuple[str, str], str] = {
     # S3 enhanced checks are config-pattern (no CloudWatch). Override the
     # generic "enhanced_checks" → "Metric Backed" default (audit L3-S3-003).
     ("s3", "enhanced_checks"): "Audit Based",
+    # Network sub-domains are local config/heuristic audits priced via the
+    # AWS Pricing API (no CloudWatch reads), so they carry the "Audit Based" prefix.
+    ("network", "elastic_ips"): "Audit Based",
+    ("network", "nat_gateways"): "Audit Based",
+    ("network", "vpc_endpoints"): "Audit Based",
+    ("network", "load_balancers"): "Audit Based",
+    ("network", "auto_scaling_groups"): "Audit Based",
 }
 
 _GENERIC_SOURCE_TYPES: Dict[str, str] = {
@@ -2470,7 +2477,15 @@ PHASE_B_HANDLERS: Dict[Tuple[str, str], Callable] = {
     ("containers", "enhanced_checks"): _render_containers_enhanced_checks,
     ("elasticache", "enhanced_checks"): _render_elasticache_enhanced_checks,
     ("opensearch", "enhanced_checks"): _render_opensearch_enhanced_checks,
+    # Network emits five per-domain sources (NOT a single enhanced_checks bucket).
+    # Each must map to the renderer or the tab body renders empty while savings
+    # are still counted in the headline (audit C1).
     ("network", "enhanced_checks"): _render_network_enhanced_checks,
+    ("network", "elastic_ips"): _render_network_enhanced_checks,
+    ("network", "nat_gateways"): _render_network_enhanced_checks,
+    ("network", "vpc_endpoints"): _render_network_enhanced_checks,
+    ("network", "load_balancers"): _render_network_enhanced_checks,
+    ("network", "auto_scaling_groups"): _render_network_enhanced_checks,
     ("monitoring", "cloudwatch_checks"): _render_monitoring_enhanced_checks,
     ("monitoring", "cloudtrail_checks"): _render_monitoring_enhanced_checks,
     ("monitoring", "backup_checks"): _render_monitoring_enhanced_checks,

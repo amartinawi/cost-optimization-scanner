@@ -7,16 +7,17 @@ Extracted from CostOptimizer.get_load_balancer_checks() as a free function.
 from __future__ import annotations
 
 import logging
-
-logger = logging.getLogger(__name__)
-
 from datetime import datetime
 from typing import Any
 
+from core.pricing_engine import FALLBACK_ALB_MONTH, FALLBACK_GWLB_MONTH, FALLBACK_NLB_MONTH
 from core.scan_context import ScanContext
+from services._aws_errors import record_aws_error
+
+logger = logging.getLogger(__name__)
 
 
-def _is_kubernetes_managed_alb(elbv2: Any, lb_name: str, lb_arn: str) -> bool:
+def _is_kubernetes_managed_alb(ctx: ScanContext, elbv2: Any, lb_name: str, lb_arn: str) -> bool:
     k8s_patterns = [
         "k8s-",
         "eks-",
@@ -47,7 +48,7 @@ def _is_kubernetes_managed_alb(elbv2: Any, lb_name: str, lb_arn: str) -> bool:
                     return True
 
     except Exception as e:
-        logger.warning(f"Warning: Could not get tags for ALB {lb_arn}: {e}")
+        record_aws_error(ctx, e, service="network", context=f"ALB tag lookup for {lb_arn} failed")
 
     return False
 
@@ -59,8 +60,16 @@ def get_load_balancer_checks(ctx: ScanContext) -> dict[str, Any]:
     # base. The previous 1.4× ratio was invented; for the NLB→ALB savings
     # rec we can only honestly emit 0 + warning until per-LB CW metrics
     # (LCU/NLCU consumption) are wired through.
-    alb_monthly = ctx.pricing_engine.get_alb_monthly_price() if ctx.pricing_engine is not None else 16.20
-    nlb_monthly = alb_monthly  # Same base; LCU/NLCU diff requires traffic data.
+    pe = ctx.pricing_engine
+    mult = ctx.pricing_multiplier
+    alb_monthly = pe.get_alb_monthly_price() if pe is not None else FALLBACK_ALB_MONTH * mult
+    # NLB and ALB share the same base hourly ($0.0225/hr); the cost delta lives in
+    # LCU vs NLCU consumption (traffic-driven). GWLB has its own lower base.
+    nlb_monthly = pe.get_nlb_monthly_price() if pe is not None else FALLBACK_NLB_MONTH * mult
+    gwlb_monthly = pe.get_gwlb_monthly_price() if pe is not None else FALLBACK_GWLB_MONTH * mult
+    # Map the elbv2 Type value to its base monthly rate so a GWLB is never priced
+    # as an ALB (audit M3).
+    lb_rate_by_type = {"application": alb_monthly, "network": nlb_monthly, "gateway": gwlb_monthly}
     checks: dict[str, list[dict[str, Any]]] = {
         "zero_traffic_albs": [],
         "single_service_albs": [],
@@ -88,7 +97,7 @@ def get_load_balancer_checks(ctx: ScanContext) -> dict[str, Any]:
             for page in clb_paginator.paginate():
                 classic_lbs.extend(page.get("LoadBalancerDescriptions", []))
         except Exception as e:
-            logger.warning(f"⚠️ Error getting Classic Load Balancers: {str(e)}")
+            record_aws_error(ctx, e, service="network", context="Classic Load Balancer lookup failed")
             classic_lbs = []
 
         alb_count = 0
@@ -101,7 +110,7 @@ def get_load_balancer_checks(ctx: ScanContext) -> dict[str, Any]:
             lb_type = lb.get("Type", "application")
             scheme = lb.get("Scheme", "internet-facing")
 
-            is_k8s_managed = _is_kubernetes_managed_alb(elbv2, lb_name, lb_arn) if lb_name and lb_arn else False
+            is_k8s_managed = _is_kubernetes_managed_alb(ctx, elbv2, lb_name, lb_arn) if lb_name and lb_arn else False
 
             if lb_type == "application":
                 alb_count += 1
@@ -140,7 +149,7 @@ def get_load_balancer_checks(ctx: ScanContext) -> dict[str, Any]:
                             "LoadBalancerName": lb_name,
                             "Type": lb_type,
                             "Recommendation": "Load balancer has no listeners configured - verify configuration or delete if unused",
-                            "EstimatedSavings": f"${alb_monthly if lb_type == 'application' else nlb_monthly:.0f}/month if deleted",
+                            "EstimatedSavings": f"${lb_rate_by_type.get(lb_type, alb_monthly):.0f}/month if deleted",
                             "Action": "1. Check if listeners were accidentally deleted\n2. Verify if LB is still needed\n3. Configure listeners or delete LB",
                             "CheckCategory": "Load Balancer Configuration Issue",
                         }
@@ -176,7 +185,7 @@ def get_load_balancer_checks(ctx: ScanContext) -> dict[str, Any]:
                         rules_response = elbv2.describe_rules(ListenerArn=listener["ListenerArn"])
                         total_rules += len(rules_response.get("Rules", []))
                     except Exception as e:
-                        logger.warning(f"Warning: Could not get rules for listener {listener['ListenerArn']}: {e}")
+                        record_aws_error(ctx, e, service="network", context=f"listener rule lookup for {listener['ListenerArn']} failed")
                         continue
 
                 # Excessive ALB rules finding removed: emitted no concrete $ — LCU savings
@@ -184,7 +193,7 @@ def get_load_balancer_checks(ctx: ScanContext) -> dict[str, Any]:
                 _ = total_rules
 
             except Exception as e:
-                logger.warning(f"Warning: Could not analyze ALB {lb_name}: {e}")
+                record_aws_error(ctx, e, service="network", context=f"load balancer analysis for {lb_name} failed")
                 continue
 
             # Unnecessary Cross-AZ LB finding removed: estimate used a fake "1GB/hour"
@@ -236,7 +245,7 @@ def get_load_balancer_checks(ctx: ScanContext) -> dict[str, Any]:
                     )
 
     except Exception as e:
-        logger.warning(f"Warning: Load Balancer checks failed: {e}")
+        record_aws_error(ctx, e, service="network", context="Load Balancer checks failed")
 
     recommendations: list[dict[str, Any]] = []
     for _category, items in checks.items():

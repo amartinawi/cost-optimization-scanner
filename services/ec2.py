@@ -857,8 +857,10 @@ def get_auto_scaling_checks(ctx: ScanContext) -> dict[str, Any]:
     }
 
     try:
-        asg_response = autoscaling.describe_auto_scaling_groups()
-        asgs = asg_response.get("AutoScalingGroups", [])
+        asgs: list[dict[str, Any]] = []
+        asg_paginator = autoscaling.get_paginator("describe_auto_scaling_groups")
+        for page in asg_paginator.paginate():
+            asgs.extend(page.get("AutoScalingGroups", []))
 
         for asg in asgs:
             asg_name = asg.get("AutoScalingGroupName")
@@ -885,7 +887,13 @@ def get_auto_scaling_checks(ctx: ScanContext) -> dict[str, Any]:
                     lt_data = lt_response["LaunchTemplateVersions"][0]["LaunchTemplateData"]
                     instance_type = lt_data.get("InstanceType")
 
-                    if instance_type and any(size in instance_type for size in ["xlarge", "2xlarge", "4xlarge"]):
+                    # A scaled-to-zero ASG runs no instances, so there are no
+                    # per-node dollars to save (mirror the EKS 0-node fix).
+                    if (
+                        instance_type
+                        and desired_capacity > 0
+                        and any(size in instance_type for size in ["xlarge", "2xlarge", "4xlarge"])
+                    ):
                         asg_node_savings, asg_node_basis = _compute_ec2_savings(
                             ctx, instance_type, "Rightsizing Opportunities"
                         )
