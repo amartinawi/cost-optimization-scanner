@@ -32,12 +32,17 @@ CW_LOGS_GB_MONTH: float = 0.03
 CW_CUSTOM_METRIC_TIER_1: float = 0.30
 CW_CUSTOM_METRIC_TIER_2: float = 0.10
 CW_CUSTOM_METRIC_TIER_3: float = 0.05
+CW_CUSTOM_METRIC_TIER_4: float = 0.02
 CW_CUSTOM_METRIC_TIER_1_LIMIT: int = 10_000
 CW_CUSTOM_METRIC_TIER_2_LIMIT: int = 250_000
+CW_CUSTOM_METRIC_TIER_3_LIMIT: int = 1_000_000
 
 # Tiered custom-metric rates re-verified against the AWS Pricing API on
 # 2026-06-27 (AmazonCloudWatch SKU KG586CTNGQ4VRZKZ, usagetype
-# CW:MetricMonitorUsage): $0.30 first 10k / $0.10 to 250k / $0.05 to 1M.
+# CW:MetricMonitorUsage): $0.30 first 10k / $0.10 to 250k / $0.05 to 1M /
+# $0.02 above 1M. The 4th tier was previously observed but never coded, so
+# tier_3 covered everything above 250k at $0.05 — overstating the marginal
+# rate (and the saving) for any account with >1M custom metrics (monitoring L2).
 
 # A custom metric that published NO datapoints over this trailing window is
 # treated as stale (removable). Drives the H3 removable quantity from a
@@ -60,8 +65,12 @@ def _cw_custom_metrics_monthly_cost(count: int) -> float:
         0,
         min(count, CW_CUSTOM_METRIC_TIER_2_LIMIT) - CW_CUSTOM_METRIC_TIER_1_LIMIT,
     ) * CW_CUSTOM_METRIC_TIER_2
-    tier_3 = max(0, count - CW_CUSTOM_METRIC_TIER_2_LIMIT) * CW_CUSTOM_METRIC_TIER_3
-    return tier_1 + tier_2 + tier_3
+    tier_3 = max(
+        0,
+        min(count, CW_CUSTOM_METRIC_TIER_3_LIMIT) - CW_CUSTOM_METRIC_TIER_2_LIMIT,
+    ) * CW_CUSTOM_METRIC_TIER_3
+    tier_4 = max(0, count - CW_CUSTOM_METRIC_TIER_3_LIMIT) * CW_CUSTOM_METRIC_TIER_4
+    return tier_1 + tier_2 + tier_3 + tier_4
 
 
 def _stale_custom_metric_counts(

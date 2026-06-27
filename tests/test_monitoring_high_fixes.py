@@ -187,6 +187,19 @@ def test_never_expiring_logs_is_zero_advisory() -> None:
 # --------------------------------------------------------------------------- #
 # monitoring H3 — removable quantity is measured staleness, never count//2
 # --------------------------------------------------------------------------- #
+def test_custom_metric_cost_applies_fourth_tier_above_1m() -> None:
+    # monitoring L2: the 4th tier ($0.02 above 1M) caps the marginal rate; the
+    # old 3-tier code charged everything above 250k at $0.05, overstating cost.
+    assert _cw_custom_metrics_monthly_cost(5_000) == pytest.approx(1_500.0)
+    assert _cw_custom_metrics_monthly_cost(250_000) == pytest.approx(27_000.0)
+    # 3k + 24k + 750k*0.05 = 64,500 at exactly 1M.
+    assert _cw_custom_metrics_monthly_cost(1_000_000) == pytest.approx(64_500.0)
+    # 64,500 + 1,000,000*0.02 = 84,500 at 2M (NOT the old 114,500).
+    assert _cw_custom_metrics_monthly_cost(2_000_000) == pytest.approx(84_500.0)
+    old_flat_tier3 = 27_000.0 + (2_000_000 - 250_000) * 0.05  # 114,500
+    assert _cw_custom_metrics_monthly_cost(2_000_000) < old_flat_tier3
+
+
 def test_unused_custom_metrics_counts_only_stale_metrics() -> None:
     metrics = _custom_metrics("MyApp", 120)
     # 40 active (m0..m39) → 80 stale.
