@@ -44,11 +44,17 @@ class TestEvidenceGatedSavingsClasses:
     """Audit S3-B — only transition-gap classes are savings-eligible."""
 
     def test_gap_classes_are_the_transitionable_ones(self):
+        # S3-N4: a bucket that already has a lifecycle policy ("intelligent_tiering"
+        # class) is excluded — its existing rule may already transition the bytes,
+        # so crediting the full Standard->IA delta would overstate the saving.
         assert _GAP_OPPORTUNITY_CLASSES == {
             "both_missing",
             "lifecycle_missing",
-            "intelligent_tiering",
         }
+
+    def test_intelligent_tiering_is_not_a_gap_class(self):
+        # S3-N4: existing-lifecycle buckets must not receive the IA-delta saving.
+        assert "intelligent_tiering" not in _GAP_OPPORTUNITY_CLASSES
 
     def test_static_website_is_not_a_gap_class(self):
         assert "static_website" not in _GAP_OPPORTUNITY_CLASSES

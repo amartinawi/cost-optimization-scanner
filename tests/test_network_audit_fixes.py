@@ -289,6 +289,43 @@ def test_eip_fallback_region_scaled() -> None:
     assert parse_dollar_savings(rec["EstimatedSavings"]) == pytest.approx(FALLBACK_EIP_MONTH * 2.0)
 
 
+def _eng_eip(rate: float = 3.65) -> SimpleNamespace:
+    return SimpleNamespace(get_eip_monthly_price=lambda: rate)
+
+
+def test_net03_stopped_instance_eips_not_double_counted() -> None:
+    # NET-03: two EIPs on a STOPPED instance are counted once (in
+    # eips_on_stopped_instances); the instance must NOT also appear under
+    # multiple_eips_per_instance (which would attribute $3.65/EIP twice).
+    addresses = [
+        {"AllocationId": "eipalloc-1", "PublicIp": "1.1.1.1", "InstanceId": "i-stopped"},
+        {"AllocationId": "eipalloc-2", "PublicIp": "1.1.1.2", "InstanceId": "i-stopped"},
+    ]
+    instances_pages = [
+        {"Reservations": [{"Instances": [{"InstanceId": "i-stopped", "State": {"Name": "stopped"}}]}]}
+    ]
+    ec2 = _FakeEc2(addresses=addresses, instances_pages=instances_pages)
+    out = get_elastic_ip_checks(_ctx(ec2, pricing_engine=_eng_eip()))
+    assert len(out["eips_on_stopped_instances"]) == 2
+    assert out["multiple_eips_per_instance"] == []  # excluded — no double count
+
+
+def test_net03_running_instance_multiple_eips_still_flagged() -> None:
+    # Contrast: a RUNNING instance with >1 EIP is NOT on the stopped list, so the
+    # multiple-EIPs lever still fires (the dedup only suppresses stopped ones).
+    addresses = [
+        {"AllocationId": "eipalloc-1", "PublicIp": "1.1.1.1", "InstanceId": "i-run"},
+        {"AllocationId": "eipalloc-2", "PublicIp": "1.1.1.2", "InstanceId": "i-run"},
+    ]
+    instances_pages = [
+        {"Reservations": [{"Instances": [{"InstanceId": "i-run", "State": {"Name": "running"}}]}]}
+    ]
+    ec2 = _FakeEc2(addresses=addresses, instances_pages=instances_pages)
+    out = get_elastic_ip_checks(_ctx(ec2, pricing_engine=_eng_eip()))
+    assert out["eips_on_stopped_instances"] == []
+    assert len(out["multiple_eips_per_instance"]) == 1
+
+
 def test_nat_fallback_region_scaled() -> None:
     from core.pricing_engine import FALLBACK_NAT_MONTH
 

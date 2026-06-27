@@ -104,10 +104,14 @@ S3_INTELLIGENT_TIERING_MONITORING_FEE: float = 0.0025
 # rather than inventing a dollar figure.
 COLD_LOOKBACK_DAYS: int = 30
 
-# Opportunity classes that represent a transition gap a lifecycle policy or
-# Intelligent-Tiering could close (and therefore may carry real savings).
+# Opportunity classes that represent a transition gap a NEW lifecycle policy
+# could close (and therefore may carry real savings). A bucket that already has
+# a lifecycle policy (the "intelligent_tiering" class: has_lifecycle=True,
+# has_tiering=False) is excluded — its existing rule may already be performing
+# the transition, so crediting the full Standard->Standard-IA delta would
+# overstate / double-count the saving (network_cost / s3 S3-N4).
 _GAP_OPPORTUNITY_CLASSES: frozenset[str] = frozenset(
-    {"both_missing", "lifecycle_missing", "intelligent_tiering"}
+    {"both_missing", "lifecycle_missing"}
 )
 
 # Bucket-error classifier — used by all bucket-level S3 calls to route
