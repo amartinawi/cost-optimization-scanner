@@ -14,6 +14,7 @@ from typing import Any
 
 from core.contracts import GroupingSpec, ServiceFindings, SourceBlock, StatCardSpec
 from services._base import BaseServiceModule
+from services._savings import mark_zero_savings_advisory
 
 SPOT_SAVINGS_RATE: float = 0.70
 HOURS_PER_MONTH: int = 730
@@ -153,17 +154,35 @@ def _check_idle_endpoints(
             # re-multiply by pricing_multiplier (would double-count).
             _ = pricing_multiplier
             instance_monthly = _get_instance_monthly(ctx, instance_type)
+            if instance_monthly <= 0:
+                # No region-correct price (Pricing API unavailable or unknown
+                # instance type) — abstain instead of emitting a $0 "Delete
+                # endpoint" placeholder that would inflate the rec count and
+                # dollar total (sagemaker C2). Mirrors the skip the spot and
+                # consolidation checks already apply.
+                continue
 
             recs.append(
                 {
                     "endpoint_name": name,
                     "instance_type": instance_type,
                     "check_category": "Idle Endpoints",
+                    "Counted": True,
                     "current_value": f"Endpoint '{name}' ({instance_type}) has 0 invocations in {IDLE_ENDPOINT_DAYS} days",
                     "recommended_value": "Delete endpoint or reduce instance count",
-                    "monthly_savings": round(instance_monthly, 2),
+                    "EstimatedMonthlySavings": round(instance_monthly, 2),
+                    "EstimatedSavings": f"${instance_monthly:,.2f}/month",
                     "reason": f"SageMaker endpoint '{name}' is active but received zero invocations "
                     f"in the last {IDLE_ENDPOINT_DAYS} days",
+                    "AuditBasis": {
+                        "rate": "AmazonSageMaker Hosting on-demand instance-hour, region-correct via "
+                        "PricingEngine (e.g. ml.m5.xlarge us-east-1 = $0.23/hr -> $167.90/mo; "
+                        "live-validated 2026-06-27)",
+                        "region": getattr(ctx, "region", "unknown"),
+                        "metric_window": f"{IDLE_ENDPOINT_DAYS}d AWS/SageMaker Invocations Sum == 0",
+                        "formula": "full endpoint instance monthly = instance_monthly_price (delete idle endpoint)",
+                        "instance_monthly": round(instance_monthly, 2),
+                    },
                 }
             )
         except Exception:
@@ -199,16 +218,34 @@ def _check_idle_notebooks(
 
             instance_monthly = _get_instance_monthly(ctx, instance_type)
 
+            # Every InService notebook was previously flagged idle and counted at
+            # full monthly cost with zero idle evidence — most notebooks are
+            # intentionally left running. Demote to $0 advisory: count only when
+            # proven idle (LastModifiedTime age or a CW agent metric), which is
+            # not available at scan time (sagemaker C1).
             recs.append(
                 {
                     "notebook_name": name,
                     "instance_type": instance_type,
                     "check_category": "Idle Notebooks",
-                    "current_value": f"Notebook '{name}' ({instance_type}) is running",
-                    "recommended_value": "Stop or delete idle notebook instance",
-                    "monthly_savings": round(instance_monthly, 2),
-                    "reason": f"SageMaker notebook '{name}' ({instance_type}) is running; "
-                    f"consider stopping if not actively in use",
+                    "Counted": False,
+                    "current_value": f"Notebook '{name}' ({instance_type}) is InService",
+                    "recommended_value": "Stop or delete if not actively in use",
+                    "EstimatedMonthlySavings": 0.0,
+                    "EstimatedSavings": (
+                        f"$0.00/month — advisory: notebook running (~${instance_monthly:.2f}/mo); "
+                        f"verify idle before stopping"
+                    ),
+                    "reason": (
+                        f"SageMaker notebook '{name}' ({instance_type}) is running "
+                        f"(~${instance_monthly:.2f}/mo); verify idle via "
+                        f"LastModifiedTime age before stopping"
+                    ),
+                    "AuditBasis": {
+                        "instance_monthly": round(instance_monthly, 2),
+                        "unmeasured_inputs": ["last_modified_age", "cw_idle_signal"],
+                        "reason": "not proven idle; advisory per cost-scope rule",
+                    },
                 }
             )
         except Exception:
@@ -283,18 +320,38 @@ def _check_spot_training(
             if savings < 0.50:
                 continue
 
+            # sagemaker H1 — a completed training job's Spot saving is a
+            # ONE-TIME per-run figure (speculative future spend if the job is
+            # re-run with Managed Spot enabled), not a recurring monthly cost.
+            # Summing it into the monthly headline overstates savings and
+            # compounds across historical jobs. Emit it as a $0 advisory
+            # (Counted=False) and label the figure "per-run, one-time".
             recs.append(
                 {
                     "job_name": job_name,
                     "instance_type": instance_type,
                     "training_hours": round(training_hours, 1),
                     "check_category": "Spot Training",
+                    "Counted": False,
                     "current_value": f"Training job '{job_name}' ran {training_hours:.1f}h on-demand ({instance_type})",
                     "recommended_value": "Enable Managed Spot Training for similar future jobs",
-                    "monthly_savings": round(savings, 2),
+                    "EstimatedMonthlySavings": 0.0,
+                    "EstimatedSavings": (
+                        f"$0.00/month — advisory: ~${savings:.2f} per-run, one-time "
+                        f"(speculative future spend, not a recurring monthly saving)"
+                    ),
                     "reason": f"Training job '{job_name}' ran {training_hours:.1f}h on-demand; "
-                    f"Spot Training could save ~{SPOT_SAVINGS_RATE:.0%} "
-                    f"(${savings:.2f} per equivalent run)",
+                    f"Managed Spot Training could save ~{SPOT_SAVINGS_RATE:.0%} "
+                    f"(~${savings:.2f} per equivalent run, one-time — not summed into the monthly headline)",
+                    "AuditBasis": {
+                        "rate": f"SPOT_SAVINGS_RATE={SPOT_SAVINGS_RATE} of on-demand run cost "
+                        f"(Managed Spot Training; AWS advertises up to 90%, 0.70 is a conservative documented constant)",
+                        "training_hours": round(training_hours, 1),
+                        "hourly_rate": round(hourly_rate, 4),
+                        "on_demand_run_cost": round(on_demand_cost, 2),
+                        "per_run_savings": round(savings, 2),
+                        "basis": "one-time per-run saving; speculative future spend; advisory $0 (Counted=False)",
+                    },
                 }
             )
         except Exception:
@@ -307,10 +364,20 @@ def _check_multi_model_consolidation(
     sm: Any,
     ctx: Any,
     pricing_multiplier: float,
+    idle_endpoint_names: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     recs: list[dict[str, Any]] = []
     endpoints = _list_endpoints(sm)
-    active = [ep for ep in endpoints if ep.get("EndpointStatus") == "InService"]
+    # sagemaker H2 — an idle endpoint is already counted at full cost for
+    # deletion; excluding it from the consolidation grouping population
+    # prevents the same compute being counted a second time as a
+    # consolidation saving.
+    idle_names = idle_endpoint_names or set()
+    active = [
+        ep
+        for ep in endpoints
+        if ep.get("EndpointStatus") == "InService" and ep.get("EndpointName", "") not in idle_names
+    ]
 
     instance_groups: dict[str, list[dict[str, Any]]] = {}
     for ep in active:
@@ -354,11 +421,22 @@ def _check_multi_model_consolidation(
                 "endpoint_count": len(group),
                 "endpoints": ", ".join(endpoint_names[:5]),
                 "check_category": "Consolidation",
+                "Counted": True,
                 "current_value": f"{len(group)} endpoints using {instance_type}",
-                "recommended_value": f"Consolidate into fewer multi-model endpoints",
-                "monthly_savings": round(savings, 2),
-                "reason": f"{len(group)} SageMaker endpoints use {instance_type}; "
+                "recommended_value": "Consolidate into fewer multi-model endpoints",
+                "EstimatedMonthlySavings": round(savings, 2),
+                "EstimatedSavings": f"${savings:,.2f}/month",
+                "reason": f"{len(group)} active (non-idle) SageMaker endpoints use {instance_type}; "
                 f"consolidating onto multi-model endpoints could save ~{CONSOLIDATION_SAVINGS_RATE:.0%}",
+                "AuditBasis": {
+                    "rate": "AmazonSageMaker Hosting on-demand instance-hour, region-correct via PricingEngine",
+                    "region": getattr(ctx, "region", "unknown"),
+                    "factor": CONSOLIDATION_SAVINGS_RATE,
+                    "formula": "(endpoint_count - 1) * instance_monthly * CONSOLIDATION_SAVINGS_RATE; "
+                    "idle endpoints excluded from the group so idle compute is not double-counted (sagemaker H2)",
+                    "instance_monthly": round(instance_monthly, 2),
+                    "endpoint_count": len(group),
+                },
             }
         )
 
@@ -408,14 +486,26 @@ class SageMakerModule(BaseServiceModule):
         idle_ep_recs, active_ep_count = _check_idle_endpoints(sm, cw, ctx, multiplier, fast_mode)
         notebook_recs, notebook_count = _check_idle_notebooks(sm, ctx, multiplier)
         spot_recs = _check_spot_training(sm, ctx)
-        consolidation_recs = _check_multi_model_consolidation(sm, ctx, multiplier)
+        # sagemaker H2 — feed the idle-endpoint names into consolidation so an
+        # idle endpoint (already counted at full cost for deletion) is excluded
+        # from the consolidation grouping and never counted twice.
+        idle_endpoint_names = {r["endpoint_name"] for r in idle_ep_recs}
+        consolidation_recs = _check_multi_model_consolidation(sm, ctx, multiplier, idle_endpoint_names)
 
         all_recs = idle_ep_recs + notebook_recs + spot_recs + consolidation_recs
-        total_savings = sum(r.get("monthly_savings", 0.0) for r in all_recs)
+
+        # sagemaker C2 — gate any $0 rec as advisory (Counted=False) so $0
+        # placeholders are excluded from BOTH the dollar total and the counted
+        # rec count. counted == rendered: total sums only Counted!=False recs.
+        mark_zero_savings_advisory(all_recs, lambda r: r.get("EstimatedMonthlySavings", 0.0))
+        total_savings = sum(
+            r.get("EstimatedMonthlySavings", 0.0) for r in all_recs if r.get("Counted") is not False
+        )
+        total_recs = sum(1 for r in all_recs if r.get("Counted") is not False)
 
         return ServiceFindings(
             service_name="SageMaker",
-            total_recommendations=len(all_recs),
+            total_recommendations=total_recs,
             total_monthly_savings=round(total_savings, 2),
             sources={
                 "idle_endpoints": SourceBlock(

@@ -936,10 +936,47 @@ def get_auto_scaling_checks(ctx: ScanContext) -> dict[str, Any]:
     return {"recommendations": recommendations, **checks}
 
 
+def _tag_heuristic_savings(
+    savings: float,
+    counted_suffix: str,
+    corroborated: bool,
+) -> tuple[str, dict[str, Any]]:
+    """Build the ``EstimatedSavings`` string + extra rec fields for a tag heuristic.
+
+    ec2 H2 — the cron / batch / instance-store / non-prod findings are inferred
+    from Name/Environment tags alone and carry no usage evidence. Their
+    blanket-factor dollar (``EC2_SAVINGS_FACTORS``) is only counted when the same
+    instance is corroborated by the CloudWatch idle/low-CPU signal the rightsizing
+    checks already gather. Otherwise the rec is a ``$0.00`` advisory
+    (``Counted=False``) that still renders as a visible architectural nudge — the
+    speculative figure is preserved in ``AdvisoryEstimate`` — but is never summed
+    into the EC2 headline. This avoids both fabricating dollars on well-utilized
+    (or unmeasured) instances and double-counting against the idle/rightsizing
+    lever that already owns a corroborated instance.
+
+    Args:
+        savings: The factor-based monthly saving (``$/mo``) if the lever applied.
+        counted_suffix: Trailing clause for the counted ``EstimatedSavings`` text.
+        corroborated: Whether the instance shows measured low utilization.
+
+    Returns:
+        ``(estimated_savings_string, extra_rec_fields)`` — ``extra_rec_fields`` is
+        empty when counted, or ``{"Counted": False, "AdvisoryEstimate": ...}``
+        when advisory.
+    """
+    if corroborated:
+        return f"${savings:.2f}/month {counted_suffix}", {}
+    return (
+        "$0.00/month — advisory: tag-based heuristic, no CloudWatch utilization evidence",
+        {"Counted": False, "AdvisoryEstimate": round(savings, 2)},
+    )
+
+
 def get_advanced_ec2_checks(
     ctx: ScanContext,
     pricing_multiplier: float,
     fast_mode: bool,
+    corroborated_ids: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
     """Category 6: EC2 Advanced optimization checks.
 
@@ -948,10 +985,25 @@ def get_advanced_ec2_checks(
     Batch are mutually exclusive (an instance matches at most one), and Spot
     instances are excluded.
 
+    ec2 H2 — the four tag-based levers (cron, batch, instance-store, non-prod)
+    only emit a **counted** dollar when their instance id is in
+    ``corroborated_ids`` (the set the adapter derives from the CloudWatch
+    idle/low-CPU rightsizing findings). Without that evidence each is demoted to
+    a ``$0.00`` ``Counted=False`` advisory that still renders. Spot migration is
+    unaffected — its saving is the live on-demand minus Spot price, not a factor.
+
     Volume sizing is intentionally NOT handled here: it is owned by the EBS
     adapter (AWS Compute Optimizer volume rightsizing + gp2→gp3), so emitting a
     root-volume resize from EC2 would double-count the same dollars across the
     EC2 and EBS tabs and lacked disk-utilization evidence.
+
+    Args:
+        ctx: ScanContext with clients and pricing data.
+        pricing_multiplier: Regional pricing multiplier (fallback paths only).
+        fast_mode: When True the adapter passes an empty ``corroborated_ids`` (no
+            CloudWatch evidence is gathered), so every tag lever is advisory.
+        corroborated_ids: Instance ids with measured low utilization, used to gate
+            the four tag levers from advisory to counted.
     """
     ec2 = ctx.client("ec2")
     checks: dict[str, list[dict[str, Any]]] = {
@@ -1004,6 +1056,9 @@ def get_advanced_ec2_checks(
                             ctx, instance_type, "Cron Job Instances", os_name, license_model
                         )
                         if cron_savings > 0:
+                            est, extra = _tag_heuristic_savings(
+                                cron_savings, "with serverless equivalent", instance_id in corroborated_ids
+                            )
                             checks["cron_job_instances"].append(
                                 {
                                     "InstanceId": instance_id,
@@ -1011,9 +1066,10 @@ def get_advanced_ec2_checks(
                                     "OS": os_name,
                                     "Name": name,
                                     "Recommendation": ("Consider Lambda, EventBridge, or Batch for cron jobs"),
-                                    "EstimatedSavings": f"${cron_savings:.2f}/month with serverless equivalent",
+                                    "EstimatedSavings": est,
                                     "PricingBasis": cron_basis,
                                     "CheckCategory": "Cron Job Instances",
+                                    **extra,
                                 }
                             )
                     elif is_batch:
@@ -1021,6 +1077,9 @@ def get_advanced_ec2_checks(
                             ctx, instance_type, "Batch Job Instances", os_name, license_model
                         )
                         if batch_savings > 0:
+                            est, extra = _tag_heuristic_savings(
+                                batch_savings, "with Spot in Batch", instance_id in corroborated_ids
+                            )
                             checks["batch_job_instances"].append(
                                 {
                                     "InstanceId": instance_id,
@@ -1028,9 +1087,10 @@ def get_advanced_ec2_checks(
                                     "OS": os_name,
                                     "Name": name,
                                     "Recommendation": ("Consider AWS Batch with Spot instances for batch workloads"),
-                                    "EstimatedSavings": f"${batch_savings:.2f}/month with Spot in Batch",
+                                    "EstimatedSavings": est,
                                     "PricingBasis": batch_basis,
                                     "CheckCategory": "Batch Job Instances",
+                                    **extra,
                                 }
                             )
 
@@ -1049,6 +1109,9 @@ def get_advanced_ec2_checks(
                             ctx, instance_type, "Underutilized Instance Store", os_name, license_model
                         )
                         if store_savings > 0:
+                            est, extra = _tag_heuristic_savings(
+                                store_savings, "with non-storage equivalent", instance_id in corroborated_ids
+                            )
                             checks["underutilized_instance_store"].append(
                                 {
                                     "InstanceId": instance_id,
@@ -1061,9 +1124,10 @@ def get_advanced_ec2_checks(
                                         " consider non-storage optimized"
                                         " type"
                                     ),
-                                    "EstimatedSavings": f"${store_savings:.2f}/month with non-storage equivalent",
+                                    "EstimatedSavings": est,
                                     "PricingBasis": store_basis,
                                     "CheckCategory": ("Underutilized Instance Store"),
+                                    **extra,
                                 }
                             )
 
@@ -1075,6 +1139,9 @@ def get_advanced_ec2_checks(
                             ctx, instance_type, "Non-Prod Scheduling", os_name, license_model
                         )
                         if sched_savings > 0:
+                            est, extra = _tag_heuristic_savings(
+                                sched_savings, "with an off-hours schedule", instance_id in corroborated_ids
+                            )
                             checks["nonprod_scheduling"].append(
                                 {
                                     "InstanceId": instance_id,
@@ -1086,9 +1153,10 @@ def get_advanced_ec2_checks(
                                         "Non-production instance runs 24/7 - schedule stop/start"
                                         " outside business hours (e.g. via Instance Scheduler)"
                                     ),
-                                    "EstimatedSavings": f"${sched_savings:.2f}/month with an off-hours schedule",
+                                    "EstimatedSavings": est,
                                     "PricingBasis": sched_basis,
                                     "CheckCategory": "Non-Prod Scheduling",
+                                    **extra,
                                 }
                             )
 

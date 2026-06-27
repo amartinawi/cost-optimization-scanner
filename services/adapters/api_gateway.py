@@ -40,6 +40,15 @@ class ApiGatewayModule(BaseServiceModule):
         result = get_enhanced_api_gateway_checks(ctx)
         recs = result.get("recommendations", [])
 
+        # A rec with no quantified saving (e.g. monthly_requests == 0 in fast
+        # mode or a throttled CW read) is advisory, not counted — mark it so the
+        # card renders under "advisory" rather than "counted" (api_gateway C1
+        # label; zero dollar impact now that the SR-2 flat-$50 fabrication is
+        # gone, but keeps the counted/advisory split honest).
+        for rec in recs:
+            if (rec.get("EstimatedMonthlySavings", 0.0) or 0.0) <= 0:
+                rec["Counted"] = False
+
         savings = sum(rec.get("EstimatedMonthlySavings", 0.0) for rec in recs) * ctx.pricing_multiplier
 
         return ServiceFindings(

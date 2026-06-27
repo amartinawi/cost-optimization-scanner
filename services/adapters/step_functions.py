@@ -8,6 +8,16 @@ from core.contracts import ServiceFindings, SourceBlock
 from services._base import BaseServiceModule
 from services.step_functions import STEP_FUNCTIONS_OPTIMIZATION_DESCRIPTIONS, get_enhanced_step_functions_checks
 
+# Documented Step Functions rates (us-east-1; not in the AWS Pricing API — these
+# are the stable public OnDemand rates). Recorded so the advisory AuditBasis is
+# defensible; no counted dollar is derived from them because the Express side of
+# the Standard→Express delta (per GB-s = duration × memory consumed) cannot be
+# measured at scan time — Step Functions publishes no CloudWatch metric for
+# states-per-execution or memory consumed. (step_functions C1)
+SF_STANDARD_PER_1K_TRANSITIONS: float = 0.025
+SF_EXPRESS_PER_M_REQUESTS: float = 1.0
+SF_EXPRESS_PER_GB_SECOND: float = 0.00001667
+
 
 class StepFunctionsModule(BaseServiceModule):
     """ServiceModule adapter for Step Functions. CloudWatch state-transition savings strategy."""
@@ -26,9 +36,16 @@ class StepFunctionsModule(BaseServiceModule):
     def scan(self, ctx: Any) -> ServiceFindings:
         """Scan Step Functions state machines for cost optimization opportunities.
 
-        Consults enhanced Step Functions checks. Savings calculated via
-        CloudWatch ExecutionsStarted metrics with $0.025/1K state transitions
-        pricing (Standard→Express migration, 60% cost reduction).
+        Consults enhanced Step Functions checks. The Standard→Express lever is
+        emitted as a **$0 advisory** (``Counted=False``): Express bills per
+        request + GB-s (duration × memory consumed), but Step Functions exposes
+        no CloudWatch metric for states-per-execution or memory consumed, so the
+        delta cannot be quantified from evidence at scan time. The previous
+        ``eligible_for_migration`` gate (``state_count > 25 and avg_duration <
+        60``) was fed by fields no producer ever set, so the counted block was
+        structurally dead and the tab was always $0 — which in turn triggered
+        the reporter's flat-$50 fabrication (SR-2). Emitting an honest $0
+        advisory removes the fabrication trigger (step_functions C1).
 
         Args:
             ctx: ScanContext with region, clients, and pricing data.
@@ -39,66 +56,33 @@ class StepFunctionsModule(BaseServiceModule):
         result = get_enhanced_step_functions_checks(ctx)
         recs = result.get("recommendations", [])
 
-        STEP_FUNCTIONS_PER_1K_TRANSITIONS = 0.025
-        AVG_STATES_PER_EXECUTION = 5
-
-        savings = 0.0
         for rec in recs:
-            if not ctx.fast_mode:
-                state_machine_arn = rec.get("StateMachineArn", "")
-                monthly_executions = rec.get("MonthlyExecutions", 0)
+            # Advisory only: render the high-volume flag without a fabricated $.
+            rec["Counted"] = False
+            rec["EstimatedMonthlySavings"] = 0.0
+            rec["EstimatedSavings"] = (
+                "$0.00/month — advisory: Standard→Express migration savings are "
+                "execution-shape dependent (Express = $1.0/M requests + "
+                "$0.00001667/GB-s vs Standard $0.025/1K transitions) and cannot "
+                "be quantified without states-per-execution and memory-consumed "
+                "data, which Step Functions does not expose."
+            )
+            rec["AuditBasis"] = {
+                "rate_source": "documented Step Functions OnDemand rates (not in Pricing API)",
+                "standard_rate_per_1k_transitions": SF_STANDARD_PER_1K_TRANSITIONS,
+                "express_rate_per_m_requests": SF_EXPRESS_PER_M_REQUESTS,
+                "express_rate_per_gb_second": SF_EXPRESS_PER_GB_SECOND,
+                "unmeasured_inputs": ["states_per_execution", "memory_consumed_gb"],
+                "reason": "delta underdetermined — advisory per cost-scope rule",
+            }
 
-                if monthly_executions <= 0:
-                    try:
-                        from datetime import datetime, timedelta, timezone
-
-                        cw = ctx.client("cloudwatch")
-                        end = datetime.now(timezone.utc)
-                        start = end - timedelta(days=30)
-                        resp = cw.get_metric_statistics(
-                            Namespace="AWS/States",
-                            MetricName="ExecutionsStarted",
-                            Dimensions=[{"Name": "StateMachineArn", "Value": state_machine_arn}]
-                            if state_machine_arn
-                            else [],
-                            StartTime=start,
-                            EndTime=end,
-                            Period=2592000,
-                            Statistics=["Sum"],
-                        )
-                        monthly_executions = sum(dp["Sum"] for dp in resp.get("Datapoints", []))
-                    except Exception:
-                        monthly_executions = 0
-
-                state_count = rec.get("StateCount", AVG_STATES_PER_EXECUTION)
-                avg_duration_sec = rec.get("AvgDurationSec", 0)
-                eligible_for_migration = state_count > 25 and avg_duration_sec < 60
-
-                if monthly_executions > 0:
-                    monthly_transitions = monthly_executions * AVG_STATES_PER_EXECUTION
-                    if eligible_for_migration:
-                        # Standard→Express savings approximated as 60% of
-                        # Standard transition cost. Express has a different
-                        # pricing model ($1/M requests + GB-s duration), but
-                        # the 60% midpoint is a documented upper-bound for
-                        # short workflows. NOTE: real savings can be 95%+ for
-                        # short executions or negative for long ones; this
-                        # rec is conservative.
-                        savings += (
-                            (monthly_transitions / 1000)
-                            * STEP_FUNCTIONS_PER_1K_TRANSITIONS
-                            * 0.60
-                            * ctx.pricing_multiplier
-                        )
-                # Idle state machines incur NO AWS charges (Step Functions
-                # bills only per state transition for Standard, per
-                # request+duration for Express). Previous $150 fabricated
-                # fallback removed — emitting 0 is the only honest value.
-
+        # Idle state machines incur NO AWS charges (Step Functions bills only per
+        # state transition for Standard, per request+duration for Express), so $0
+        # is the only honest tab total until evidence-backed pricing is wired.
         return ServiceFindings(
             service_name="Step Functions",
             total_recommendations=len(recs),
-            total_monthly_savings=savings,
+            total_monthly_savings=0.0,
             sources={"enhanced_checks": SourceBlock(count=len(recs), recommendations=tuple(recs))},
             optimization_descriptions=STEP_FUNCTIONS_OPTIMIZATION_DESCRIPTIONS,
         )

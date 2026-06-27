@@ -7,7 +7,7 @@ Shared infrastructure for the AWS Cost Optimization Scanner. Adapters depend on 
 | File | Lines | Purpose |
 |------|-------|---------|
 | `contracts.py` | 188 | `ServiceModule` Protocol, `ServiceFindings`, `SourceBlock`, `StatCardSpec`, `GroupingSpec`, `Group`, `WarningRecord`, `PermissionIssueRecord` |
-| `pricing_engine.py` | 517 | AWS Pricing API client with `PricingCache` (6-hour TTL). 12 public methods |
+| `pricing_engine.py` | ~1800 | AWS Pricing API client with `PricingCache` (6-hour TTL) + `for_region()` region-scoped sibling engines. 30+ public pricing methods (the table below is a representative subset — see the source for the full list incl. EFS/FSx/Fargate/EKS/Aurora/SageMaker/MSK/ECR) |
 | `scan_context.py` | 72 | `ScanContext` — region, account, clients, `pricing_engine`, `fast_mode`, `pricing_multiplier` |
 | `scan_orchestrator.py` | 143 | `ScanOrchestrator`, `safe_scan` — iterates modules, pre-fetches AWS Cost Optimization Hub recommendations and buckets them into `ctx.cost_hub_splits` for per-service adapters to consume (replaces the retired aggregate CoH tab) |
 | `result_builder.py` | 70 | `ScanResultBuilder` — serializes `ServiceFindings` to JSON dict |
@@ -28,13 +28,12 @@ Centralized AWS Pricing API access. Key design:
 
 | Method | Service | Returns |
 |--------|---------|---------|
-| `get_ec2_instance_monthly_price(instance_type)` | AmazonEC2 | Monthly on-demand price |
+| `get_ec2_hourly_price(instance_type, os, license_model)` | AmazonEC2 | OS/license-aware hourly on-demand price |
 | `get_ebs_monthly_price_per_gb(volume_type)` | AmazonEC2 | $/GB/month for EBS |
-| `get_rds_instance_monthly_price(engine, instance_class)` | AmazonRDS | Monthly on-demand price |
+| `get_rds_instance_monthly_price(engine, instance_class, multi_az, license_model)` | AmazonRDS | Monthly on-demand price (edition/license/AZ-pinned) |
 | `get_rds_monthly_storage_price_per_gb(storage_type, *, multi_az=False)` | AmazonRDS | $/GB/month storage, AZ-aware |
 | `get_s3_monthly_price_per_gb(storage_class)` | AmazonS3 | $/GB/month for storage class |
-| `get_elasticache_node_monthly_price(engine, node_type)` | AmazonElastiCache | Monthly on-demand price |
-| `get_instance_monthly_price(service_code, instance_type)` | Generic | Generic instance lookup |
+| `get_instance_monthly_price(service_code, instance_type, *, engine=None)` | Generic | Generic instance lookup; `engine` pins the per-engine SKU for shared instance types (ElastiCache Redis/Memcached/Valkey — **SR-1**; supersedes the removed `get_elasticache_node_monthly_price`) |
 | `get_eip_monthly_price()` | AmazonVPC | Elastic IP / public IPv4 monthly cost ($3.65) |
 | `get_nat_gateway_monthly_price()` | AmazonEC2 | NAT Gateway monthly cost ($32.85) |
 | `get_vpc_endpoint_monthly_price()` | AmazonVPC | Interface endpoint monthly cost, per AZ ($7.30) |
@@ -46,8 +45,10 @@ Centralized AWS Pricing API access. Key design:
 ### Usage in Adapters
 
 ```python
-price = ctx.pricing_engine.get_ec2_instance_monthly_price("m5.xlarge")
-monthly = price * ctx.pricing_multiplier
+# PricingEngine methods already return region-correct prices — do NOT multiply
+# by pricing_multiplier again (that is for module-constant / fallback paths only).
+hourly = ctx.pricing_engine.get_ec2_hourly_price("m5.xlarge", os="Linux", license_model=None)
+monthly = hourly * 730
 ```
 
 

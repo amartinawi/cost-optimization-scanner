@@ -38,31 +38,42 @@ def get_enhanced_msk_checks(ctx: ScanContext) -> dict[str, Any]:
                 state = cluster.get("State")
                 broker_node_group = cluster.get("BrokerNodeGroupInfo", {})
                 instance_type = broker_node_group.get("InstanceType")
+                num_brokers = cluster.get("NumberOfBrokerNodes", 3)
 
-                if state == "ACTIVE" and instance_type and "large" in instance_type:
-                    checks["cluster_rightsizing"].append(
-                        {
-                            "ClusterName": cluster_name,
-                            "InstanceType": instance_type,
-                            "Recommendation": (
-                                "Review cluster utilization - consider MSK Serverless for variable workloads"
-                            ),
-                            "EstimatedSavings": "$200/month potential",
-                            "CheckCategory": "Cluster Rightsizing",
-                            "Note": "Verify actual throughput and utilization before downsizing",
-                            "NumberOfBrokerNodes": cluster.get("NumberOfBrokerNodes", 3),
-                        }
-                    )
-
+                # Real per-broker provisioned EBS size (MSK reports it under
+                # BrokerNodeGroupInfo.StorageInfo.EBSStorageInfo.VolumeSize).
+                # ``0`` means MSK did not report a size — keep it falsy so the
+                # adapter omits the storage leg instead of inventing 100 GB (H3).
                 storage_info = broker_node_group.get("StorageInfo", {})
                 ebs_storage = storage_info.get("EBSStorageInfo", {})
                 volume_size = ebs_storage.get("VolumeSize", 0)
+
+                if state == "ACTIVE" and instance_type and "large" in instance_type:
+                    rightsizing_rec: dict[str, Any] = {
+                        "ClusterName": cluster_name,
+                        "InstanceType": instance_type,
+                        "Recommendation": (
+                            "Review cluster utilization - consider MSK Serverless for variable workloads"
+                        ),
+                        "EstimatedSavings": "$200/month potential",
+                        "CheckCategory": "Cluster Rightsizing",
+                        "Note": "Verify actual throughput and utilization before downsizing",
+                        "NumberOfBrokerNodes": num_brokers,
+                    }
+                    # H3: carry the real per-broker EBS volume size so the adapter
+                    # prices the storage leg from evidence, not a phantom 100 GB.
+                    # Omit the key entirely when the size is unknown.
+                    if volume_size:
+                        rightsizing_rec["BrokerStorageGB"] = volume_size
+                    checks["cluster_rightsizing"].append(rightsizing_rec)
 
                 if volume_size > 1000:
                     checks["storage_optimization"].append(
                         {
                             "ClusterName": cluster_name,
                             "VolumeSize": f"{volume_size} GB",
+                            "BrokerStorageGB": volume_size,
+                            "NumberOfBrokerNodes": num_brokers,
                             "Recommendation": "Large EBS volumes - review retention policies and consider gp3 volumes",
                             "EstimatedSavings": "20% with gp3 migration + retention optimization",
                             "CheckCategory": "MSK Storage Optimization",

@@ -6,7 +6,11 @@ from typing import Any
 
 from core.contracts import ServiceFindings, SourceBlock
 from services._base import BaseServiceModule
-from services.quicksight import QUICKSIGHT_OPTIMIZATION_DESCRIPTIONS, get_enhanced_quicksight_checks
+from services.quicksight import (
+    QUICKSIGHT_OPTIMIZATION_DESCRIPTIONS,
+    quicksight_spice_rate,
+    get_enhanced_quicksight_checks,
+)
 
 
 class QuicksightModule(BaseServiceModule):
@@ -23,45 +27,75 @@ class QuicksightModule(BaseServiceModule):
     def scan(self, ctx: Any) -> ServiceFindings:
         """Scan QuickSight SPICE capacity for cost optimization opportunities.
 
-        Consults enhanced QuickSight checks. Savings calculated via SPICE
-        capacity pricing (per-GB rates by edition) with flat-rate fallback.
+        SPICE $/GB is edition-aware (quicksight C1): Standard $0.25, Enterprise
+        $0.38 (us-east-1, live-validated SKUs R8PKSKFCHES8YSKK / T4GAEKP5WQQWCUD5).
 
-        Args:
-            ctx: ScanContext with region, clients, and pricing data.
-
-        Returns:
-            ServiceFindings with enhanced_checks SourceBlock.
+        H3 — the dollar is single-sourced here: a region-scaled value
+        (``unused_gb × quicksight_spice_rate(edition) × pricing_multiplier``) is
+        rounded once and written to BOTH ``EstimatedMonthlySavings`` (the counted
+        number) and ``EstimatedSavings`` (the card string), so the card and the
+        headline always agree in every region. The shim no longer emits a
+        competing non-region-scaled string. When the edition or used-GB cannot be
+        resolved the rec is demoted to an honest $0 advisory whose string matches
+        its number. New rec dicts are built (no in-place mutation of shim output).
         """
         result = get_enhanced_quicksight_checks(ctx)
         recs = result.get("recommendations", [])
 
-        # AWS QuickSight SPICE storage is $0.38/GB-month for BOTH Standard
-        # and Enterprise editions (verified via the QuickSight pricing page
-        # 2026-05). Previous code used $0.25 for Standard — wrong by 34%.
-        # Region-scaled via ctx.pricing_multiplier per L2.3.2.
-        SPICE_PRICE_PER_GB: float = 0.38
+        priced_recs: list[dict[str, Any]] = []
         savings = 0.0
         for rec in recs:
-            spice_price = SPICE_PRICE_PER_GB * ctx.pricing_multiplier
+            edition = rec.get("Edition", "")
             unused_gb = rec.get("UnusedSpiceCapacityGB", 0)
-            if unused_gb > 0:
-                rec_savings = unused_gb * spice_price
-                rec["EstimatedMonthlySavings"] = round(rec_savings, 2)
+            if unused_gb > 0 and edition:
+                rate = quicksight_spice_rate(edition)
+                # Single source of truth for the dollar: region-scaled, rounded
+                # once, then summed AND rendered from the same value so the
+                # counted number equals the card string (quicksight H3).
+                rec_savings = round(unused_gb * rate * ctx.pricing_multiplier, 2)
+                priced_recs.append(
+                    dict(
+                        rec,
+                        EstimatedMonthlySavings=rec_savings,
+                        EstimatedSavings=f"${rec_savings:.2f}/month ({edition} SPICE rate)",
+                        AuditBasis={
+                            "edition": edition,
+                            "rate_per_gb_month": rate,
+                            "region": getattr(ctx, "region", None),
+                            "used_gb": rec.get("UsedCapacityGB"),
+                            "total_gb": rec.get("TotalCapacityGB"),
+                            "unused_gb": unused_gb,
+                            "pricing_multiplier": ctx.pricing_multiplier,
+                            "formula": "unused_gb * rate_per_gb_month * pricing_multiplier",
+                        },
+                    )
+                )
                 savings += rec_savings
             else:
-                # No unused-capacity figure on the rec; skip rather than
-                # fabricate $30 fallback constant.
-                rec.setdefault("EstimatedMonthlySavings", 0.0)
-                rec.setdefault(
-                    "PricingWarning",
-                    "requires UnusedSpiceCapacityGB on rec for quantified savings",
+                # Edition/used-GB unknown → cannot resolve the edition-correct
+                # rate; emit an honest $0 advisory whose string matches the number.
+                advisory = dict(
+                    rec,
+                    Counted=False,
+                    EstimatedMonthlySavings=0.0,
+                    EstimatedSavings=(
+                        "$0.00/month — advisory: requires UnusedSpiceCapacityGB "
+                        "+ Edition on rec for quantified savings"
+                    ),
                 )
+                advisory.setdefault(
+                    "PricingWarning",
+                    "requires UnusedSpiceCapacityGB + Edition on rec for quantified savings",
+                )
+                priced_recs.append(advisory)
 
-        sources = {"enhanced_checks": SourceBlock(count=len(recs), recommendations=tuple(recs))}
+        sources = {
+            "enhanced_checks": SourceBlock(count=len(priced_recs), recommendations=tuple(priced_recs))
+        }
 
         return ServiceFindings(
             service_name="QuickSight",
-            total_recommendations=len(recs),
+            total_recommendations=len(priced_recs),
             total_monthly_savings=savings,
             sources=sources,
             optimization_descriptions=QUICKSIGHT_OPTIMIZATION_DESCRIPTIONS,

@@ -53,12 +53,24 @@ def get_enhanced_glue_checks(ctx: ScanContext) -> dict[str, Any]:
             status = endpoint.get("Status")
 
             if status == "READY":
+                # A READY dev endpoint bills continuously at the DPU-hour rate.
+                # Carry its own provisioned DPU footprint (WorkerType/
+                # NumberOfWorkers for modern endpoints, legacy NumberOfNodes
+                # otherwise) so the adapter prices the *actual* allocation
+                # instead of a hardcoded flat string (glue H2). The hardcoded
+                # "$316/month per endpoint" string is removed — the adapter
+                # single-sources the dollar from the DPU footprint.
                 checks["dev_endpoints"].append(
                     {
                         "EndpointName": endpoint_name,
                         "Status": status,
-                        "Recommendation": "Dev endpoints cost $0.44/hour - delete when not in use",
-                        "EstimatedSavings": "$316/month per endpoint",
+                        "WorkerType": endpoint.get("WorkerType"),
+                        "NumberOfWorkers": endpoint.get("NumberOfWorkers"),
+                        "NumberOfNodes": endpoint.get("NumberOfNodes"),
+                        "Recommendation": (
+                            "Dev endpoint billed continuously at $0.44/DPU-hour - "
+                            "delete when not in use"
+                        ),
                         "CheckCategory": "Glue Dev Endpoints",
                     }
                 )

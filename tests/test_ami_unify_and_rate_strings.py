@@ -136,7 +136,7 @@ def test_rate_strings_parse_to_zero():
     assert parse_dollar_savings("$25") == 25.0
 
 
-def test_network_rate_string_recs_marked_advisory():
+def test_network_rate_string_recs_marked_advisory(monkeypatch):
     """vpc_endpoint / NAT data-processing rate nudges are shown but not counted."""
     import services.adapters.network as net
 
@@ -144,11 +144,14 @@ def test_network_rate_string_recs_marked_advisory():
             "EstimatedSavings": "$0.01/GB data processing + NAT costs"}]
     eip = [{"AllocationId": "e1", "Recommendation": "Release EIP",
             "EstimatedSavings": "$3.65/month per EIP"}]
-    net.get_elastic_ip_checks = lambda c: {"recommendations": eip}
-    net.get_nat_gateway_checks = lambda c: {"recommendations": []}
-    net.get_vpc_endpoints_checks = lambda c: {"recommendations": vpc}
-    net.get_load_balancer_checks = lambda c: {"recommendations": []}
-    net.get_auto_scaling_checks = lambda c: {"recommendations": []}
+    # monkeypatch (not raw assignment) so these stubs auto-revert and do not leak
+    # empty network sub-shims into the rest of the session (broke the later
+    # NetworkModule scan tests in tests/test_network_lb_high_fixes.py).
+    monkeypatch.setattr(net, "get_elastic_ip_checks", lambda c: {"recommendations": eip})
+    monkeypatch.setattr(net, "get_nat_gateway_checks", lambda c: {"recommendations": []})
+    monkeypatch.setattr(net, "get_vpc_endpoints_checks", lambda c: {"recommendations": vpc})
+    monkeypatch.setattr(net, "get_load_balancer_checks", lambda c: {"recommendations": []})
+    monkeypatch.setattr(net, "get_auto_scaling_checks", lambda c: {"recommendations": []})
 
     ctx = SimpleNamespace()
     findings = net.NetworkModule().scan(ctx)

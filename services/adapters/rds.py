@@ -14,7 +14,7 @@ from services.rds import (
     get_rds_compute_optimizer_recommendations,
     get_rds_instance_count,
 )
-from services.rds_logic import resolve_rds_findings
+from services.rds_logic import normalize_rds_arn, resolve_rds_findings
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +125,20 @@ class RdsModule(BaseServiceModule):
         coh_kept, co_kept, enhanced_kept, savings, total_recs = resolve_rds_findings(
             co_recs, enhanced_recs, coh_recs=coh_recs, backup_actuals=backup_actuals
         )
+
+        # Cross-adapter dedup (rds H1 / aurora H3). Publish the normalized ids of
+        # the DB instances this tab actually counts (Cost Optimization Hub +
+        # Compute Optimizer) so the Aurora adapter — which runs after RDS and
+        # would otherwise re-count provisioned Aurora members via its own
+        # heuristic rightsizing/Graviton levers — can suppress those duplicates.
+        # Single owner: RDS (authority CoH > CO) outranks the Aurora heuristic.
+        covered_ids: set[str] = set()
+        for r in coh_kept + co_kept:
+            nid = normalize_rds_arn(r.get("resourceArn") or r.get("resourceId") or "")
+            if nid:
+                covered_ids.add(nid)
+        existing = getattr(ctx, "rds_covered_instance_ids", None)
+        ctx.rds_covered_instance_ids = (existing | covered_ids) if isinstance(existing, set) else covered_ids
 
         sources = {
             "compute_optimizer": SourceBlock(count=len(co_kept), recommendations=tuple(co_kept)),

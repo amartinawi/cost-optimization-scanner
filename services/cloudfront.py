@@ -10,6 +10,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from core.scan_context import ScanContext
+from services._aws_errors import record_aws_error
 
 
 def get_enhanced_cloudfront_checks(ctx: ScanContext) -> dict[str, Any]:
@@ -32,8 +33,25 @@ def get_enhanced_cloudfront_checks(ctx: ScanContext) -> dict[str, Any]:
         "origin_shield_unnecessary": [],
     }
 
+    # Fast mode (cloudfront H2): a --fast scan must make no per-distribution
+    # CloudWatch reads or get_distribution_config calls. Both surviving levers
+    # depend on those reads — price_class_optimization is gated on >1000 weekly
+    # `Requests` (CloudWatch), and the Origin-Shield analysis needs
+    # get_distribution_config + CacheHitRate/Requests — so without metrics there
+    # is no honest, traffic-gated recommendation to emit. We skip both per
+    # distribution and surface a single advisory notice (mirrors the Lambda /
+    # ElastiCache fast-mode guards). list_distributions itself is one cheap call.
+    fast_mode = bool(getattr(ctx, "fast_mode", False))
+
     try:
         cloudfront = ctx.client("cloudfront")
+        if fast_mode:
+            ctx.warn(
+                "Fast mode: skipped CloudFront CloudWatch reads and "
+                "get_distribution_config — price-class and Origin-Shield "
+                "analysis require traffic metrics and were not evaluated.",
+                "cloudfront",
+            )
         paginator = cloudfront.get_paginator("list_distributions")
         for page in paginator.paginate():
             for dist in page.get("DistributionList", {}).get("Items", []):
@@ -42,6 +60,12 @@ def get_enhanced_cloudfront_checks(ctx: ScanContext) -> dict[str, Any]:
                 price_class = dist.get("PriceClass", "PriceClass_All")
                 status = dist.get("Status", "Unknown")
                 enabled = dist.get("Enabled", True)
+
+                if fast_mode:
+                    # No CW / config reads in fast mode → nothing to evaluate
+                    # per distribution. Skip the metric-gated price-class block
+                    # and the get_distribution_config Origin-Shield block.
+                    continue
 
                 if price_class == "PriceClass_All" and enabled:
                     try:
@@ -77,8 +101,16 @@ def get_enhanced_cloudfront_checks(ctx: ScanContext) -> dict[str, Any]:
                                     "CheckCategory": "CloudFront Price Class Optimization",
                                 }
                             )
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        # H1 — classify the Requests read failure; a swallowed
+                        # error silently drops the only populated category for
+                        # this distribution.
+                        record_aws_error(
+                            ctx,
+                            e,
+                            service="cloudfront",
+                            context=f"cloudwatch:GetMetricStatistics Requests failed for distribution {dist_id}",
+                        )
 
                 # Disabled CloudFront distribution housekeeping finding removed: explicitly
                 # $0/month — disabled distributions incur no data-transfer cost.
@@ -124,8 +156,15 @@ def get_enhanced_cloudfront_checks(ctx: ScanContext) -> dict[str, Any]:
                                 max_per_min = max(dp["Sum"] for dp in req_dps)
                                 if max_per_min > 1000:
                                     should_check_origin_shield = True
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        # H1 — classify the CacheHitRate/Requests read failure
+                        # rather than swallowing it.
+                        record_aws_error(
+                            ctx,
+                            e,
+                            service="cloudfront",
+                            context=f"cloudwatch:GetMetricStatistics CacheHitRate/Requests failed for distribution {dist_id}",
+                        )
 
                     # Origin Shield review finding removed: "Variable based on cache hit
                     # improvement vs additional costs" — net effect can go either way.

@@ -10,6 +10,23 @@ import logging
 from typing import Any
 
 from core.scan_context import ScanContext
+from services._aws_errors import record_aws_error
+
+# Edition-aware SPICE $/GB-month (us-east-1, live-validated via AWS Pricing API
+# — quicksight C1). Enterprise SKU R8PKSKFCHES8YSKK ($0.38); Standard SKU
+# T4GAEKP5WQQWCUD5 ($0.25). The previous $0.38-for-both assumption overstated
+# Standard accounts by 52%.
+SPICE_RATE_PER_GB: dict[str, float] = {
+    "STANDARD": 0.25,
+    "ENTERPRISE": 0.38,
+}
+SPICE_RATE_DEFAULT: float = 0.38
+
+
+def quicksight_spice_rate(edition: str) -> float:
+    """SPICE $/GB-month for the account edition (quicksight C1)."""
+    return SPICE_RATE_PER_GB.get(str(edition).upper(), SPICE_RATE_DEFAULT)
+
 
 logger = logging.getLogger(__name__)
 
@@ -34,8 +51,16 @@ def get_enhanced_quicksight_checks(ctx: ScanContext) -> dict[str, Any]:
         quicksight = ctx.client("quicksight")
 
         subscription = quicksight.describe_account_subscription(AwsAccountId=ctx.account_id)
-        if subscription.get("AccountInfo", {}).get("AccountSubscriptionStatus") != "ACCOUNT_CREATED":
+        account_info = subscription.get("AccountInfo", {})
+        if account_info.get("AccountSubscriptionStatus") != "ACCOUNT_CREATED":
             return {"recommendations": [], "checks": checks}
+        # Real account edition (STANDARD / ENTERPRISE) drives the SPICE $/GB rate
+        # (quicksight C1): Standard = $0.25/GB-Mo (SKU T4GAEKP5WQQWCUD5),
+        # Enterprise = $0.38/GB-Mo (SKU R8PKSKFCHES8YSKK), both live-validated.
+        # The previous ``PurchaseMode`` source was the SPICE purchase mode, not
+        # the account edition, and the $0.38-for-both assumption overstated
+        # Standard accounts by 52%.
+        account_edition = account_info.get("Edition", "")
 
         namespaces_paginator = quicksight.get_paginator("list_namespaces")
         namespaces: list[dict[str, Any]] = []
@@ -43,16 +68,28 @@ def get_enhanced_quicksight_checks(ctx: ScanContext) -> dict[str, Any]:
             namespaces.extend(page.get("Namespaces", []))
 
         total_users = 0
+        user_enum_failed = False
         for namespace in namespaces:
             namespace_name = namespace.get("Name")
             try:
                 paginator = quicksight.get_paginator("list_users")
                 for page in paginator.paginate(AwsAccountId=ctx.account_id, Namespace=namespace_name):
                     total_users += len(page.get("UserList", []))
-            except Exception:
+            except Exception as ns_exc:
+                # H2 — record the per-namespace failure; an inability to enumerate
+                # users must not silently zero the account-level SPICE check below.
+                record_aws_error(
+                    ctx,
+                    ns_exc,
+                    service="quicksight",
+                    context=f"quicksight:ListUsers failed for namespace '{namespace_name}'",
+                )
+                user_enum_failed = True
                 continue
 
-        if total_users > 0:
+        # H2 — proceed when enumeration failed so a ListUsers permission gap does
+        # not masquerade as "0 users → no SPICE finding".
+        if total_users > 0 or user_enum_failed:
             try:
                 spice_capacity = quicksight.describe_spice_capacity(AwsAccountId=ctx.account_id)
                 capacity_config = spice_capacity.get("SpiceCapacityConfiguration", {})
@@ -68,22 +105,26 @@ def get_enhanced_quicksight_checks(ctx: ScanContext) -> dict[str, Any]:
                             "TotalCapacityGB": round(total_capacity, 2),
                             "UtilizationPercent": round((used_capacity / total_capacity) * 100, 1),
                             "UnusedSpiceCapacityGB": round(total_capacity - used_capacity, 2),
-                            "Edition": capacity_config.get("PurchaseMode", "ENTERPRISE"),
+                            "Edition": account_edition,
                             "Recommendation": (
                                 f"SPICE capacity underutilized"
                                 f" ({round(used_capacity, 1)}/{round(total_capacity, 1)}"
                                 " GB) - consider reducing"
                             ),
-                            "EstimatedSavings": (
-                                # AWS lists SPICE at $0.38/GB-mo for BOTH Standard
-                                # and Enterprise editions.
-                                f"~${(total_capacity - used_capacity) * 0.38:.0f}/month"
-                            ),
+                            # H3 — the dollar (string + number) is single-sourced in
+                            # the adapter from quicksight_spice_rate × pricing_multiplier
+                            # so the card string and the counted number always agree and
+                            # are region-scaled. The shim deliberately carries no
+                            # ``EstimatedSavings`` dollar (it had a non-region-scaled,
+                            # whole-dollar string that disagreed with the counted number
+                            # in any non-us-east-1 region).
                             "CheckCategory": "SPICE Optimization",
                         }
                     )
-            except Exception:
-                pass
+            except Exception as e:
+                # H1 — classify the SPICE-capacity read failure (the only
+                # revenue-producing QuickSight check); never swallow it.
+                record_aws_error(ctx, e, service="quicksight", context="quicksight:DescribeSpiceCapacity failed")
 
     except Exception as e:
         error_str = str(e)

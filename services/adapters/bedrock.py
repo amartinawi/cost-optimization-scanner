@@ -9,6 +9,7 @@ Analyzes Bedrock for:
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -56,11 +57,65 @@ def _list_provisioned_throughputs(bedrock: Any) -> list[dict[str, Any]]:
     return pts
 
 
-def _get_pt_invocation_sum(cw: Any, model_id: str) -> float | None:
+def _derive_model_id(pt: dict[str, Any]) -> str:
+    """Foundation model id backing a Provisioned Throughput (bedrock C1).
+
+    The botocore ``ProvisionedModelSummary`` shape has **no** ``modelId``
+    member (members are ``foundationModelArn`` / ``currentModelArn`` /
+    ``modelArn`` / ``desiredModelArn`` / ``requestModelArn`` / ``basisModelArn``
+    + ``provisionedModelArn`` / ``provisionedModelId`` / ``modelUnits`` …), so
+    the previous ``pt.get("modelId", "")`` always returned ``""`` — which made
+    ``PT_HOURLY_PRICE.get("", default)`` fabricate $1/hr and the CloudWatch
+    ``Invocations``/``InputTokenCount``/``OutputTokenCount`` queries (dimension
+    ``ModelId``) match nothing, short-circuiting both counted checks. The model
+    identity is the final path segment of the foundation-model ARN
+    (e.g. ``arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-3-haiku``
+    → ``anthropic.claude-3-haiku``) — that is both the ``PT_HOURLY_PRICE`` key
+    and the CloudWatch ``ModelId`` dimension value.
+
+    Versioned ARNs (e.g. ``.../anthropic.claude-3-haiku-20240307-v1:0``) carry a
+    ``-YYYYMMDD-vN:N`` suffix that would NOT match the bare PT_HOURLY_PRICE
+    keys, so the counted idle-PT path would still rarely fire. Strip the suffix
+    to recover the base model id.
+    """
+    raw = ""
+    for key in (
+        "currentModelArn",
+        "foundationModelArn",
+        "modelArn",
+        "desiredModelArn",
+        "requestModelArn",
+        "basisModelArn",
+    ):
+        arn = pt.get(key, "")
+        if arn and "/" in arn:
+            raw = str(arn).rsplit("/", 1)[-1]
+            break
+    if not raw:
+        return ""
+    # Strip a trailing ``-YYYYMMDD-vN:N`` (or ``-YYYYMMDD-vN``) version suffix.
+    return re.sub(r"-\d{8}-v\d+(?::\d+)?$", "", raw)
+
+
+def _get_pt_invocation_sum(cw: Any, model_id: str) -> tuple[float | None, bool]:
     """Total invocations of a PT'd model over the lookback window.
 
-    Uses Period=86400 (the CW max for queries ≤15 days); aggregates the
-    per-day Sum datapoints. Larger Period values silently fail.
+    Returns ``(invocation_sum, definitive)`` so the caller can tell a proven-idle
+    PT from a merely-suspected one (bedrock C1 follow-up):
+
+    - ``(None, False)`` — the CloudWatch read FAILED (exception). Idle status is
+      unknown, so the caller abstains (never recommends deleting a PT it could
+      not measure).
+    - ``(0.0, False)`` — the read SUCCEEDED but returned **no datapoints**. AWS
+      does not emit zero-value ``Invocations`` datapoints, so an absent metric is
+      a *candidate* idle signal — strong but not proof (the metric may simply not
+      have been published). The caller surfaces it as a ``$0`` advisory, not a
+      counted deletion.
+    - ``(sum, True)`` — explicit datapoints were returned. ``sum == 0`` is then a
+      DEFINITIVE idle reading and the caller may count the recoverable commitment.
+
+    Uses Period=86400 (the CW max for queries ≤15 days); aggregates the per-day
+    Sum datapoints. Larger Period values silently fail.
     """
     now = datetime.now(timezone.utc)
     start = now - timedelta(days=CW_LOOKBACK_DAYS)
@@ -74,12 +129,12 @@ def _get_pt_invocation_sum(cw: Any, model_id: str) -> float | None:
             Period=CW_PERIOD_1D,
             Statistics=["Sum"],
         )
-        dps = resp.get("Datapoints", [])
-        if dps:
-            return sum(d["Sum"] for d in dps)
     except Exception:
-        pass
-    return None
+        return None, False
+    dps = resp.get("Datapoints", [])
+    if not dps:
+        return 0.0, False
+    return sum(d["Sum"] for d in dps), True
 
 
 def _get_pt_token_counts(cw: Any, model_id: str) -> tuple[float | None, float | None]:
@@ -135,34 +190,90 @@ def _check_idle_pt(
         return recs
 
     pt_id = pt.get("provisionedModelId", pt.get("provisionedModelArn", "unknown"))
-    model_id = pt.get("modelId", "")
+    model_id = _derive_model_id(pt)
     model_units = pt.get("modelUnits", 1)
     status = pt.get("status", "Unknown")
 
-    invocations = _get_pt_invocation_sum(cw, model_id)
+    invocation_sum, definitive = _get_pt_invocation_sum(cw, model_id)
 
-    if invocations is None:
+    if invocation_sum is None:
+        # CloudWatch read failed — idle status unprovable; abstain (fail safe:
+        # never recommend deleting a PT we could not measure).
         return recs
 
-    if invocations == 0:
-        hourly = PT_HOURLY_PRICE.get(model_id, PT_HOURLY_DEFAULT)
-        monthly_waste = hourly * model_units * HOURS_PER_MONTH * pricing_multiplier
+    if invocation_sum > 0:
+        # Active PT — not idle.
+        return recs
+
+    # invocation_sum == 0: idle. ``definitive`` separates an explicit Sum=0
+    # datapoint (proven idle → counted) from absent datapoints (candidate idle →
+    # $0 advisory). Either path now SURFACES the idle PT — previously absent
+    # datapoints returned None and the PT was invisible (bedrock C1 follow-up).
+    window = f"{CW_LOOKBACK_DAYS} days"
+    base = {
+        "provisioned_model_id": pt_id,
+        "model_id": model_id,
+        "model_units": model_units,
+        "status": status,
+        "check_category": "Provisioned Throughput",
+        "current_value": f"PT '{pt_id}' with {model_units} unit(s), 0 invocations in {window}",
+        "recommended_value": "Delete idle Provisioned Throughput",
+    }
+
+    hourly = PT_HOURLY_PRICE.get(model_id)
+    if hourly is None:
+        # H1 — never fabricate the $1/hr default for an unknown-rate PT.
+        # Surface the idle commitment as a $0 advisory so it renders without
+        # inventing a dollar (the committed rate is account-specific and not
+        # in the PT_HOURLY_PRICE table).
+        recs.append(
+            {
+                **base,
+                "monthly_savings": 0.0,
+                "Counted": False,
+                "pricing_warning": (
+                    "idle PT but committed rate unknown — account-specific "
+                    "commitment not in PT_HOURLY_PRICE; verify in Billing"
+                ),
+                "reason": f"Provisioned Throughput '{pt_id}' has zero invocations in "
+                f"{window} — delete to recover the committed spend "
+                f"(rate not quantified: '$0.00/month — advisory').",
+            }
+        )
+        return recs
+
+    monthly_waste = hourly * model_units * HOURS_PER_MONTH * pricing_multiplier
+    if definitive:
+        # Explicit Sum=0 datapoint — proven idle. Count the recoverable spend
+        # (still gated at >$1/mo to suppress trivial sub-dollar noise).
         if monthly_waste > 1.0:
             recs.append(
                 {
-                    "provisioned_model_id": pt_id,
-                    "model_id": model_id,
-                    "model_units": model_units,
-                    "status": status,
-                    "check_category": "Provisioned Throughput",
-                    "current_value": f"PT '{pt_id}' with {model_units} unit(s), 0 invocations in {CW_LOOKBACK_DAYS} days",
-                    "recommended_value": "Delete idle Provisioned Throughput",
+                    **base,
                     "monthly_savings": round(monthly_waste, 2),
                     "reason": f"Provisioned Throughput '{pt_id}' has zero invocations in "
-                    f"{CW_LOOKBACK_DAYS} days — wasting ${monthly_waste:.2f}/mo",
+                    f"{window} (explicit metric) — wasting ${monthly_waste:.2f}/mo",
                 }
             )
+        return recs
 
+    # Candidate idle: no Invocations datapoints. AWS does not publish zero-value
+    # datapoints, so absence is suggestive but not proof — surface as a $0
+    # advisory naming the estimated recoverable spend, never a counted dollar.
+    recs.append(
+        {
+            **base,
+            "monthly_savings": 0.0,
+            "Counted": False,
+            "pricing_warning": (
+                "no Invocations datapoints — idle inferred from metric absence, "
+                "not an explicit zero; verify before deleting"
+            ),
+            "reason": f"Provisioned Throughput '{pt_id}' shows no Invocations in {window} "
+            f"— likely idle (~${monthly_waste:.2f}/mo committed); verify and delete "
+            f"to recover the spend ('$0.00/month — advisory').",
+        }
+    )
     return recs
 
 
@@ -177,10 +288,15 @@ def _check_pt_breakeven(
         return recs
 
     pt_id = pt.get("provisionedModelId", pt.get("provisionedModelArn", "unknown"))
-    model_id = pt.get("modelId", "")
+    model_id = _derive_model_id(pt)
     model_units = pt.get("modelUnits", 1)
 
-    hourly = PT_HOURLY_PRICE.get(model_id, PT_HOURLY_DEFAULT)
+    hourly = PT_HOURLY_PRICE.get(model_id)
+    if hourly is None:
+        # H1 — cannot compute breakeven without the committed rate; skip rather
+        # than fabricate the $1/hr default (the on-demand vs PT comparison would
+        # be meaningless against an invented commitment cost).
+        return recs
     pt_monthly = hourly * model_units * HOURS_PER_MONTH
 
     if pt_monthly <= 0:

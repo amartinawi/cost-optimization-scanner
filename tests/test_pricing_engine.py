@@ -153,6 +153,7 @@ class TestPricingEngine:
         AmazonS3/EC2/RDS. A wrong form makes every lookup for that region
         silently fall back to us-east-1 constants."""
         from core.pricing_engine import REGION_DISPLAY_NAMES
+
         assert REGION_DISPLAY_NAMES["eu-west-1"] == "EU (Ireland)"
         assert REGION_DISPLAY_NAMES["eu-west-2"] == "EU (London)"
         assert REGION_DISPLAY_NAMES["eu-west-3"] == "EU (Paris)"
@@ -193,18 +194,22 @@ class TestPricingEngine:
         """Audit S3-E/S3-D — select the timed *storage* SKU, not Staging/Overhead."""
         staging = {
             "product": {"attributes": {"usagetype": "TimedStorage-GDA-Staging"}},
-            "terms": {"OnDemand": {"S.T": {"priceDimensions": {
-                "d": {"beginRange": "0", "pricePerUnit": {"USD": "0.0210000000"}}}}}},
+            "terms": {
+                "OnDemand": {
+                    "S.T": {"priceDimensions": {"d": {"beginRange": "0", "pricePerUnit": {"USD": "0.0210000000"}}}}
+                }
+            },
         }
         storage = {
             "product": {"attributes": {"usagetype": "TimedStorage-GDA-ByteHrs"}},
-            "terms": {"OnDemand": {"S.T": {"priceDimensions": {
-                "d": {"beginRange": "0", "pricePerUnit": {"USD": "0.0009900000"}}}}}},
+            "terms": {
+                "OnDemand": {
+                    "S.T": {"priceDimensions": {"d": {"beginRange": "0", "pricePerUnit": {"USD": "0.0009900000"}}}}
+                }
+            },
         }
         mock_client = MagicMock()
-        mock_client.get_products.return_value = {
-            "PriceList": [json.dumps(staging), json.dumps(storage)]
-        }
+        mock_client.get_products.return_value = {"PriceList": [json.dumps(staging), json.dumps(storage)]}
         engine = PricingEngine("us-east-1", mock_client)
         assert engine.get_s3_monthly_price_per_gb("DEEP_ARCHIVE") == pytest.approx(0.00099)
 
@@ -224,8 +229,220 @@ class TestPricingEngine:
 
     def test_instance_monthly_live_price(self):
         engine = _make_engine(api_return=0.20)
-        price = engine.get_instance_monthly_price("AmazonElastiCache", "cache.m5.large")
+        # OpenSearch is not SR-1-specialized, so it uses the unchanged
+        # MaxResults=1 path where a bare $/hr price item is a valid mock.
+        price = engine.get_instance_monthly_price("AmazonES", "m5.large.search")
         assert price == pytest.approx(0.20 * 730)
+
+    def test_redshift_selects_compute_instance_not_concurrency_scaling(self):
+        """SR-1 / Redshift C2 — a bare instanceType+location filter matches four
+        ra3.4xlarge SKUs. The deterministic selector must pick the Compute
+        Instance node-hour SKU ($3.26/hr), never the per-second Concurrency
+        Scaling ($0.0009/sec), per-GB Managed Storage ($0.024), or $0 Free row.
+        Feed the SKUs in adversarial order (correct SKU last)."""
+
+        def sku(product_family, usagetype, unit, usd):
+            return {
+                "product": {
+                    "attributes": {
+                        "instanceType": "ra3.4xlarge",
+                        "usagetype": usagetype,
+                        "productFamily": product_family,
+                        "location": "US East (N. Virginia)",
+                    }
+                },
+                "terms": {"OnDemand": {"T": {"priceDimensions": {"d": {"unit": unit, "pricePerUnit": {"USD": usd}}}}}},
+            }
+
+        price_list = [
+            json.dumps(sku("Redshift Concurrency Scaling", "CS:ra3.4xlarge", "seconds", "0.0009")),
+            json.dumps(sku("Redshift Managed Storage", "RMS:ra3.4xlarge", "GB-Mo", "0.024")),
+            json.dumps(sku("Redshift Concurrency Scaling", "CSFreeUsage:ra3.4xlarge", "seconds", "0.0")),
+            json.dumps(sku("Compute Instance", "Node:ra3.4xlarge", "Hrs", "3.26")),
+        ]
+        mock_client = MagicMock()
+        mock_client.get_products.return_value = {"PriceList": price_list}
+        engine = PricingEngine("us-east-1", mock_client)
+        # $3.26/hr × 730 = $2,379.80/mo (the real Compute Instance rate).
+        assert engine.get_instance_monthly_price("AmazonRedshift", "ra3.4xlarge") == pytest.approx(3.26 * 730)
+        # Determinism: a second call returns the identical rate (cache hit,
+        # same SKU chosen every time).
+        assert engine.get_instance_monthly_price("AmazonRedshift", "ra3.4xlarge") == pytest.approx(3.26 * 730)
+
+    def test_redshift_rejects_zero_compute_sku(self):
+        """If the Compute Instance row were a $0 placeholder it is rejected and
+        the function falls back rather than reporting a fabricated $0 node."""
+        sku_zero = {
+            "product": {
+                "attributes": {
+                    "instanceType": "ra3.xlplus",
+                    "usagetype": "Node:ra3.xlplus",
+                    "productFamily": "Compute Instance",
+                    "location": "US East (N. Virginia)",
+                }
+            },
+            "terms": {
+                "OnDemand": {"T": {"priceDimensions": {"d": {"unit": "Hrs", "pricePerUnit": {"USD": "0.0000000000"}}}}}
+            },
+        }
+        mock_client = MagicMock()
+        mock_client.get_products.return_value = {"PriceList": [json.dumps(sku_zero)]}
+        engine = PricingEngine("us-east-1", mock_client)
+        assert engine.get_instance_monthly_price("AmazonRedshift", "ra3.xlplus") == 0.0
+
+    def test_elasticache_selects_redis_nodeusage_not_extended_support(self):
+        """SR-1 / ElastiCache C2 — all six cache.r6g.large SKUs share unit=Hrs.
+        With engine=Redis the selector must pick the exact NodeUsage row
+        ($0.206/hr), never the USE1-ExtendedSupportYr3 surcharge ($0.33/hr) or
+        the USE1-SyncDurability row. Adversarial order: $0.33 SKU first."""
+
+        def sku(usagetype, cache_engine, usd):
+            return {
+                "product": {
+                    "attributes": {
+                        "instanceType": "cache.r6g.large",
+                        "usagetype": usagetype,
+                        "cacheEngine": cache_engine,
+                        "productFamily": "Cache Instance",
+                        "location": "US East (N. Virginia)",
+                    }
+                },
+                "terms": {"OnDemand": {"T": {"priceDimensions": {"d": {"unit": "Hrs", "pricePerUnit": {"USD": usd}}}}}},
+            }
+
+        price_list = [
+            json.dumps(sku("USE1-ExtendedSupportYr3-NodeUsage:cache.r6g.large", "Redis", "0.33")),
+            json.dumps(sku("USE1-ExtendedSupportYr1_Yr2-NodeUsage:cache.r6g.large", "Redis", "0.165")),
+            json.dumps(sku("USE1-SyncDurability-NodeUsage:cache.r6g.large", "Valkey", "0.0297")),
+            json.dumps(sku("NodeUsage:cache.r6g.large", "Valkey", "0.1648")),
+            json.dumps(sku("NodeUsage:cache.r6g.large", "Memcached", "0.206")),
+            json.dumps(sku("NodeUsage:cache.r6g.large", "Redis", "0.206")),
+        ]
+        mock_client = MagicMock()
+        mock_client.get_products.return_value = {"PriceList": price_list}
+        engine = PricingEngine("us-east-1", mock_client)
+        # Redis NodeUsage = $0.206/hr × 730 = $150.38/mo.
+        assert engine.get_instance_monthly_price(
+            "AmazonElastiCache", "cache.r6g.large", engine="Redis"
+        ) == pytest.approx(0.206 * 730)
+        # Valkey NodeUsage = $0.1648/hr × 730 = $120.30/mo (engine-scoped cache).
+        assert engine.get_instance_monthly_price(
+            "AmazonElastiCache", "cache.r6g.large", engine="Valkey"
+        ) == pytest.approx(0.1648 * 730)
+
+    def test_node_pricing_matches_region_prefixed_usagetype(self):
+        """Outside us-east-1 the Pricing API region-prefixes the usagetype
+        (e.g. ``EUW1-NodeUsage:...`` / ``EU-Node:...``). The node selector must
+        strip the ``<REGION>-`` prefix and still match, otherwise it returns
+        None and the caller silently falls back to $0 in every non-default
+        region (a real price mis-read as zero)."""
+
+        def cache_sku(usagetype, usd):
+            return {
+                "product": {
+                    "attributes": {
+                        "instanceType": "cache.r6g.large",
+                        "usagetype": usagetype,
+                        "cacheEngine": "Redis",
+                        "productFamily": "Cache Instance",
+                        "location": "EU (Ireland)",
+                    }
+                },
+                "terms": {"OnDemand": {"T": {"priceDimensions": {"d": {"unit": "Hrs", "pricePerUnit": {"USD": usd}}}}}},
+            }
+
+        def redshift_sku(usagetype, usd):
+            return {
+                "product": {
+                    "attributes": {
+                        "instanceType": "ra3.4xlarge",
+                        "usagetype": usagetype,
+                        "productFamily": "Compute Instance",
+                        "location": "EU (Ireland)",
+                    }
+                },
+                "terms": {"OnDemand": {"T": {"priceDimensions": {"d": {"unit": "Hrs", "pricePerUnit": {"USD": usd}}}}}},
+            }
+
+        # ElastiCache: EUW1-prefixed NodeUsage must match; the EUW1-prefixed
+        # ExtendedSupport surcharge must still be rejected.
+        ec_client = MagicMock()
+        ec_client.get_products.return_value = {
+            "PriceList": [
+                json.dumps(cache_sku("EUW1-ExtendedSupportYr3-NodeUsage:cache.r6g.large", "0.36")),
+                json.dumps(cache_sku("EUW1-NodeUsage:cache.r6g.large", "0.227")),
+            ]
+        }
+        ec_engine = PricingEngine("eu-west-1", ec_client)
+        assert ec_engine.get_instance_monthly_price(
+            "AmazonElastiCache", "cache.r6g.large", engine="Redis"
+        ) == pytest.approx(0.227 * 730)
+
+        # Redshift: EU-prefixed Node: must match (was silently $0 before the fix).
+        rs_client = MagicMock()
+        rs_client.get_products.return_value = {"PriceList": [json.dumps(redshift_sku("EU-Node:ra3.4xlarge", "3.48"))]}
+        rs_engine = PricingEngine("eu-west-1", rs_client)
+        assert rs_engine.get_instance_monthly_price("AmazonRedshift", "ra3.4xlarge") == pytest.approx(3.48 * 730)
+
+    def test_elasticache_without_engine_returns_none(self):
+        """Without the engine discriminator the NodeUsage SKU is ambiguous
+        (three engines share it) — return None → $0 fallback rather than a
+        non-deterministic pick."""
+        sku = {
+            "product": {
+                "attributes": {
+                    "instanceType": "cache.r6g.large",
+                    "usagetype": "NodeUsage:cache.r6g.large",
+                    "cacheEngine": "Redis",
+                    "productFamily": "Cache Instance",
+                    "location": "US East (N. Virginia)",
+                }
+            },
+            "terms": {"OnDemand": {"T": {"priceDimensions": {"d": {"unit": "Hrs", "pricePerUnit": {"USD": "0.206"}}}}}},
+        }
+        mock_client = MagicMock()
+        mock_client.get_products.return_value = {"PriceList": [json.dumps(sku)]}
+        engine = PricingEngine("us-east-1", mock_client)
+        assert engine.get_instance_monthly_price("AmazonElastiCache", "cache.r6g.large") == 0.0
+
+    def test_elasticache_normalizes_lowercase_engine(self):
+        """elasticache C2 production bug — the shim reads ``Engine`` from
+        DescribeCacheClusters which AWS returns lowercase ("redis"), while the
+        Pricing API ``cacheEngine`` attribute is capitalized ("Redis"). A
+        verbatim match returns no NodeUsage row → $0. The pricing boundary
+        normalizes casing so lowercase "redis" still selects the $0.206/hr
+        Redis NodeUsage SKU."""
+
+        def sku(cache_engine, usd):
+            return {
+                "product": {
+                    "attributes": {
+                        "instanceType": "cache.r6g.large",
+                        "usagetype": "NodeUsage:cache.r6g.large",
+                        "cacheEngine": cache_engine,
+                        "productFamily": "Cache Instance",
+                        "location": "US East (N. Virginia)",
+                    }
+                },
+                "terms": {"OnDemand": {"T": {"priceDimensions": {"d": {"unit": "Hrs", "pricePerUnit": {"USD": usd}}}}}},
+            }
+
+        price_list = [
+            json.dumps(sku("Redis", "0.206")),
+            json.dumps(sku("Valkey", "0.1648")),
+        ]
+        mock_client = MagicMock()
+        mock_client.get_products.return_value = {"PriceList": price_list}
+        engine = PricingEngine("us-east-1", mock_client)
+        # Lowercase "redis" (what the real shim produces) must still resolve to
+        # the Redis NodeUsage rate, not collapse to $0.
+        assert engine.get_instance_monthly_price(
+            "AmazonElastiCache", "cache.r6g.large", engine="redis"
+        ) == pytest.approx(0.206 * 730)
+        # Mixed-case and uppercase also normalize.
+        assert engine.get_instance_monthly_price(
+            "AmazonElastiCache", "cache.r6g.large", engine="VALKEY"
+        ) == pytest.approx(0.1648 * 730)
 
     def test_rds_instance_monthly_fallback_single_az(self):
         engine = _make_engine(api_return=None)
@@ -289,10 +506,7 @@ class TestPricingEngine:
         """48k IOPS spans tier 1 (0-32k) and tier 2 (32k-64k)."""
         engine = _make_engine(api_return=None)
         cost = engine.get_ebs_io2_iops_cost(48000)
-        expected = (
-            32000 * FALLBACK_EBS_IOPS_MONTH["io2"]
-            + 16000 * FALLBACK_IO2_IOPS_TIER2_MONTH
-        )
+        expected = 32000 * FALLBACK_EBS_IOPS_MONTH["io2"] + 16000 * FALLBACK_IO2_IOPS_TIER2_MONTH
         assert cost == pytest.approx(expected)
 
     def test_ebs_io2_iops_cost_three_tiers(self):

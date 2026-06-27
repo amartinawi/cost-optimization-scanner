@@ -4,6 +4,16 @@
 **Scope**: 28 service adapters  
 **Auditor**: Automated audit pipeline  
 
+> **Superseded for current state.** This is the original 28-adapter pass. The
+> authoritative, full-coverage audit is **`docs/audits/UNIFIED_AUDIT_FINDINGS.md`**
+> (34/34 adapters, 342 findings, adversarially verified). Remediation is tracked
+> per severity in `CRITICAL_/HIGH_/MEDIUM_/LOW_REMEDIATION_PROMPT.md`. **All 29
+> CRITICAL findings are remediated** (cost-fidelity batch, 2026-06-27 — see the
+> CHANGELOG "cost-fidelity CRITICAL remediation" entry), and **all 83 actionable
+> HIGH findings are remediated** (2026-06-28 — see the CHANGELOG "cost-fidelity
+> HIGH remediation" entry; every remediated service carries a
+> `tests/test_<svc>_high_fixes.py`). MEDIUM/LOW remain.
+
 ---
 
 ## Executive Summary

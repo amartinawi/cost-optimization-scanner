@@ -86,13 +86,40 @@ class ContainersModule(BaseServiceModule):
             )
         co_recs = [r for r in co_raw if not _co_placeholder(r)]
 
-        # Cross-source dedup by normalized service name (authority CoH > CO >
-        # heuristic) so one Fargate service never contributes savings twice.
+        # Authority CoH > CO > heuristic. Cost Hub is the authority: an ECS
+        # service it surfaces (EcsService / EcsTask) is already summed and
+        # counted from its bucket below, so a Compute Optimizer rec for the SAME
+        # normalized service name is the same saving from a lower-authority
+        # source. Build the CoH-covered set and drop those CO duplicates BEFORE
+        # summing/counting so one Fargate service never contributes savings
+        # twice (mirrors lambda_svc.py:113-131). A CoH ARN
+        # (...:service/cluster/web) and a CO resource_id (cluster/web) both
+        # normalize to "web", so they converge.
+        covered: set[str] = set()
+        for rec in cost_hub_recs:
+            name = normalize_resource_name(
+                rec.get("resourceArn") or rec.get("ResourceArn") or rec.get("resourceId") or ""
+            )
+            if name:
+                covered.add(name)
+        deduped_co: list[dict[str, Any]] = []
+        for rec in co_recs:
+            name = normalize_resource_name(rec.get("resource_id") or rec.get("resource_name") or "")
+            if name and name in covered:
+                continue  # already counted by Cost Hub — drop the CO duplicate
+            deduped_co.append(rec)
+            if name:
+                covered.add(name)
+        co_recs = deduped_co
+
+        # Drop any heuristic rec already covered by CoH or a surviving CO rec
+        # (same authority order) so a heuristic finding never double-counts an
+        # AWS-native source.
         enhanced_recs = dedupe_by_authority(
             cost_hub_recs,
             co_recs,
             enhanced_recs,
-            coh_key=lambda r: r.get("resourceArn") or r.get("ResourceArn") or "",
+            coh_key=lambda r: r.get("resourceArn") or r.get("ResourceArn") or r.get("resourceId") or "",
             co_key=lambda r: r.get("resource_id") or "",
             heuristic_key=_heuristic_resource_key,
         )

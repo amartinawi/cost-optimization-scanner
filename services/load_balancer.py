@@ -156,24 +156,41 @@ def get_load_balancer_checks(ctx: ScanContext) -> dict[str, Any]:
                     )
 
                 if lb_type == "application" and len(listeners) == 1 and not is_k8s_managed:
+                    # NET-01: advisory $0 only. Counting full alb_monthly here per
+                    # single-listener ALB double-counts the same standalone ALBs that
+                    # `shared_alb_opportunity` already scores in aggregate, and
+                    # consolidation merges services onto a *surviving* ALB so not every
+                    # single-service ALB can be eliminated. The realizable saving depends
+                    # on per-ALB LCU/traffic evidence that is not measured here, so this
+                    # lever is rendered (visible) but never counted. Mirrors
+                    # `nlb_vs_alb`/`old_classic_elbs`.
                     checks["single_service_albs"].append(
                         {
                             "LoadBalancerName": lb_name,
                             "ListenerCount": len(listeners),
                             "Recommendation": "ALB serving single service - consider consolidating multiple services on one ALB to reduce costs",
-                            "EstimatedSavings": f"Up to ${alb_monthly:.2f}/month per ALB eliminated through consolidation",
+                            "EstimatedSavings": "$0.00/month - advisory: per-ALB consolidation saving requires LCU/traffic evidence and double-counts the shared_alb_opportunity lever",
+                            "EstimatedMonthlySavings": 0.0,
+                            "Counted": False,
+                            "PricingWarning": "Not counted: consolidation merges services onto a surviving ALB (not all can be eliminated) and the realizable saving needs per-ALB LCU/traffic metrics not collected here",
+                            "AuditBasis": "ALB base $0.0225/hr x 730 = $16.43/mo (us-east-1, validated AWS Pricing API 2026-06-27). Advisory $0 — counting full base per single-listener ALB double-counts the standalone ALBs aggregated by shared_alb_opportunity; surviving-ALB count and per-ALB LCU/traffic are unmeasured.",
                             "Action": "1. Identify other single-service ALBs\n2. Plan consolidation using host-based or path-based routing\n3. Test routing rules before migration\n4. Delete unused ALBs after consolidation",
                             "CheckCategory": "ALB Consolidation Opportunity",
                         }
                     )
 
                 elif lb_type == "application" and len(listeners) == 1 and is_k8s_managed:
+                    # NET-01: advisory $0 only (same rationale as the standalone branch).
                     checks["single_service_albs"].append(
                         {
                             "LoadBalancerName": lb_name,
                             "ListenerCount": len(listeners),
                             "Recommendation": "K8s ALB serving single service - consider using Ingress Groups to share ALBs across multiple services",
-                            "EstimatedSavings": f"Up to ${alb_monthly:.2f}/month per ALB eliminated through Ingress Groups",
+                            "EstimatedSavings": "$0.00/month - advisory: per-ALB Ingress-Group consolidation saving requires LCU/traffic evidence and double-counts the shared_alb_opportunity lever",
+                            "EstimatedMonthlySavings": 0.0,
+                            "Counted": False,
+                            "PricingWarning": "Not counted: Ingress-Group consolidation merges services onto a surviving ALB (not all can be eliminated) and the realizable saving needs per-ALB LCU/traffic metrics not collected here",
+                            "AuditBasis": "ALB base $0.0225/hr x 730 = $16.43/mo (us-east-1, validated AWS Pricing API 2026-06-27). Advisory $0 — counting full base per single-listener K8s ALB double-counts the standalone ALBs aggregated by shared_alb_opportunity; surviving-ALB count and per-ALB LCU/traffic are unmeasured.",
                             "Action": "1. Review Kubernetes Ingress resources\n2. Add alb.ingress.kubernetes.io/group.name annotation\n3. Use same group name across multiple Ingress resources\n4. Test routing before removing individual ALBs",
                             "CheckCategory": "K8s ALB Consolidation Opportunity",
                         }
@@ -204,24 +221,38 @@ def get_load_balancer_checks(ctx: ScanContext) -> dict[str, Any]:
         if alb_count > 5:
             standalone_count = len(standalone_albs)
             if standalone_count > 2:
+                # NET-01: advisory $0 only. Even the aggregate `(standalone_count - 2)`
+                # figure is not backed by per-ALB LCU/traffic evidence — it assumes every
+                # surplus ALB can be eliminated and collapsed onto 2 surviving ALBs without
+                # exceeding their LCU capacity. Render it for context but do not count it
+                # (also avoids double-counting the per-ALB single_service_albs lever).
                 checks["shared_alb_opportunity"].append(
                     {
                         "ALBCount": standalone_count,
                         "K8sALBCount": k8s_managed_albs,
                         "Recommendation": f"{standalone_count} standalone ALBs detected - consolidate using host-based or path-based routing to reduce costs",
-                        "EstimatedSavings": f"Save ${(standalone_count - 2) * alb_monthly:.0f}/month by consolidating to 2 ALBs",
+                        "EstimatedSavings": "$0.00/month - advisory: consolidation ceiling requires per-ALB LCU/traffic evidence",
+                        "EstimatedMonthlySavings": 0.0,
+                        "Counted": False,
+                        "PricingWarning": f"Not counted: a theoretical ceiling of ~${(standalone_count - 2) * alb_monthly:.0f}/month assumes every surplus ALB collapses onto 2 surviving ALBs within their LCU capacity; no per-ALB LCU/traffic metrics collected here",
+                        "AuditBasis": "ALB base $0.0225/hr x 730 = $16.43/mo (us-east-1, validated AWS Pricing API 2026-06-27). Advisory $0 — the (standalone_count-2) ceiling is unbacked by per-ALB LCU/traffic and would double-count the single_service_albs lever.",
                         "Action": f"1. Identify ALBs serving similar applications or environments\n2. Plan consolidation using host-based routing (different domains) or path-based routing (same domain, different paths)\n3. Test routing rules in staging environment\n4. Migrate traffic gradually and monitor performance\n5. Delete unused ALBs after successful consolidation\n6. Each ALB costs ${alb_monthly:.2f}/month base + data processing fees",
                         "CheckCategory": "Shared ALB Opportunity",
                     }
                 )
 
             if k8s_managed_albs > 3:
+                # NET-01: advisory $0 only (same rationale as the standalone branch).
                 checks["shared_alb_opportunity"].append(
                     {
                         "ALBCount": k8s_managed_albs,
                         "StandaloneALBCount": standalone_count,
                         "Recommendation": f"{k8s_managed_albs} K8s ALBs detected - consider using Ingress Groups for consolidation",
-                        "EstimatedSavings": f"Save ${(k8s_managed_albs - 2) * alb_monthly:.0f}/month through Ingress Groups",
+                        "EstimatedSavings": "$0.00/month - advisory: Ingress-Group consolidation ceiling requires per-ALB LCU/traffic evidence",
+                        "EstimatedMonthlySavings": 0.0,
+                        "Counted": False,
+                        "PricingWarning": f"Not counted: a theoretical ceiling of ~${(k8s_managed_albs - 2) * alb_monthly:.0f}/month assumes every surplus K8s ALB collapses onto 2 surviving ALBs within their LCU capacity; no per-ALB LCU/traffic metrics collected here",
+                        "AuditBasis": "ALB base $0.0225/hr x 730 = $16.43/mo (us-east-1, validated AWS Pricing API 2026-06-27). Advisory $0 — the (k8s_managed_albs-2) ceiling is unbacked by per-ALB LCU/traffic and would double-count the single_service_albs lever.",
                         "Action": "1. Review Kubernetes Ingress resources\n2. Add alb.ingress.kubernetes.io/group.name annotation\n3. Use same group name across multiple Ingress resources\n4. Set alb.ingress.kubernetes.io/group.order for rule priority\n5. Test routing before removing individual ALBs",
                         "CheckCategory": "K8s Ingress Groups Opportunity",
                     }

@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from core.scan_context import ScanContext
+from services._aws_errors import record_aws_error
 
 OLD_SNAPSHOT_DAYS: int = 90
 UNUSED_MIN_DAYS: int = 30
@@ -53,10 +54,14 @@ def _snapshot_storage_gb(ec2: Any, ami: dict[str, Any]) -> tuple[float, list[str
 def compute_ami_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> dict[str, Any]:
     """Compute AMI deletion-candidate checks.
 
-    Only AMIs that are **unused** (not referenced by any running/stopped
-    instance, launch template, or ASG) are deletion candidates — an in-use
-    AMI's snapshots cannot be safely deleted. Candidates are split by age
-    into two mutually exclusive sources purely for confidence/presentation:
+    Only AMIs that are **unused** are deletion candidates — an in-use AMI's
+    snapshots cannot be safely deleted. An AMI is treated as in-use when it is
+    referenced by any running/stopped instance, launch template, ASG, EC2 Fleet
+    or Spot Fleet launch spec/override, OR shared cross-account/publicly via
+    ``launchPermission`` (a consumer account we cannot enumerate may depend on
+    it). Residual gap: EC2 Image Builder references are not enumerated; the rec
+    text flags this. Candidates are split by age into two mutually exclusive
+    sources purely for confidence/presentation:
 
       - ``old_amis``    — unused and older than ``OLD_SNAPSHOT_DAYS`` (stale,
                           high confidence).
@@ -82,41 +87,111 @@ def compute_ami_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> dic
         amis_response = {"Images": amis_list}
 
         running_amis: set[str] = set()
-        paginator = ec2.get_paginator("describe_instances")
-        for page in paginator.paginate():
-            for reservation in page["Reservations"]:
-                for instance in reservation["Instances"]:
-                    if instance["State"]["Name"] in ["running", "stopped"]:
-                        running_amis.add(instance.get("ImageId"))
+        # Fail-safe: if ANY reference source (instances / launch templates /
+        # ASGs / launch configs) cannot be enumerated, an AMI referenced only by
+        # the unresolved source would pass the ``ami_id in running_amis`` guard
+        # and be emitted as "deregister and delete snapshots" — a destructive
+        # false positive (ami C1). Treat unresolved references as in-use by
+        # suppressing every deletion candidate when any read failed.
+        references_resolve_failed = False
 
         try:
-            lt_response = ec2.describe_launch_templates()
-            for lt in lt_response.get("LaunchTemplates", []):
-                try:
-                    lt_versions = ec2.describe_launch_template_versions(LaunchTemplateId=lt["LaunchTemplateId"])
-                    for version in lt_versions.get("LaunchTemplateVersions", []):
-                        lt_data = version.get("LaunchTemplateData", {})
-                        if "ImageId" in lt_data:
-                            running_amis.add(lt_data["ImageId"])
-                except Exception:
-                    pass
-        except Exception:
-            pass
+            paginator = ec2.get_paginator("describe_instances")
+            for page in paginator.paginate():
+                for reservation in page["Reservations"]:
+                    for instance in reservation["Instances"]:
+                        if instance["State"]["Name"] in ["running", "stopped"]:
+                            running_amis.add(instance.get("ImageId"))
+        except Exception as e:
+            record_aws_error(ctx, e, service="ami", context="describe_instances")
+            references_resolve_failed = True
 
         try:
-            asg_response = autoscaling.describe_auto_scaling_groups()
-            for asg in asg_response.get("AutoScalingGroups", []):
-                if "LaunchConfigurationName" in asg:
+            lt_paginator = ec2.get_paginator("describe_launch_templates")
+            for lt_page in lt_paginator.paginate():
+                for lt in lt_page.get("LaunchTemplates", []):
                     try:
-                        lc_response = autoscaling.describe_launch_configurations(
-                            LaunchConfigurationNames=[asg["LaunchConfigurationName"]]
-                        )
-                        for lc in lc_response.get("LaunchConfigurations", []):
-                            running_amis.add(lc.get("ImageId"))
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+                        lt_versions = ec2.describe_launch_template_versions(LaunchTemplateId=lt["LaunchTemplateId"])
+                        for version in lt_versions.get("LaunchTemplateVersions", []):
+                            lt_data = version.get("LaunchTemplateData", {})
+                            if "ImageId" in lt_data:
+                                running_amis.add(lt_data["ImageId"])
+                    except Exception as e:
+                        record_aws_error(ctx, e, service="ami", context="describe_launch_template_versions")
+                        references_resolve_failed = True
+        except Exception as e:
+            record_aws_error(ctx, e, service="ami", context="describe_launch_templates")
+            references_resolve_failed = True
+
+        try:
+            asg_paginator = autoscaling.get_paginator("describe_auto_scaling_groups")
+            for asg_page in asg_paginator.paginate():
+                for asg in asg_page.get("AutoScalingGroups", []):
+                    if "LaunchConfigurationName" in asg:
+                        try:
+                            lc_response = autoscaling.describe_launch_configurations(
+                                LaunchConfigurationNames=[asg["LaunchConfigurationName"]]
+                            )
+                            for lc in lc_response.get("LaunchConfigurations", []):
+                                running_amis.add(lc.get("ImageId"))
+                        except Exception as e:
+                            record_aws_error(ctx, e, service="ami", context="describe_launch_configurations")
+                            references_resolve_failed = True
+        except Exception as e:
+            record_aws_error(ctx, e, service="ami", context="describe_auto_scaling_groups")
+            references_resolve_failed = True
+
+        # EC2 Fleet: a fleet's launch-template Overrides can pin an ``ImageId``
+        # that overrides the template's AMI, so the override AMI is in active
+        # use even though no instance/template/ASG references it directly
+        # (ami H3). Missing this path flags a live AMI for deregistration.
+        try:
+            fleet_paginator = ec2.get_paginator("describe_fleets")
+            for fleet_page in fleet_paginator.paginate():
+                for fleet in fleet_page.get("Fleets", []):
+                    for lt_config in fleet.get("LaunchTemplateConfigs", []):
+                        for override in lt_config.get("Overrides", []):
+                            image_id = override.get("ImageId")
+                            if image_id:
+                                running_amis.add(image_id)
+        except Exception as e:
+            record_aws_error(ctx, e, service="ami", context="describe_fleets")
+            references_resolve_failed = True
+
+        # Spot Fleet: references AMIs through both inline
+        # ``LaunchSpecifications[].ImageId`` and launch-template ``Overrides``
+        # (ami H3). Either path keeps the AMI in active use.
+        try:
+            spot_fleet_paginator = ec2.get_paginator("describe_spot_fleet_requests")
+            for spot_page in spot_fleet_paginator.paginate():
+                for spot_config in spot_page.get("SpotFleetRequestConfigs", []):
+                    request_config = spot_config.get("SpotFleetRequestConfig") or {}
+                    for launch_spec in request_config.get("LaunchSpecifications", []):
+                        image_id = launch_spec.get("ImageId")
+                        if image_id:
+                            running_amis.add(image_id)
+                    for lt_config in request_config.get("LaunchTemplateConfigs", []):
+                        for override in lt_config.get("Overrides", []):
+                            image_id = override.get("ImageId")
+                            if image_id:
+                                running_amis.add(image_id)
+        except Exception as e:
+            record_aws_error(ctx, e, service="ami", context="describe_spot_fleet_requests")
+            references_resolve_failed = True
+
+        if references_resolve_failed:
+            ctx.warn(
+                "AMI reference enumeration incomplete (instance/launch-template/ASG "
+                "read failed); suppressing unused-AMI deletion candidates to avoid "
+                "false-positive deregistration.",
+                service="ami",
+            )
+            return {
+                "recommendations": [],
+                "total_count": 0,
+                "unused_amis": [],
+                "old_amis": [],
+            }
 
         # Snapshot storage rate is region-uniform; resolve it once. PricingEngine
         # returns a region-correct $/GB-month — NO additional pricing_multiplier
@@ -146,6 +221,25 @@ def compute_ami_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> dic
                 # no storage cost to recover. Skip rather than emit $0 noise.
                 continue
 
+            # Cross-account / public sharing (ami H3): an AMI shared via
+            # launchPermission can be actively launched by another account whose
+            # instances we cannot enumerate, so deregistering it is destructive.
+            # Treat any shared AMI as in-use. A FAILED attribute read is
+            # ambiguous evidence on a deletion rec, so abstain on this AMI rather
+            # than asserting "unused" (fail-safe, global rule 5).
+            try:
+                image_attr = ec2.describe_image_attribute(ImageId=ami_id, Attribute="launchPermission")
+            except Exception as e:
+                record_aws_error(ctx, e, service="ami", context="describe_image_attribute")
+                continue
+            # Validate the API shape before trusting it (never trust external
+            # data): a real response is a dict carrying a LaunchPermissions list.
+            launch_permissions = image_attr.get("LaunchPermissions", []) if isinstance(image_attr, dict) else []
+            if launch_permissions:
+                # Shared with specific accounts and/or the public ("all") — a
+                # consumer we cannot see may depend on it. Skip the deletion rec.
+                continue
+
             # AWS EBS snapshots are incremental — only changed blocks are billed.
             # VolumeSize is an UPPER BOUND; we emit the MAX with an explicit
             # qualifier in the display string.
@@ -160,19 +254,30 @@ def compute_ami_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> dic
                 "SnapshotIds": snapshot_ids,
                 "Recommendation": (
                     f"Unused AMI ({age_days} days old, not referenced by any"
-                    " running instance, launch template, or ASG) -"
-                    f" {'deregister and delete snapshots' if is_old else 'verify then delete'}"
+                    " running/stopped instance, launch template, ASG, EC2 Fleet,"
+                    " or Spot Fleet, and not shared cross-account) -"
+                    f" {'deregister and delete snapshots' if is_old else 'verify then delete'}."
+                    " Residual gap: EC2 Image Builder recipe/pipeline references"
+                    " are not enumerated — confirm the AMI is not an Image Builder"
+                    " output before deregistering."
                 ),
                 "EstimatedSavings": (
                     f"${monthly_snapshot_cost:.2f}/month"
                     f" ({total_snapshot_size_gb:.1f}GB snapshot storage - max estimate)"
                 ),
                 "EstimatedMonthlySavings": monthly_snapshot_cost,
+                "AuditBasis": (
+                    f"{total_snapshot_size_gb:.1f}GB stored snapshot blocks x"
+                    f" ${snapshot_rate:.4f}/GB-Mo EBS snapshot storage"
+                    " (AmazonEC2 EBS:SnapshotUsage, region-scaled) ="
+                    f" ${monthly_snapshot_cost:.2f}/mo. Upper bound — snapshots"
+                    " bill on changed blocks only."
+                ),
                 "CheckCategory": "Old Unused AMIs" if is_old else "Unused AMIs",
             }
             checks["old_amis" if is_old else "unused_amis"].append(rec)
     except Exception as e:
-        logger.warning(f"Warning: Could not get AMI checks: {e}")
+        record_aws_error(ctx, e, service="ami", context="compute_ami_checks")
 
     return {
         "recommendations": checks.get("old_amis", []) + checks.get("unused_amis", []),

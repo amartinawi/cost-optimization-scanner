@@ -104,18 +104,31 @@ def dedupe_by_authority(
     inflate one volume's savings 2-3x. Cost Hub recs are always retained by the
     caller; this returns the de-duplicated ``(co_kept, heuristic_kept_lists)``.
 
+    The heuristic lists are also de-duplicated **against each other** in the order
+    given: a volume claimed by an earlier list drops from every later list. The
+    same unattached/``available`` volume is otherwise surfaced as both a 100 %
+    delete (``unattached_volumes``) **and** a gp2→gp3 migration delta (or an
+    over-provisioned-IOPS reduction), double-counting one volume's savings. With
+    ``unattached`` passed first, the full delete cost wins and the migration/IOPS
+    legs — which become moot once the volume is deleted — are dropped.
+
     Args:
         coh_recs: Cost Optimization Hub recommendations (highest authority).
         co_recs: Compute Optimizer recommendations.
         heuristic_rec_lists: Ordered list of heuristic rec lists (e.g. unattached,
-            gp2, over-provisioned) — each filtered independently, order preserved.
+            gp2, over-provisioned). Earlier lists have priority; ids they claim are
+            accumulated and removed from later lists. Order is preserved.
     """
     coh_ids = {coh_volume_id(r) for r in coh_recs} - {""}
     co_kept = [r for r in co_recs if co_volume_id(r) not in coh_ids]
     covered = coh_ids | ({co_volume_id(r) for r in co_kept} - {""})
-    heuristic_kept = [
-        [r for r in recs if heuristic_volume_id(r) not in covered] for recs in heuristic_rec_lists
-    ]
+    heuristic_kept: list[list[dict[str, Any]]] = []
+    for recs in heuristic_rec_lists:
+        kept = [r for r in recs if heuristic_volume_id(r) not in covered]
+        heuristic_kept.append(kept)
+        # Accumulate this list's surviving ids so later lists drop any overlap
+        # (e.g. an unattached volume must not also be counted as a gp2 migration).
+        covered = covered | ({heuristic_volume_id(r) for r in kept} - {""})
     return co_kept, heuristic_kept
 
 

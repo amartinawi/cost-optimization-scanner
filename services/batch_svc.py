@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import Any
 
 from core.scan_context import ScanContext
+from services._aws_errors import record_aws_error
 
 BATCH_OPTIMIZATION_DESCRIPTIONS: dict[str, dict[str, str]] = {
     "compute_optimization": {
@@ -35,11 +36,20 @@ def get_enhanced_batch_checks(ctx: ScanContext) -> dict[str, Any]:
                     compute_resources = ce.get("computeResources", {})
                     allocation_strategy = compute_resources.get("allocationStrategy", "BEST_FIT")
                     instance_types = compute_resources.get("instanceTypes", [])
+                    # batch C1/H1 — a Fargate compute environment carries its
+                    # platform in ``computeResources.type`` ("FARGATE" /
+                    # "FARGATE_SPOT") and has an EMPTY ``instanceTypes`` list.
+                    # Keying is_fargate off ``instanceTypes`` (which never holds
+                    # the token "FARGATE") misclassified every Fargate CE into the
+                    # EC2 branch, so the Fargate-Spot lever never fired and Fargate
+                    # CEs were wrongly checked for EC2 Spot/Graviton. Read the type.
+                    compute_type = str(compute_resources.get("type", "")).upper()
 
-                    is_fargate = ce_type == "MANAGED" and any(t.upper() == "FARGATE" for t in instance_types)
+                    is_fargate = ce_type == "MANAGED" and compute_type in ("FARGATE", "FARGATE_SPOT")
 
                     if is_fargate:
-                        if allocation_strategy != "SPOT_CAPACITY_OPTIMIZED":
+                        # Recommend Fargate Spot only when not already on FARGATE_SPOT.
+                        if compute_type != "FARGATE_SPOT":
                             checks["compute_environments"].append(
                                 {
                                     "ComputeEnvironmentName": ce_name,
@@ -97,10 +107,13 @@ def get_enhanced_batch_checks(ctx: ScanContext) -> dict[str, Any]:
                                 "CheckCategory": "Batch Job Rightsizing",
                             }
                         )
-        except Exception:
-            pass
+        except Exception as e:
+            # H2 — classify, don't swallow describe_job_definitions failures.
+            record_aws_error(ctx, e, service="batch", context="batch:DescribeJobDefinitions failed")
     except Exception as e:
-        ctx.warn(f"Could not analyze Batch resources: {e}", "batch")
+        # H3 — an AccessDenied on DescribeComputeEnvironments is a permission gap,
+        # not a generic warning; classify so the Batch tab does not empty silently.
+        record_aws_error(ctx, e, service="batch", context="batch:DescribeComputeEnvironments failed")
 
     all_recommendations: list[dict[str, Any]] = []
     for _category, recs in checks.items():

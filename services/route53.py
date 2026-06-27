@@ -38,6 +38,17 @@ def _route53_zone_monthly_cost(extra_zones: int, *, base_zones_in_account: int =
     return cheap_removable + expensive_removable
 
 
+def _normalize_zone_id(raw: str) -> str:
+    """Reduce a hosted-zone identifier to its bare id for cross-check dedup.
+
+    Route 53 returns the zone id as ``/hostedzone/Z123ABC`` from some calls
+    and as the bare ``Z123ABC`` from others. Strip to the final path segment
+    so the ``unused_hosted_zones`` and ``duplicate_private_zones`` checks key
+    on the same value and never count one zone's monthly $ twice (H4).
+    """
+    return (raw or "").split("/")[-1]
+
+
 ROUTE53_OPTIMIZATION_DESCRIPTIONS: dict[str, dict[str, str]] = {
     "unused_hosted_zones": {
         "title": "Remove Unused Hosted Zones",
@@ -77,8 +88,13 @@ def get_route53_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> dic
         for page in paginator.paginate():
             hosted_zones.extend(page.get("HostedZones", []))
 
+        # H4 — track which normalized zone ids the unused check has already
+        # claimed so the duplicate-private-zone check below cannot count the
+        # same zone's monthly $ a second time (count each zone once).
+        counted_unused_ids: set[str] = set()
+
         for zone in hosted_zones:
-            zone_id = (zone.get("Id") or "").split("/")[-1]
+            zone_id = _normalize_zone_id(zone.get("Id") or "")
             zone_name = zone.get("Name")
             is_private = zone.get("Config", {}).get("PrivateZone", False)
             record_count = zone.get("ResourceRecordSetCount", 0)
@@ -88,6 +104,7 @@ def get_route53_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> dic
                 zone_savings = _route53_zone_monthly_cost(
                     1, base_zones_in_account=len(hosted_zones)
                 ) * pricing_multiplier
+                counted_unused_ids.add(zone_id)
                 checks["unused_hosted_zones"].append(
                     {
                         "HostedZoneId": zone_id,
@@ -98,6 +115,17 @@ def get_route53_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> dic
                         "EstimatedSavings": f"${zone_savings:.2f}/month per zone if deleted",
                         "EstimatedMonthlySavings": round(zone_savings, 2),
                         "CheckCategory": "Unused Hosted Zones",
+                        "AuditBasis": {
+                            "removable_zones": 1,
+                            "tier_rates_per_zone_month": [
+                                ROUTE53_HOSTED_ZONE_TIER_1,
+                                ROUTE53_HOSTED_ZONE_TIER_2,
+                            ],
+                            "base_zones_in_account": len(hosted_zones),
+                            "record_count": record_count,
+                            "region_multiplier": round(pricing_multiplier, 4),
+                            "formula": "route53_tiered_cost(1) x region_multiplier",
+                        },
                     }
                 )
 
@@ -158,21 +186,47 @@ def get_route53_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> dic
 
         for zone_name, zone_ids in zone_names.items():
             if len(zone_ids) > 1:
+                # Consolidating N same-name zones removes (N-1) of them.
                 removable = len(zone_ids) - 1
+                # H4 — any of these zones already counted by the unused check
+                # (≤2 records) must NOT be counted again here. Subtract the
+                # overlap so each zone's monthly $ is summed exactly once.
+                normalized_group = {_normalize_zone_id(z) for z in zone_ids}
+                overlap = len(normalized_group & counted_unused_ids)
+                dedup_removable = max(0, removable - overlap)
                 consolidate_savings = _route53_zone_monthly_cost(
-                    removable, base_zones_in_account=len(hosted_zones)
+                    dedup_removable, base_zones_in_account=len(hosted_zones)
                 ) * pricing_multiplier
-                checks["duplicate_private_zones"].append(
-                    {
-                        "ZoneName": zone_name,
-                        "ZoneCount": len(zone_ids),
-                        "ZoneIds": zone_ids,
-                        "Recommendation": "Multiple private zones with same name - check VPC associations",
-                        "EstimatedSavings": f"${consolidate_savings:.2f}/month if consolidated",
-                        "EstimatedMonthlySavings": round(consolidate_savings, 2),
-                        "CheckCategory": "Duplicate Private Zones",
-                    }
-                )
+                rec: dict[str, Any] = {
+                    "ZoneName": zone_name,
+                    "ZoneCount": len(zone_ids),
+                    "ZoneIds": zone_ids,
+                    "Recommendation": "Multiple private zones with same name - check VPC associations",
+                    "EstimatedMonthlySavings": round(consolidate_savings, 2),
+                    "CheckCategory": "Duplicate Private Zones",
+                    "AuditBasis": {
+                        "duplicate_zone_count": len(zone_ids),
+                        "removable_zones": dedup_removable,
+                        "already_counted_as_unused": overlap,
+                        "base_zones_in_account": len(hosted_zones),
+                        "region_multiplier": round(pricing_multiplier, 4),
+                        "formula": (
+                            "route53_tiered_cost((zone_count - 1) - unused_overlap) "
+                            "x region_multiplier"
+                        ),
+                    },
+                }
+                if consolidate_savings > 0:
+                    rec["EstimatedSavings"] = f"${consolidate_savings:.2f}/month if consolidated"
+                else:
+                    # Every removable duplicate is already counted under Unused
+                    # Hosted Zones → advisory $0 here (no double-count).
+                    rec["EstimatedSavings"] = (
+                        "$0.00/month — advisory: removable zones already counted "
+                        "under Unused Hosted Zones"
+                    )
+                    rec["Counted"] = False
+                checks["duplicate_private_zones"].append(rec)
 
     except Exception as e:
         ctx.warn(f"Could not perform Route 53 checks: {e}", "route53")

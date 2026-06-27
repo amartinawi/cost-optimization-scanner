@@ -24,6 +24,37 @@ def _priority_class(rec: Rec) -> str:
     return ""
 
 
+def _counted_savings_line(group: List[Rec]) -> str:
+    """SR-2 — single-source a grouped card's savings line to the *counted* total.
+
+    Sums ``EstimatedMonthlySavings`` across the group excluding advisory
+    (``Counted is False``) recs — which never fed the tab headline — so the card
+    total reconciles to ``total_monthly_savings``. Returns the ``<p class="savings">``
+    line: the counted dollar when any rec carries a numeric saving, an honest
+    ``$0.00/month — advisory`` for an advisory-only group, or the first rec's
+    free-text ``EstimatedSavings`` as a last resort when no numeric saving exists.
+    """
+    total = 0.0
+    has_numeric = False
+    for rec in group:
+        if "EstimatedMonthlySavings" not in rec:
+            continue
+        has_numeric = True
+        if rec.get("Counted") is not False:
+            try:
+                total += float(rec.get("EstimatedMonthlySavings") or 0.0)
+            except (TypeError, ValueError):
+                continue
+    if has_numeric:
+        if total > 0:
+            return f'<p class="savings"><strong>Estimated Savings:</strong> ${total:,.2f}/month</p>'
+        return '<p class="savings"><strong>Estimated Savings:</strong> $0.00/month — advisory</p>'
+    savings_str = group[0].get("EstimatedSavings", "") if group else ""
+    if savings_str:
+        return f'<p class="savings"><strong>Estimated Savings:</strong> {savings_str}</p>'
+    return ""
+
+
 def _render_ec2_enhanced_checks(recommendations: List[Rec], source_name: str, service_data: Dict) -> str:
     """Renders EC2 enhanced-check recommendations grouped by category. Called by: HTMLReportGenerator._get_detailed_recommendations."""
     grouped_recs: Dict[str, List[Rec]] = {}
@@ -1108,9 +1139,9 @@ def _render_opensearch_enhanced_checks(recommendations: List[Rec], source_name: 
         content += f"<h4>{category} ({len(domains)} {label})</h4>"
         content += f"<p><strong>Recommendation:</strong> {domains[0].get('Recommendation', 'Optimize domain')}</p>"
 
-        savings_str = domains[0].get("EstimatedSavings", "")
-        if savings_str:
-            content += f'<p class="savings"><strong>Estimated Savings:</strong> {savings_str}</p>'
+        # SR-2 (OpenSearch H2) — render the group's counted dollar, never the
+        # first domain's free-text percentage; advisory domains excluded.
+        content += _counted_savings_line(domains)
 
         content += "<p><strong>Domains:</strong></p><ul>"
         for domain in domains:
@@ -1862,16 +1893,34 @@ def _render_generic_other_rec(content: str, rec: Rec, source_name: str) -> str:
 
     content += f"<h4>{check_category}: {resource_id}</h4>"
 
+    # SR-2 — these drive the savings line (below) or are internal bookkeeping;
+    # never dump them as raw property rows (e.g. "Estimatedmonthlysavings: 5.0").
+    _SAVINGS_KEYS = ("CheckCategory", "Recommendation", "EstimatedSavings", "EstimatedMonthlySavings", "Counted", "MetricReadFailed")
     for key, value in rec.items():
-        if key not in ["CheckCategory", "Recommendation", "EstimatedSavings"] and not key.endswith("Arn"):
-            if isinstance(value, (str, int, float)) and value:
+        if key not in _SAVINGS_KEYS and not key.endswith("Arn"):
+            if isinstance(value, (str, int, float)) and not isinstance(value, bool) and value:
                 formatted_key = key.replace("_", " ").title()
                 content += f"<p><strong>{formatted_key}:</strong> {value}</p>"
 
     if "Recommendation" in rec:
         content += f"<p><strong>Recommendation:</strong> {rec['Recommendation']}</p>"
 
-    if "EstimatedSavings" in rec:
+    # SR-2 (msk H2 / redshift H3 / commitment H1) — single-source the per-rec
+    # savings line: an advisory (Counted=False) rec is labelled and contributes
+    # $0 to the tab total; a counted rec renders its computed EstimatedMonthlySavings
+    # (not a free-text percentage / RI string); otherwise fall back to the string.
+    if rec.get("Counted") is False:
+        content += (
+            '<p class="savings muted"><strong>Estimated Savings:</strong> '
+            "$0.00/month — advisory (not added to the tab total)</p>"
+        )
+    elif "EstimatedMonthlySavings" in rec:
+        try:
+            ems = float(rec.get("EstimatedMonthlySavings") or 0.0)
+        except (TypeError, ValueError):
+            ems = 0.0
+        content += f'<p class="savings"><strong>Estimated Savings:</strong> ${ems:,.2f}/month</p>'
+    elif "EstimatedSavings" in rec:
         content += f'<p class="savings"><strong>Estimated Savings:</strong> {rec["EstimatedSavings"]}</p>'
     return content
 
@@ -2033,7 +2082,11 @@ def _render_eks_source(recommendations: List[Rec], source_name: str, service_dat
 
     content = ""
     for category, recs in grouped.items():
-        total_savings = sum(r.get("monthly_savings", 0.0) for r in recs)
+        # SR-2 (EKS H3) — sum only counted recs into the card total; advisory
+        # (Counted=False) recs — e.g. mutually-exclusive Spot+Graviton
+        # alternatives — never fed the headline, so they must not inflate the
+        # card. They still render, clearly labelled and $0-excluded.
+        total_savings = sum(r.get("monthly_savings", 0.0) for r in recs if r.get("Counted") is not False)
         content += f'<div class="rec-item{_priority_class(recs[0])}">'
         label = "finding" if len(recs) == 1 else "findings"
         content += f"<h4>{category} ({len(recs)} {label})</h4>"
@@ -2049,9 +2102,12 @@ def _render_eks_source(recommendations: List[Rec], source_name: str, service_dat
                 line += f" [{severity}]"
             if reason:
                 line += f" — {reason}"
-            savings = rec.get("monthly_savings", 0.0)
-            if savings > 0:
-                line += f" (${savings:.2f}/month)"
+            if rec.get("Counted") is False:
+                line += " (advisory — not added to the tab total)"
+            else:
+                savings = rec.get("monthly_savings", 0.0)
+                if savings > 0:
+                    line += f" (${savings:.2f}/month)"
             content += f"<li>{line}</li>"
         content += "</ul></div>"
     return content

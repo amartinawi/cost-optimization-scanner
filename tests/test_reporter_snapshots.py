@@ -216,3 +216,65 @@ def test_service_savings_snapshot(
         f"expected {expected}, got {actual_str}. "
         f"Run --snapshot-update to refresh if change is intentional."
     )
+
+
+@pytest.mark.parametrize("service_key", ["opensearch", "api_gateway", "step_functions"])
+def test_no_flat_fifty_fabrication_when_total_is_zero(service_key: str, reporter: HTMLReportGenerator) -> None:
+    """SR-2 — the reporter must never invent a dollar the adapter did not count.
+
+    Previously a $0 service_total for {opensearch, api_gateway, step_functions}
+    triggered ``$50 × recs`` in the tab headline, exec-summary, and
+    reconciliation footnote. With ``_FLAT_SAVINGS_SERVICES`` deleted, a
+    zero-total service with N recs must compute $0.00 (the recs still render as
+    advisory cards via Counted=False). This guards against any future
+    re-introduction of the flat-$50 fabrication.
+    """
+    n_recs = 3
+    service_data = {
+        "total_monthly_savings": 0,
+        "sources": {
+            "enhanced_checks": {
+                "count": n_recs,
+                "recommendations": [{"Recommendation": f"advisory rec {i}", "Counted": False} for i in range(n_recs)],
+            }
+        },
+    }
+    assert reporter._calculate_service_savings(service_key, service_data) == 0.0
+
+
+@pytest.mark.parametrize(
+    "service_key, rec_text",
+    [
+        ("ec2", "schedule stop/start outside business hours"),  # was the $150 "schedule" keyword
+        ("ec2", "Consider Lambda for cron jobs"),  # was the $25 _DEFAULT_SAVINGS fallback
+        ("dynamodb", "switch to reserved capacity"),  # was the $200 "reserved" keyword
+        ("dynamodb", "over-provisioned table"),  # was the $50 _DEFAULT_SAVINGS fallback
+    ],
+)
+def test_ec2_dynamodb_keyword_fabrication_removed(service_key: str, rec_text: str, reporter: HTMLReportGenerator) -> None:
+    """Cost-fidelity (extends SR-2 to ec2/dynamodb) — the reporter must not invent
+    a dollar the adapter did not count.
+
+    ``_calculate_service_savings`` previously synthesized $25-$200/rec from
+    recommendation-text keywords (e.g. ec2 "schedule" -> $150, dynamodb "reserved"
+    -> $200) whenever an adapter's ``total_monthly_savings`` was $0 — re-fabricating
+    at the report layer exactly the advisory dollars the ec2 H2 / dynamodb fixes
+    demote to $0. A $0-canonical service with keyword-laden advisory recs must now
+    compute $0.00.
+    """
+    service_data = {
+        "total_monthly_savings": 0,
+        "sources": {
+            "enhanced_checks": {
+                "count": 2,
+                "recommendations": [{"Recommendation": rec_text, "Counted": False} for _ in range(2)],
+            }
+        },
+    }
+    assert reporter._calculate_service_savings(service_key, service_data) == 0.0
+
+
+def test_canonical_savings_passed_through(reporter: HTMLReportGenerator) -> None:
+    """A non-zero counted total is returned verbatim (never re-derived/inflated)."""
+    service_data = {"total_monthly_savings": 1234.56, "sources": {}}
+    assert reporter._calculate_service_savings("ec2", service_data) == pytest.approx(1234.56)
