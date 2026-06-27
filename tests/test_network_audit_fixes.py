@@ -365,4 +365,8 @@ def test_network_detail_renders_counted_and_advisory() -> None:
     detail = gen._get_detailed_recommendations("network", net)
     assert "Unassociated EIPs" in detail  # counted card rendered
     assert "Low Throughput NAT Gateway" in detail  # advisory card rendered
-    assert "$3.65/month per EIP" in detail
+    # H2: the card now shows the group's counted sum ($3.65 for the single EIP),
+    # reconciling to the tab headline, instead of echoing the per-unit rate string.
+    assert "$3.65/month" in detail
+    # The metric-gated NAT card is advisory and must show the $0.00 advisory line.
+    assert "$0.00/month — advisory" in detail

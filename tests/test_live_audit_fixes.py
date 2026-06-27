@@ -206,3 +206,71 @@ def test_h6_humanize_key(key: str, expected: str) -> None:
     from reporter_phase_b import _humanize_key
 
     assert _humanize_key(key) == expected
+
+
+# --------------------------------------------------------------------------- #
+# H2 - grouped card savings reconcile to the counted group sum
+# --------------------------------------------------------------------------- #
+def test_h2_card_sums_free_text_savings_across_group() -> None:
+    """A multi-resource card sums every rec's parsed dollar, not just the first."""
+    from reporter_phase_b import _grouped_text_savings_line
+
+    group = [
+        {"EstimatedSavings": "$3.65/month per EIP"},
+        {"EstimatedSavings": "$3.65/month per EIP"},
+        {"EstimatedSavings": "$3.65/month per EIP"},
+    ]
+    line = _grouped_text_savings_line(group)
+
+    assert "$10.95/month" in line  # 3 x 3.65, not the first rec's 3.65
+
+
+def test_h2_card_prefers_numeric_savings_when_present() -> None:
+    """Numeric EstimatedMonthlySavings is summed in preference to the free text."""
+    from reporter_phase_b import _grouped_text_savings_line
+
+    group = [
+        {"EstimatedSavings": "$32.85/month if consolidated", "EstimatedMonthlySavings": 32.85},
+        {"EstimatedSavings": "$32.85/month if consolidated", "EstimatedMonthlySavings": 32.85},
+    ]
+    line = _grouped_text_savings_line(group)
+
+    assert "$65.70/month" in line
+
+
+def test_h2_card_excludes_advisory_recs_from_sum() -> None:
+    """Counted=False advisory recs never contribute to the card dollar."""
+    from reporter_phase_b import _grouped_text_savings_line
+
+    group = [
+        {"EstimatedSavings": "$16.43/month if deleted", "EstimatedMonthlySavings": 16.43},
+        {
+            "EstimatedSavings": "$50.00/month - advisory",
+            "EstimatedMonthlySavings": 50.0,
+            "Counted": False,
+        },
+    ]
+    line = _grouped_text_savings_line(group)
+
+    assert "$16.43/month" in line
+    assert "66" not in line  # 16.43 + 50.0 must NOT be summed
+
+
+def test_h2_advisory_only_group_renders_zero_advisory() -> None:
+    """An all-advisory group shows an honest $0.00 advisory line, not a rate."""
+    from reporter_phase_b import _grouped_text_savings_line
+
+    group = [
+        {"EstimatedSavings": "rightsizing", "EstimatedMonthlySavings": 12.0, "Counted": False},
+        {"EstimatedSavings": "rightsizing", "EstimatedMonthlySavings": 8.0, "Counted": False},
+    ]
+    line = _grouped_text_savings_line(group)
+
+    assert "$0.00/month — advisory" in line
+
+
+def test_h2_no_savings_signal_renders_nothing() -> None:
+    """A group with no savings signal at all renders no savings line."""
+    from reporter_phase_b import _grouped_text_savings_line
+
+    assert _grouped_text_savings_line([{"ResourceName": "foo"}]) == ""

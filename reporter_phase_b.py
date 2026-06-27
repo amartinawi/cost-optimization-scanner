@@ -56,6 +56,39 @@ def _counted_savings_line(group: List[Rec]) -> str:
     return ""
 
 
+def _grouped_text_savings_line(group: List[Rec]) -> str:
+    """Card savings line for free-text-savings renderers (network, monitoring).
+
+    Sums each rec's *counted* monthly dollar — the numeric
+    ``EstimatedMonthlySavings`` when present, else the value parsed from the
+    ``EstimatedSavings`` free-text — excluding advisory (``Counted is False``)
+    recs. This mirrors the per-rec savings basis the network / monitoring
+    adapters use for their tab headline, so a multi-resource card reconciles to
+    the headline instead of showing only the first resource's rate (live-audit
+    H2). Returns ``$0.00/month — advisory`` for an advisory-only group and the
+    empty string for a group with no savings signal at all.
+    """
+    from services._savings import parse_dollar_savings
+
+    total = 0.0
+    saw_signal = False
+    for rec in group:
+        if rec.get("EstimatedMonthlySavings") is not None or rec.get("EstimatedSavings"):
+            saw_signal = True
+        if rec.get("Counted") is False:
+            continue
+        numeric = rec.get("EstimatedMonthlySavings")
+        if isinstance(numeric, (int, float)) and not isinstance(numeric, bool):
+            total += float(numeric)
+        else:
+            total += parse_dollar_savings(rec.get("EstimatedSavings", ""))
+    if not saw_signal:
+        return ""
+    if total > 0:
+        return f'<p class="savings"><strong>Estimated Savings:</strong> ${total:,.2f}/month</p>'
+    return '<p class="savings"><strong>Estimated Savings:</strong> $0.00/month — advisory</p>'
+
+
 def _render_ec2_enhanced_checks(recommendations: List[Rec], source_name: str, service_data: Dict) -> str:
     """Renders EC2 enhanced-check recommendations grouped by category. Called by: HTMLReportGenerator._get_detailed_recommendations."""
     grouped_recs: Dict[str, List[Rec]] = {}
@@ -1179,9 +1212,10 @@ def _render_network_enhanced_checks(recommendations: List[Rec], source_name: str
         content += f"<h4>{category} ({len(resources)} resources)</h4>"
         content += f"<p><strong>Recommendation:</strong> {resources[0].get('Recommendation', 'Optimize resource')}</p>"
 
-        savings_str = resources[0].get("EstimatedSavings", "")
-        if savings_str:
-            content += f'<p class="savings"><strong>Estimated Savings:</strong> {savings_str}</p>'
+        # Sum the group's counted savings rather than echoing the first
+        # resource's per-unit rate, so the card reconciles to the tab headline
+        # (live-audit H2).
+        content += _grouped_text_savings_line(resources)
 
         content += "<p><strong>Resources:</strong></p><ul>"
         for res in resources:
@@ -1260,9 +1294,9 @@ def _render_monitoring_enhanced_checks(recommendations: List[Rec], source_name: 
         content += f"<h4>{category} ({len(resources)} resources)</h4>"
         content += f"<p><strong>Recommendation:</strong> {resources[0].get('Recommendation', 'Optimize resource')}</p>"
 
-        savings_str = resources[0].get("EstimatedSavings", "")
-        if savings_str:
-            content += f'<p class="savings"><strong>Estimated Savings:</strong> {savings_str}</p>'
+        # Sum the group's counted savings rather than echoing the first
+        # resource's rate, so the card reconciles to the tab headline (live-audit H2).
+        content += _grouped_text_savings_line(resources)
 
         content += "<p><strong>Resources:</strong></p><ul>"
         for res in resources:
