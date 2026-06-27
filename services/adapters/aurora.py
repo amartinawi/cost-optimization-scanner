@@ -32,7 +32,11 @@ IO_COST_PER_MILLION: float = 0.20
 # region-priced premium comes from
 # PricingEngine.get_aurora_io_storage_premium_per_gb().
 IO_OPTIMIZED_STORAGE_PREMIUM_FALLBACK_PER_GB: float = 0.125
-AURORA_ENGINES: tuple[str, ...] = ("aurora", "aurora-mysql", "aurora-postgresql")
+# DescribeDBClusters' engine filter rejects the deprecated generic "aurora"
+# value ("Unrecognized engine name: aurora"), which made the whole paginated
+# call fail and silently zeroed every Aurora cluster finding (live-audit H1).
+# Only the concrete engine names are valid filter values.
+AURORA_ENGINES: tuple[str, ...] = ("aurora-mysql", "aurora-postgresql")
 HOURS_PER_MONTH: int = 730
 
 

@@ -6,6 +6,7 @@ and generic fallback renderers used by ``HTMLReportGenerator``.
 
 import html
 import logging
+import re
 from typing import Any, Callable, Dict, List, Tuple
 
 logger = logging.getLogger(__name__)
@@ -1840,6 +1841,21 @@ def _render_generic_lambda_rec(content: str, rec: Rec) -> str:
     return content
 
 
+def _humanize_key(key: str) -> str:
+    """Turn a rec key into a human label for a property row.
+
+    snake_case keys keep their existing rendering (``cluster_id`` -> "Cluster
+    Id"); camelCase / PascalCase keys are split on case boundaries with acronyms
+    preserved (``DBInstanceIdentifier`` -> "DB Instance Identifier",
+    ``CurrentSize`` -> "Current Size") instead of being collapsed to one word by
+    ``.title()`` ("Dbinstanceidentifier") (live-audit H6).
+    """
+    s = key.replace("_", " ")
+    s = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", s)  # fooBar -> foo Bar
+    s = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", " ", s)  # DBInstance -> DB Instance
+    return " ".join(w if w.isupper() else w.capitalize() for w in s.split())
+
+
 def _render_generic_other_rec(content: str, rec: Rec, source_name: str) -> str:
     """Render a generic recommendation card for any service. Called by: render_generic_per_rec."""
     check_category = rec.get("CheckCategory", source_name.replace("_", " ").title())
@@ -1908,12 +1924,17 @@ def _render_generic_other_rec(content: str, rec: Rec, source_name: str) -> str:
         "MetricReadFailed",
         "estimatedMonthlySavings",
         "estimatedSavingsPercentage",
+        # snake_case savings key (Aurora et al.) — drives the savings line below,
+        # never dump it raw as "Monthly Savings: 214.62" (live-audit H7).
+        "monthly_savings",
+        # internal diagnostic surfaced as a savings-line qualifier, not a raw
+        # "Pricingwarning:" property row (live-audit M1).
+        "PricingWarning",
     )
     for key, value in rec.items():
         if key not in _SAVINGS_KEYS and not key.endswith("Arn"):
             if isinstance(value, (str, int, float)) and not isinstance(value, bool) and value:
-                formatted_key = key.replace("_", " ").title()
-                content += f"<p><strong>{formatted_key}:</strong> {value}</p>"
+                content += f"<p><strong>{_humanize_key(key)}:</strong> {value}</p>"
 
     if "Recommendation" in rec:
         content += f"<p><strong>Recommendation:</strong> {rec['Recommendation']}</p>"
@@ -1948,8 +1969,23 @@ def _render_generic_other_rec(content: str, rec: Rec, source_name: str) -> str:
             pct_val = None
         suffix = f" ({pct_val:.1f}%)" if pct_val else ""
         content += f'<p class="savings"><strong>Estimated Savings:</strong> ${ems:,.2f}/month{suffix}</p>'
+    elif "monthly_savings" in rec:
+        # snake_case savings (Aurora et al.) — render the canonical numeric line
+        # instead of the verbatim "/mo" string and never the raw suppressed
+        # "Monthly Savings: 214.62" property row (live-audit H7/M2).
+        try:
+            ms = float(rec.get("monthly_savings") or 0.0)
+        except (TypeError, ValueError):
+            ms = 0.0
+        content += f'<p class="savings"><strong>Estimated Savings:</strong> ${ms:,.2f}/month</p>'
     elif "EstimatedSavings" in rec:
         content += f'<p class="savings"><strong>Estimated Savings:</strong> {rec["EstimatedSavings"]}</p>'
+
+    # Surface a metric-gap diagnostic as a small qualifier on the card rather
+    # than dumping it as a raw "Pricingwarning:" property row (live-audit M1).
+    pricing_warning = rec.get("PricingWarning")
+    if pricing_warning:
+        content += f'<p class="muted"><small>{html.escape(str(pricing_warning))}</small></p>'
     return content
 
 
@@ -2355,7 +2391,13 @@ def _render_cost_hub_source(recommendations: List[Rec], source_name: str, servic
 
     content = ""
     for action_type, recs in grouped.items():
-        total_savings = sum(r.get("estimatedMonthlySavings", 0) for r in recs)
+        # Only COUNTED recs contribute to the card sum — an advisory
+        # (Counted=False) CoH rec (e.g. a commitment_analysis RI recommendation
+        # surfaced for visibility) must not render a positive card dollar that
+        # contradicts its $0 tab headline (live-audit C3).
+        total_savings = sum(
+            r.get("estimatedMonthlySavings", 0) for r in recs if r.get("Counted") is not False
+        )
         label = "recommendation" if len(recs) == 1 else "recommendations"
         content += f'<div class="rec-item{_priority_class(recs[0])}">'
 
@@ -2364,6 +2406,11 @@ def _render_cost_hub_source(recommendations: List[Rec], source_name: str, servic
 
         if total_savings > 0:
             content += f'<p class="savings"><strong>Estimated Monthly Savings:</strong> ${total_savings:.2f}</p>'
+        elif any(r.get("Counted") is False for r in recs):
+            content += (
+                '<p class="savings muted"><strong>Estimated Monthly Savings:</strong> '
+                "$0.00/month — advisory (not added to the tab total)</p>"
+            )
 
         effort = recs[0].get("implementationEffort", "")
         if effort:

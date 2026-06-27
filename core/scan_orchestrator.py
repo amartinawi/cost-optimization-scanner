@@ -85,6 +85,11 @@ class ScanOrchestrator:
         splits: dict[str, list[dict[str, Any]]] = {svc: [] for svc in _HUB_SERVICES}
         type_map = {
             "Ec2Instance": "ec2",
+            # ASG rightsizing dollars are owned by the EC2 tab (the network ASG
+            # block is advisory), so CoH Auto Scaling Group recs route to ec2 —
+            # without this they fell through to unbucketed_types and were dropped,
+            # silently understating savings (live-audit C2).
+            "Ec2AutoScalingGroup": "ec2",
             "LambdaFunction": "lambda",
             "EbsVolume": "ebs",
             "RdsDbInstance": "rds",
