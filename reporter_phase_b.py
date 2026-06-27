@@ -485,6 +485,8 @@ def _render_ebs_compute_optimizer(recommendations: List[Rec], source_name: str, 
             grouped_findings[finding] = []
         grouped_findings[finding].append(rec)
 
+    from services._savings import compute_optimizer_savings
+
     content = ""
     for finding, recs in grouped_findings.items():
         content += f'<div class="rec-item{_priority_class(recs[0])}">'
@@ -497,7 +499,13 @@ def _render_ebs_compute_optimizer(recommendations: List[Rec], source_name: str, 
             volume_size_data = current_config.get("volumeSize", 0)
             volume_size = volume_size_data.get("value", 0) if isinstance(volume_size_data, dict) else volume_size_data
 
-            content += f"<li>{volume_id}: {volume_type} ({volume_size} GB)</li>"
+            # Surface the per-volume saving the headline already counts, so the
+            # card is defensible instead of showing a bare volume id (ebs L3).
+            vol_savings = compute_optimizer_savings(rec)
+            savings_html = (
+                f' &mdash; <span class="savings">${vol_savings:,.2f}/month</span>' if vol_savings > 0 else ""
+            )
+            content += f"<li>{volume_id}: {volume_type} ({volume_size} GB){savings_html}</li>"
         content += "</ul></div>"
     return content
 
