@@ -243,6 +243,10 @@ def test_scan_all_recs_are_zero_advisories() -> None:
         assert rec["EstimatedSavings"].startswith("$0.00/month — advisory")
         assert rec["AuditBasis"]["realizable_monthly_savings"] == 0.0
     assert findings.total_monthly_savings == 0.0
+    # Count hygiene: advisory recs render but are excluded from the rec-count
+    # headline (mirror batch / step_functions / quicksight).
+    assert findings.total_recommendations == 0
+    assert findings.sources["enhanced_checks"].count == len(recs)
 
 
 def test_scan_does_not_mutate_source_recs(monkeypatch) -> None:

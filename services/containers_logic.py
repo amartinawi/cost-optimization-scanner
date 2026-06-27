@@ -277,6 +277,38 @@ def normalize_resource_name(value: str) -> str:
     return str(value).split("/")[-1].split(":")[-1]
 
 
+# ECS resource-type path tokens that prefix a service/task/cluster ARN tail
+# (``service/<cluster>/<name>``, ``cluster/<name>``). Stripped so a full ARN and
+# a bare path reduce to the same key — and so an ``EcsCluster`` ARN tail
+# ``cluster/<name>`` matches a ClusterName-only heuristic key ``<name>``.
+_ECS_PATH_TOKENS: frozenset[str] = frozenset({"service", "task", "task-set", "cluster"})
+
+
+def ecs_dedup_key(value: str) -> str:
+    """Cluster-qualified dedup key for an ECS resource ARN/path.
+
+    Keeps the final two path segments (``cluster/service``) so two services with
+    the same name in different clusters do NOT collapse to one key and
+    over-dedup against a single CoH / Compute Optimizer finding (containers
+    cross-cluster dedup). A CoH service ARN (``...:service/clusterA/web``), a
+    Compute Optimizer ``resource_id`` (``clusterA/web``), and a heuristic's
+    constructed ``clusterA/web`` all converge on ``clusterA/web``. Single-segment
+    names (ECR repo, EKS cluster, a classic cluster-less ``service/web`` ARN)
+    pass through unchanged.
+    """
+    if not value:
+        return ""
+    tail = str(value).split(":")[-1]  # strip any ``arn:…:`` prefix
+    parts = [p for p in tail.split("/") if p]
+    if not parts:
+        return ""
+    # Drop a leading ECS resource-type token so ``service/clusterA/web`` and
+    # ``clusterA/web`` reduce to the same ``clusterA/web``.
+    if len(parts) > 1 and parts[0] in _ECS_PATH_TOKENS:
+        parts = parts[1:]
+    return "/".join(parts[-2:])
+
+
 def dedupe_by_authority(
     cost_hub: list[dict[str, Any]],
     compute_optimizer: list[dict[str, Any]],
@@ -285,26 +317,29 @@ def dedupe_by_authority(
     coh_key: Any,
     co_key: Any,
     heuristic_key: Any,
+    normalizer: Any = normalize_resource_name,
 ) -> list[dict[str, Any]]:
     """Return heuristic recs not already covered by CoH or Compute Optimizer.
 
     Authority order CoH > Compute Optimizer > heuristics: a heuristic finding
     for a resource already surfaced by an AWS-native source is dropped so its
-    savings are never counted twice. ``*_key`` callables extract the normalized
-    resource name from a rec of that source.
+    savings are never counted twice. ``*_key`` callables extract the raw resource
+    identifier from a rec of that source; ``normalizer`` reduces each to the
+    canonical dedup key (pass ``ecs_dedup_key`` to keep the cluster so same-named
+    services in different clusters stay distinct).
     """
     covered: set[str] = set()
     for rec in cost_hub:
-        name = normalize_resource_name(coh_key(rec))
+        name = normalizer(coh_key(rec))
         if name:
             covered.add(name)
     for rec in compute_optimizer:
-        name = normalize_resource_name(co_key(rec))
+        name = normalizer(co_key(rec))
         if name:
             covered.add(name)
     kept: list[dict[str, Any]] = []
     for rec in heuristics:
-        name = normalize_resource_name(heuristic_key(rec))
+        name = normalizer(heuristic_key(rec))
         if name and name in covered:
             continue
         kept.append(rec)

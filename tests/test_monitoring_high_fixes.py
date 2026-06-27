@@ -209,6 +209,28 @@ def test_unused_custom_metrics_counts_only_stale_metrics() -> None:
     assert _counted_sum(result["recommendations"]) == pytest.approx(24.0)
 
 
+def test_custom_metrics_priced_at_account_wide_marginal_tier() -> None:
+    # AWS tiers custom metrics account-wide per region ($0.30 first 10k, then
+    # $0.10). Two high-volume namespaces (8000 + 4000 = 12000 metrics, all stale)
+    # must be priced at the marginal tier, not as if each started at $0.30.
+    metrics = _custom_metrics("nsA", 8000) + _custom_metrics("nsB", 4000)
+    cw = _FakeCloudWatchClient(metrics=metrics, metric_data_fn=_metric_data_fn(active_names=set()))
+    ctx = _shim_ctx({"logs": _FakeLogsClient([]), "cloudwatch": cw})
+
+    result = get_cloudwatch_checks(ctx, pricing_multiplier=1.0)
+    total = _counted_sum(result["recommendations"])
+
+    # Account-wide marginal: cost(12000) - cost(0) = 10000*0.30 + 2000*0.10 = $3200.
+    expected = _cw_custom_metrics_monthly_cost(12000) - _cw_custom_metrics_monthly_cost(0)
+    assert expected == pytest.approx(3200.0)
+    assert total == pytest.approx(3200.0)
+    # The old per-namespace pricing (each starting at tier-1 $0.30) overstated by
+    # $400: 8000*0.30 + 4000*0.30 = $3600.
+    old_per_namespace = 8000 * 0.30 + 4000 * 0.30
+    assert old_per_namespace == pytest.approx(3600.0)
+    assert total != pytest.approx(old_per_namespace)
+
+
 def test_unused_custom_metrics_region_scaled() -> None:
     metrics = _custom_metrics("MyApp", 120)
     active = {f"m{i}" for i in range(40)}  # 80 stale

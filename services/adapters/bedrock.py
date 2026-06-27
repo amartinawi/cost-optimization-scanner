@@ -23,7 +23,6 @@ PT_HOURLY_PRICE: dict[str, float] = {
     "anthropic.claude-3-opus": 21.50,
     "amazon.titan-text-lite": 0.30,
 }
-PT_HOURLY_DEFAULT: float = 1.0
 KB_OCU_HOURLY: float = 0.20
 HOURS_PER_MONTH: int = 730
 CW_NAMESPACE: str = "AWS/Bedrock"

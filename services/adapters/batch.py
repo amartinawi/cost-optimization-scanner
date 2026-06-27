@@ -58,10 +58,13 @@ class BatchModule(BaseServiceModule):
         savings = 0.0
 
         sources = {"enhanced_checks": SourceBlock(count=len(recs), recommendations=tuple(recs))}
+        # Count hygiene (mirror mediastore H1 / lambda): advisory ($0 Counted=False)
+        # recs render but are excluded from the rec-count headline.
+        counted_recs = sum(1 for r in recs if r.get("Counted") is not False)
 
         return ServiceFindings(
             service_name="Batch",
-            total_recommendations=len(recs),
+            total_recommendations=counted_recs,
             total_monthly_savings=savings,
             sources=sources,
             optimization_descriptions=BATCH_OPTIMIZATION_DESCRIPTIONS,

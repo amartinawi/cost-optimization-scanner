@@ -1,4 +1,4 @@
-"""CloudWatch state-transition pricing adapter for Step Functions."""
+"""Advisory adapter for Step Functions (Standard->Express delta is unmeasurable $0)."""
 
 from __future__ import annotations
 
@@ -79,9 +79,12 @@ class StepFunctionsModule(BaseServiceModule):
         # Idle state machines incur NO AWS charges (Step Functions bills only per
         # state transition for Standard, per request+duration for Express), so $0
         # is the only honest tab total until evidence-backed pricing is wired.
+        # Count hygiene (mirror mediastore H1 / lambda): advisory ($0 Counted=False)
+        # recs render but are excluded from the rec-count headline.
+        counted_recs = sum(1 for r in recs if r.get("Counted") is not False)
         return ServiceFindings(
             service_name="Step Functions",
-            total_recommendations=len(recs),
+            total_recommendations=counted_recs,
             total_monthly_savings=0.0,
             sources={"enhanced_checks": SourceBlock(count=len(recs), recommendations=tuple(recs))},
             optimization_descriptions=STEP_FUNCTIONS_OPTIMIZATION_DESCRIPTIONS,

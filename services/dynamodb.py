@@ -78,18 +78,6 @@ _PROVISIONED_WCU_COST: float = 0.00065 * 730  # = $0.4745/WCU-month
 _ON_DEMAND_RCU_PER_REQUEST: float = 0.125 / 1_000_000  # = $0.000000125/RRU
 _ON_DEMAND_WCU_PER_REQUEST: float = 0.625 / 1_000_000  # = $0.000000625/WRU
 
-# Per-opportunity savings factors. Each factor is applied to the table's
-# current monthly cost to estimate savings if the recommendation is acted
-# on. Factors are AWS-documented midpoints rather than arbitrary constants.
-DYNAMODB_SAVINGS_FACTORS: dict[str, float] = {
-    "reserved_capacity": 0.66,       # AWS-published 53-76% midpoint
-    "rightsize_provisioned": 0.40,   # measured-utilization fallback midpoint
-    "billing_mode_switch": 0.40,     # AWS-published 20-60% midpoint
-    "unused_table": 1.00,            # deleting an empty table = 100% saved
-    "data_lifecycle": 0.60,          # AWS-published 40-80% TTL/archive midpoint
-    "default": 0.30,                 # conservative fallback when category unknown
-}
-
 # CheckCategories that are commitment levers (a future PURCHASE, not a rightsizing
 # saving). The adapter demotes these to $0 advisories so they are never summed
 # into the per-service rightsizing headline — Reserved Capacity dollars are owned

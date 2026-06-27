@@ -1,4 +1,4 @@
-"""Flat-rate adapter for MSK."""
+"""Advisory adapter for MSK (broker/storage savings are utilization-gated $0)."""
 
 from __future__ import annotations
 
@@ -98,7 +98,7 @@ def _to_advisory_rec(ctx: Any, rec: dict[str, Any]) -> dict[str, Any]:
 
 
 class MskModule(BaseServiceModule):
-    """ServiceModule adapter for MSK. Flat-rate savings strategy."""
+    """ServiceModule adapter for MSK. Advisory-only ($0 Counted=False) strategy."""
 
     key: str = "msk"
     cli_aliases: tuple[str, ...] = ("msk",)
@@ -111,8 +111,12 @@ class MskModule(BaseServiceModule):
     def scan(self, ctx: Any) -> ServiceFindings:
         """Scan MSK clusters for cost optimization opportunities.
 
-        Consults enhanced MSK checks. Savings calculated via flat-rate
-        heuristic per recommendation.
+        Consults enhanced MSK checks. Every rec is emitted as a $0
+        ``Counted=False`` advisory (the prior blanket 30% flat-rate factor was
+        removed — msk C1): the realized broker-rightsizing / storage saving is
+        utilization-dependent and needs a target broker size + run-hour signal
+        MSK does not expose at scan time. The live current-spend SKUs are still
+        priced into each rec's AuditBasis so the advisory is defensible.
 
         Args:
             ctx: ScanContext with region, clients, and pricing data.
@@ -134,10 +138,14 @@ class MskModule(BaseServiceModule):
         savings = 0.0
 
         sources = {"enhanced_checks": SourceBlock(count=len(recs), recommendations=tuple(recs))}
+        # Count hygiene (mirror batch / step_functions / quicksight): every MSK
+        # rec is a $0 Counted=False advisory — it renders but must not inflate the
+        # counted rec-count headline.
+        counted_recs = sum(1 for r in recs if r.get("Counted") is not False)
 
         return ServiceFindings(
             service_name="MSK",
-            total_recommendations=len(recs),
+            total_recommendations=counted_recs,
             total_monthly_savings=savings,
             sources=sources,
             optimization_descriptions=MSK_OPTIMIZATION_DESCRIPTIONS,

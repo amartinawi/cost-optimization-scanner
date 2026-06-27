@@ -273,16 +273,26 @@ def get_enhanced_workspaces_checks(ctx: ScanContext) -> dict[str, Any]:
                         savings = max(current_price - target_price, 0.0)
 
                         if savings > 0:
+                            # Advisory only: a high bundle tier is NOT evidence the
+                            # WorkSpace is over-provisioned, and WorkSpaces publishes
+                            # no default CPU/memory utilization metric to CloudWatch
+                            # to gate on — so counting the current->target delta (and
+                            # claiming "based on utilization profile") fabricated a
+                            # saving. Carry the potential figure; the adapter renders
+                            # it Counted=False, never summed.
                             checks["bundle_rightsizing"].append(
                                 {
                                     "WorkspaceId": workspace_id,
                                     "CurrentBundle": compute_type,
                                     "RecommendedBundle": target_type,
+                                    "Counted": False,
+                                    "PotentialMonthlySavings": round(savings, 2),
                                     "Recommendation": (
-                                        f"Downgrade from {compute_type} to {target_type} based on utilization profile"
+                                        f"If {compute_type} is underutilized, downgrading to {target_type} "
+                                        f"would save ~${savings:.2f}/mo — verify CPU/memory utilization first "
+                                        f"(not measured: WorkSpaces does not publish utilization to CloudWatch "
+                                        f"by default)"
                                     ),
-                                    "EstimatedSavings": f"${savings:.2f}/month",
-                                    "EstimatedSavingsAmount": savings,
                                     "CheckCategory": "Bundle Rightsizing",
                                 }
                             )

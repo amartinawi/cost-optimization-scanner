@@ -92,10 +92,13 @@ class QuicksightModule(BaseServiceModule):
         sources = {
             "enhanced_checks": SourceBlock(count=len(priced_recs), recommendations=tuple(priced_recs))
         }
+        # Count hygiene (mirror mediastore H1 / lambda): advisory ($0 Counted=False)
+        # recs render but are excluded from the rec-count headline.
+        counted_recs = sum(1 for r in priced_recs if r.get("Counted") is not False)
 
         return ServiceFindings(
             service_name="QuickSight",
-            total_recommendations=len(priced_recs),
+            total_recommendations=counted_recs,
             total_monthly_savings=savings,
             sources=sources,
             optimization_descriptions=QUICKSIGHT_OPTIMIZATION_DESCRIPTIONS,

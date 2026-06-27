@@ -303,6 +303,19 @@ def test_scan_path_counted_equals_rendered_region_scaled() -> None:
     assert rec["AuditBasis"]["region"] == "eu-west-1"
 
 
+def test_count_hygiene_excludes_advisory_recs(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A counted rec (edition + unused GB present) and an advisory rec (missing
+    # edition → $0). total_recommendations counts only the counted one; both render.
+    recs = [
+        {"DomainName": "d1", "Edition": "ENTERPRISE", "UnusedSpiceCapacityGB": 100, "CheckCategory": "SPICE Optimization"},
+        {"DomainName": "d2", "CheckCategory": "SPICE Optimization"},  # no edition/GB → advisory
+    ]
+    findings = _patched_scan(monkeypatch, recs)
+    assert findings.sources["enhanced_checks"].count == 2  # both render
+    assert findings.total_recommendations == 1  # advisory excluded from the count
+    assert findings.total_monthly_savings > 0
+
+
 def test_scan_path_standard_edition_rate() -> None:
     client = _FakeQuickSight(edition="STANDARD", used_gb=30.0, total_gb=100.0)
     ctx = _scan_ctx(client, pricing_multiplier=1.0, region="us-east-1")

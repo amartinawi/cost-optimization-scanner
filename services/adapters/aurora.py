@@ -21,7 +21,6 @@ from services.rds_logic import normalize_rds_arn
 
 logger = logging.getLogger(__name__)
 
-ACU_HOURLY_FALLBACK: float = 0.06
 # Aurora Standard per-request I/O charge that I/O-Optimized eliminates.
 # Validated live us-east-1 (Pricing API 2026-06-19): Aurora:StorageIOUsage
 # $0.0000002/IO = $0.20 per 1M I/O requests.
@@ -35,23 +34,6 @@ IO_COST_PER_MILLION: float = 0.20
 IO_OPTIMIZED_STORAGE_PREMIUM_FALLBACK_PER_GB: float = 0.125
 AURORA_ENGINES: tuple[str, ...] = ("aurora", "aurora-mysql", "aurora-postgresql")
 HOURS_PER_MONTH: int = 730
-
-
-def _get_acu_hourly(ctx: Any) -> float:
-    """Return the per-ACU hourly price already region-correct.
-
-    Live PricingEngine returns a region-priced value (no multiplier needed).
-    Fallback applies ctx.pricing_multiplier internally so the caller can
-    treat the return value uniformly without per-source casing. Callers
-    MUST NOT re-multiply by ctx.pricing_multiplier downstream.
-    """
-    try:
-        price = ctx.pricing_engine.get_aurora_acu_hourly()
-        if price and price > 0:
-            return price
-    except Exception:
-        pass
-    return ACU_HOURLY_FALLBACK * ctx.pricing_multiplier
 
 
 def _describe_aurora_clusters(rds: Any, ctx: Any) -> list[dict[str, Any]]:
@@ -346,12 +328,12 @@ def _check_provisioned_instances(
 
 def _check_serverless_v2(
     cluster: dict[str, Any],
-    rds: Any,
     cw: Any,
-    acu_hourly: float,
-    pricing_multiplier: float,
     fast_mode: bool,
 ) -> list[dict[str, Any]]:
+    # The Serverless v2 lever is a $0 advisory (lowering MaxCapacity saves
+    # nothing without consumed-vs-Min history), so no pricing inputs are needed —
+    # only the cluster config and the CloudWatch ACUUtilization read.
     recs: list[dict[str, Any]] = []
     scaling = cluster.get("ServerlessV2ScalingConfiguration")
     if not scaling:
@@ -589,7 +571,6 @@ class AuroraModule(BaseServiceModule):
                 extras={"cluster_count": 0, "serverless_cluster_count": 0, "global_cluster_count": 0},
             )
 
-        acu_hourly = _get_acu_hourly(ctx)
         multiplier = ctx.pricing_multiplier
         fast_mode = getattr(ctx, "fast_mode", False)
         pe = getattr(ctx, "pricing_engine", None)
@@ -633,7 +614,7 @@ class AuroraModule(BaseServiceModule):
                 if cluster.get("GlobalClusterIdentifier"):
                     global_count += 1
 
-                serverless_recs.extend(_check_serverless_v2(cluster, rds, cw, acu_hourly, multiplier, fast_mode))
+                serverless_recs.extend(_check_serverless_v2(cluster, cw, fast_mode))
                 cluster_id = cluster.get("DBClusterIdentifier", "")
                 io_recs.extend(
                     _check_io_tier(

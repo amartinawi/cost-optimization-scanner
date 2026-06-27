@@ -1895,7 +1895,20 @@ def _render_generic_other_rec(content: str, rec: Rec, source_name: str) -> str:
 
     # SR-2 — these drive the savings line (below) or are internal bookkeeping;
     # never dump them as raw property rows (e.g. "Estimatedmonthlysavings: 5.0").
-    _SAVINGS_KEYS = ("CheckCategory", "Recommendation", "EstimatedSavings", "EstimatedMonthlySavings", "Counted", "MetricReadFailed")
+    # The lowercase camelCase keys are the Cost Optimization Hub schema
+    # (elasticache / opensearch / redshift inline-render their CoH bucket through
+    # this generic path); suppress them here so they render as the clean savings
+    # line below instead of a raw "Estimatedmonthlysavings: 5.0" dump (CoH H-render).
+    _SAVINGS_KEYS = (
+        "CheckCategory",
+        "Recommendation",
+        "EstimatedSavings",
+        "EstimatedMonthlySavings",
+        "Counted",
+        "MetricReadFailed",
+        "estimatedMonthlySavings",
+        "estimatedSavingsPercentage",
+    )
     for key, value in rec.items():
         if key not in _SAVINGS_KEYS and not key.endswith("Arn"):
             if isinstance(value, (str, int, float)) and not isinstance(value, bool) and value:
@@ -1920,6 +1933,21 @@ def _render_generic_other_rec(content: str, rec: Rec, source_name: str) -> str:
         except (TypeError, ValueError):
             ems = 0.0
         content += f'<p class="savings"><strong>Estimated Savings:</strong> ${ems:,.2f}/month</p>'
+    elif "estimatedMonthlySavings" in rec:
+        # Cost Optimization Hub schema (lowercase camelCase). These recs are the
+        # counted authority for their resource, so render the CoH-reported dollar
+        # as a clean savings line (CoH H-render) — never the raw property dump.
+        try:
+            ems = float(rec.get("estimatedMonthlySavings") or 0.0)
+        except (TypeError, ValueError):
+            ems = 0.0
+        pct = rec.get("estimatedSavingsPercentage")
+        try:
+            pct_val = float(pct) if pct is not None else None
+        except (TypeError, ValueError):
+            pct_val = None
+        suffix = f" ({pct_val:.1f}%)" if pct_val else ""
+        content += f'<p class="savings"><strong>Estimated Savings:</strong> ${ems:,.2f}/month{suffix}</p>'
     elif "EstimatedSavings" in rec:
         content += f'<p class="savings"><strong>Estimated Savings:</strong> {rec["EstimatedSavings"]}</p>'
     return content
@@ -2532,6 +2560,14 @@ PHASE_B_HANDLERS: Dict[Tuple[str, str], Callable] = {
     ("dynamodb", "cost_optimization_hub"): _render_cost_hub_source,
     ("containers", "enhanced_checks"): _render_containers_enhanced_checks,
     ("elasticache", "enhanced_checks"): _render_elasticache_enhanced_checks,
+    # CoH buckets the orchestrator routes into these per-service tabs. Bind to the
+    # purpose-built CoH renderer (grouped action table) consistent with rds /
+    # dynamodb / containers — without this the cost_optimization_hub SourceBlock
+    # fell through to the generic renderer and dumped a raw "Estimatedmonthlysavings:
+    # 5.0" property row with no clean savings line (CoH H-render).
+    ("elasticache", "cost_optimization_hub"): _render_cost_hub_source,
+    ("opensearch", "cost_optimization_hub"): _render_cost_hub_source,
+    ("redshift", "cost_optimization_hub"): _render_cost_hub_source,
     ("opensearch", "enhanced_checks"): _render_opensearch_enhanced_checks,
     # Network emits five per-domain sources (NOT a single enhanced_checks bucket).
     # Each must map to the renderer or the tab body renders empty while savings

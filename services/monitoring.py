@@ -309,6 +309,14 @@ def get_cloudwatch_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> 
                     )
                     stale_by_ns = None
 
+            # AWS custom-metric tiering is account-wide per region ($0.30 first 10k,
+            # then $0.10, then $0.05), so the removable (stale) metrics come off the
+            # TOP of the account's metric stack. Anchor the marginal-rate computation
+            # on the total custom-metric count and walk it down as each namespace's
+            # stale metrics are attributed — pricing per-namespace from 0 overstated
+            # the saving once the account exceeds the 10k tier-1 limit.
+            running_account_count = len(custom_metrics)
+
             for namespace in sorted(high_volume):
                 count = namespace_counts[namespace]
 
@@ -367,11 +375,12 @@ def get_cloudwatch_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> 
                     )
                     continue
 
-                # Counted: removable = measured stale metrics. Saving = tiered
-                # cost(count) - tiered cost(count - stale), region-scaled.
-                current_cost = _cw_custom_metrics_monthly_cost(count)
-                reduced_cost = _cw_custom_metrics_monthly_cost(count - stale)
+                # Counted: removable = measured stale metrics, priced at the
+                # account-wide MARGINAL tier (top of the stack), region-scaled.
+                current_cost = _cw_custom_metrics_monthly_cost(running_account_count)
+                reduced_cost = _cw_custom_metrics_monthly_cost(running_account_count - stale)
                 monthly_savings = (current_cost - reduced_cost) * pricing_multiplier
+                running_account_count -= stale
                 checks["unused_custom_metrics"].append(
                     {
                         "Namespace": namespace,
@@ -397,8 +406,10 @@ def get_cloudwatch_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> 
                                 "(no datapoints = stale)"
                             ),
                             "region_multiplier": round(pricing_multiplier, 4),
+                            "account_marginal_anchor": running_account_count + stale,
                             "formula": (
-                                "(tiered_cost(count) - tiered_cost(count - stale)) x region_multiplier"
+                                "(tiered_cost(account_anchor) - tiered_cost(account_anchor - stale)) "
+                                "x region_multiplier  [account-wide marginal tier]"
                             ),
                         },
                     }

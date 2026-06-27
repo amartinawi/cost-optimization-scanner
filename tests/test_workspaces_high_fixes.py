@@ -344,21 +344,29 @@ def test_count_hygiene_excludes_advisory(monkeypatch: pytest.MonkeyPatch) -> Non
     assert findings.total_monthly_savings == pytest.approx(35.0, abs=0.01)
 
 
-def test_bundle_rightsizing_counted_from_amount(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_bundle_rightsizing_is_advisory_not_counted(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A high-tier bundle is not evidence of over-provisioning and WorkSpaces
+    # publishes no default utilization metric, so the downsizing delta is a $0
+    # advisory carrying the potential figure — never a counted dollar.
     rec = {
         "WorkspaceId": "ws-rs",
         "CurrentBundle": "POWERPRO",
         "RecommendedBundle": "STANDARD",
-        "EstimatedSavingsAmount": 105.0,
+        "PotentialMonthlySavings": 105.0,
+        "Counted": False,
         "CheckCategory": "Bundle Rightsizing",
     }
     _patch_shim(monkeypatch, [rec])
     findings = WorkspacesModule().scan(_recording_ctx())
 
-    assert findings.total_monthly_savings == pytest.approx(105.0, abs=0.01)
+    assert findings.total_monthly_savings == 0.0
     emitted = findings.sources["enhanced_checks"].recommendations[0]
-    assert emitted["EstimatedMonthlySavings"] == pytest.approx(105.0, abs=0.01)
-    assert emitted["EstimatedSavings"].startswith("$105.00")
+    assert emitted["Counted"] is False
+    assert emitted["EstimatedMonthlySavings"] == 0.0
+    assert emitted["EstimatedSavings"].startswith("$0.00/month")
+    assert "105.00" in emitted["EstimatedSavings"]  # potential figure preserved
+    # Advisory rec is excluded from the counted rec-count headline.
+    assert findings.total_recommendations == 0
 
 
 # --------------------------------------------------------------------------- #
