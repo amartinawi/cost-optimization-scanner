@@ -40,9 +40,10 @@ import services.opensearch as opensearch_shim
 from services.adapters.opensearch import (
     GP2_PRICE_PER_GB_MONTH,
     GP3_PRICE_PER_GB_MONTH,
-    GRAVITON_RATE,
     OpensearchModule,
     _downsize_node_delta,
+    _graviton_equivalent,
+    _graviton_node_delta,
     _one_size_down,
 )
 
@@ -140,21 +141,46 @@ def test_graviton_scales_by_instance_count(monkeypatch: pytest.MonkeyPatch) -> N
             "CheckCategory": "Graviton Migration",
         }
     ]
-    findings = _scan_with(recs, monkeypatch, pricing_engine=_FakePricing(default=120.0))
+    # H4: counted dollar is the exact x86->Graviton node delta, per node.
+    # r5.large.search $120 - r6g.large.search $110 = $10/node x 6 = $60.
+    pricing = _FakePricing({"r5.large.search": 120.0, "r6g.large.search": 110.0})
+    findings = _scan_with(recs, monkeypatch, pricing_engine=pricing)
     rec = _by_category(findings)["Graviton Migration"]
-    # 120 * 6 nodes * 0.25 = 180.00 (NOT 120 * 1 * 0.25 = 30.00, the 1-node bug).
-    assert rec["EstimatedMonthlySavings"] == pytest.approx(120.0 * 6 * GRAVITON_RATE)
-    assert rec["EstimatedMonthlySavings"] == pytest.approx(180.0)
+    assert rec["EstimatedMonthlySavings"] == pytest.approx(60.0)
     assert rec["Counted"] is True
-    assert findings.total_monthly_savings == pytest.approx(180.0)
+    assert findings.total_monthly_savings == pytest.approx(60.0)
     assert rec["AuditBasis"]["instance_count"] == 6
+    assert rec["AuditBasis"]["target_type"] == "r6g.large.search"
+    assert rec["AuditBasis"]["per_node_delta_monthly"] == pytest.approx(10.0)
 
 
 def test_graviton_default_count_is_one_when_absent(monkeypatch: pytest.MonkeyPatch) -> None:
     recs = [{"DomainName": "d", "InstanceType": "r5.large.search", "CheckCategory": "Graviton Migration"}]
-    findings = _scan_with(recs, monkeypatch, pricing_engine=_FakePricing(default=120.0))
+    pricing = _FakePricing({"r5.large.search": 120.0, "r6g.large.search": 110.0})
+    findings = _scan_with(recs, monkeypatch, pricing_engine=pricing)
     rec = _by_category(findings)["Graviton Migration"]
-    assert rec["EstimatedMonthlySavings"] == pytest.approx(120.0 * GRAVITON_RATE)  # 30.00
+    assert rec["EstimatedMonthlySavings"] == pytest.approx(10.0)  # delta x 1 node
+
+
+def test_graviton_equivalent_maps_x86_family_same_size() -> None:
+    assert _graviton_equivalent("r5.xlarge.search") == "r6g.xlarge.search"
+    assert _graviton_equivalent("m5.large.search") == "m6g.large.search"
+    assert _graviton_equivalent("c5.2xlarge.search") == "c6g.2xlarge.search"
+    assert _graviton_equivalent("t3.medium.search") == "t4g.medium.search"
+    # already-Graviton or unmappable -> None (caller emits $0 advisory).
+    assert _graviton_equivalent("r6g.large.search") is None
+    assert _graviton_equivalent("i3.large.search") is None
+    assert _graviton_equivalent(None) is None
+    assert _graviton_equivalent("weird") is None
+
+
+def test_graviton_node_delta_abstains_when_target_unpriceable() -> None:
+    # x86 with no priced Graviton counterpart -> (0.0, None) fail safe.
+    pricing = _FakePricing({"r5.large.search": 120.0}, default=0.0)
+    assert _graviton_node_delta(_ctx(pricing_engine=pricing), "r5.large.search") == (0.0, None)
+    # already-Graviton -> no x86->Graviton mapping -> abstain.
+    assert _graviton_node_delta(_ctx(pricing_engine=_FakePricing()), "r6g.large.search") == (0.0, None)
+    assert _graviton_node_delta(SimpleNamespace(pricing_engine=None), "r5.large.search") == (0.0, None)
 
 
 # --------------------------------------------------------------------------- #
@@ -247,27 +273,31 @@ def test_underutilized_no_instance_type_is_zero_advisory(monkeypatch: pytest.Mon
 
 
 def test_underutilized_beats_graviton_in_per_domain_dedup(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Same domain: a concrete 50%-style downsize delta should outrank the 25%
-    # graviton proxy and be the single counted instance lever.
+    # Same domain: the larger concrete downsize delta outranks the smaller
+    # Graviton node delta and is the single counted instance lever.
     recs = [
         {
             "DomainName": "slow",
-            "InstanceType": "r6g.2xlarge.search",
+            "InstanceType": "r5.2xlarge.search",
             "InstanceCount": 1,
             "CheckCategory": "Graviton Migration",
         },
         {
             "DomainName": "slow",
-            "InstanceType": "r6g.2xlarge.search",
+            "InstanceType": "r5.2xlarge.search",
             "InstanceCount": 1,
             "CheckCategory": "Underutilized Domain",
         },
     ]
-    pricing = _FakePricing({"r6g.2xlarge.search": 200.0, "r6g.xlarge.search": 100.0})
+    # downsize r5.2xlarge $200 -> r5.xlarge $100 = $100 delta;
+    # graviton r5.2xlarge $200 -> r6g.2xlarge $190 = $10 delta (loses).
+    pricing = _FakePricing(
+        {"r5.2xlarge.search": 200.0, "r5.xlarge.search": 100.0, "r6g.2xlarge.search": 190.0}
+    )
     findings = _scan_with(recs, monkeypatch, pricing_engine=pricing)
     cats = _by_category(findings)
     assert cats["Underutilized Domain"]["Counted"] is True  # delta 100 wins
-    assert cats["Graviton Migration"]["Counted"] is False  # 200*0.25=50 superseded
+    assert cats["Graviton Migration"]["Counted"] is False  # delta 10 superseded
     assert findings.total_monthly_savings == pytest.approx(100.0)
 
 
@@ -338,14 +368,18 @@ def test_shim_to_adapter_end_to_end_prices_every_lever(monkeypatch: pytest.Monke
         "get_enhanced_opensearch_checks",
         lambda ctx: opensearch_shim.get_enhanced_opensearch_checks(_shim_ctx(status, avg_cpu=12.0)),
     )
-    pricing = _FakePricing({"r5.2xlarge.search": 400.0, "r5.xlarge.search": 200.0})
+    # r6g.2xlarge.search priced just below the x86 node so the Graviton delta is
+    # small and the downsize lever wins.
+    pricing = _FakePricing(
+        {"r5.2xlarge.search": 400.0, "r5.xlarge.search": 200.0, "r6g.2xlarge.search": 380.0}
+    )
     findings = OpensearchModule().scan(_ctx(pricing_engine=pricing))
     cats = _by_category(findings)
 
     # Underutilized downsize delta: (400 - 200) * 4 = 800 (the counted instance lever).
     assert cats["Underutilized Domain"]["EstimatedMonthlySavings"] == pytest.approx(800.0)
     assert cats["Underutilized Domain"]["Counted"] is True
-    # Graviton: 400 * 4 * 0.25 = 400 -> superseded by the downsize lever.
+    # Graviton node delta: (400 - 380) * 4 = 80 -> superseded by the downsize lever.
     assert cats["Graviton Migration"]["Counted"] is False
     # Storage delta is a separate axis: 1000 * 0.013 = 13.00, counted.
     assert cats["Storage Optimization"]["EstimatedMonthlySavings"] == pytest.approx(13.0)
