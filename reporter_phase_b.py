@@ -1319,41 +1319,6 @@ def _render_monitoring_enhanced_checks(recommendations: List[Rec], source_name: 
     return content
 
 
-def _render_additional_services(recommendations: List[Rec], source_name: str, service_data: Dict) -> str:
-    """Renders miscellaneous service recommendations grouped by category. Called by: HTMLReportGenerator._get_detailed_recommendations."""
-    grouped_additional: Dict[str, List[Rec]] = {}
-    for rec in recommendations:
-        category = rec.get("CheckCategory", "Other")
-        if category not in grouped_additional:
-            grouped_additional[category] = []
-        grouped_additional[category].append(rec)
-
-    content = ""
-    for category, resources in grouped_additional.items():
-        if not resources:
-            continue
-
-        content += f'<div class="rec-item{_priority_class(resources[0])}">'
-        content += f"<h4>{category} ({len(resources)} resources)</h4>"
-        content += f"<p><strong>Recommendation:</strong> {resources[0].get('Recommendation', 'Optimize resource')}</p>"
-
-        savings_str = resources[0].get("EstimatedSavings", "")
-        if savings_str:
-            content += f'<p class="savings"><strong>Estimated Savings:</strong> {savings_str}</p>'
-
-        content += "<p><strong>Resources:</strong></p><ul>"
-        for res in resources:
-            resource_id = res.get(
-                "DistributionId",
-                res.get("ApiId", res.get("StateMachineArn", res.get("FunctionName", "Unknown"))),
-            )
-            if isinstance(resource_id, str) and ":" in resource_id:
-                resource_id = resource_id.split(":")[-1]
-            content += f"<li>{resource_id}</li>"
-        content += "</ul></div>"
-    return content
-
-
 def _render_compute_optimizer_source(recommendations: List[Rec], source_name: str, service_data: Dict) -> str:
     """Renders Compute Optimizer normalized recommendations grouped by finding type.
 
@@ -1431,8 +1396,6 @@ def render_generic_per_rec(service_key: str, recommendations: List[Rec], source_
             should_skip, content = _render_generic_rds_rec(content, rec)
             if should_skip:
                 continue
-        elif service_key == "file_systems":
-            content = _render_generic_file_systems_rec(content, rec)
         elif service_key == "s3":
             should_skip, content = _render_generic_s3_rec(content, rec)
             if should_skip:
@@ -1645,82 +1608,6 @@ def _render_generic_rds_rec(content: str, rec: Rec) -> Tuple[bool, str]:
         content += "</ul>"
 
     return False, content
-
-
-def _render_generic_file_systems_rec(content: str, rec: Rec) -> str:
-    """Render a single file-system recommendation card. Called by: render_generic_per_rec."""
-    if "FileSystemId" in rec and rec.get("FileSystemType"):
-        fs_id = rec.get("FileSystemId", "N/A")
-        fs_type = rec.get("FileSystemType", "N/A")
-        content += f"<h4>FSx {fs_type}: {fs_id}</h4>"
-        content += f"<p>Capacity: {rec.get('StorageCapacity', 0)} GB</p>"
-        content += f"<p>Storage Type: {rec.get('StorageType', 'N/A')}</p>"
-        content += f'<p class="savings">Monthly Cost: ${rec.get("EstimatedMonthlyCost", 0):.2f}</p>'
-
-        opportunities = rec.get("OptimizationOpportunities", [])
-        if opportunities:
-            content += "<p><strong>Recommended Actions:</strong></p><ul>"
-            for opp in opportunities:
-                content += f"<li>{opp}</li>"
-            content += "</ul>"
-
-        potential_savings = rec.get("EstimatedMonthlyCost", 0) * 0.3
-        if fs_type.upper() == "ONTAP":
-            content += "<p><strong>ONTAP Optimizations:</strong></p><ul>"
-            content += (
-                f"<li>Enable data deduplication and compression (Save ~${potential_savings * 0.5:.2f}/month)</li>"
-            )
-            content += f"<li>Configure capacity pool for cold data (Save ~${potential_savings * 0.3:.2f}/month)</li>"
-            content += "<li>Use SnapMirror for efficient replication</li>"
-            content += "</ul>"
-        elif fs_type.upper() == "LUSTRE":
-            content += "<p><strong>Lustre Optimizations:</strong></p><ul>"
-            content += f"<li>Consider scratch file systems for temporary workloads (Save ~${potential_savings * 0.6:.2f}/month)</li>"
-            content += f"<li>Enable LZ4 data compression (Save ~${potential_savings * 0.2:.2f}/month)</li>"
-            content += "<li>Optimize metadata configuration</li>"
-            content += "</ul>"
-        elif fs_type.upper() == "OPENZFS":
-            content += "<p><strong>OpenZFS Optimizations:</strong></p><ul>"
-            content += f"<li>Enable Intelligent-Tiering (Save ~${potential_savings * 0.5:.2f}/month)</li>"
-            content += "<li>Use zero-copy snapshots and clones</li>"
-            content += "<li>Configure user/group quotas</li>"
-            content += "</ul>"
-
-    else:
-        fs_name = rec.get("Name") or rec.get("FileSystemId", "N/A")
-        if fs_name == "Unnamed":
-            fs_name = rec.get("FileSystemId", fs_name)
-        content += f"<h4>EFS: {fs_name}</h4>"
-        size_gb = rec.get("SizeGB", 0)
-        size_display = f"{size_gb:.2f} GB" if isinstance(size_gb, float) else f"{size_gb} GB"
-        if size_gb == 0 or (isinstance(size_gb, float) and size_gb < 0.1):
-            size_display = "Nearly empty (< 0.1 GB)"
-        content += f"<p>Size: {size_display}</p>"
-        content += f"<p>Storage Class: {rec.get('StorageClass', 'N/A')}</p>"
-        content += f"<p>Mount Targets: {rec.get('MountTargets', 0)}</p>"
-        content += f'<p class="savings">Monthly Cost: ${rec.get("EstimatedMonthlyCost", 0):.2f}</p>'
-
-        content += "<p><strong>Recommended Actions:</strong></p><ul>"
-
-        if not rec.get("HasIAPolicy", True):
-            ia_savings = rec.get("EstimatedMonthlyCost", 0) * 0.8
-            content += f"<li>Enable Transition to IA after 30 days (Save ~${ia_savings:.2f}/month)</li>"
-
-        if not rec.get("HasArchivePolicy", True):
-            archive_savings = rec.get("EstimatedMonthlyCost", 0) * 0.9
-            content += f"<li>Enable Transition to Archive after 90 days (Save ~${archive_savings:.2f}/month)</li>"
-
-        if rec.get("StorageClass") == "Standard" and rec.get("SizeGB", 0) > 1:
-            one_zone_savings = rec.get("EstimatedMonthlyCost", 0) * 0.47
-            content += (
-                f"<li>Consider One Zone storage if Multi-AZ not required (Save ~${one_zone_savings:.2f}/month)</li>"
-            )
-
-        if rec.get("MountTargets", 0) == 0 and rec.get("SizeGB", 0) < 0.1:
-            content += f"<li>Delete unused file system (Save ${rec.get('EstimatedMonthlyCost', 0):.2f}/month)</li>"
-
-        content += "</ul>"
-    return content
 
 
 def _render_generic_s3_rec(content: str, rec: Rec) -> Tuple[bool, str]:
@@ -2524,7 +2411,6 @@ SOURCE_TYPE_MAP: Dict[Tuple[str, str], str] = {
     ("cost_optimization_hub", "cross_service"): "Cost Hub",
     # CO recs that now flow through per-service adapters after the standalone
     # Compute Optimizer tab retirement.
-    ("lambda", "compute_optimizer"): "ML Backed",
     ("containers", "compute_optimizer"): "ML Backed",
     ("ec2", "asg_compute_optimizer"): "ML Backed",
     # S3 enhanced checks are config-pattern (no CloudWatch). Override the
@@ -2610,7 +2496,6 @@ PHASE_B_HANDLERS: Dict[Tuple[str, str], Callable] = {
     # Compute Optimizer tab retirement. Each binding reuses the unified
     # renderer because the rec schema is identical (resource_name, finding,
     # current_config, recommended_config, estimatedMonthlySavings).
-    ("lambda", "compute_optimizer"): _render_compute_optimizer_source,
     ("containers", "compute_optimizer"): _render_compute_optimizer_source,
     ("ec2", "asg_compute_optimizer"): _render_compute_optimizer_source,
     # Legacy bindings retained for any in-flight scan JSON that predates
