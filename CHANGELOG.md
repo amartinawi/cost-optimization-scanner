@@ -7,6 +7,183 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (cost-fidelity HIGH remediation — `docs/audits/UNIFIED_AUDIT_FINDINGS.md` / `HIGH_REMEDIATION_PROMPT.md`)
+Closes the 83 actionable HIGH findings across the 34-adapter audit. Same
+through-line as the CRITICAL batch: a rendered dollar must be **counted,
+account-specific, and defensible** — a blanket factor with no per-resource usage
+evidence becomes a `$0` `Counted=False` advisory (rendered, never summed), a
+wrong-SKU/region rate is pinned to the live AWS Pricing API, and a saving counted
+by one lever is never re-counted by an overlapping lever or by Cost Hub. Each
+remediated service carries a `tests/test_<svc>_high_fixes.py`; the static
+regression and reporter snapshots are unmoved (adapter logic changes do not touch
+the golden fixtures). Landed:
+
+- **Cluster A — silent failures classified (13 findings).** Every swallowed
+  `except: pass` / `logger`-only AWS error now routes through
+  `services/_aws_errors.record_aws_error` (AccessDenied/Unauthorized/OptInRequired
+  → `ctx.permission_issue`, else `ctx.warn`), so an IAM-gapped API surfaces as a
+  permission issue instead of a clean-looking empty tab — and a *failed* metric
+  read marks the rec `Counted=False` rather than fabricating a `$0`. Services:
+  api_gateway (H1/H2), aurora (H4), batch (H2/H3), cloudfront (H1), containers
+  (H2, ECS CO helper), ec2 (H1, ASG-member dedup degradation now visible +
+  partial set returned), monitoring (H1), network_cost (H3), quicksight (H1/H2 —
+  a ListUsers gap no longer silently zeroes the SPICE check), workspaces (C1).
+  New `tests/test_cluster_a_silent_failures.py`.
+- **SR-1 — Phase-A card dollar single-sourced (`reporter_phase_a.py`).** The
+  descriptor-driven `render_grouped_by_category` now renders a category group's
+  *counted* `EstimatedMonthlySavings` sum (advisory `Counted=False` recs excluded)
+  instead of the first rec's free-text `EstimatedSavings` percentage / hardcoded
+  "$316/month" string; an advisory-only group renders "$0.00/month — advisory".
+  Repairs API Gateway H3, Glue H1, Step Functions H2. New
+  `tests/test_reporter_sr1_counted_rendered.py`.
+- **SR-2 — Phase-B advisory vs counted (`reporter_phase_b.py`).** Grouped/per-rec
+  renderers now sum only counted recs into card totals and label `Counted=False`
+  recs "advisory — not added to the tab total": `_render_opensearch_enhanced_checks`
+  (OpenSearch H2), `_render_eks_source` (EKS H3), and `_render_generic_other_rec`
+  (MSK H2, Redshift H3, Commitment H1 purchase/SP-coverage advisories) — which
+  also stops dumping internal `EstimatedMonthlySavings`/`Counted` as raw property
+  rows and single-sources the per-rec dollar. New
+  `tests/test_reporter_sr2_advisory_counted.py`. Reporter snapshot move: **only
+  `ami`** (removes a redundant raw "Estimatedmonthlysavings: 5.0" line; the
+  displayed `$5.00/month` and the headline are unchanged).
+- **Pricing engine — load-bearing rates pinned (live-validated, us-east-1, AWS
+  Pricing API 2026-06).** `core/pricing_engine.py`: new
+  `get_aurora_io_storage_premium_per_gb()` (`IO-Optimized − Standard` ≈
+  `$0.125/GB-Mo`, was a `0.025` constant ~5× low — aurora H1) and
+  `get_aurora_io_instance_premium_monthly()` (~30% instance premium — aurora H2);
+  `_fetch_msk_broker_price` now filters on real attributes (`computeFamily` +
+  `productFamily='…(MSK)'` + `operation=RunBroker`) so the live broker-price path
+  is no longer 100% dead, markup recalibrated `1.4 → 2.19×` (msk H1); new
+  `get_dms_instance_monthly_price()` pins the `InstanceUsg:dms.<type>` vs
+  `Multi-AZUsg:dms.<type>` usagetype so the SKU is deterministic (dms H1/H2).
+  New `tests/test_pricing_engine_high_fixes.py`.
+- **Cluster B/C — fabricated config-dimension dollars & reduction factors → exact
+  delta or `$0` advisory.**
+  - *ec2 H2.* The four tag-heuristic levers (cron `0.85`, batch `0.75`,
+    instance-store `0.15`, non-prod `0.64`) no longer count a blanket-factor
+    dollar from Name/Environment tags alone. `get_advanced_ec2_checks` gates each
+    on a `corroborated_ids` set the adapter derives from the CloudWatch
+    idle/low-CPU rightsizing findings; an uncorroborated lever is a `$0`
+    `Counted=False` advisory that still renders (speculative figure preserved in
+    `AdvisoryEstimate`) but is excluded from `best_by_instance` and the headline.
+    Spot migration (live on-demand−Spot delta) is unaffected.
+  - *network_cost H1/H2.* The adapter sees only **blended Cost Explorer dollars**
+    (no per-flow GB / co-location / topology), so the cross-region `0.30`,
+    cross-AZ `0.50`, egress `0.40` reduction factors and the circular TGW branch
+    (which re-derived GB from dollars already scored cross-region/cross-AZ — a
+    ~20% double-count) were all unbacked. Every transfer/TGW rec is now a `$0`
+    `Counted=False` advisory — measured spend and the lever are shown, no
+    fabricated dollar enters the total.
+  - *Per-service deltas (workflow batch):* elasticache H2 (Graviton `0.20` →
+    exact `(x86 − Graviton)` node-price delta), opensearch H3 (gp2→gp3 flat-20% →
+    `EBS_GB × (gp2−gp3)` rate delta), dynamodb H1 (over-provisioned blanket-factor
+    → CW low-utilization-gated `current − rightsized`, else advisory), monitoring
+    H2/H3 (never-expiring-logs & 50%-removable-metrics → `$0` advisory absent a
+    measured staleness signal), redshift H2, lightsail H1/H2/H3 (synthetic ×2
+    bundle ladder → live per-bundle list prices, OS-aware, unknown bundle →
+    `Counted=False`), transfer H2 (`(n−1)` protocol removal gated on per-protocol
+    usage evidence), workspaces C2/C3 (AutoStop CW-gated; real `ComputeType`
+    propagated so a GRAPHICSPRO is not priced as STANDARD).
+- **Cluster D — overlapping/cross-adapter double-counts deduped.** containers H1
+  (ECS CO vs CoH), ebs H1 (unattached delete vs gp2→gp3/IOPS migration on the same
+  volume), eks H1 (CoH vs cluster heuristic), aurora H3 + rds H1 (an Aurora member
+  counted in both the RDS and Aurora tabs — single owner established), dynamodb H2
+  (Reserved Capacity demoted, never summed with the rightsizing lever), redshift H1
+  (RI demoted to advisory — `commitment_analysis` owns RI dollars), sagemaker H2
+  (idle endpoint excluded from its consolidation group).
+- **Cluster E/F/G/H/I — rate/region, count-hygiene, fail-safe deletion, coverage,
+  fast-mode.** glue H2 (READY dev endpoint priced from its own DPU footprint),
+  mediastore H1 (no-storage `$0` rec excluded from `total_recommendations`),
+  sagemaker H1 (one-time spot-training cost no longer summed into the monthly
+  headline), ami H3 + eks H2 + transfer H1 (delete candidates fail safe — Fleet/
+  Spot-Fleet/shared-AMI references, Karpenter 0-nodegroup clusters, and STOPPED
+  servers are corroborated or demoted to advisory before a destructive rec is
+  counted), dynamodb H3 + elasticache H1 (GSI throughput summed; `NumNodes`
+  threaded so multi-node clusters price on the real node count).
+- **Pre-commit adversarial review hardening.** A 14-agent diff review of the
+  batch (one reviewer per service group + a doc-fidelity and a dead-code sweep,
+  each finding adversarially verified) surfaced two real cost-fidelity defects
+  that the green test suite missed, now fixed:
+  - *Node pricing zeroed outside us-east-1.* `PricingEngine._select_instance_node_hourly`
+    front-anchored the node usagetype (`startswith("Node:")` / exact
+    `"NodeUsage:<type>"`), but the AWS Pricing API region-prefixes usagetypes
+    outside us-east-1 (`EUW1-NodeUsage:…`, `EU-Node:…`), so the selector returned
+    `None` → a silent `$0` fallback that zeroed every ElastiCache/Redshift node
+    cost basis (and all dependent rightsizing/idle levers) in every non-default
+    region — a real price mis-read as zero, invisible to the us-east-1-only
+    fixtures. Now strips the `<REGION>-` prefix before matching (mirrors the
+    sibling EBS/DMS/Aurora suffix selectors); `tests/test_pricing_engine.py`
+    adds a region-prefixed case.
+  - *Report-layer keyword fabrication (extends SR-2 to ec2/dynamodb).*
+    `_calculate_service_savings` synthesized `$25-$200/rec` from
+    recommendation-text keywords (ec2 "schedule" → $150, dynamodb "reserved" →
+    $200, else a `$25`/`$50` default) whenever an adapter's
+    `total_monthly_savings` was `$0` — re-fabricating into the tab headline /
+    exec-summary exactly the advisory dollars the ec2 H2 / dynamodb fixes demote
+    to `$0` (a non-prod EC2 advisory reading "schedule stop/start" re-counted
+    $150). The canonical adapter total is now authoritative; the keyword/default
+    tables are removed. `tests/test_reporter_snapshots.py` guards the ec2/dynamodb
+    keyword paths. Plus four `services/adapters/CLAUDE.md` rows corrected to match
+    the changed cost models (glue ×730 + jobs advisory, apprunner memory-only,
+    batch advisory-only, elasticache Graviton exact-delta).
+
+### Fixed (cost-fidelity CRITICAL remediation — `docs/audits/UNIFIED_AUDIT_FINDINGS.md` / `CRITICAL_REMEDIATION_PROMPT.md`)
+Cross-service batch closing the CRITICAL findings from the 34-adapter audit. The
+through-line: a rendered dollar must be **counted, account-specific, and
+defensible** — fabricated config-only dollars become `$0` advisories
+(`Counted=False`), and a saving counted by one lever is never re-counted by an
+overlapping lever or by Cost Optimization Hub.
+
+- **Shared fixes.**
+  - *SR-1 — engine/OS-aware instance SKU.* `PricingEngine._select_instance_node_hourly`
+    disambiguates instance-type SKUs that several engines share (ElastiCache
+    Redis/Memcached/Valkey), so a node is priced at its real per-engine rate.
+  - *SR-2 — flat-rate escape hatch removed.* Dropped the `_FLAT_SAVINGS_SERVICES`
+    bypass so every adapter routes through the counted/advisory discipline.
+  - *SR-3 — shared CoH de-dup.* New `services/_coh_dedup.py`
+    (`normalize_resource_id`, `is_renderable_coh_rec`, `coh_savings`) gives every
+    CoH-consuming adapter one canonical resource key and authority order
+    (CoH > CO > heuristic). Mirrors the inline RDS `_coh_is_renderable`.
+- **ElastiCache C2 (silent $0).** `describe_cache_clusters` returns a lowercase
+  engine (`"redis"`), but the Pricing-API guard is case-sensitive (`"Redis"`) —
+  every counted node silently priced $0. Normalized via `.capitalize()` in the
+  TERM_MATCH filter + `attributes_exact` guard. ElastiCache now also **consumes
+  `cost_hub_splits["elasticache"]`** (CoH-covered clusters demote their heuristic
+  levers; single highest-$ lever counted per cluster).
+- **API Gateway C1.** A `$0` REST→HTTP/caching rec is labeled `Counted=False`
+  (advisory) instead of inflating `total_recommendations` with a no-dollar row.
+- **QuickSight C1.** SPICE priced edition-aware (`quicksight_spice_rate`):
+  Standard `$0.25/GB`, Enterprise `$0.38/GB` (was `$0.38` for both → +52% on
+  Standard capacity).
+- **Transfer C1.** ProtocolHours is a region-flat rate; the spurious
+  `pricing_multiplier` was dropped so card == counted.
+- **OpenSearch C2.** An idle-domain rec (full domain cost) now wins the per-domain
+  de-dup over an overlapping Graviton-migration rec (a fraction of the same cost),
+  which is demoted to advisory — no stacked discounts on one domain.
+- **DynamoDB C1.** One counted winner per table (highest-factor lever; reserved
+  over over-provisioned), capped at `monthly_current` — never the sum of
+  overlapping capacity levers.
+- **App Runner C1.** An idle service is priced at its recoverable provisioned
+  memory charge (`$0.007/GB/hr × 730`), not a placeholder.
+- **Bedrock C1 (idle Provisioned Throughput).** `_derive_model_id` parses the
+  foundation-model ARN's final segment (the botocore `ProvisionedModelSummary`
+  has no `modelId` member, so the old `pt.get("modelId")` always returned `""` →
+  `$1/hr` fabricated and the CloudWatch `ModelId` queries matched nothing) and
+  strips the `-YYYYMMDD-vN:N` version suffix to hit the bare `PT_HOURLY_PRICE`
+  keys. **Idle-PT tightening (this batch):** `_get_pt_invocation_sum` is now
+  tri-state — a CloudWatch read failure → abstain (never delete an unmeasured
+  PT); **no** `Invocations` datapoints → candidate idle → `$0` advisory naming
+  the estimated recoverable spend (AWS does not publish zero-value datapoints, so
+  absence is suggestive, not proof); an explicit `Sum == 0` datapoint → proven
+  idle → counted recoverable commitment (still gated at >$1/mo). Previously absent
+  datapoints returned `None` and the idle PT was invisible (neither counted nor
+  surfaced). Locked by `tests/test_bedrock_idle_pt.py` (13 cases).
+- **Tests.** `tests/test_audit_fixes_counted_dollars.py` (apprunner, quicksight
+  Standard/Enterprise, transfer, opensearch C2, dynamodb dedup+cap, api_gateway
+  advisory), `tests/test_coh_bucket_audit_fixes.py`, `tests/test_bedrock_idle_pt.py`,
+  and a probe-confirmed ElastiCache C2 case in `tests/test_pricing_engine.py`.
+  Full suite: 567 passed, 1 live-only skip.
+
 ### Fixed (pricing — EU region Price List names, audit S3-J)
 - **`REGION_DISPLAY_NAMES` corrected for older EU regions.** The AWS Price List
   API names them `"EU (Frankfurt|London|Paris|Stockholm|Milan)"`, but the map had

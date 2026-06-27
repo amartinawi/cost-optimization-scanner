@@ -35,7 +35,8 @@ OPENSEARCH_OPTIMIZATION_DESCRIPTIONS: dict[str, dict[str, str]] = {
     },
     "storage_optimization": {
         "title": "Migrate gp2 to gp3 Storage",
-        "description": "gp3 volumes offer 20% cost savings over gp2 with better performance.",
+        "description": "OpenSearch-managed gp3 storage is priced lower per GB than gp2 "
+        "(~$0.013/GB-month less, us-east-1) with equal or better performance.",
         "action": "Migrate EBS volumes from gp2 to gp3",
     },
     "idle_domains": {
@@ -98,6 +99,7 @@ def get_enhanced_opensearch_checks(ctx: ScanContext) -> dict[str, Any]:
                         {
                             "DomainName": domain_name,
                             "InstanceType": instance_type,
+                            "InstanceCount": instance_count,
                             "Recommendation": "Migrate to Graviton instances",
                             "EstimatedSavings": "Estimated: 20-40% price-performance improvement",
                             "CheckCategory": "Graviton Migration",
@@ -147,6 +149,9 @@ def get_enhanced_opensearch_checks(ctx: ScanContext) -> dict[str, Any]:
                             checks["idle_domains"].append(
                                 {
                                     "DomainName": domain_name,
+                                    "InstanceType": instance_type,
+                                    "InstanceCount": instance_count,
+                                    "EBSVolumeSize": ebs_volume_size,
                                     "AvgCPU": round(avg_cpu, 2),
                                     "Recommendation": "Delete idle domain",
                                     "EstimatedSavings": "100% of domain cost",
@@ -157,6 +162,8 @@ def get_enhanced_opensearch_checks(ctx: ScanContext) -> dict[str, Any]:
                             checks["underutilized_domains"].append(
                                 {
                                     "DomainName": domain_name,
+                                    "InstanceType": instance_type,
+                                    "InstanceCount": instance_count,
                                     "AvgCPU": round(avg_cpu, 2),
                                     "Recommendation": "Downsize instance type",
                                     "EstimatedSavings": "30-50%",

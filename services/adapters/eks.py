@@ -21,7 +21,9 @@ import re
 from typing import Any
 
 from core.contracts import GroupingSpec, ServiceFindings, SourceBlock, StatCardSpec
+from services._aws_errors import record_aws_error
 from services._base import BaseServiceModule
+from services._coh_dedup import coh_key, normalize_resource_id
 
 logger = logging.getLogger(__name__)
 
@@ -129,12 +131,25 @@ class EksCostModule(BaseServiceModule):
             fargate_recs.extend(fgs)
             fargate_profile_count += fp_count
 
+            # H2 fail-safe: a cluster with 0 managed node groups and 0 Fargate
+            # profiles may still run self-managed / Karpenter-provisioned EC2
+            # nodes that the EKS describe APIs cannot enumerate. Before counting
+            # the control plane as idle (a *delete* recommendation), corroborate
+            # zero capacity from EC2 instances tagged
+            # kubernetes.io/cluster/<name>=owned. owned_node_count is None when
+            # the evidence read is unavailable/ambiguous -> abstain (advisory).
+            is_candidate_idle = ng_count == 0 and fp_count == 0
+            owned_node_count = (
+                self._count_owned_ec2_nodes(ctx, name) if is_candidate_idle else 0
+            )
+
             cr = self._check_cluster_cost(
                 name,
                 cluster,
                 control_plane_rate,
                 extended_support_rate,
-                is_idle=(ng_count == 0 and fp_count == 0),
+                is_idle=is_candidate_idle,
+                owned_node_count=owned_node_count,
             )
             cluster_recs.extend(cr)
 
@@ -142,7 +157,14 @@ class EksCostModule(BaseServiceModule):
             addon_recs.extend(ads)
             addon_count += ad_count
 
-        cost_hub_recs = self._build_cost_hub_recs(ctx)
+        # H1 dedup: Cost Optimization Hub is the authority for any cluster it
+        # covers. A cluster surfaced by BOTH a heuristic (idle / extended
+        # support / failed) and CoH (EksCluster) would otherwise be counted
+        # twice. Demote the overlapping heuristic cluster_costs rec to advisory
+        # (Counted=False) before summing, keyed on the normalized cluster name.
+        raw_hub_recs = self._raw_hub_recs(ctx)
+        cost_hub_recs = self._build_cost_hub_recs(raw_hub_recs)
+        cluster_recs = self._dedupe_clusters_against_cost_hub(cluster_recs, raw_hub_recs)
 
         all_recs = cluster_recs + node_group_recs + fargate_recs + addon_recs + cost_hub_recs
         # Counted savings exclude advisory (Counted=False) recs — node-level and
@@ -211,6 +233,7 @@ class EksCostModule(BaseServiceModule):
         extended_support_rate: float,
         *,
         is_idle: bool,
+        owned_node_count: int | None = None,
     ) -> list[dict[str, Any]]:
         """Cluster-level control-plane findings: Extended Support + idle control plane.
 
@@ -219,7 +242,12 @@ class EksCostModule(BaseServiceModule):
             cluster: The ``cluster`` dict from describe_cluster.
             control_plane_rate: $/hr base control-plane fee (region-correct).
             extended_support_rate: $/hr Extended Support surcharge (region-correct).
-            is_idle: True when the cluster has no node groups and no Fargate profiles.
+            is_idle: True when the cluster has no managed node groups and no
+                Fargate profiles (the *candidate* idle condition).
+            owned_node_count: Count of EC2 instances tagged owned by the cluster
+                (self-managed / Karpenter capacity). ``0`` corroborates idle;
+                ``> 0`` means live nodes exist; ``None`` means the evidence read
+                was unavailable/ambiguous. Only ``0`` permits a counted idle rec.
 
         Returns:
             List of cluster cost recommendation dicts.
@@ -260,30 +288,14 @@ class EksCostModule(BaseServiceModule):
             )
 
         # Idle / empty cluster: ACTIVE control plane is billed even with no
-        # node groups or Fargate profiles. Only count when truly idle; assumes
-        # no self-managed/Karpenter nodes (which describe APIs cannot enumerate).
+        # node groups or Fargate profiles. Counted only when EC2 evidence
+        # corroborates zero self-managed/Karpenter capacity (owned_node_count
+        # == 0); otherwise demoted to a Counted=False advisory (fail-safe).
         if status == "ACTIVE" and is_idle and monthly_control_plane > 0:
             recs.append(
-                {
-                    "resource_id": name,
-                    "check_type": "idle_cluster",
-                    "check_category": "EKS Idle Control Plane",
-                    "current_value": "Active cluster with no node groups or Fargate profiles",
-                    "recommended_value": "Delete or consolidate the cluster to save control-plane cost",
-                    "monthly_savings": round(monthly_control_plane, 2),
-                    "severity": "HIGH",
-                    "audit_basis": {
-                        "rate": control_plane_rate,
-                        "unit": "USD/cluster-hour",
-                        "formula": f"{control_plane_rate} x {HOURS_PER_MONTH} hr",
-                        "evidence": "0 node groups and 0 Fargate profiles via describe APIs",
-                        "assumption": "no self-managed/Karpenter nodes",
-                    },
-                    "reason": (
-                        f"EKS cluster '{name}' has no node groups or Fargate profiles; "
-                        f"its control plane still bills ${monthly_control_plane:.2f}/mo"
-                    ),
-                }
+                self._build_idle_rec(
+                    name, control_plane_rate, monthly_control_plane, owned_node_count
+                )
             )
         elif status == "FAILED" and monthly_control_plane > 0:
             recs.append(
@@ -303,6 +315,109 @@ class EksCostModule(BaseServiceModule):
             )
 
         return recs
+
+    def _build_idle_rec(
+        self,
+        name: str,
+        control_plane_rate: float,
+        monthly_control_plane: float,
+        owned_node_count: int | None,
+    ) -> dict[str, Any]:
+        """Build the idle empty-cluster control-plane rec, fail-safe on EC2 evidence.
+
+        Counted (real $ saving) only when zero owned EC2 nodes corroborate the
+        empty cluster. When live nodes are found, or the corroboration read is
+        unavailable/ambiguous (``owned_node_count is None``), the rec is demoted
+        to a ``Counted=False`` advisory so the adapter never asserts "delete"
+        (and never counts ~$73/mo) against a cluster that may be running
+        self-managed / Karpenter workloads.
+        """
+        rec: dict[str, Any] = {
+            "resource_id": name,
+            "check_type": "idle_cluster",
+            "check_category": "EKS Idle Control Plane",
+            "severity": "HIGH",
+        }
+        if owned_node_count == 0:
+            rec.update(
+                {
+                    "current_value": "Active cluster with no node groups, Fargate profiles, or owned EC2 nodes",
+                    "recommended_value": "Delete or consolidate the cluster to save control-plane cost",
+                    "monthly_savings": round(monthly_control_plane, 2),
+                    "audit_basis": {
+                        "rate": control_plane_rate,
+                        "unit": "USD/cluster-hour",
+                        "formula": f"{control_plane_rate} x {HOURS_PER_MONTH} hr",
+                        "evidence": (
+                            "0 node groups and 0 Fargate profiles (describe APIs) AND 0 running "
+                            f"EC2 instances tagged kubernetes.io/cluster/{name}=owned"
+                        ),
+                    },
+                    "reason": (
+                        f"EKS cluster '{name}' has no node groups, Fargate profiles, or owned "
+                        f"EC2 nodes; its control plane still bills ${monthly_control_plane:.2f}/mo"
+                    ),
+                }
+            )
+            return rec
+
+        if owned_node_count and owned_node_count > 0:
+            detail = (
+                f"{owned_node_count} running EC2 instance(s) tagged "
+                f"kubernetes.io/cluster/{name}=owned (self-managed/Karpenter) were found"
+            )
+        else:
+            detail = "EC2 owned-node corroboration was unavailable/ambiguous (no ec2 client or API error)"
+        rec.update(
+            {
+                "current_value": "Active cluster with no MANAGED node groups or Fargate profiles",
+                "recommended_value": "Verify no self-managed/Karpenter workloads before deleting",
+                "monthly_savings": 0.0,
+                "Counted": False,
+                "reason": (
+                    f"EKS cluster '{name}' has no managed node groups or Fargate profiles, but "
+                    f"{detail} — not counted as idle (fail-safe); the ~${monthly_control_plane:.2f}/mo "
+                    f"control-plane saving is only real if the cluster is truly unused"
+                ),
+            }
+        )
+        return rec
+
+    def _count_owned_ec2_nodes(self, ctx: Any, cluster_name: str) -> int | None:
+        """Count running/pending EC2 instances owned by an EKS cluster.
+
+        Self-managed and Karpenter-provisioned nodes are EC2 instances tagged
+        ``kubernetes.io/cluster/<name>=owned`` that the EKS describe APIs do not
+        enumerate. Returns the instance count, or ``None`` when the evidence read
+        is unavailable/ambiguous (no ec2 client or an API error) so the caller
+        can fail safe rather than assert the cluster is idle. Errors are
+        classified (never swallowed) via ``record_aws_error``.
+        """
+        ec2 = ctx.client("ec2")
+        if not ec2:
+            return None
+        try:
+            count = 0
+            paginator = ec2.get_paginator("describe_instances")
+            for page in paginator.paginate(
+                Filters=[
+                    {"Name": f"tag:kubernetes.io/cluster/{cluster_name}", "Values": ["owned"]},
+                    {"Name": "instance-state-name", "Values": ["running", "pending"]},
+                ]
+            ):
+                for reservation in page.get("Reservations", []):
+                    count += len(reservation.get("Instances", []))
+            return count
+        except Exception as e:
+            record_aws_error(
+                ctx,
+                e,
+                service="eks_cost",
+                context=(
+                    f"ec2:DescribeInstances idle-corroboration for EKS cluster '{cluster_name}' failed"
+                ),
+            )
+            return None
 
     def _analyze_node_groups(
         self,
@@ -351,6 +466,12 @@ class EksCostModule(BaseServiceModule):
                 # real savings when Compute Optimizer / ASG CO is enabled. We
                 # surface the magnitude so it is not invisible when CO is off.
                 ng_monthly = self._node_group_monthly_cost(ctx, instance_types, desired)
+
+                # A node group scaled to 0 nodes (or one whose instance price could
+                # not be resolved) has no on-demand cost basis, so Spot/Graviton
+                # savings are definitionally $0 — skip it rather than emit $0 noise.
+                if ng_monthly <= 0:
+                    continue
 
                 # Spot opportunity (ON_DEMAND groups).
                 if capacity_type != "SPOT":
@@ -499,18 +620,59 @@ class EksCostModule(BaseServiceModule):
             return [], 0
         return [], len(addon_names)
 
-    def _build_cost_hub_recs(self, ctx: Any) -> list[dict[str, Any]]:
+    def _raw_hub_recs(self, ctx: Any) -> list[dict[str, Any]]:
+        """Raw Cost Optimization Hub recs bucketed for EKS (``eks_cost`` key).
+
+        The bucket name matches this module's key (see scan_orchestrator). Used
+        both to build the CoH source block and to derive the dedup ``covered``
+        set so a heuristic cluster rec is not double-counted against CoH.
+        """
+        try:
+            return list(ctx.cost_hub_splits.get("eks_cost", []) or [])
+        except Exception:
+            return []
+
+    def _dedupe_clusters_against_cost_hub(
+        self,
+        cluster_recs: list[dict[str, Any]],
+        hub_recs: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Demote heuristic cluster_costs recs that CoH already counts (CoH > heuristic).
+
+        Builds a ``covered`` set of normalized cluster names from the CoH bucket
+        and returns a NEW list where any overlapping heuristic rec is copied with
+        ``Counted=False`` (so its dollar is not summed twice). Non-overlapping
+        recs pass through unchanged. Inputs are not mutated in place.
+        """
+        covered = {coh_key(rec) for rec in hub_recs}
+        covered.discard("")
+        if not covered:
+            return cluster_recs
+        deduped: list[dict[str, Any]] = []
+        for rec in cluster_recs:
+            key = normalize_resource_id(str(rec.get("resource_id", "")))
+            if key and key in covered:
+                superseded = dict(rec)
+                superseded["Counted"] = False
+                superseded["dedup_basis"] = "CoH > heuristic (EksCluster)"
+                superseded["reason"] = (
+                    f"{rec.get('reason', '')} — superseded by AWS Cost Optimization "
+                    f"Hub (EksCluster); counted there, not double-counted here"
+                )
+                deduped.append(superseded)
+            else:
+                deduped.append(rec)
+        return deduped
+
+    def _build_cost_hub_recs(self, hub_recs: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Build recommendations from Cost Optimization Hub EKS data.
 
-        Reads the orchestrator's ``cost_hub_splits["eks_cost"]`` bucket (the
-        bucket name now matches this module's key — see scan_orchestrator).
+        Consumes the raw ``cost_hub_splits["eks_cost"]`` bucket (via
+        ``_raw_hub_recs``). CoH is the authority: any cluster it covers has its
+        overlapping heuristic rec demoted by ``_dedupe_clusters_against_cost_hub``
+        so the same saving is never counted twice.
         """
         recs: list[dict[str, Any]] = []
-        try:
-            hub_recs = ctx.cost_hub_splits.get("eks_cost", [])
-        except Exception:
-            return recs
-
         for rec in hub_recs:
             monthly_savings = float(rec.get("estimatedMonthlySavings", 0.0) or 0.0)
             recs.append(

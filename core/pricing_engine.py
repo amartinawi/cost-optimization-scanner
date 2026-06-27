@@ -89,12 +89,24 @@ FALLBACK_RDS_BACKUP_GB_MONTH: float = 0.095
 # (verified via the Pricing API: usagetype EU-Aurora:BackupUsage). Pricing an
 # Aurora snapshot at the standard rate overstates by ~4.5x.
 FALLBACK_AURORA_BACKUP_GB_MONTH: float = 0.021
+# Aurora I/O-Optimized STORAGE premium over Standard storage, $/GB-Mo. Live
+# us-east-1 (Pricing API 2026-06): Aurora:IO-OptimizedStorageUsage $0.225 −
+# Aurora:StorageUsage $0.10 = $0.125/GB-Mo. The Aurora adapter's old hardcoded
+# 0.025 was ~5x too low, inflating every io_tier_optimization saving. Used only
+# when the live API is unavailable; multiplied by the regional fallback multiplier.
+FALLBACK_AURORA_IO_STORAGE_PREMIUM_GB_MONTH: float = 0.125
 # Single-AZ db.t3.medium MySQL us-east-1 on-demand monthly cost (730h × $0.068/h).
 # Used only when AWS Pricing API is unavailable; multiplied by the regional fallback multiplier.
 FALLBACK_RDS_INSTANCE_MONTHLY: float = 49.64
 # Multiplier applied to FALLBACK_RDS_INSTANCE_MONTHLY for Multi-AZ deployments
 # (Multi-AZ is roughly 2× Single-AZ for all engines per AWS Pricing API).
 FALLBACK_RDS_MULTI_AZ_FACTOR: float = 2.0
+# Single-AZ dms.t3.medium us-east-1 on-demand monthly cost (730h × $0.0745/hr,
+# verified via Pricing API 2026-06). Used only when the AWS Pricing API is
+# unavailable; ×FALLBACK_DMS_MULTI_AZ_FACTOR for Multi-AZ (Multi-AZ DMS is
+# exactly 2x Single-AZ — dms.t3.medium $0.0745/hr vs $0.149/hr).
+FALLBACK_DMS_INSTANCE_MONTHLY: float = 54.39
+FALLBACK_DMS_MULTI_AZ_FACTOR: float = 2.0
 
 # RDS engine name → AWS Pricing API 'databaseEngine' filter value.
 # RDS describe_db_instances returns engine strings like "mysql", "postgres",
@@ -125,9 +137,14 @@ _RDS_ENGINE_LABELS: dict[str, str] = {
 # RDS engines whose Multi-AZ deployment is published under the "SQL Server
 # Mirror" deploymentOption rather than plain "Multi-AZ" (verified via the
 # Pricing API: deploymentOption values include "Multi-AZ (SQL Server Mirror)").
-_RDS_SQLSERVER_ENGINES: frozenset[str] = frozenset({
-    "sqlserver-ee", "sqlserver-se", "sqlserver-ex", "sqlserver-web",
-})
+_RDS_SQLSERVER_ENGINES: frozenset[str] = frozenset(
+    {
+        "sqlserver-ee",
+        "sqlserver-se",
+        "sqlserver-ex",
+        "sqlserver-web",
+    }
+)
 
 # RDS describe-API storage type -> AWS Pricing API 'volumeType' attribute value.
 # The Price List uses human-readable labels ("General Purpose", "General
@@ -203,6 +220,8 @@ def _normalize_rds_license_model(rds_license_model: str | None, engine: str) -> 
     if engine.startswith("oracle"):
         return "Bring your own license"
     return "No license required"
+
+
 FALLBACK_S3_GB_MONTH: dict[str, float] = {
     "STANDARD": 0.023,
     "STANDARD_IA": 0.0125,
@@ -291,12 +310,23 @@ _FSX_FILE_SYSTEM_TYPE_LABELS: dict[str, str] = {
 # fallback ternaries (`else 32.0` for NAT, `else 7.30` for VPC EP,
 # `else 16.20` for ALB) — section 4.4 violation of two-different-
 # fallback-prices-for-same-SKU.
-FALLBACK_EIP_MONTH: float = 3.65       # $0.005/hr × 730 = $3.65/mo
-FALLBACK_NAT_MONTH: float = 32.85      # $0.045/hr × 730 = $32.85/mo
-FALLBACK_VPC_ENDPOINT_MONTH: float = 7.30   # $0.01/hr × 730 = $7.30/mo
-FALLBACK_ALB_MONTH: float = 16.43      # $0.0225/hr × 730 = $16.43/mo
+FALLBACK_EIP_MONTH: float = 3.65  # $0.005/hr × 730 = $3.65/mo
+FALLBACK_NAT_MONTH: float = 32.85  # $0.045/hr × 730 = $32.85/mo
+FALLBACK_VPC_ENDPOINT_MONTH: float = 7.30  # $0.01/hr × 730 = $7.30/mo
+FALLBACK_ALB_MONTH: float = 16.43  # $0.0225/hr × 730 = $16.43/mo (Load Balancer-Application)
+FALLBACK_NLB_MONTH: float = 16.43  # $0.0225/hr × 730 = $16.43/mo (Load Balancer-Network, same base as ALB)
+FALLBACK_GWLB_MONTH: float = 9.13  # $0.0125/hr × 730 = $9.13/mo (Load Balancer-Gateway)
+FALLBACK_CLB_MONTH: float = 18.25  # $0.025/hr × 730 = $18.25/mo (Classic Load Balancer)
 FALLBACK_AURORA_ACU_HOURLY: float = 0.12  # us-east-1 Aurora Serverless v2 ACU-Hr list rate
 SAGEMAKER_OVER_EC2: float = 1.15
+# MSK broker $/hr expressed as a multiple of the equivalent EC2 on-demand rate.
+# Used only when the live AmazonMSK Broker-hours SKU is unavailable. Validated
+# us-east-1 (Pricing API 2026-06): Kafka.m5.large $0.21/hr vs EC2 m5.large
+# $0.096/hr = 2.19x. The previous 1.4x markup understated broker cost ~36%.
+MSK_BROKER_OVER_EC2: float = 2.19
+# Last-ditch MSK broker $/hr used only when BOTH the live MSK lookup and EC2
+# pricing fail; region-scaled via the fallback multiplier at the call site.
+FALLBACK_MSK_BROKER_HOURLY: float = 0.15
 
 # AWS Fargate compute rates (us-east-1, verified via Pricing API 2026-06).
 # Keyed by (architecture, os). ARM is ~20% cheaper than x86; Windows adds a
@@ -545,9 +575,7 @@ class PricingEngine:
             return cached
         price = self._fetch_ebs_snapshot_price(archive_tier=archive_tier)
         if price is None:
-            fallback = (
-                FALLBACK_EBS_SNAPSHOT_ARCHIVE_GB_MONTH if archive_tier else FALLBACK_EBS_SNAPSHOT_GB_MONTH
-            )
+            fallback = FALLBACK_EBS_SNAPSHOT_ARCHIVE_GB_MONTH if archive_tier else FALLBACK_EBS_SNAPSHOT_GB_MONTH
             price = self._use_fallback(
                 fallback * self._fallback_multiplier,
                 f"Pricing API unavailable for EBS Snapshot {'Archive' if archive_tier else 'Standard'}"
@@ -613,14 +641,20 @@ class PricingEngine:
         normalized = engine.lower().strip()
         resolved_license = _normalize_rds_license_model(license_model, normalized)
         key = (
-            "rds_instance", normalized, instance_class,
-            "Multi-AZ" if multi_az else "Single-AZ", resolved_license,
+            "rds_instance",
+            normalized,
+            instance_class,
+            "Multi-AZ" if multi_az else "Single-AZ",
+            resolved_license,
             "io-opt" if aurora_io_optimized else "std",
         )
         if (cached := self._get_cached(key)) is not None:
             return cached
         price = self._fetch_rds_instance_price(
-            normalized, instance_class, multi_az=multi_az, license_model=license_model,
+            normalized,
+            instance_class,
+            multi_az=multi_az,
+            license_model=license_model,
             aurora_io_optimized=aurora_io_optimized,
         )
         if price is None:
@@ -711,10 +745,18 @@ class PricingEngine:
         return price
 
     def get_msk_broker_hourly_price(self, instance_type: str) -> float:
-        """On-Demand hourly price for an MSK broker instance in self._region.
+        """On-Demand $/broker-hour for an MSK broker instance in self._region.
 
-        Uses the AmazonMSK service code.  Strips 'kafka.' prefix if present.
-        Falls back to EC2 pricing * 1.4 (MSK markup factor) on failure.
+        Selects the deterministic AmazonMSK Broker-hours SKU
+        (``computeFamily=<type>`` + ``productFamily='Managed Streaming for Apache
+        Kafka (MSK)'`` + ``operation='RunBroker'``; usagetype
+        ``<region>-Kafka.<type>``, unit "hours"). Strips a ``kafka.`` prefix if
+        present.
+
+        On a live miss falls back to EC2 on-demand × :data:`MSK_BROKER_OVER_EC2`
+        (the broker premium ≈ 2.19×, validated us-east-1 m5.large: $0.21 broker
+        vs $0.096 EC2 — the previous 1.4× was ~36% low); when EC2 pricing is also
+        unavailable, a region-scaled :data:`FALLBACK_MSK_BROKER_HOURLY` constant.
         """
         clean_type = instance_type.replace("kafka.", "")
         key = ("msk_hourly", clean_type)
@@ -723,10 +765,15 @@ class PricingEngine:
         price = self._fetch_msk_broker_price(clean_type)
         if price is None:
             try:
-                ec2_price = self.get_ec2_hourly_price(clean_type)
-                fallback_price = ec2_price * 1.4
+                # quiet: a missing EC2 proxy here is expected (degraded path),
+                # not a data-quality signal — don't emit a spurious EC2 warning.
+                ec2_price = self.get_ec2_hourly_price(clean_type, quiet=True)
             except Exception:
-                fallback_price = 0.15
+                ec2_price = 0.0
+            if ec2_price and ec2_price > 0:
+                fallback_price = ec2_price * MSK_BROKER_OVER_EC2
+            else:
+                fallback_price = FALLBACK_MSK_BROKER_HOURLY * self._fallback_multiplier
             price = self._use_fallback(
                 fallback_price,
                 f"Pricing API unavailable for MSK {clean_type} in {self._region}; using fallback",
@@ -734,12 +781,19 @@ class PricingEngine:
         self._cache.set(key, price)
         return price
 
-    def get_instance_monthly_price(self, service_code: str, instance_type: str) -> float:
-        """On-Demand monthly price for non-EC2 instances (ElastiCache, OpenSearch, etc.)."""
-        key = (service_code, "monthly", instance_type)
+    def get_instance_monthly_price(self, service_code: str, instance_type: str, *, engine: str | None = None) -> float:
+        """On-Demand monthly price for non-EC2 instances (ElastiCache, OpenSearch, etc.).
+
+        For ``AmazonElastiCache`` pass the cluster ``engine`` (Redis/Memcached/
+        Valkey) so the canonical ``NodeUsage:<type>`` SKU is selected
+        deterministically. Without it six SKUs (ExtendedSupport, SyncDurability,
+        per-engine NodeUsage) share the instance type and the rate is
+        ambiguous — see SR-1 / ElastiCache C2.
+        """
+        key = (service_code, "monthly", instance_type, engine)
         if (cached := self._get_cached(key)) is not None:
             return cached
-        price = self._fetch_generic_instance_price(service_code, instance_type)
+        price = self._fetch_generic_instance_price(service_code, instance_type, engine=engine)
         if price is None:
             price = self._use_fallback(
                 0.0,
@@ -861,14 +915,60 @@ class PricingEngine:
         return price
 
     def get_alb_monthly_price(self) -> float:
-        key = ("alb_month",)
+        return self._lb_monthly_price(
+            key=("alb_month",),
+            product_family="Load Balancer-Application",
+            operation="LoadBalancing:Application",
+            fallback=FALLBACK_ALB_MONTH,
+            label="ALB",
+        )
+
+    def get_nlb_monthly_price(self) -> float:
+        return self._lb_monthly_price(
+            key=("nlb_month",),
+            product_family="Load Balancer-Network",
+            operation="LoadBalancing:Network",
+            fallback=FALLBACK_NLB_MONTH,
+            label="NLB",
+        )
+
+    def get_gwlb_monthly_price(self) -> float:
+        return self._lb_monthly_price(
+            key=("gwlb_month",),
+            product_family="Load Balancer-Gateway",
+            operation="LoadBalancing:Gateway",
+            fallback=FALLBACK_GWLB_MONTH,
+            label="GWLB",
+        )
+
+    def get_clb_monthly_price(self) -> float:
+        return self._lb_monthly_price(
+            key=("clb_month",),
+            product_family="Load Balancer",
+            operation="LoadBalancing",
+            fallback=FALLBACK_CLB_MONTH,
+            label="Classic LB",
+        )
+
+    def _lb_monthly_price(
+        self, *, key: tuple, product_family: str, operation: str, fallback: float, label: str
+    ) -> float:
+        """Shared monthly-price lookup for the four ELB types.
+
+        Each ELB type has its own ``productFamily`` ("Load Balancer-Application"
+        for ALB, "-Network" for NLB, "-Gateway" for GWLB, bare "Load Balancer"
+        for Classic). The previous ALB lookup filtered ``productFamily="Load
+        Balancer"`` which matches ONLY the Classic LB SKU ($0.025/hr), so it
+        silently returned the Classic rate instead of the ALB rate.
+        """
         if (cached := self._get_cached(key)) is not None:
             return cached
-        price = self._fetch_alb_price()
+        hourly = self._fetch_lb_base_hourly(product_family, operation)
+        price = hourly * 730 if hourly is not None else None
         if price is None:
             price = self._use_fallback(
-                FALLBACK_ALB_MONTH * self._fallback_multiplier,
-                f"Pricing API unavailable for ALB in {self._region}; using fallback",
+                fallback * self._fallback_multiplier,
+                f"Pricing API unavailable for {label} in {self._region}; using fallback",
             )
         self._cache.set(key, price)
         return price
@@ -883,6 +983,124 @@ class PricingEngine:
             price = self._use_fallback(
                 FALLBACK_AURORA_ACU_HOURLY * self._fallback_multiplier,
                 f"Pricing API unavailable for Aurora Serverless v2 ACU in {self._region}; using fallback",
+            )
+        self._cache.set(key, price)
+        return price
+
+    def get_aurora_io_storage_premium_per_gb(self) -> float:
+        """$/GB-month premium of Aurora I/O-Optimized storage over Standard.
+
+        Returns ``(Aurora:IO-OptimizedStorageUsage − Aurora:StorageUsage)`` per
+        GB-month in ``self._region`` — both are ``productFamily="Database
+        Storage"`` rows on ``AmazonRDS`` billed in ``GB-Mo``. Live us-east-1
+        (Pricing API 2026-06): ``$0.225 − $0.10 = $0.125/GB-Mo``. This is the
+        additional storage charge a cluster incurs by switching its consumed
+        storage to the I/O-Optimized tier; the Aurora adapter nets it (with the
+        per-member instance premium) against the saved per-request I/O charges.
+        Region-scaled once via the live API; on an API miss returns the
+        documented :data:`FALLBACK_AURORA_IO_STORAGE_PREMIUM_GB_MONTH` ×
+        fallback_multiplier.
+
+        The exact suffixes are matched so neither tier collides with the other
+        (``Aurora:StorageUsage`` is not a suffix of
+        ``Aurora:IO-OptimizedStorageUsage``) nor with the $0.00
+        ``Aurora:IO-OptimizedStorageUsage-LimitlessPreview`` decoy.
+        """
+        key = ("aurora_io_storage_premium",)
+        if (cached := self._get_cached(key)) is not None:
+            return cached
+        standard = self._fetch_aurora_storage_rate("Aurora:StorageUsage")
+        optimized = self._fetch_aurora_storage_rate("Aurora:IO-OptimizedStorageUsage")
+        if standard is not None and optimized is not None and optimized > standard:
+            premium = optimized - standard
+        else:
+            premium = self._use_fallback(
+                FALLBACK_AURORA_IO_STORAGE_PREMIUM_GB_MONTH * self._fallback_multiplier,
+                f"Pricing API unavailable for Aurora I/O-Optimized storage premium in {self._region}; using fallback",
+            )
+        self._cache.set(key, premium)
+        return premium
+
+    def get_aurora_io_instance_premium_monthly(
+        self,
+        engine: str,
+        instance_class: str,
+        *,
+        multi_az: bool = False,
+        license_model: str | None = None,
+    ) -> float:
+        """$/month premium of running ONE Aurora member in I/O-Optimized mode.
+
+        Returns ``io_optimized_price − standard_price`` for a single provisioned
+        Aurora instance (``engine`` ``aurora-mysql`` / ``aurora-postgresql``),
+        i.e. the extra instance cost the cluster pays under the I/O-Optimized
+        configuration. The I/O-Optimized instance rate carries a ~30% premium
+        (validated us-east-1 db.r6g.large Aurora MySQL Single-AZ: $0.338/hr
+        I/O-Optimized vs $0.260/hr Standard → premium $0.078/hr × 730 =
+        $56.94/mo). The Aurora adapter sums this premium over the cluster's
+        provisioned members so the I/O-tier saving nets the instance-side cost,
+        not just the storage-side cost.
+
+        Both legs reuse :meth:`get_rds_instance_monthly_price` (which pins the
+        Aurora ``storage`` mode — "EBS Only" vs "Aurora IO Optimization Mode" —
+        so the two rates never collide). Returns ``0.0`` when either price is
+        unavailable or the computed delta is non-positive, so no premium is
+        fabricated when the rate cannot be resolved.
+        """
+        standard = self.get_rds_instance_monthly_price(
+            engine,
+            instance_class,
+            multi_az=multi_az,
+            license_model=license_model,
+            aurora_io_optimized=False,
+        )
+        optimized = self.get_rds_instance_monthly_price(
+            engine,
+            instance_class,
+            multi_az=multi_az,
+            license_model=license_model,
+            aurora_io_optimized=True,
+        )
+        if standard <= 0 or optimized <= 0:
+            return 0.0
+        premium = optimized - standard
+        return premium if premium > 0 else 0.0
+
+    def get_dms_instance_monthly_price(self, instance_class: str, *, multi_az: bool = False) -> float:
+        """$/month for a DMS replication instance in self._region, AZ-aware.
+
+        Pins the ``AWSDatabaseMigrationSvc`` Replication-Server SKU by exact
+        usagetype suffix — ``InstanceUsg:dms.<type>`` (Single-AZ) vs
+        ``Multi-AZUsg:dms.<type>`` (Multi-AZ) — so the lookup is deterministic.
+        The previous generic ``get_instance_monthly_price`` path filtered on
+        ``instanceType`` with ``MaxResults=1`` and could return EITHER AZ SKU,
+        making the counted rate up to 2x off (Multi-AZ DMS is exactly 2x
+        Single-AZ — validated us-east-1 dms.t3.medium: $0.0745/hr Single-AZ vs
+        $0.149/hr Multi-AZ).
+
+        Args:
+            instance_class: DMS class, with or without the ``dms.`` prefix (e.g.
+                ``"dms.t3.medium"`` or ``"t3.medium"``); normalized to
+                ``dms.<type>`` for the usagetype match.
+            multi_az: When True, selects the Multi-AZ SKU.
+
+        Returns:
+            Monthly on-demand price in USD (730 hours). Returns the documented
+            fallback (× fallback_multiplier; ×2 for Multi-AZ) when the live SKU
+            is unavailable.
+        """
+        clean = instance_class.strip()
+        clean = f"dms.{clean[len('dms.'):] if clean.startswith('dms.') else clean}"
+        key = ("dms_instance", clean, "Multi-AZ" if multi_az else "Single-AZ")
+        if (cached := self._get_cached(key)) is not None:
+            return cached
+        price = self._fetch_dms_instance_price(clean, multi_az=multi_az)
+        if price is None:
+            fallback = FALLBACK_DMS_INSTANCE_MONTHLY * (FALLBACK_DMS_MULTI_AZ_FACTOR if multi_az else 1.0)
+            price = self._use_fallback(
+                fallback * self._fallback_multiplier,
+                f"Pricing API unavailable for DMS {clean} "
+                f"({'Multi-AZ' if multi_az else 'Single-AZ'}) in {self._region}; using fallback",
             )
         self._cache.set(key, price)
         return price
@@ -1015,9 +1233,7 @@ class PricingEngine:
 
     # ── Private fetch methods ─────────────────────────────────────────────────
 
-    def _fetch_ec2_price(
-        self, instance_type: str, os: str, license_model: str = "No License required"
-    ) -> float | None:
+    def _fetch_ec2_price(self, instance_type: str, os: str, license_model: str = "No License required") -> float | None:
         # licenseModel is pinned so the lookup is deterministic. Without it,
         # Windows matches three SKUs (license-included $0.233, license-infra
         # $0.141, BYOL $0.141) and MaxResults=1 would pick one
@@ -1123,8 +1339,11 @@ class PricingEngine:
         filters = [
             {"Type": "TERM_MATCH", "Field": "instanceType", "Value": instance_class},
             {"Type": "TERM_MATCH", "Field": "databaseEngine", "Value": engine_label},
-            {"Type": "TERM_MATCH", "Field": "deploymentOption",
-             "Value": _rds_multi_az_deployment_option(engine, multi_az=multi_az)},
+            {
+                "Type": "TERM_MATCH",
+                "Field": "deploymentOption",
+                "Value": _rds_multi_az_deployment_option(engine, multi_az=multi_az),
+            },
             {"Type": "TERM_MATCH", "Field": "licenseModel", "Value": resolved_license},
             {"Type": "TERM_MATCH", "Field": "location", "Value": self._display_name},
             {"Type": "TERM_MATCH", "Field": "productFamily", "Value": "Database Instance"},
@@ -1224,8 +1443,27 @@ class PricingEngine:
             return None
 
     def _fetch_msk_broker_price(self, instance_type: str) -> float | None:
+        """On-Demand $/broker-hour for an MSK broker instance; None on miss.
+
+        AmazonMSK has NO ``instanceType`` attribute — the previous filter pinned
+        it and matched nothing, so the live broker-price path was 100% dead and
+        every broker silently fell back to an EC2 proxy. Broker SKUs are keyed by
+        the ``computeFamily`` attribute (clean type, e.g. ``m5.large``) under the
+        single ``Managed Streaming for Apache Kafka (MSK)`` productFamily; pin
+        ``computeFamily`` + ``productFamily`` + ``operation='RunBroker'`` so the
+        Broker-hours SKU (usagetype ``<region>-Kafka.<type>``) is selected
+        deterministically. The billing unit is the lowercase ``"hours"`` (not
+        ``"Hrs"``), so the generic ``_call_pricing_api`` / ``_extract_usd`` path
+        is used rather than the ``Hrs``-guarded hourly path.
+        """
         filters = [
-            {"Type": "TERM_MATCH", "Field": "instanceType", "Value": instance_type},
+            {"Type": "TERM_MATCH", "Field": "computeFamily", "Value": instance_type},
+            {
+                "Type": "TERM_MATCH",
+                "Field": "productFamily",
+                "Value": "Managed Streaming for Apache Kafka (MSK)",
+            },
+            {"Type": "TERM_MATCH", "Field": "operation", "Value": "RunBroker"},
             {"Type": "TERM_MATCH", "Field": "location", "Value": self._display_name},
         ]
         return self._call_pricing_api("AmazonMSK", filters)
@@ -1238,15 +1476,142 @@ class PricingEngine:
         hourly = self._call_pricing_api("AmazonSageMaker", filters)
         return hourly * 730 if hourly is not None else None
 
-    def _fetch_generic_instance_price(self, service_code: str, instance_type: str) -> float | None:
+    def _fetch_generic_instance_price(
+        self, service_code: str, instance_type: str, *, engine: str | None = None
+    ) -> float | None:
+        """On-Demand node-hour price for a non-EC2 compute instance (SR-1).
+
+        A bare ``instanceType + location`` filter matches many OnDemand SKUs
+        whose billing dimensions differ wildly (per-second Concurrency Scaling,
+        per-GB Managed Storage, ExtendedSupport/SyncDurability surcharges, …)
+        and boto3 result ordering is **not** guaranteed. ``MaxResults=1``
+        therefore returns a non-deterministic, frequently wrong dimension.
+        Pin the canonical node-hour SKU per service:
+
+        * ``AmazonRedshift`` — pin ``productFamily=Compute Instance`` (the
+          ``usagetype=Node:<type>`` row, ``unit=Hrs``); rejects Concurrency
+          Scaling (``CS:``/``CSFreeUsage:``, seconds) and Managed Storage
+          (``RMS:``, GB-Mo).
+        * ``AmazonElastiCache`` — pin ``cacheEngine=<engine>`` and select the
+          exact ``NodeUsage:<type>`` row; all six SKUs share ``unit=Hrs`` so
+          unit alone cannot discriminate. Rejects ``USE1-ExtendedSupport*`` and
+          ``USE1-SyncDurability-*`` surcharges. Requires ``engine``.
+        * other services — unchanged ``MaxResults=1`` path (SR-1 scope is
+          Redshift/ElastiCache only).
+        """
         filters = [
             {"Type": "TERM_MATCH", "Field": "instanceType", "Value": instance_type},
             {"Type": "TERM_MATCH", "Field": "location", "Value": self._display_name},
         ]
+        if service_code == "AmazonRedshift":
+            filters.append({"Type": "TERM_MATCH", "Field": "productFamily", "Value": "Compute Instance"})
+            hourly = self._select_instance_node_hourly("AmazonRedshift", filters, usagetype_prefix="Node:")
+            return hourly * 730 if hourly is not None else None
+        if service_code == "AmazonElastiCache":
+            if not engine:
+                logger.debug(
+                    "pricing:GetProducts  AmazonElastiCache  %s  → no engine supplied; "
+                    "cannot disambiguate NodeUsage SKU (SR-1)",
+                    instance_type,
+                )
+                return None
+            # Normalize engine casing to the Pricing-API canonical form
+            # (Redis/Memcached/Valkey). The ElastiCache DescribeCacheClusters
+            # ``Engine`` field is lowercase ("redis"); the Pricing API
+            # ``cacheEngine`` attribute is capitalized ("Redis"). A verbatim
+            # TERM_MATCH on "redis" returns no NodeUsage row → None → $0
+            # (elasticache C2 production bug).
+            engine_norm = str(engine).strip().capitalize()
+            filters.append({"Type": "TERM_MATCH", "Field": "cacheEngine", "Value": engine_norm})
+            hourly = self._select_instance_node_hourly(
+                "AmazonElastiCache",
+                filters,
+                usagetype_exact=f"NodeUsage:{instance_type}",
+                attributes_exact={"cacheEngine": engine_norm},
+            )
+            return hourly * 730 if hourly is not None else None
         price_hourly = self._call_pricing_api(service_code, filters)
         if price_hourly is not None:
             return price_hourly * 730  # hours/month
         return None
+
+    def _select_instance_node_hourly(
+        self,
+        service_code: str,
+        filters: list[dict],
+        *,
+        usagetype_prefix: str | None = None,
+        usagetype_exact: str | None = None,
+        attributes_exact: dict[str, str] | None = None,
+    ) -> float | None:
+        """Pick the canonical node-hour OnDemand SKU from a multi-SKU set.
+
+        Mirrors ``_select_efs_storage_rate``: fetch up to 100 rows and select
+        the one whose ``usagetype`` matches the canonical node-usage pattern
+        (``Node:<type>`` for Redshift, ``NodeUsage:<type>`` for ElastiCache)
+        and whose billing ``unit`` is ``Hrs``. The match is region-prefix aware:
+        the AWS Pricing API region-prefixes usagetypes outside us-east-1 (e.g.
+        ``EUW1-NodeUsage:cache.r6g.large``, ``EU-Node:ra3.4xlarge``) while
+        us-east-1 carries no prefix, so we strip a leading ``<REGION>-`` before
+        comparing — otherwise the selector matches only in us-east-1 and silently
+        returns ``None`` (a $0 fallback that mis-reads a real price as zero) in
+        every other region. ``attributes_exact`` adds
+        defense-in-depth exact-match guards (e.g. ``cacheEngine``) so the
+        selector stays deterministic even when a caller's mock or a stale API
+        page returns rows for multiple engines. Rejects per-second / per-GB /
+        ExtendedSupport / SyncDurability / $0 rows that share the same
+        ``instanceType``.
+        """
+        key_fields = {f["Field"]: f["Value"] for f in filters if f["Field"] not in _LOG_SKIP_FIELDS}
+        try:
+            resp = self._pricing.get_products(
+                ServiceCode=service_code,
+                Filters=filters,
+                MaxResults=100,
+            )
+            self._stats["api_calls"] += 1
+            for raw in resp.get("PriceList", []):
+                item = json.loads(raw)
+                attrs = item.get("product", {}).get("attributes", {})
+                usagetype = attrs.get("usagetype", "")
+                # Strip a leading "<REGION>-" prefix so a node SKU matches in every
+                # region, not just us-east-1. Node/NodeUsage usagetypes never
+                # contain "-" internally (the instance type uses "."), so the first
+                # "-" is the region separator; an unprefixed (us-east-1) usagetype
+                # is unchanged.
+                bare_usagetype = usagetype.split("-", 1)[-1]
+                if usagetype_prefix is not None and not bare_usagetype.startswith(usagetype_prefix):
+                    continue
+                if usagetype_exact is not None and bare_usagetype != usagetype_exact:
+                    continue
+                if attributes_exact and any(attrs.get(k) != v for k, v in attributes_exact.items()):
+                    continue
+                price, unit = _extract_usd_with_unit(item)
+                if price is None or unit != "Hrs":
+                    continue
+                logger.debug(
+                    "pricing:GetProducts[node]  %s  %s  → $%.6f/hr (%s)",
+                    service_code,
+                    key_fields,
+                    price,
+                    usagetype,
+                )
+                return price
+            logger.debug(
+                "pricing:GetProducts[node]  %s  %s  → no node-hour SKU matched",
+                service_code,
+                key_fields,
+            )
+            return None
+        except Exception as exc:
+            self._stats["api_errors"] += 1
+            logger.debug(
+                "pricing:GetProducts[node]  %s  %s  → FAILED: %s",
+                service_code,
+                key_fields,
+                exc,
+            )
+            return None
 
     def _fetch_efs_price(self, storage_class: str = "General Purpose") -> float | None:
         # EFS prices by the `storageClass` attribute (there is NO `volumeType`
@@ -1379,13 +1744,40 @@ class PricingEngine:
         hourly = self._call_pricing_api("AmazonVPC", filters)
         return hourly * 730 if hourly is not None else None
 
-    def _fetch_alb_price(self) -> float | None:
+    def _fetch_lb_base_hourly(self, product_family: str, operation: str) -> float | None:
+        """Return the base hourly $/hr for a load-balancer type.
+
+        Filters AWSELB by ``productFamily`` + ``operation`` (region-independent,
+        unlike the region-prefixed ``usagetype``) and selects the standard
+        ``LoadBalancerUsage`` Hrs row — excluding the Trust Store (``TS-``) and
+        ``Outposts-`` variants that share the same productFamily/operation.
+        """
         filters = [
             {"Type": "TERM_MATCH", "Field": "location", "Value": self._display_name},
-            {"Type": "TERM_MATCH", "Field": "productFamily", "Value": "Load Balancer"},
+            {"Type": "TERM_MATCH", "Field": "productFamily", "Value": product_family},
+            {"Type": "TERM_MATCH", "Field": "operation", "Value": operation},
         ]
-        hourly = self._call_pricing_api("AWSELB", filters)
-        return hourly * 730 if hourly is not None else None
+        key_fields = {f["Field"]: f["Value"] for f in filters if f["Field"] not in _LOG_SKIP_FIELDS}
+        try:
+            resp = self._pricing.get_products(ServiceCode="AWSELB", Filters=filters, MaxResults=100)
+            self._stats["api_calls"] += 1
+            for raw in resp.get("PriceList", []):
+                item = json.loads(raw)
+                usagetype = item.get("product", {}).get("attributes", {}).get("usagetype", "")
+                if not usagetype.endswith("LoadBalancerUsage"):
+                    continue
+                if "TS-" in usagetype or "Outposts" in usagetype:
+                    continue
+                price, unit = _extract_usd_with_unit(item)
+                if unit == "Hrs" and price is not None:
+                    logger.debug("pricing:GetProducts  AWSELB  %s  → $%.6f/hr", key_fields, price)
+                    return price
+            logger.debug("pricing:GetProducts  AWSELB  %s  → no base LoadBalancerUsage row", key_fields)
+            return None
+        except Exception as exc:
+            self._stats["api_errors"] += 1
+            logger.debug("pricing:GetProducts  AWSELB  %s  → FAILED: %s", key_fields, exc)
+            return None
 
     def _fetch_aurora_acu_price(self) -> float | None:
         # The usagetype "ACU-Hour" does not exist; AWS publishes the Aurora
@@ -1396,6 +1788,42 @@ class PricingEngine:
             {"Type": "TERM_MATCH", "Field": "databaseEngine", "Value": "Aurora MySQL"},
         ]
         return self._select_by_usagetype_suffix("AmazonRDS", filters, "Aurora:ServerlessV2Usage")
+
+    def _fetch_aurora_storage_rate(self, usagetype_suffix: str) -> float | None:
+        """$/GB-month for an Aurora storage tier by exact usagetype suffix.
+
+        ``usagetype_suffix`` is ``Aurora:StorageUsage`` (Standard) or
+        ``Aurora:IO-OptimizedStorageUsage`` (I/O-Optimized). Both are
+        ``productFamily="Database Storage"`` rows (unit "GB-Mo") whose Aurora
+        rate is engine-independent ($0.10 / $0.225 in us-east-1 across MySQL,
+        PostgreSQL and the engine-neutral "Any" row), so no databaseEngine pin
+        is needed. Region prefixes (USE1-, EUW1-, …) vary, so the suffix is
+        matched. The exact suffix avoids the $0.00
+        ``…StorageUsage-LimitlessPreview`` decoy.
+        """
+        filters = [
+            {"Type": "TERM_MATCH", "Field": "location", "Value": self._display_name},
+            {"Type": "TERM_MATCH", "Field": "productFamily", "Value": "Database Storage"},
+        ]
+        return self._select_by_usagetype_suffix("AmazonRDS", filters, usagetype_suffix)
+
+    def _fetch_dms_instance_price(self, dms_class: str, *, multi_az: bool = False) -> float | None:
+        """Fetch on-demand monthly DMS replication-instance price; None on miss.
+
+        ``dms_class`` is the full ``dms.<type>`` form. Selects the deterministic
+        ``AWSDatabaseMigrationSvc`` Replication-Server SKU by exact usagetype
+        suffix: ``Multi-AZUsg:<dms_class>`` (Multi-AZ) or
+        ``InstanceUsg:<dms_class>`` (Single-AZ). Region prefixes vary, so the
+        suffix is matched; the two AZ suffixes are mutually exclusive (neither is
+        a suffix of the other). unit is "Hrs"; ×730 to monthly.
+        """
+        suffix = f"Multi-AZUsg:{dms_class}" if multi_az else f"InstanceUsg:{dms_class}"
+        filters = [
+            {"Type": "TERM_MATCH", "Field": "location", "Value": self._display_name},
+            {"Type": "TERM_MATCH", "Field": "productFamily", "Value": "Replication Server"},
+        ]
+        hourly = self._select_by_usagetype_suffix("AWSDatabaseMigrationSvc", filters, suffix)
+        return hourly * 730 if hourly is not None else None
 
     # Maps a logical Fargate rate to the usagetype suffix AWS publishes for it.
     # Region prefixes (USE1-, EUW1-, …) vary, so we match on the suffix.

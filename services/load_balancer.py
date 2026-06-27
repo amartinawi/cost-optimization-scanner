@@ -7,16 +7,17 @@ Extracted from CostOptimizer.get_load_balancer_checks() as a free function.
 from __future__ import annotations
 
 import logging
-
-logger = logging.getLogger(__name__)
-
 from datetime import datetime
 from typing import Any
 
+from core.pricing_engine import FALLBACK_ALB_MONTH, FALLBACK_GWLB_MONTH, FALLBACK_NLB_MONTH
 from core.scan_context import ScanContext
+from services._aws_errors import record_aws_error
+
+logger = logging.getLogger(__name__)
 
 
-def _is_kubernetes_managed_alb(elbv2: Any, lb_name: str, lb_arn: str) -> bool:
+def _is_kubernetes_managed_alb(ctx: ScanContext, elbv2: Any, lb_name: str, lb_arn: str) -> bool:
     k8s_patterns = [
         "k8s-",
         "eks-",
@@ -47,7 +48,7 @@ def _is_kubernetes_managed_alb(elbv2: Any, lb_name: str, lb_arn: str) -> bool:
                     return True
 
     except Exception as e:
-        logger.warning(f"Warning: Could not get tags for ALB {lb_arn}: {e}")
+        record_aws_error(ctx, e, service="network", context=f"ALB tag lookup for {lb_arn} failed")
 
     return False
 
@@ -59,8 +60,16 @@ def get_load_balancer_checks(ctx: ScanContext) -> dict[str, Any]:
     # base. The previous 1.4× ratio was invented; for the NLB→ALB savings
     # rec we can only honestly emit 0 + warning until per-LB CW metrics
     # (LCU/NLCU consumption) are wired through.
-    alb_monthly = ctx.pricing_engine.get_alb_monthly_price() if ctx.pricing_engine is not None else 16.20
-    nlb_monthly = alb_monthly  # Same base; LCU/NLCU diff requires traffic data.
+    pe = ctx.pricing_engine
+    mult = ctx.pricing_multiplier
+    alb_monthly = pe.get_alb_monthly_price() if pe is not None else FALLBACK_ALB_MONTH * mult
+    # NLB and ALB share the same base hourly ($0.0225/hr); the cost delta lives in
+    # LCU vs NLCU consumption (traffic-driven). GWLB has its own lower base.
+    nlb_monthly = pe.get_nlb_monthly_price() if pe is not None else FALLBACK_NLB_MONTH * mult
+    gwlb_monthly = pe.get_gwlb_monthly_price() if pe is not None else FALLBACK_GWLB_MONTH * mult
+    # Map the elbv2 Type value to its base monthly rate so a GWLB is never priced
+    # as an ALB (audit M3).
+    lb_rate_by_type = {"application": alb_monthly, "network": nlb_monthly, "gateway": gwlb_monthly}
     checks: dict[str, list[dict[str, Any]]] = {
         "zero_traffic_albs": [],
         "single_service_albs": [],
@@ -88,7 +97,7 @@ def get_load_balancer_checks(ctx: ScanContext) -> dict[str, Any]:
             for page in clb_paginator.paginate():
                 classic_lbs.extend(page.get("LoadBalancerDescriptions", []))
         except Exception as e:
-            logger.warning(f"⚠️ Error getting Classic Load Balancers: {str(e)}")
+            record_aws_error(ctx, e, service="network", context="Classic Load Balancer lookup failed")
             classic_lbs = []
 
         alb_count = 0
@@ -101,7 +110,7 @@ def get_load_balancer_checks(ctx: ScanContext) -> dict[str, Any]:
             lb_type = lb.get("Type", "application")
             scheme = lb.get("Scheme", "internet-facing")
 
-            is_k8s_managed = _is_kubernetes_managed_alb(elbv2, lb_name, lb_arn) if lb_name and lb_arn else False
+            is_k8s_managed = _is_kubernetes_managed_alb(ctx, elbv2, lb_name, lb_arn) if lb_name and lb_arn else False
 
             if lb_type == "application":
                 alb_count += 1
@@ -140,31 +149,48 @@ def get_load_balancer_checks(ctx: ScanContext) -> dict[str, Any]:
                             "LoadBalancerName": lb_name,
                             "Type": lb_type,
                             "Recommendation": "Load balancer has no listeners configured - verify configuration or delete if unused",
-                            "EstimatedSavings": f"${alb_monthly if lb_type == 'application' else nlb_monthly:.0f}/month if deleted",
+                            "EstimatedSavings": f"${lb_rate_by_type.get(lb_type, alb_monthly):.0f}/month if deleted",
                             "Action": "1. Check if listeners were accidentally deleted\n2. Verify if LB is still needed\n3. Configure listeners or delete LB",
                             "CheckCategory": "Load Balancer Configuration Issue",
                         }
                     )
 
                 if lb_type == "application" and len(listeners) == 1 and not is_k8s_managed:
+                    # NET-01: advisory $0 only. Counting full alb_monthly here per
+                    # single-listener ALB double-counts the same standalone ALBs that
+                    # `shared_alb_opportunity` already scores in aggregate, and
+                    # consolidation merges services onto a *surviving* ALB so not every
+                    # single-service ALB can be eliminated. The realizable saving depends
+                    # on per-ALB LCU/traffic evidence that is not measured here, so this
+                    # lever is rendered (visible) but never counted. Mirrors
+                    # `nlb_vs_alb`/`old_classic_elbs`.
                     checks["single_service_albs"].append(
                         {
                             "LoadBalancerName": lb_name,
                             "ListenerCount": len(listeners),
                             "Recommendation": "ALB serving single service - consider consolidating multiple services on one ALB to reduce costs",
-                            "EstimatedSavings": f"Up to ${alb_monthly:.2f}/month per ALB eliminated through consolidation",
+                            "EstimatedSavings": "$0.00/month - advisory: per-ALB consolidation saving requires LCU/traffic evidence and double-counts the shared_alb_opportunity lever",
+                            "EstimatedMonthlySavings": 0.0,
+                            "Counted": False,
+                            "PricingWarning": "Not counted: consolidation merges services onto a surviving ALB (not all can be eliminated) and the realizable saving needs per-ALB LCU/traffic metrics not collected here",
+                            "AuditBasis": "ALB base $0.0225/hr x 730 = $16.43/mo (us-east-1, validated AWS Pricing API 2026-06-27). Advisory $0 — counting full base per single-listener ALB double-counts the standalone ALBs aggregated by shared_alb_opportunity; surviving-ALB count and per-ALB LCU/traffic are unmeasured.",
                             "Action": "1. Identify other single-service ALBs\n2. Plan consolidation using host-based or path-based routing\n3. Test routing rules before migration\n4. Delete unused ALBs after consolidation",
                             "CheckCategory": "ALB Consolidation Opportunity",
                         }
                     )
 
                 elif lb_type == "application" and len(listeners) == 1 and is_k8s_managed:
+                    # NET-01: advisory $0 only (same rationale as the standalone branch).
                     checks["single_service_albs"].append(
                         {
                             "LoadBalancerName": lb_name,
                             "ListenerCount": len(listeners),
                             "Recommendation": "K8s ALB serving single service - consider using Ingress Groups to share ALBs across multiple services",
-                            "EstimatedSavings": f"Up to ${alb_monthly:.2f}/month per ALB eliminated through Ingress Groups",
+                            "EstimatedSavings": "$0.00/month - advisory: per-ALB Ingress-Group consolidation saving requires LCU/traffic evidence and double-counts the shared_alb_opportunity lever",
+                            "EstimatedMonthlySavings": 0.0,
+                            "Counted": False,
+                            "PricingWarning": "Not counted: Ingress-Group consolidation merges services onto a surviving ALB (not all can be eliminated) and the realizable saving needs per-ALB LCU/traffic metrics not collected here",
+                            "AuditBasis": "ALB base $0.0225/hr x 730 = $16.43/mo (us-east-1, validated AWS Pricing API 2026-06-27). Advisory $0 — counting full base per single-listener K8s ALB double-counts the standalone ALBs aggregated by shared_alb_opportunity; surviving-ALB count and per-ALB LCU/traffic are unmeasured.",
                             "Action": "1. Review Kubernetes Ingress resources\n2. Add alb.ingress.kubernetes.io/group.name annotation\n3. Use same group name across multiple Ingress resources\n4. Test routing before removing individual ALBs",
                             "CheckCategory": "K8s ALB Consolidation Opportunity",
                         }
@@ -176,7 +202,7 @@ def get_load_balancer_checks(ctx: ScanContext) -> dict[str, Any]:
                         rules_response = elbv2.describe_rules(ListenerArn=listener["ListenerArn"])
                         total_rules += len(rules_response.get("Rules", []))
                     except Exception as e:
-                        logger.warning(f"Warning: Could not get rules for listener {listener['ListenerArn']}: {e}")
+                        record_aws_error(ctx, e, service="network", context=f"listener rule lookup for {listener['ListenerArn']} failed")
                         continue
 
                 # Excessive ALB rules finding removed: emitted no concrete $ — LCU savings
@@ -184,7 +210,7 @@ def get_load_balancer_checks(ctx: ScanContext) -> dict[str, Any]:
                 _ = total_rules
 
             except Exception as e:
-                logger.warning(f"Warning: Could not analyze ALB {lb_name}: {e}")
+                record_aws_error(ctx, e, service="network", context=f"load balancer analysis for {lb_name} failed")
                 continue
 
             # Unnecessary Cross-AZ LB finding removed: estimate used a fake "1GB/hour"
@@ -195,24 +221,38 @@ def get_load_balancer_checks(ctx: ScanContext) -> dict[str, Any]:
         if alb_count > 5:
             standalone_count = len(standalone_albs)
             if standalone_count > 2:
+                # NET-01: advisory $0 only. Even the aggregate `(standalone_count - 2)`
+                # figure is not backed by per-ALB LCU/traffic evidence — it assumes every
+                # surplus ALB can be eliminated and collapsed onto 2 surviving ALBs without
+                # exceeding their LCU capacity. Render it for context but do not count it
+                # (also avoids double-counting the per-ALB single_service_albs lever).
                 checks["shared_alb_opportunity"].append(
                     {
                         "ALBCount": standalone_count,
                         "K8sALBCount": k8s_managed_albs,
                         "Recommendation": f"{standalone_count} standalone ALBs detected - consolidate using host-based or path-based routing to reduce costs",
-                        "EstimatedSavings": f"Save ${(standalone_count - 2) * alb_monthly:.0f}/month by consolidating to 2 ALBs",
+                        "EstimatedSavings": "$0.00/month - advisory: consolidation ceiling requires per-ALB LCU/traffic evidence",
+                        "EstimatedMonthlySavings": 0.0,
+                        "Counted": False,
+                        "PricingWarning": f"Not counted: a theoretical ceiling of ~${(standalone_count - 2) * alb_monthly:.0f}/month assumes every surplus ALB collapses onto 2 surviving ALBs within their LCU capacity; no per-ALB LCU/traffic metrics collected here",
+                        "AuditBasis": "ALB base $0.0225/hr x 730 = $16.43/mo (us-east-1, validated AWS Pricing API 2026-06-27). Advisory $0 — the (standalone_count-2) ceiling is unbacked by per-ALB LCU/traffic and would double-count the single_service_albs lever.",
                         "Action": f"1. Identify ALBs serving similar applications or environments\n2. Plan consolidation using host-based routing (different domains) or path-based routing (same domain, different paths)\n3. Test routing rules in staging environment\n4. Migrate traffic gradually and monitor performance\n5. Delete unused ALBs after successful consolidation\n6. Each ALB costs ${alb_monthly:.2f}/month base + data processing fees",
                         "CheckCategory": "Shared ALB Opportunity",
                     }
                 )
 
             if k8s_managed_albs > 3:
+                # NET-01: advisory $0 only (same rationale as the standalone branch).
                 checks["shared_alb_opportunity"].append(
                     {
                         "ALBCount": k8s_managed_albs,
                         "StandaloneALBCount": standalone_count,
                         "Recommendation": f"{k8s_managed_albs} K8s ALBs detected - consider using Ingress Groups for consolidation",
-                        "EstimatedSavings": f"Save ${(k8s_managed_albs - 2) * alb_monthly:.0f}/month through Ingress Groups",
+                        "EstimatedSavings": "$0.00/month - advisory: Ingress-Group consolidation ceiling requires per-ALB LCU/traffic evidence",
+                        "EstimatedMonthlySavings": 0.0,
+                        "Counted": False,
+                        "PricingWarning": f"Not counted: a theoretical ceiling of ~${(k8s_managed_albs - 2) * alb_monthly:.0f}/month assumes every surplus K8s ALB collapses onto 2 surviving ALBs within their LCU capacity; no per-ALB LCU/traffic metrics collected here",
+                        "AuditBasis": "ALB base $0.0225/hr x 730 = $16.43/mo (us-east-1, validated AWS Pricing API 2026-06-27). Advisory $0 — the (k8s_managed_albs-2) ceiling is unbacked by per-ALB LCU/traffic and would double-count the single_service_albs lever.",
                         "Action": "1. Review Kubernetes Ingress resources\n2. Add alb.ingress.kubernetes.io/group.name annotation\n3. Use same group name across multiple Ingress resources\n4. Set alb.ingress.kubernetes.io/group.order for rule priority\n5. Test routing before removing individual ALBs",
                         "CheckCategory": "K8s Ingress Groups Opportunity",
                     }
@@ -236,7 +276,7 @@ def get_load_balancer_checks(ctx: ScanContext) -> dict[str, Any]:
                     )
 
     except Exception as e:
-        logger.warning(f"Warning: Load Balancer checks failed: {e}")
+        record_aws_error(ctx, e, service="network", context="Load Balancer checks failed")
 
     recommendations: list[dict[str, Any]] = []
     for _category, items in checks.items():

@@ -387,6 +387,32 @@ def _render_rds_group(content: str, category: str, resources: List[Rec], descrip
     return content
 
 
+def _group_counted_savings(resources: List[Rec]) -> Tuple[float, bool]:
+    """Sum the *counted* ``EstimatedMonthlySavings`` across a category group.
+
+    Returns ``(total, has_numeric)`` for the SR-1 single-source rule:
+
+    - ``has_numeric`` is True when at least one rec in the group carries an
+      ``EstimatedMonthlySavings`` key — i.e. the adapter single-sourced a computed
+      dollar, so the card must render that dollar (matching the tab headline)
+      rather than the free-text ``EstimatedSavings`` percentage / hardcoded string.
+    - A rec with ``Counted is False`` is advisory and excluded from ``total`` (it
+      never fed the headline), so an advisory-only group totals ``0.0``.
+    """
+    total = 0.0
+    has_numeric = False
+    for rec in resources:
+        if "EstimatedMonthlySavings" not in rec:
+            continue
+        has_numeric = True
+        if rec.get("Counted") is not False:
+            try:
+                total += float(rec.get("EstimatedMonthlySavings") or 0.0)
+            except (TypeError, ValueError):
+                continue
+    return total, has_numeric
+
+
 def render_grouped_by_category(
     service_key: str,
     sources: Dict[str, Any],
@@ -447,7 +473,19 @@ def render_grouped_by_category(
                 f"<p><strong>Recommendation:</strong> {resources[0].get('Recommendation', 'Optimize resource')}</p>"
             )
 
-            if savings_mode == "always":
+            # SR-1 — single-source the card dollar. When the adapter computed a
+            # numeric EstimatedMonthlySavings, render the group's *counted* sum so
+            # the card equals the tab headline (instead of a free-text percentage
+            # or hardcoded "$316/month" string); an advisory-only group renders the
+            # honest "$0.00/month — advisory". Services that compute no numeric
+            # saving keep the legacy string behaviour.
+            group_total, has_numeric = _group_counted_savings(resources)
+            if has_numeric:
+                if group_total > 0:
+                    content += f'<p class="savings"><strong>Estimated Savings:</strong> ${group_total:,.2f}/month</p>'
+                else:
+                    content += '<p class="savings"><strong>Estimated Savings:</strong> $0.00/month — advisory</p>'
+            elif savings_mode == "always":
                 content += f'<p class="savings"><strong>Estimated Savings:</strong> {resources[0].get("EstimatedSavings", "Cost optimization")}</p>'
             elif savings_mode == "conditional":
                 if resources[0].get("EstimatedSavings"):

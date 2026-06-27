@@ -91,5 +91,8 @@ def test_opensearch_reserved_advisory_storage_counted():
     assert rs["Underutilized Domain"]["Counted"] is False            # $0 (no InstanceType)
     assert rs["Graviton Migration"]["Counted"] is True               # instance lever
     assert rs["Storage Optimization"]["Counted"] is True             # separate axis
-    # total = graviton (100*2*0.25=50) + storage (150*0.11*0.20=3.30) = 53.30
-    assert f.total_monthly_savings == round(100.0 * 2 * 0.25 + 150 * 0.11 * 0.20, 2)
+    # total = graviton (100*2*0.25=50) + storage gp2->gp3 delta
+    # (150 * (0.135-0.122) = 1.95) = 51.95. Storage now uses the real
+    # (gp2_rate - gp3_rate) migration delta, not the old flat 20% of gp3 base
+    # (OpenSearch H3).
+    assert f.total_monthly_savings == round(100.0 * 2 * 0.25 + 150 * (0.135 - 0.122), 2)

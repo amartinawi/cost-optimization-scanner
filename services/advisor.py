@@ -298,9 +298,18 @@ def get_lambda_compute_optimizer_recommendations(
             response = compute_optimizer.get_lambda_function_recommendations(nextToken=response["nextToken"])
             raw.extend(response.get("lambdaFunctionRecommendations", []))
     except Exception as e:
+        msg = str(e)
         logger.warning("Lambda Compute Optimizer not available: %s", e)
-        if "OptInRequiredException" in str(e) or "not registered" in str(e):
+        if "OptInRequiredException" in msg or "not registered" in msg:
             return [_compute_optimizer_opt_in_rec("Lambda", "memory-rightsizing")]
+        if "AccessDenied" in msg or "UnauthorizedOperation" in msg:
+            ctx.permission_issue(
+                f"Compute Optimizer Lambda recommendations denied: {msg}",
+                service="lambda",
+                action="compute-optimizer:GetLambdaFunctionRecommendations",
+            )
+        else:
+            ctx.warn(f"Compute Optimizer Lambda recommendations unavailable: {msg}", service="lambda")
         return []
     # Drop "Optimized"/no-action findings ($0 savings) — not cost recs, they
     # only inflate the count (mirrors the ECS CO helper).
@@ -327,9 +336,21 @@ def get_ecs_compute_optimizer_recommendations(
             response = compute_optimizer.get_ecs_service_recommendations(nextToken=response["nextToken"])
             raw.extend(response.get("ecsServiceRecommendations", []))
     except Exception as e:
+        # H2 — classify the failure (mirror the EBS/RDS CO helpers) instead of
+        # logger-only, else the entire ECS CO source vanishes silently on an
+        # AccessDenied/throttle.
+        msg = str(e)
         logger.warning("ECS Compute Optimizer not available: %s", e)
-        if "OptInRequiredException" in str(e) or "not registered" in str(e):
+        if "OptInRequiredException" in msg or "not registered" in msg:
             return [_compute_optimizer_opt_in_rec("ECS", "task-rightsizing")]
+        if "AccessDenied" in msg or "UnauthorizedOperation" in msg:
+            ctx.permission_issue(
+                f"Compute Optimizer ECS recommendations denied: {msg}",
+                service="containers",
+                action="compute-optimizer:GetECSServiceRecommendations",
+            )
+        else:
+            ctx.warn(f"Compute Optimizer ECS recommendations unavailable: {msg}", service="containers")
         return []
     # Drop "Optimized"/no-action findings ($0 savings): they are not cost
     # recommendations and would inflate the count (mirrors EC2/RDS CO helpers).

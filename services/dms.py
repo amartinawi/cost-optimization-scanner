@@ -10,6 +10,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from core.scan_context import ScanContext
+from services._aws_errors import record_aws_error
 
 DMS_OPTIMIZATION_DESCRIPTIONS: dict[str, dict[str, str]] = {
     "serverless_migration": {
@@ -50,6 +51,10 @@ def get_enhanced_dms_checks(ctx: ScanContext) -> dict[str, Any]:
                 instance_id = instance.get("ReplicationInstanceIdentifier")
                 instance_class = instance.get("ReplicationInstanceClass")
                 status = instance.get("ReplicationInstanceStatus")
+                # Carry the deployment mode so the adapter can pin the correct
+                # AZ-specific Pricing SKU (InstanceUsg vs Multi-AZUsg) and drive
+                # the Multi-AZ->Single-AZ per-AZ-delta lever (dms H1/H2).
+                multi_az = bool(instance.get("MultiAZ", False))
 
                 if status == "available" and instance_class:
                     try:
@@ -67,15 +72,39 @@ def get_enhanced_dms_checks(ctx: ScanContext) -> dict[str, Any]:
                             Statistics=["Average"],
                         )
 
-                        avg_cpu = sum(point["Average"] for point in cpu_metrics.get("Datapoints", [])) / max(
-                            len(cpu_metrics.get("Datapoints", [])), 1
-                        )
+                        datapoints = cpu_metrics.get("Datapoints", [])
+                        # Zero datapoints → no metric coverage (brand-new instance
+                        # or CW denied). ``sum()/max(len,1)`` yields 0.0, which
+                        # passes both ``<30`` and ``<5`` and would flag a
+                        # metric-less instance as rightsized AND unused (dms C2).
+                        # Abstain rather than fabricate either finding.
+                        if not datapoints:
+                            continue
+                        avg_cpu = sum(point["Average"] for point in datapoints) / len(datapoints)
 
-                        if avg_cpu < 30:
+                        # Mutually exclusive: a very-low-CPU instance is EITHER
+                        # unused (terminate, full cost) OR rightsized (downsize,
+                        # ~35%), never both — the previous nested ``<5`` inside
+                        # ``<30`` double-counted one InstanceId at ~0.70× monthly
+                        # (dms C1).
+                        if avg_cpu < 5:
+                            checks["unused_instances"].append(
+                                {
+                                    "InstanceId": instance_id,
+                                    "InstanceClass": instance_class,
+                                    "MultiAZ": multi_az,
+                                    "AvgCPU": f"{avg_cpu:.1f}%",
+                                    "Recommendation": "Very low CPU utilization - consider stopping if unused",
+                                    "EstimatedSavings": "Full instance cost if terminated",
+                                    "CheckCategory": "Unused DMS Instances",
+                                }
+                            )
+                        elif avg_cpu < 30:
                             checks["instance_rightsizing"].append(
                                 {
                                     "InstanceId": instance_id,
                                     "InstanceClass": instance_class,
+                                    "MultiAZ": multi_az,
                                     "AvgCPU": f"{avg_cpu:.1f}%",
                                     "Recommendation": (
                                         f"Low CPU utilization ({avg_cpu:.1f}%) "
@@ -85,32 +114,12 @@ def get_enhanced_dms_checks(ctx: ScanContext) -> dict[str, Any]:
                                     "CheckCategory": "Instance Optimization",
                                 }
                             )
-
-                            if avg_cpu < 5:
-                                checks["unused_instances"].append(
-                                    {
-                                        "InstanceId": instance_id,
-                                        "InstanceClass": instance_class,
-                                        "AvgCPU": f"{avg_cpu:.1f}%",
-                                        "Recommendation": "Very low CPU utilization - consider stopping if unused",
-                                        "EstimatedSavings": "Full instance cost if terminated",
-                                        "CheckCategory": "Unused DMS Instances",
-                                    }
-                                )
-                    except Exception:
-                        checks["instance_rightsizing"].append(
-                            {
-                                "InstanceId": instance_id,
-                                "InstanceClass": instance_class,
-                                "Recommendation": (
-                                    "Review replication instance utilization "
-                                    "- consider DMS Serverless for variable workloads"
-                                ),
-                                "EstimatedSavings": "Rightsize for ~35% savings on instance cost",
-                                "CheckCategory": "Instance Optimization",
-                                "Note": "Verify actual CPU and network utilization before downsizing",
-                            }
-                        )
+                    except Exception as e:
+                        # Account-wide CW AccessDenied/Throttling must NOT
+                        # silently append a counted 35% rec for every instance
+                        # (dms C3). Classify the error and emit a $0 advisory
+                        # only — never counted.
+                        record_aws_error(ctx, e, service="dms", context=f"DMS CPUUtilization metric for {instance_id}")
 
         try:
             serverless_paginator = dms.get_paginator("describe_replication_configs")

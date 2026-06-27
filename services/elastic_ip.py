@@ -6,17 +6,22 @@ Extracted from CostOptimizer.get_elastic_ip_checks() as a free function.
 from __future__ import annotations
 
 import logging
+from typing import Any
+
+from core.pricing_engine import FALLBACK_EIP_MONTH
+from core.scan_context import ScanContext
+from services._aws_errors import record_aws_error
 
 logger = logging.getLogger(__name__)
 
-from typing import Any
-
-from core.scan_context import ScanContext
-
 
 def get_elastic_ip_checks(ctx: ScanContext) -> dict[str, Any]:
-    eip_monthly = ctx.pricing_engine.get_eip_monthly_price() if ctx.pricing_engine is not None else 3.65
-    """Category 1: Elastic IPs & Public Addressing optimization checks"""
+    """Category 1: Elastic IPs & Public Addressing optimization checks."""
+    eip_monthly = (
+        ctx.pricing_engine.get_eip_monthly_price()
+        if ctx.pricing_engine is not None
+        else FALLBACK_EIP_MONTH * ctx.pricing_multiplier
+    )
     checks: dict[str, list[dict[str, Any]]] = {
         "unassociated_eips": [],
         "eips_on_stopped_instances": [],
@@ -121,11 +126,13 @@ def get_elastic_ip_checks(ctx: ScanContext) -> dict[str, Any]:
                                 }
                             )
                     except Exception as e:
-                        logger.warning(f"Warning: Could not check instance {instance_id}: {e}")
+                        record_aws_error(
+                            ctx, e, service="network", context=f"EIP subnet check for {instance_id} failed"
+                        )
                         continue
 
     except Exception as e:
-        logger.warning(f"Warning: Could not perform Elastic IP checks: {e}")
+        record_aws_error(ctx, e, service="network", context="Elastic IP checks failed")
 
     recommendations: list[dict[str, Any]] = []
     for _category, items in checks.items():

@@ -20,29 +20,34 @@ ATHENA_OPTIMIZATION_DESCRIPTIONS: dict[str, dict[str, str]] = {
 
 
 def get_enhanced_athena_checks(ctx: ScanContext) -> dict[str, Any]:
-    """Get enhanced Athena cost optimization checks"""
-    checks: dict[str, list[dict[str, Any]]] = {"workgroup_optimization": [], "query_results": []}
+    """Get enhanced Athena cost optimization checks.
+
+    Emits one rec per ENABLED workgroup carrying ``WorkGroup`` so the adapter's
+    CloudWatch ``ProcessedBytes`` pricing loop can price the partitioning /
+    columnar-format opportunity (athena C1 — the ``checks`` dict was previously
+    initialized and never appended to, so the tab was permanently empty).
+    """
+    checks: dict[str, list[dict[str, Any]]] = {"workgroup_optimization": []}
 
     try:
         athena = ctx.client("athena")
         response = athena.list_work_groups()
         for wg in response.get("WorkGroups", []):
             wg_name = wg.get("Name")
-
-            try:
-                wg_details = athena.get_work_group(WorkGroup=wg_name)
-                config = wg_details.get("WorkGroup", {}).get("Configuration", {})
-
-                result_config = config.get("ResultConfiguration", {})
-                output_location = result_config.get("OutputLocation", "")
-
-                # Athena Query Results (lifecycle on output bucket) and Workgroup
-                # Optimization (scan-limit) findings removed: each emitted vague
-                # "Reduce S3 storage costs" / "Prevent runaway query costs" without
-                # concrete per-workgroup quantification.
-                _ = (output_location, config)
-            except Exception:
+            state = wg.get("State", "ENABLED")
+            if not wg_name or state != "ENABLED":
                 continue
+            checks["workgroup_optimization"].append(
+                {
+                    "WorkGroup": wg_name,
+                    "State": state,
+                    "Recommendation": (
+                        "Reduce Athena scan costs via partitioning + columnar formats (Parquet/ORC) + compression"
+                    ),
+                    "EstimatedSavings": ("Up to 75% scan-cost reduction (priced from CW ProcessedBytes)"),
+                    "CheckCategory": "Workgroup Scan Optimization",
+                }
+            )
     except Exception as e:
         ctx.warn(f"Could not analyze Athena resources: {e}", "athena")
 

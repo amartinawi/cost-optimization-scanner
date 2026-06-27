@@ -23,15 +23,14 @@ class AmiModule(BaseServiceModule):
     def scan(self, ctx: Any) -> ServiceFindings:
         """Scan AMI resources for cost optimization opportunities.
 
-        Emits two distinct sources:
+        Emits two mutually exclusive sources, split by age purely for
+        confidence/presentation — both are unused (deletion-safe) AMIs and
+        both carry quantified savings from EBS-snapshot storage:
 
-          - ``old_amis``    — AMIs older than the snapshot-retention
-                              threshold; carry quantified savings derived
-                              from EBS snapshot storage rate.
-          - ``unused_amis`` — AMIs not referenced by any running instance,
-                              launch template, or ASG. No cost data yet;
-                              emit 0 + PricingWarning until snapshot-size
-                              data is wired through.
+          - ``old_amis``    — unused AMIs older than the snapshot-retention
+                              threshold (stale, high confidence).
+          - ``unused_amis`` — unused AMIs newer than that threshold but past
+                              the action floor (verify before deletion).
 
         Args:
             ctx: ScanContext with region, clients, and pricing data.
@@ -40,18 +39,11 @@ class AmiModule(BaseServiceModule):
         old_recs = result.get("old_amis", [])
         unused_recs = result.get("unused_amis", [])
 
+        # Both sources are quantified deletion candidates; every rec carries a
+        # concrete EstimatedMonthlySavings from its backing-snapshot storage.
         savings = 0.0
-        for rec in old_recs:
+        for rec in old_recs + unused_recs:
             savings += float(rec.get("EstimatedMonthlySavings", 0) or 0)
-        # `unused_amis` no longer contribute fictional dollars; they emit 0
-        # + PricingWarning so total_recommendations and total_monthly_savings
-        # diverge cleanly only on visibility-only recs (intentional).
-        for rec in unused_recs:
-            if "EstimatedMonthlySavings" not in rec:
-                rec["EstimatedMonthlySavings"] = 0.0
-                rec["PricingWarning"] = (
-                    "requires associated snapshot size for quantified savings"
-                )
 
         total_recs = len(old_recs) + len(unused_recs)
 
@@ -82,13 +74,13 @@ class AmiModule(BaseServiceModule):
                     "title": "Review Unused AMIs",
                     "description": (
                         "AMIs not referenced by any running instance, launch"
-                        " template, or ASG. Snapshot-storage savings depend on"
-                        " the underlying block-device snapshot size."
+                        " template, or ASG. Savings = backing EBS-snapshot"
+                        " storage cost per GB-month (max estimate)."
                     ),
                     "action": (
                         "1. Verify the AMI is truly orphaned\n"
-                        "2. Capture snapshot size via describe_snapshots\n"
-                        "3. Deregister and delete snapshots"
+                        "2. Deregister via AWS Console or CLI\n"
+                        "3. Delete the backing snapshots"
                     ),
                 },
             },

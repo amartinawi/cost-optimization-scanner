@@ -10,6 +10,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from core.scan_context import ScanContext
+from services._aws_errors import record_aws_error
 
 MEDIASTORE_OPTIMIZATION_DESCRIPTIONS: dict[str, dict[str, str]] = {
     "unused_containers": {
@@ -40,6 +41,13 @@ def get_enhanced_mediastore_checks(ctx: ScanContext) -> dict[str, Any]:
 
                     metrics_to_check = ["RequestCount", "BytesDownloaded", "BytesUploaded"]
                     total_activity = 0
+                    # A read failure and a genuine zero look identical (total=0),
+                    # so an active container whose activity reads merely failed
+                    # would be flagged "no activity → consider deletion" with a
+                    # non-zero saving. Track read health and abstain on any
+                    # failure (mediastore C1).
+                    activity_read_failed = False
+                    activity_datapoints_seen = 0
 
                     cloudwatch = ctx.client("cloudwatch")
                     for metric_name in metrics_to_check:
@@ -53,9 +61,23 @@ def get_enhanced_mediastore_checks(ctx: ScanContext) -> dict[str, Any]:
                                 Period=86400,
                                 Statistics=["Sum"],
                             )
-                            total_activity += sum(point["Sum"] for point in metrics.get("Datapoints", []))
-                        except Exception:
-                            continue
+                            dps = metrics.get("Datapoints", [])
+                            activity_datapoints_seen += len(dps)
+                            total_activity += sum(point["Sum"] for point in dps)
+                        except Exception as e:
+                            record_aws_error(
+                                ctx,
+                                e,
+                                service="mediastore",
+                                context=f"MediaStore {metric_name} metric for {container_name}",
+                            )
+                            activity_read_failed = True
+
+                    # Skip this container entirely if ANY activity read failed —
+                    # a failed read must not be interpreted as "no activity" and
+                    # must not trigger a deletion recommendation.
+                    if activity_read_failed:
+                        continue
 
                     try:
                         size_metrics = cloudwatch.get_metric_statistics(
@@ -92,7 +114,10 @@ def get_enhanced_mediastore_checks(ctx: ScanContext) -> dict[str, Any]:
                     estimated_savings = (storage_gb * storage_cost_per_gb) + ingest_cost
                     savings_str = f"${estimated_savings:.2f}/month" if estimated_savings > 0 else "$0.00/month"
 
-                    if total_activity == 0:
+                    # Only flag unused when every activity read succeeded AND
+                    # returned no datapoints (confirmed idle), never on a
+                    # failed/empty read that might mask real traffic.
+                    if activity_datapoints_seen > 0 and total_activity == 0:
                         checks["unused_containers"].append(
                             {
                                 "ContainerName": container_name,

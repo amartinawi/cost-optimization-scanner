@@ -6,6 +6,7 @@ import logging
 from typing import Any
 
 from core.contracts import ServiceFindings, SourceBlock
+from services._aws_errors import record_aws_error
 from services._base import BaseServiceModule
 from services._savings import compute_optimizer_savings, parse_dollar_savings
 from services.advisor import (
@@ -15,6 +16,14 @@ from services.advisor import (
 from services.ec2 import get_advanced_ec2_checks, get_ec2_instance_count, get_enhanced_ec2_checks
 
 logger = logging.getLogger(__name__)
+
+# ec2 H2 — the enhanced CloudWatch checks only emit these categories when a
+# metric read shows genuine low utilization, so an instance appearing under any
+# of them is corroborating evidence that its tag-based advanced lever (cron/
+# batch/instance-store/non-prod) reflects a real, measured opportunity.
+_CW_LOW_UTIL_CATEGORIES: frozenset[str] = frozenset(
+    {"Idle Instances", "Rightsizing Opportunities", "Burstable Instance Optimization"}
+)
 
 
 def _coh_is_renderable(rec: dict[str, Any]) -> bool:
@@ -50,14 +59,18 @@ def _asg_member_instance_ids(ctx: Any) -> set[str]:
 
     ASG members are sized via their launch template and covered by ASG Compute
     Optimizer, so per-instance heuristics must defer to that source rather than
-    recommend rightsizing an individual managed instance. Returns an empty set
-    on any error (missing client, permission) so the scan never fails here.
+    recommend rightsizing an individual managed instance.
+
+    H1 — a *silent* empty set re-enables the per-instance heuristics AND the
+    ``asg_compute_optimizer`` block on managed instances (double-counting managed
+    dollars). On a failed read we classify the error so the degraded dedup is
+    visible, and return the partial set gathered so far rather than wiping it.
     """
+    ids: set[str] = set()
     try:
         autoscaling = ctx.client("autoscaling")
         if not autoscaling:
-            return set()
-        ids: set[str] = set()
+            return ids
         paginator = autoscaling.get_paginator("describe_auto_scaling_groups")
         for page in paginator.paginate():
             for group in page.get("AutoScalingGroups", []):
@@ -65,9 +78,14 @@ def _asg_member_instance_ids(ctx: Any) -> set[str]:
                     iid = member.get("InstanceId")
                     if iid:
                         ids.add(iid)
-        return ids
-    except Exception:
-        return set()
+    except Exception as e:
+        record_aws_error(
+            ctx,
+            e,
+            service="ec2",
+            context="autoscaling:DescribeAutoScalingGroups failed (ASG-member dedup degraded)",
+        )
+    return ids
 
 
 class EC2Module(BaseServiceModule):
@@ -117,9 +135,20 @@ class EC2Module(BaseServiceModule):
         enhanced_recs = get_enhanced_ec2_checks(ctx, ctx.pricing_multiplier, ctx.fast_mode).get(
             "recommendations", []
         )
-        advanced_recs = get_advanced_ec2_checks(ctx, ctx.pricing_multiplier, ctx.fast_mode).get(
-            "recommendations", []
+        # ec2 H2 — the four tag-based advanced levers (cron/batch/instance-store/
+        # non-prod) may only count a dollar when corroborated by a measured
+        # low-utilization signal. The CloudWatch idle/rightsizing/burstable checks
+        # only emit those categories when CW shows low util, so an instance present
+        # under one of them IS the corroboration. (In fast_mode no CW runs, so the
+        # set is empty and every tag lever is advisory — the honest outcome.)
+        corroborated_ids = frozenset(
+            str(r.get("InstanceId", "") or "")
+            for r in enhanced_recs
+            if r.get("CheckCategory") in _CW_LOW_UTIL_CATEGORIES and r.get("InstanceId")
         )
+        advanced_recs = get_advanced_ec2_checks(
+            ctx, ctx.pricing_multiplier, ctx.fast_mode, corroborated_ids
+        ).get("recommendations", [])
 
         # --- Cross-source de-duplication by instance id ------------------------
         # Cost Optimization Hub surfaces Compute Optimizer's own rightsizing
@@ -139,9 +168,15 @@ class EC2Module(BaseServiceModule):
         # by an AWS source, then keep at most ONE finding per instance — the
         # highest-savings one — so overlapping checks (idle + prev-gen + cron …)
         # on the same instance never stack.
+        # ec2 H2 — advisory advanced recs (Counted=False) still render as visible
+        # architectural nudges but never compete for the per-instance slot and are
+        # never summed; only counted heuristics contend in best_by_instance.
+        counted_advanced = [r for r in advanced_recs if r.get("Counted", True) is not False]
+        advisory_advanced = [r for r in advanced_recs if r.get("Counted", True) is False]
+
         best_by_instance: dict[str, tuple[str, dict[str, Any], float]] = {}
         for origin, rec in (
-            [("enhanced", r) for r in enhanced_recs] + [("advanced", r) for r in advanced_recs]
+            [("enhanced", r) for r in enhanced_recs] + [("advanced", r) for r in counted_advanced]
         ):
             iid = str(rec.get("InstanceId", "") or "")
             if iid and iid in covered:
@@ -155,7 +190,12 @@ class EC2Module(BaseServiceModule):
                 best_by_instance[key] = (origin, rec, sav)
 
         enhanced_final = [rec for origin, rec, _ in best_by_instance.values() if origin == "enhanced"]
-        advanced_final = [rec for origin, rec, _ in best_by_instance.values() if origin == "advanced"]
+        advanced_counted_final = [rec for origin, rec, _ in best_by_instance.values() if origin == "advanced"]
+        # Advisory recs render unless the instance is already owned by an AWS source
+        # (CoH/CO/ASG). They carry "$0.00" EstimatedSavings, so the savings sum below
+        # leaves them at $0 — rendered, never counted.
+        advisory_final = [r for r in advisory_advanced if str(r.get("InstanceId", "") or "") not in covered]
+        advanced_final = advanced_counted_final + advisory_final
 
         # --- Savings (each instance counted once) ------------------------------
         savings = 0.0

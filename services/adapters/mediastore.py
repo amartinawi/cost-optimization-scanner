@@ -34,30 +34,60 @@ class MediastoreModule(BaseServiceModule):
             ServiceFindings with enhanced_checks SourceBlock.
         """
         result = get_enhanced_mediastore_checks(ctx)
-        recs = result.get("recommendations", [])
+        source_recs = result.get("recommendations", [])
+
+        if ctx.pricing_engine:
+            # PricingEngine returns region-correct $/GB; no multiplier.
+            price_per_gb = ctx.pricing_engine.get_s3_monthly_price_per_gb("STANDARD")
+            rate_source = "S3 STANDARD via PricingEngine (region-correct)"
+        else:
+            # Module-const fallback path → apply multiplier (L2.3.2).
+            price_per_gb = 0.023 * ctx.pricing_multiplier
+            rate_source = f"$0.023/GB-Mo S3 STANDARD fallback x{ctx.pricing_multiplier} multiplier"
+
+        recs: list[dict[str, Any]] = []
         savings = 0.0
-        for rec in recs:
-            estimated_gb = rec.get("EstimatedStorageGB", 0)
-            if ctx.pricing_engine:
-                # PricingEngine returns region-correct $/GB; no multiplier.
-                price_per_gb = ctx.pricing_engine.get_s3_monthly_price_per_gb("STANDARD")
-            else:
-                # Module-const fallback path → apply multiplier (L2.3.2).
-                price_per_gb = 0.023 * ctx.pricing_multiplier
+        for src in source_recs:
+            # Immutability: build a NEW rec; never mutate the shim's dict.
+            rec = dict(src)
+            estimated_gb = rec.get("EstimatedStorageGB", 0) or 0
             if estimated_gb > 0:
-                rec_savings = estimated_gb * price_per_gb
-                rec["EstimatedMonthlySavings"] = round(rec_savings, 2)
+                rec_savings = round(estimated_gb * price_per_gb, 2)
+                rec["EstimatedMonthlySavings"] = rec_savings
+                # Each counted dollar carries a defensible AuditBasis.
+                rec["AuditBasis"] = {
+                    "rate": f"${price_per_gb:.4f}/GB-Mo",
+                    "region": getattr(ctx, "region", "us-east-1"),
+                    "metric_window": "BucketSizeBytes 14-day Average (AWS/MediaStore)",
+                    "formula": (
+                        f"{estimated_gb:.2f} GB x ${price_per_gb:.4f}/GB-Mo "
+                        f"= ${rec_savings:.2f}/mo"
+                    ),
+                    "rate_source": rate_source,
+                }
                 savings += rec_savings
             else:
-                # No storage figure; emit 0 + warning rather than fabricate $20.
+                # No storage figure → cannot quantify a real dollar. Demote to a
+                # $0 advisory (Counted=False) so the card still renders but is
+                # excluded from BOTH the dollar total AND total_recommendations
+                # (mediastore H1 count hygiene) — never fabricate a saving.
                 rec["EstimatedMonthlySavings"] = 0.0
+                rec["Counted"] = False
+                rec["EstimatedSavings"] = (
+                    "$0.00/month — advisory: requires EstimatedStorageGB for quantified savings"
+                )
                 rec["PricingWarning"] = "requires EstimatedStorageGB for quantified savings"
+            recs.append(rec)
 
         sources = {"enhanced_checks": SourceBlock(count=len(recs), recommendations=tuple(recs))}
 
+        # Count hygiene: a $0 advisory (Counted=False) renders but must not
+        # inflate the rec headline (mirrors services/_savings.mark_zero_savings_advisory).
+        counted = sum(1 for r in recs if r.get("Counted") is not False)
+
         return ServiceFindings(
             service_name="MediaStore",
-            total_recommendations=len(recs),
+            total_recommendations=counted,
             total_monthly_savings=savings,
             sources=sources,
             optimization_descriptions=MEDIASTORE_OPTIMIZATION_DESCRIPTIONS,

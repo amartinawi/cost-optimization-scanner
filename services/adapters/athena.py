@@ -58,7 +58,9 @@ class AthenaModule(BaseServiceModule):
                             Statistics=["Sum"],
                         )
                         total_bytes = sum(dp["Sum"] for dp in resp.get("Datapoints", []))
-                        monthly_tb = total_bytes / (1024**4) if total_bytes > 0 else 0
+                        # AWS bills Athena per TB = 10^12 bytes (H2: the previous
+                        # 1024**4 / TiB divisor understated scans by ~9.05%).
+                        monthly_tb = total_bytes / 1e12 if total_bytes > 0 else 0
                     except Exception as e:
                         logger.warning(f"[athena] CloudWatch ProcessedBytes metric check failed: {e}")
                         monthly_tb = 0

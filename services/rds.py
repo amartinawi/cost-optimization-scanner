@@ -642,6 +642,9 @@ def get_enhanced_rds_checks(
                                 f"({best_scenario['term']} {best_scenario['payment_option']})"
                             ),
                             "CheckCategory": ("Reserved Instance Opportunities"),
+                            # RI purchases are the commitment_analysis tab's domain and
+                            # overlap with rightsizing — advisory, never summed/counted.
+                            "Counted": False,
                             "instanceFinding": (f"Instance ({db_instance_class}) - RI candidate"),
                             "RIScenarios": ri_scenarios,
                             "OnDemandMonthlyEstimate": round(ri_base_price, 2),

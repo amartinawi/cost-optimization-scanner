@@ -14,6 +14,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from core.scan_context import ScanContext
+from services._aws_errors import record_aws_error
 
 LOW_CPU_THRESHOLD: int = 20
 
@@ -44,7 +45,14 @@ SMALLEST_SIZES: dict[str, str] = {
 
 
 def get_enhanced_elasticache_checks(ctx: ScanContext) -> dict[str, Any]:
-    """Get enhanced ElastiCache cost optimization checks."""
+    """Get enhanced ElastiCache cost optimization checks.
+
+    The Underutilized-cluster downsizing lever is gated on a CloudWatch
+    ``CPUUtilization`` read (14-day average). In ``fast_mode`` that per-cluster
+    metric read is skipped (one warning) and the lever is suppressed entirely —
+    no guessed downsize saving is emitted without the metric, mirroring
+    ``rds.py`` / ``file_systems.py`` (elasticache H3).
+    """
     checks: dict[str, list[dict[str, Any]]] = {
         "reserved_nodes": [],
         "underutilized_clusters": [],
@@ -53,9 +61,19 @@ def get_enhanced_elasticache_checks(ctx: ScanContext) -> dict[str, Any]:
         "graviton_migration": [],
     }
 
+    fast_mode = bool(getattr(ctx, "fast_mode", False))
+
     try:
         elasticache = ctx.client("elasticache")
-        cloudwatch = ctx.client("cloudwatch")
+        # Skip CloudWatch entirely in fast mode so --fast makes no per-cluster
+        # metric calls (fast-mode contract — elasticache H3).
+        cloudwatch = ctx.client("cloudwatch") if not fast_mode else None
+        if fast_mode:
+            ctx.warn(
+                "[elasticache] fast mode: Underutilized-cluster downsizing needs "
+                "CloudWatch CPUUtilization metrics and was skipped.",
+                "elasticache",
+            )
 
         paginator = elasticache.get_paginator("describe_cache_clusters")
         for page in paginator.paginate(ShowCacheNodeInfo=True):
@@ -96,7 +114,11 @@ def get_enhanced_elasticache_checks(ctx: ScanContext) -> dict[str, Any]:
                     checks["graviton_migration"].append(
                         {
                             "ClusterId": cluster_id,
+                            "Engine": engine,
                             "NodeType": node_type,
+                            # NumNodes so the adapter prices the Graviton node-price
+                            # delta across every node, not just one (elasticache H1).
+                            "NumNodes": num_nodes,
                             "Recommendation": "Migrate to Graviton instances",
                             "EstimatedSavings": "Estimated: 20-40% price-performance improvement",
                             "CheckCategory": "Graviton Migration",
@@ -110,6 +132,7 @@ def get_enhanced_elasticache_checks(ctx: ScanContext) -> dict[str, Any]:
                     checks["reserved_nodes"].append(
                         {
                             "ClusterId": cluster_id,
+                            "Engine": engine,
                             "NodeType": node_type,
                             "NumNodes": num_nodes,
                             "Recommendation": "Consider Reserved Nodes for stable workloads (1-3 year commitment)",
@@ -117,6 +140,11 @@ def get_enhanced_elasticache_checks(ctx: ScanContext) -> dict[str, Any]:
                             "CheckCategory": "Reserved Nodes Opportunity",
                         }
                     )
+
+                if fast_mode:
+                    # CloudWatch skipped — no underutilized downsizing lever
+                    # without a measured CPU signal (elasticache H3).
+                    continue
 
                 try:
                     end_time = datetime.now(UTC)
@@ -149,7 +177,11 @@ def get_enhanced_elasticache_checks(ctx: ScanContext) -> dict[str, Any]:
                             checks["underutilized_clusters"].append(
                                 {
                                     "ClusterId": cluster_id,
+                                    "Engine": engine,
                                     "NodeType": node_type,
+                                    # NumNodes so the downsize delta prices every
+                                    # node, not just one (elasticache H1).
+                                    "NumNodes": num_nodes,
                                     "AvgCPU": round(avg_cpu, 2),
                                     "Recommendation": "Downsize node type or consider smaller instance family",
                                     "EstimatedSavings": "30-50%",
@@ -157,7 +189,15 @@ def get_enhanced_elasticache_checks(ctx: ScanContext) -> dict[str, Any]:
                                 }
                             )
                 except Exception as e:
-                    logger.warning(f"Warning: Could not get metrics for cluster {cluster_id}: {e}")
+                    # Classify (AccessDenied -> permission_issue, else warn); a
+                    # failed metric read drops only this cluster's downsize lever,
+                    # never a fabricated saving (rule #4).
+                    record_aws_error(
+                        ctx,
+                        e,
+                        service="elasticache",
+                        context=f"CloudWatch CPUUtilization read failed for cluster {cluster_id}",
+                    )
                     continue
 
     except Exception as e:

@@ -38,31 +38,24 @@ class BatchModule(BaseServiceModule):
         """
         result = get_enhanced_batch_checks(ctx)
         recs = result.get("recommendations", [])
-        savings = 0.0
-        multiplier = getattr(ctx, "pricing_multiplier", 1.0)
+        # Batch CEs are bursty (minvCpus→maxvCpus); without a run-hours signal
+        # (CloudWatch CPUUtilization datapoint count or Batch ListJobs runtime)
+        # multiplying by a hardcoded 730 (24/7) overstates savings for idle CEs
+        # and understates for saturated ones. Demote every rec to a $0 advisory
+        # so the lever renders without an invented dollar (batch C2 / batch C1).
         for rec in recs:
-            category = rec.get("CheckCategory", "")
-            if "Fargate Spot" in category:
-                rate = 0.70
-            elif "Graviton" in category:
-                # AWS Graviton list-price delta x86→arm is ~20%.
-                rate = 0.20
-            elif "Spot" in category:
-                rate = 0.70
-            else:
-                rate = 0.30
-
-            instance_types = rec.get("InstanceTypes", [])
-            if ctx.pricing_engine is not None and instance_types:
-                # get_ec2_hourly_price returns region-correct $/hr; do NOT
-                # re-multiply by ctx.pricing_multiplier (L2.3.1).
-                hourly = ctx.pricing_engine.get_ec2_hourly_price(instance_types[0])
-                monthly = hourly * 730
-                savings += monthly * rate
-            # else: instance_types unknown; skip rather than fabricate
-            # $150 fallback (was over/under-stated 1.5-36x depending on
-            # actual instance type).
-        _ = multiplier  # documented; live path is region-correct already.
+            rec["Counted"] = False
+            rec["EstimatedMonthlySavings"] = 0.0
+            rec["EstimatedSavings"] = (
+                "$0.00/month — advisory: enable Spot/Fargate-Spot/Graviton; "
+                "realized saving is run-hour dependent and needs Batch ListJobs "
+                "or CloudWatch CPUUtilization coverage to quantify"
+            )
+            rec["AuditBasis"] = {
+                "unmeasured_inputs": ["run_hours_per_month", "minvCpus_floor"],
+                "reason": "24/7 assumption rejected; bursty CE — advisory per cost-scope rule",
+            }
+        savings = 0.0
 
         sources = {"enhanced_checks": SourceBlock(count=len(recs), recommendations=tuple(recs))}
 

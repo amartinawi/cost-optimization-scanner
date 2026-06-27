@@ -256,25 +256,36 @@ def test_is_nonprod_and_spot_eligible():
 
 
 def test_nonprod_scheduling_check():
-    """A non-prod instance gets a quantified scheduling saving (cost x off-fraction)."""
-    ctx = _fake_ctx(
-        [
-            {
-                "InstanceId": "i-np",
-                "InstanceType": "m5.large",
-                "State": {"Name": "running"},
-                "PlatformDetails": "Linux/UNIX",
-                "Tags": [{"Key": "Environment", "Value": "dev"}, {"Key": "Name", "Value": "dev-app"}],
-            }
-        ],
-        hourly=0.10,
-    )
-    recs = get_advanced_ec2_checks(ctx, 1.0, fast_mode=True)["recommendations"]
+    """ec2 H2: the non-prod lever is a $0 advisory without CloudWatch corroboration,
+    and a counted cost×off-fraction saving when the instance shows measured low util."""
+    instances = [
+        {
+            "InstanceId": "i-np",
+            "InstanceType": "m5.large",
+            "State": {"Name": "running"},
+            "PlatformDetails": "Linux/UNIX",
+            "Tags": [{"Key": "Environment", "Value": "dev"}, {"Key": "Name", "Value": "dev-app"}],
+        }
+    ]
+
+    # No corroboration -> advisory (Counted=False), still rendered, never a $46.72 count.
+    recs = get_advanced_ec2_checks(_fake_ctx(instances, hourly=0.10), 1.0, fast_mode=True)["recommendations"]
     sched = [r for r in recs if r["CheckCategory"] == "Non-Prod Scheduling"]
     assert len(sched) == 1
-    # 0.10 * 730 * 0.64 = 46.72
-    assert sched[0]["EstimatedSavings"].startswith("$46.72")
+    assert sched[0]["Counted"] is False
+    assert sched[0]["EstimatedSavings"].startswith("$0.00")
+    # The speculative figure is preserved for the reader but not summed.
+    assert sched[0]["AdvisoryEstimate"] == pytest.approx(46.72, abs=0.01)
     assert sched[0]["Environment"] == "dev"
+
+    # Corroborated (CW low-util signal) -> counted 0.10 * 730 * 0.64 = 46.72.
+    recs2 = get_advanced_ec2_checks(
+        _fake_ctx(instances, hourly=0.10), 1.0, True, corroborated_ids=frozenset({"i-np"})
+    )["recommendations"]
+    sched2 = next(r for r in recs2 if r["CheckCategory"] == "Non-Prod Scheduling")
+    assert "Counted" not in sched2  # counted path carries no advisory flag
+    assert sched2["EstimatedSavings"].startswith("$46.72")
+    assert sched2["Environment"] == "dev"
 
 
 def test_spot_migration_only_when_tagged_interruptible():
@@ -366,7 +377,14 @@ def test_cross_source_dedup_counts_each_instance_once(monkeypatch):
     monkeypatch.setattr(ec2_adapter, "get_advanced_ec2_checks", lambda *a, **k: {"recommendations": advanced})
     monkeypatch.setattr(ec2_adapter, "get_ec2_instance_count", lambda ctx: 4)
 
-    ctx = SimpleNamespace(cost_hub_splits={"ec2": coh}, pricing_multiplier=1.0, fast_mode=False)
+    ctx = SimpleNamespace(
+        cost_hub_splits={"ec2": coh},
+        pricing_multiplier=1.0,
+        fast_mode=False,
+        client=lambda name, region=None: None,
+        warn=lambda *a, **k: None,
+        permission_issue=lambda *a, **k: None,
+    )
     findings = EC2Module().scan(ctx)
 
     # CoH 100 + CO i-BBB 50 + heuristic i-CCC max(30,40)=40 + i-DDD 20 = 210

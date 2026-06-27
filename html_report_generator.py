@@ -57,29 +57,19 @@ def _format_savings_chip(amount: float) -> str:
     return f"${amount / 1000:.1f}k"
 
 
-_SAVINGS_KEYWORDS: Dict[str, List[Tuple[str, float]]] = {
-    "ec2": [
-        ("previous generation", 50),
-        ("dedicated tenancy", 200),
-        ("burstable", 30),
-        ("spot", 100),
-        ("schedule", 150),
-    ],
-    "dynamodb": [
-        ("on-demand", 100),
-        ("provisioned", 75),
-        ("reserved", 200),
-    ],
-}
+# _SAVINGS_KEYWORDS / _SAVINGS_FALLBACK_TO_ESTIMATED / _DEFAULT_SAVINGS removed
+# (cost-fidelity, extends SR-2): the reporter previously synthesized $25-$200/rec
+# for ec2/dynamodb from recommendation-text keywords whenever an adapter's
+# total_monthly_savings was $0 — re-fabricating at the report layer the advisory
+# dollars the adapters demote to $0. _calculate_service_savings now passes the
+# canonical adapter total straight through, so the keyword/default tables are gone.
 
-_SAVINGS_FALLBACK_TO_ESTIMATED: set = {"ec2"}
-
-_DEFAULT_SAVINGS: Dict[str, float] = {
-    "ec2": 25,
-    "dynamodb": 50,
-}
-
-_FLAT_SAVINGS_SERVICES: set = {"opensearch", "api_gateway", "step_functions"}
+# _FLAT_SAVINGS_SERVICES removed (SR-2): the reporter previously fabricated
+# $50/rec for {opensearch, api_gateway, step_functions} when an adapter's
+# total_monthly_savings was $0 — inflating the tab headline, exec-summary, and
+# reconciliation footnote with dollars no adapter counted. Adapters now emit an
+# honest $0 (advisory recs render with Counted=False), so the reporter must not
+# invent a dollar the adapter did not count.
 
 _StatCard = Tuple[str, str]
 
@@ -2295,23 +2285,20 @@ class HTMLReportGenerator:
         # Top services value: "Cost Optimization Hub, RDS (83%)" or single name.
         if len(top_two) >= 2 and top_share > 0:
             top_services_value = (
-                f'{html.escape(top_two[0][0])}, {html.escape(top_two[1][0])} '
+                f"{html.escape(top_two[0][0])}, {html.escape(top_two[1][0])} "
                 f'<span class="summary-fact__qual">'
-                f'<strong>{top_share * 100:.0f}%</strong> of total</span>'
+                f"<strong>{top_share * 100:.0f}%</strong> of total</span>"
             )
         elif len(top_two) == 1:
             top_services_value = (
-                f'{html.escape(top_two[0][0])} '
-                f'<span class="summary-fact__qual">largest opportunity</span>'
+                f'{html.escape(top_two[0][0])} <span class="summary-fact__qual">largest opportunity</span>'
             )
         else:
             top_services_value = '<span class="summary-fact__qual">no defensible savings located</span>'
 
         # Open risks value: HIGH-severity recommendations across all services.
         if high_count > 0:
-            risks_value = (
-                f'<span class="risk-tag risk-tag--high"><strong>{high_count}</strong> HIGH</span>'
-            )
+            risks_value = f'<span class="risk-tag risk-tag--high"><strong>{high_count}</strong> HIGH</span>'
         else:
             risks_value = '<span class="summary-fact__qual">none open</span>'
 
@@ -2321,22 +2308,22 @@ class HTMLReportGenerator:
             '<div class="summary-figure">'
             f'<span class="summary-figure__amount">${total_savings:,.2f}</span>'
             '<span class="summary-figure__period">per month</span>'
-            '</div>'
+            "</div>"
             '<p class="summary-figure__caption">defensibly recoverable</p>'
             '<dl class="summary-facts">'
             '<div class="summary-fact">'
-            '<dt>Annual</dt>'
-            f'<dd>${total_savings * 12:,.0f}</dd>'
-            '</div>'
+            "<dt>Annual</dt>"
+            f"<dd>${total_savings * 12:,.0f}</dd>"
+            "</div>"
             '<div class="summary-fact">'
-            '<dt>Top services</dt>'
-            f'<dd>{top_services_value}</dd>'
-            '</div>'
+            "<dt>Top services</dt>"
+            f"<dd>{top_services_value}</dd>"
+            "</div>"
             '<div class="summary-fact">'
-            '<dt>Open risks</dt>'
-            f'<dd>{risks_value}</dd>'
-            '</div>'
-            '</dl>'
+            "<dt>Open risks</dt>"
+            f"<dd>{risks_value}</dd>"
+            "</div>"
+            "</dl>"
         )
 
         # Reconciliation footnote: surface a divergence between the sum of the
@@ -2375,9 +2362,17 @@ class HTMLReportGenerator:
                 else:
                     recs = []
                 for rec in recs:
-                    priority = str(
-                        rec.get("priority") or rec.get("Priority") or rec.get("severity") or rec.get("Severity") or ""
-                    ).strip().lower()
+                    priority = (
+                        str(
+                            rec.get("priority")
+                            or rec.get("Priority")
+                            or rec.get("severity")
+                            or rec.get("Severity")
+                            or ""
+                        )
+                        .strip()
+                        .lower()
+                    )
                     if priority in ("high", "critical"):
                         counts["high"] += 1
                     elif priority in ("medium", "warning"):
@@ -2415,49 +2410,54 @@ class HTMLReportGenerator:
             label = str(service_data["service_name"])
             if service_key == "ami" and amis_data["count"] > 0:
                 # AMI tab is rendered via the dedicated AMIs panel.
-                tab_entries.append((
-                    savings,
-                    service_key,
-                    label,
-                    rec_count,
-                    lambda d=amis_data: self._get_amis_content(d),
-                ))
+                tab_entries.append(
+                    (
+                        savings,
+                        service_key,
+                        label,
+                        rec_count,
+                        lambda d=amis_data: self._get_amis_content(d),
+                    )
+                )
             else:
-                tab_entries.append((
-                    savings,
-                    service_key,
-                    label,
-                    rec_count,
-                    lambda k=service_key, d=service_data: self._get_service_content(k, d),
-                ))
+                tab_entries.append(
+                    (
+                        savings,
+                        service_key,
+                        label,
+                        rec_count,
+                        lambda k=service_key, d=service_data: self._get_service_content(k, d),
+                    )
+                )
 
         # Synthetic Snapshots tab.
         if snapshots_data["count"] > 0:
             snap_savings = float(snapshots_data.get("total_savings", 0) or 0)
-            tab_entries.append((
-                snap_savings,
-                "snapshots",
-                "Snapshots",
-                snapshots_data["count"],
-                lambda d=snapshots_data: self._get_snapshots_content(d),
-            ))
+            tab_entries.append(
+                (
+                    snap_savings,
+                    "snapshots",
+                    "Snapshots",
+                    snapshots_data["count"],
+                    lambda d=snapshots_data: self._get_snapshots_content(d),
+                )
+            )
 
         # Synthetic AMIs tab only if there's no underlying AMI service section.
-        ami_already_present = any(
-            s.get("total_recommendations", 0) > 0 for k, s in services.items() if k == "ami"
-        )
+        ami_already_present = any(s.get("total_recommendations", 0) > 0 for k, s in services.items() if k == "ami")
         if amis_data["count"] > 0 and not ami_already_present:
             ami_savings = sum(
-                float(r.get("EstimatedMonthlySavings", 0) or 0)
-                for r in amis_data.get("recommendations", [])
+                float(r.get("EstimatedMonthlySavings", 0) or 0) for r in amis_data.get("recommendations", [])
             )
-            tab_entries.append((
-                ami_savings,
-                "amis",
-                "AMIs",
-                amis_data["count"],
-                lambda d=amis_data: self._get_amis_content(d),
-            ))
+            tab_entries.append(
+                (
+                    ami_savings,
+                    "amis",
+                    "AMIs",
+                    amis_data["count"],
+                    lambda d=amis_data: self._get_amis_content(d),
+                )
+            )
 
         # Descending sort: highest savings first. Ties broken by recommendation
         # count desc then label asc so the order is deterministic.
@@ -2468,7 +2468,7 @@ class HTMLReportGenerator:
         tab_buttons += (
             '<button class="tab-button active" role="tab" aria-selected="true" '
             'aria-controls="panel-executive-summary" id="tab-executive-summary" '
-            'onclick="showTab(\'executive-summary\', event)">'
+            "onclick=\"showTab('executive-summary', event)\">"
             '<svg class="icon icon-sm"><use href="#icon-chart"/></svg> Executive Summary'
             "</button>"
         )
@@ -2483,8 +2483,8 @@ class HTMLReportGenerator:
             tab_buttons += (
                 f'<button class="tab-button" role="tab" aria-selected="false" '
                 f'aria-controls="panel-{html.escape(key)}" id="tab-{html.escape(key)}" '
-                f'onclick="showTab(\'{html.escape(key)}\', event)">'
-                f'{html.escape(label)}{chip}</button>'
+                f"onclick=\"showTab('{html.escape(key)}', event)\">"
+                f"{html.escape(label)}{chip}</button>"
             )
 
         tab_buttons += "</div>"
@@ -2520,7 +2520,7 @@ class HTMLReportGenerator:
         # Anchor click activates the target tab via jumpToPanel and scrolls.
         rail_items = "".join(
             f'<li><a href="#panel-{html.escape(key)}" '
-            f'onclick="jumpToPanel(\'{html.escape(key)}\'); event.preventDefault();">'
+            f"onclick=\"jumpToPanel('{html.escape(key)}'); event.preventDefault();\">"
             f'<span class="jump-nav__label">{html.escape(label)}</span>'
             f'<span class="jump-nav__amount">{_format_savings_chip(savings) or "&mdash;"}</span>'
             "</a></li>"
@@ -2530,7 +2530,7 @@ class HTMLReportGenerator:
             '<aside class="jump-nav" aria-label="Service savings jump nav">'
             '<h3 class="jump-nav__heading">By savings</h3>'
             f'<ol class="jump-nav__list">{rail_items}</ol>'
-            '</aside>'
+            "</aside>"
         )
 
         return jump_nav + f'<div class="tabs">{tab_buttons}{filter_strip}{tab_contents}</div>'
@@ -2653,9 +2653,7 @@ class HTMLReportGenerator:
         content = '<div class="service-header">'
         content += '<h2 class="service-title">Snapshots Cost Optimization</h2>'
         content += '<div class="service-stats">'
-        content += (
-            f'<div class="stat-card"><div class="stat-label">Old Snapshots</div><div class="value">{snapshots_data["count"]}</div></div>'
-        )
+        content += f'<div class="stat-card"><div class="stat-label">Old Snapshots</div><div class="value">{snapshots_data["count"]}</div></div>'
         content += f'<div class="stat-card"><div class="stat-label">Potential Monthly Savings</div><div class="value savings">${total_savings:.2f}</div></div>'
         content += "</div></div>"
 
@@ -2819,8 +2817,8 @@ class HTMLReportGenerator:
             '<div class="service-header">'
             '<h2 class="service-title">'
             '<svg class="icon icon-sm"><use href="#icon-chart"/></svg> Executive Summary'
-            '</h2>'
-            '</div>'
+            "</h2>"
+            "</div>"
         )
 
         # Accessible data table fallback for the canvas charts — visually hidden
@@ -2906,9 +2904,7 @@ class HTMLReportGenerator:
             f'<div class="value">{spend_change_pct:+.1f}%</div></div>'
         )
         if forecast and isinstance(forecast, (int, float)):
-            stat_cards += (
-                f'<div class="stat-card"><div class="stat-label">30-Day Forecast</div><div class="value">${forecast:,.2f}</div></div>'
-            )
+            stat_cards += f'<div class="stat-card"><div class="stat-label">30-Day Forecast</div><div class="value">${forecast:,.2f}</div></div>'
 
         chart_html = ""
         if daily_spend_series:
@@ -3074,49 +3070,27 @@ class HTMLReportGenerator:
         return content
 
     def _calculate_service_savings(self, service_key: str, service_data: Dict[str, Any]) -> float:
-        """Calculate realistic savings for services showing $0.00"""
-        if service_data.get("total_monthly_savings", 0) > 0:
-            return service_data["total_monthly_savings"]
+        """Return the adapter's counted ``total_monthly_savings`` — never fabricate.
 
-        total_savings = 0
-        sources = service_data.get("sources", {})
-
-        for source_name, source_data in sources.items():
-            if isinstance(source_data, dict):
-                recommendations = source_data.get("recommendations", [])
-            elif isinstance(source_data, list):
-                recommendations = source_data
-            else:
-                recommendations = []
-
-            for rec in recommendations:
-                if service_key in _FLAT_SAVINGS_SERVICES:
-                    total_savings += 50
-                elif service_key in _SAVINGS_KEYWORDS:
-                    recommendation = rec.get("Recommendation", "").lower()
-                    matched = False
-                    for keyword, amount in _SAVINGS_KEYWORDS[service_key]:
-                        if keyword in recommendation:
-                            total_savings += amount
-                            matched = True
-                            break
-                    if not matched:
-                        if service_key in _SAVINGS_FALLBACK_TO_ESTIMATED and rec.get("estimatedMonthlySavings", 0) > 0:
-                            total_savings += rec.get("estimatedMonthlySavings", 0)
-                        else:
-                            total_savings += _DEFAULT_SAVINGS.get(service_key, 0)
-
-        return total_savings
+        Cost-fidelity (extends SR-2 to ec2/dynamodb): the adapter's counted
+        ``total_monthly_savings`` is authoritative. The reporter must never invent
+        a dollar the adapter did not count. This method previously synthesized
+        ``$25-$200/rec`` from recommendation-text keywords (e.g. "schedule" → $150,
+        "reserved" → $200) whenever the canonical total was ``$0`` — re-fabricating
+        at the report layer exactly the advisory dollars the adapters now demote to
+        ``$0`` (a non-prod EC2 advisory rec reading "schedule stop/start" would have
+        re-counted $150 into the EC2 headline). It now passes the canonical total
+        straight through, so an honest ``$0`` stays ``$0`` and advisory recs render
+        via ``Counted=False`` without a fabricated headline.
+        """
+        return float(service_data.get("total_monthly_savings", 0) or 0)
 
     def _get_service_content(self, service_key: str, service_data: Dict[str, Any]) -> str:
         """Get content for a specific service tab"""
-        canonical_savings = service_data.get("total_monthly_savings", 0)
-        calculated_savings = self._calculate_service_savings(service_key, service_data)
-        is_estimated = calculated_savings > 0 and (canonical_savings == 0 or calculated_savings != canonical_savings)
-
-        if calculated_savings > 0:
-            service_data = service_data.copy()
-            service_data["total_monthly_savings"] = calculated_savings
+        # Cost-fidelity: the adapter's counted total is authoritative and the
+        # reporter never fabricates a substitute, so the headline is never an
+        # "estimated" figure (the old keyword/default synthesis is removed).
+        is_estimated = False
 
         # Savings Plans removed - will be generated from another source
 
@@ -3136,7 +3110,10 @@ class HTMLReportGenerator:
 
         content = f'<div class="service-header">'
         service_name_raw = str(filtered_service_data["service_name"])
-        if any(token in service_name_raw.lower() for token in ("cost", "optimizer", "optimization", "anomaly", "visibility", "hub")):
+        if any(
+            token in service_name_raw.lower()
+            for token in ("cost", "optimizer", "optimization", "anomaly", "visibility", "hub")
+        ):
             service_title = html.escape(service_name_raw)
         else:
             service_title = f"{html.escape(service_name_raw)} Cost Optimization"
@@ -3244,15 +3221,11 @@ class HTMLReportGenerator:
         elif "multi_source_cards" in config:
             for label, sub_key, field in config["multi_source_cards"]:
                 sub_dict = service_data.get(sub_key, {})
-                stats_html += (
-                    f'<div class="stat-card"><div class="stat-label">{label}</div><div class="value">{sub_dict.get(field, 0)}</div></div>'
-                )
+                stats_html += f'<div class="stat-card"><div class="stat-label">{label}</div><div class="value">{sub_dict.get(field, 0)}</div></div>'
         else:
             counts = service_data.get(config.get("count_key", ""), {})
             for label, field in config["cards"]:
-                stats_html += (
-                    f'<div class="stat-card"><div class="stat-label">{label}</div><div class="value">{counts.get(field, 0)}</div></div>'
-                )
+                stats_html += f'<div class="stat-card"><div class="stat-label">{label}</div><div class="value">{counts.get(field, 0)}</div></div>'
 
         enrichment = _STATS_ENRICHMENTS.get(service_key)
         if enrichment:
@@ -3345,11 +3318,7 @@ class HTMLReportGenerator:
                     # typographic prefix on every nested rec-item h4 via the
                     # data-source attribute. The chip-style badge retires; the
                     # audit chain now lives in the rec-item title's typesetting.
-                    open_wrap = (
-                        f'<section class="source-section" data-source="{html.escape(label)}">'
-                        if label
-                        else ""
-                    )
+                    open_wrap = f'<section class="source-section" data-source="{html.escape(label)}">' if label else ""
                     close_wrap = "</section>" if label else ""
                     content += open_wrap
                     if not should_skip_section_header(service_key):
@@ -3374,6 +3343,7 @@ class HTMLReportGenerator:
         readers can re-open the snapshot in any JSON viewer without needing the
         originating filesystem.
         """
+
         # Compact JSON keeps the data URL small; whitespace is not load-bearing in
         # downstream tools. AWS Cost Optimization Hub responses carry datetime
         # objects (lastRefreshTimestamp et al.); default-stringify them so the
@@ -3441,9 +3411,7 @@ class HTMLReportGenerator:
             cov_pct = coverage.get("coverage_percentage", 0)
             cov_status = coverage.get("status", "Unknown")
             status_class = "success" if cov_status == "Good" else "warning" if cov_status == "Moderate" else "danger"
-            content += (
-                f'<div class="stat-card"><div class="stat-label">Coverage</div><div class="value {status_class}">{cov_pct:.1f}%</div></div>'
-            )
+            content += f'<div class="stat-card"><div class="stat-label">Coverage</div><div class="value {status_class}">{cov_pct:.1f}%</div></div>'
 
         content += "</div></div>"
 

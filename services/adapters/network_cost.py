@@ -8,6 +8,20 @@ data transfer cost savings opportunities:
 - Internet egress patterns (direct vs CloudFront)
 - Transit Gateway vs VPC Peering cost comparison
 
+Counted-savings policy (network_cost H1/H2).
+This adapter operates on **blended Cost Explorer dollars** grouped by usage
+type — it never sees per-flow GB, co-location, or topology. There is therefore
+no defensible way to assert that a fixed fraction of a transfer bill is
+recoverable: the old 0.30 (cross-region), 0.50 (cross-AZ) and 0.40 (egress)
+reduction factors, and the circular TGW branch (which re-derived GB from the
+same dollars already scored elsewhere), were all unbacked. Every transfer rec
+is now a ``$0.00`` ``Counted=False`` advisory — the measured spend and the
+architectural lever are shown (so a FinOps reader can act and quantify), but no
+fabricated dollar enters ``total_monthly_savings``. A counted dollar would
+require a per-flow GB signal (e.g. ``DataTransfer-Regional-Bytes`` UsageQuantity
+× a validated co-location fraction, or an egress GB × CloudFront price delta)
+that the current CE query does not expose.
+
 AWS API cost: Cost Explorer charges $0.01 per API request. This adapter
 makes ~1 CE call per scan. The calls are:
 
@@ -23,12 +37,11 @@ from datetime import date, timedelta
 from typing import Any
 
 from core.contracts import GroupingSpec, ServiceFindings, SourceBlock, StatCardSpec
+from services._aws_errors import record_aws_error
 from services._base import BaseServiceModule
 
 logger = logging.getLogger(__name__)
 
-CROSS_AZ_SAVINGS_FACTOR: float = 0.5
-CLOUDFRONT_SAVINGS_FACTOR: float = 0.40
 TGW_ATTACHMENT_COST_PER_GB: float = 0.05
 TGW_PROCESSING_COST_PER_GB: float = 0.02
 
@@ -102,12 +115,18 @@ class NetworkCostModule(BaseServiceModule):
         ce = ctx.client("ce")
         ec2 = ctx.client("ec2")
         if not ce:
+            # H3 — a missing CE client means no transfer-spend signal at all;
+            # surface it instead of returning a clean-looking empty tab.
+            ctx.warn(
+                "Cost Explorer client unavailable — network transfer spend not analyzed",
+                service="network_cost",
+            )
             return self._empty_findings()
 
         multiplier = ctx.pricing_multiplier
         tp = _time_period()
 
-        transfer_spend, usage_breakdown = self._fetch_transfer_spend(ce, tp)
+        transfer_spend, usage_breakdown = self._fetch_transfer_spend(ce, tp, ctx)
 
         cross_region_spend = usage_breakdown.get("cross_region", 0.0)
         cross_az_spend = usage_breakdown.get("cross_az", 0.0)
@@ -121,7 +140,7 @@ class NetworkCostModule(BaseServiceModule):
         tgw_count = 0
         tgw_recs: list[dict[str, Any]] = []
         if ec2:
-            peering_count, tgw_count = self._fetch_network_topology(ec2)
+            peering_count, tgw_count = self._fetch_network_topology(ec2, ctx)
             tgw_recs = self._analyze_tgw_vs_peering(peering_count, tgw_count, usage_breakdown, multiplier)
 
         from services._savings import mark_zero_savings_advisory
@@ -162,7 +181,7 @@ class NetworkCostModule(BaseServiceModule):
             },
         )
 
-    def _fetch_transfer_spend(self, ce: Any, tp: dict[str, str]) -> tuple[float, dict[str, float]]:
+    def _fetch_transfer_spend(self, ce: Any, tp: dict[str, str], ctx: Any) -> tuple[float, dict[str, float]]:
         """Query Cost Explorer for data transfer spend breakdown.
 
         Fetches 30-day data transfer costs grouped by USAGE_TYPE and
@@ -218,40 +237,51 @@ class NetworkCostModule(BaseServiceModule):
                 total += cost
                 usage_type = keys[0].lower() if keys else ""
 
-                if any(kw in usage_type for kw in ("interregion", "cross-region", "region")):
-                    breakdown["cross_region"] += cost
-                elif any(kw in usage_type for kw in ("transfer-region", "az", "availability-zone")):
+                # Anchor on full usage-type tokens (network_cost C1). Bare
+                # substrings mis-routed everything: cross-AZ
+                # ``DataTransfer-Regional-Bytes`` matched the ``region`` keyword
+                # → cross_region; inter-region ``USE1-USW2-AWS-Out-Bytes`` fell
+                # through → egress; the ``az`` keyword set never fired. Order
+                # matters: test cross-AZ (Regional) BEFORE inter-region, since
+                # both can share a region prefix.
+                if "datatransfer-regional-bytes" in usage_type:
                     breakdown["cross_az"] += cost
-                elif any(kw in usage_type for kw in ("egress", "internet", "data-transfer-out")):
+                elif "-aws-out-bytes" in usage_type or "-aws-in-bytes" in usage_type:
+                    breakdown["cross_region"] += cost
+                elif "datatransfer-out-bytes" in usage_type or "datatransfer-out-aabytes" in usage_type:
                     breakdown["egress"] += cost
                 else:
                     breakdown["egress"] += cost
 
         except Exception as e:
-            logger.warning(f"Data transfer spend query failed: {e}")
+            # H3 — CE AccessDenied/OptInRequired/throttle silently zeroed every
+            # transfer bucket (blank tab despite real spend). Classify it.
+            record_aws_error(ctx, e, service="network_cost", context="ce:GetCostAndUsage transfer-spend query failed")
 
         return total, breakdown
 
     def _analyze_cross_region(self, cross_region_spend: float, multiplier: float) -> list[dict[str, Any]]:
-        """Analyze cross-region data transfer for optimization opportunities.
+        """Surface cross-region transfer spend as a $0 advisory (network_cost H1).
 
         Cross-region transfer is the most expensive data transfer type
-        ($0.02-$0.09/GB). This check identifies significant spend and
-        recommends architectural patterns to reduce it.
+        ($0.02-$0.09/GB). The 30-day spend is real, but the **recoverable**
+        fraction depends on per-flow GB and topology not visible in the blended
+        Cost Explorer dollar, so the old flat 0.30 reduction factor was a
+        fabricated counted dollar. The opportunity is shown for action, never
+        counted (``Counted=False``).
 
         Args:
             cross_region_spend: 30-day cross-region transfer spend from CE.
-            multiplier: Regional pricing multiplier for savings estimates.
+            multiplier: Regional pricing multiplier (unused; CE returns real $).
 
         Returns:
-            List of cross-region transfer recommendation dicts.
+            List of cross-region transfer recommendation dicts (advisory).
         """
+        _ = multiplier
         recs: list[dict[str, Any]] = []
 
         if cross_region_spend > 0:
             monthly_est = cross_region_spend
-            potential_savings = monthly_est * 0.30
-
             recs.append(
                 {
                     "resource_id": "cross-region-transfer",
@@ -259,36 +289,39 @@ class NetworkCostModule(BaseServiceModule):
                     "check_category": "Cross-Region Transfer",
                     "current_value": f"${monthly_est:.2f}/mo cross-region transfer spend",
                     "recommended_value": "Consolidate workloads to fewer regions or use VPC endpoints",
-                    "monthly_savings": round(potential_savings, 2),
+                    "monthly_savings": 0.0,
+                    "Counted": False,
                     "severity": "HIGH" if monthly_est > 100 else "MEDIUM",
-                    "reason": f"Cross-region data transfer costs ${monthly_est:.2f}/mo; "
-                    f"architectural changes (regional consolidation, caching, "
-                    f"endpoint placement) could reduce by up to 30%",
+                    "reason": f"Cross-region data transfer costs ${monthly_est:.2f}/mo. Architectural "
+                    f"changes (regional consolidation, caching, endpoint placement) can reduce this, "
+                    f"but the recoverable fraction depends on per-flow GB and topology not available "
+                    f"from the blended Cost Explorer dollar — quantify before acting. Not counted.",
                 }
             )
 
         return recs
 
     def _analyze_cross_az(self, cross_az_spend: float, multiplier: float) -> list[dict[str, Any]]:
-        """Analyze cross-AZ data transfer for AZ-local optimization.
+        """Surface cross-AZ transfer spend as a $0 advisory (network_cost H1).
 
-        Cross-AZ transfer costs $0.01/GB each direction. Approximately 50%
-        of cross-AZ traffic can be made AZ-local through careful placement
-        of communicating services in the same AZ.
+        Cross-AZ transfer costs $0.01/GB each direction. How much can be made
+        AZ-local depends on which services actually communicate cross-AZ — a
+        co-location signal the blended Cost Explorer dollar does not carry — so
+        the old flat 0.50 factor was a fabricated counted dollar. The spend and
+        the lever are shown for action, never counted (``Counted=False``).
 
         Args:
             cross_az_spend: 30-day cross-AZ transfer spend from CE.
-            multiplier: Regional pricing multiplier for savings estimates.
+            multiplier: Regional pricing multiplier (unused; CE returns real $).
 
         Returns:
-            List of cross-AZ transfer recommendation dicts.
+            List of cross-AZ transfer recommendation dicts (advisory).
         """
+        _ = multiplier
         recs: list[dict[str, Any]] = []
 
         if cross_az_spend > 0:
             monthly_est = cross_az_spend
-            potential_savings = monthly_est * CROSS_AZ_SAVINGS_FACTOR
-
             recs.append(
                 {
                     "resource_id": "cross-az-transfer",
@@ -296,39 +329,39 @@ class NetworkCostModule(BaseServiceModule):
                     "check_category": "Cross-AZ Transfer",
                     "current_value": f"${monthly_est:.2f}/mo cross-AZ transfer spend",
                     "recommended_value": "Co-locate communicating services in the same AZ",
-                    "monthly_savings": round(potential_savings, 2),
+                    "monthly_savings": 0.0,
+                    "Counted": False,
                     "severity": "MEDIUM",
-                    "reason": f"Cross-AZ transfer costs ${monthly_est:.2f}/mo; "
-                    f"co-locating services in the same AZ could save ~50%",
+                    "reason": f"Cross-AZ transfer costs ${monthly_est:.2f}/mo. Co-locating communicating "
+                    f"services in the same AZ can cut this, but the movable fraction needs a real "
+                    f"co-location signal (which services talk cross-AZ) that the blended spend lacks — "
+                    f"quantify before acting. Not counted.",
                 }
             )
 
         return recs
 
     def _analyze_internet_egress(self, egress_spend: float, multiplier: float) -> list[dict[str, Any]]:
-        """Analyze internet egress for CloudFront savings opportunity.
+        """Surface internet egress spend as a $0 advisory (network_cost H1).
 
-        CloudFront typically provides 40-60% savings on internet egress
-        compared to direct EC2/S3 delivery, plus better performance.
+        CloudFront can be cheaper than direct EC2/S3 delivery, but the realizable
+        delta is ``egress GB × (egress rate − CloudFront rate)`` — both rates are
+        tiered and the GB count is not derivable from the blended Cost Explorer
+        dollar, so the old flat 0.40 factor was a fabricated counted dollar. The
+        spend and the lever are shown for action, never counted (``Counted=False``).
 
         Args:
             egress_spend: 30-day internet egress spend from CE.
-            multiplier: Regional pricing multiplier for savings estimates.
+            multiplier: Regional pricing multiplier (unused; CE returns real $).
 
         Returns:
-            List of internet egress recommendation dicts.
+            List of internet egress recommendation dicts (advisory).
         """
+        _ = multiplier
         recs: list[dict[str, Any]] = []
 
         if egress_spend > 0:
             monthly_est = egress_spend
-            # `egress_spend` comes from Cost Explorer which already returns
-            # real region-priced dollars. Do NOT apply pricing_multiplier
-            # (L2.3.1). Cross-region and cross-AZ paths correctly omit
-            # multiplier; egress now matches for consistency.
-            _ = multiplier
-            potential_savings = monthly_est * CLOUDFRONT_SAVINGS_FACTOR
-
             recs.append(
                 {
                     "resource_id": "internet-egress",
@@ -336,16 +369,19 @@ class NetworkCostModule(BaseServiceModule):
                     "check_category": "Internet Egress",
                     "current_value": f"${monthly_est:.2f}/mo direct internet egress",
                     "recommended_value": "Route traffic through CloudFront for egress optimization",
-                    "monthly_savings": round(potential_savings, 2),
+                    "monthly_savings": 0.0,
+                    "Counted": False,
                     "severity": "MEDIUM",
-                    "reason": f"Direct internet egress costs ${monthly_est:.2f}/mo; "
-                    f"CloudFront could reduce costs by ~40% with better performance",
+                    "reason": f"Direct internet egress costs ${monthly_est:.2f}/mo. CloudFront can reduce "
+                    f"this, but the saving is egress GB × (egress rate − CloudFront rate) — the GB count "
+                    f"is not derivable from the blended spend, so a flat percentage would be fabricated — "
+                    f"quantify before acting. Not counted.",
                 }
             )
 
         return recs
 
-    def _fetch_network_topology(self, ec2: Any) -> tuple[int, int]:
+    def _fetch_network_topology(self, ec2: Any, ctx: Any) -> tuple[int, int]:
         """Fetch VPC peering and Transit Gateway counts from EC2.
 
         Args:
@@ -361,14 +397,16 @@ class NetworkCostModule(BaseServiceModule):
             resp = ec2.describe_vpc_peering_connections(Filters=[{"Name": "status-code", "Values": ["active"]}])
             peering_count = len(resp.get("VpcPeeringConnections", []))
         except Exception as e:
-            logger.warning(f"VPC peering query failed: {e}")
+            # H3 — classify so a denied describe does not silently zero peering_count.
+            record_aws_error(ctx, e, service="network_cost", context="ec2:DescribeVpcPeeringConnections failed")
 
         try:
             resp = ec2.describe_transit_gateways()
             tgws = resp.get("TransitGateways", [])
             tgw_count = len(tgws)
         except Exception as e:
-            logger.warning(f"Transit Gateway query failed: {e}")
+            # H3 — classify so a denied describe does not silently zero tgw_count.
+            record_aws_error(ctx, e, service="network_cost", context="ec2:DescribeTransitGateways failed")
 
         return peering_count, tgw_count
 
@@ -394,6 +432,7 @@ class NetworkCostModule(BaseServiceModule):
         Returns:
             List of TGW vs peering recommendation dicts.
         """
+        _ = multiplier
         recs: list[dict[str, Any]] = []
         tgw_total_per_gb = TGW_ATTACHMENT_COST_PER_GB + TGW_PROCESSING_COST_PER_GB
 
@@ -432,22 +471,28 @@ class NetworkCostModule(BaseServiceModule):
         if tgw_count > 0 and peering_count > 0:
             transfer_spend = usage_breakdown.get("cross_region", 0.0) + usage_breakdown.get("cross_az", 0.0)
             if transfer_spend > 0:
-                estimated_tgw_data_gb = transfer_spend / 0.02
-                potential_savings = estimated_tgw_data_gb * TGW_PROCESSING_COST_PER_GB * 0.20
-                if potential_savings > 1.0:
-                    recs.append(
-                        {
-                            "resource_id": "tgw-route-optimization",
-                            "check_type": "tgw_vs_peering",
-                            "check_category": "TGW vs Peering",
-                            "current_value": f"TGW + {peering_count} peering connections, ${transfer_spend:.2f}/mo transfer",
-                            "recommended_value": "Optimize TGW route tables to minimize cross-hub traffic",
-                            "monthly_savings": round(potential_savings, 2),
-                            "severity": "MEDIUM",
-                            "reason": f"Mixed TGW/peering topology with ${transfer_spend:.2f}/mo transfer. "
-                            f"Optimizing TGW routes could save ~20% on processing costs.",
-                        }
-                    )
+                # network_cost H2 — the old branch divided the cross-region+cross-AZ
+                # spend by $0.02 to "derive" GB, then re-multiplied by $0.02 × 0.20,
+                # which is just 20% of dollars already scored by the cross-region /
+                # cross-AZ recs — a circular double-count. A real TGW route saving
+                # needs actual TGW-Bytes UsageQuantity (not in this CE query) and
+                # would subtract from, not add to, those recs. Emit a $0 advisory.
+                recs.append(
+                    {
+                        "resource_id": "tgw-route-optimization",
+                        "check_type": "tgw_vs_peering",
+                        "check_category": "TGW vs Peering",
+                        "current_value": f"TGW + {peering_count} peering connections, ${transfer_spend:.2f}/mo transfer",
+                        "recommended_value": "Optimize TGW route tables to minimize cross-hub traffic",
+                        "monthly_savings": 0.0,
+                        "Counted": False,
+                        "severity": "MEDIUM",
+                        "reason": f"Mixed TGW/peering topology with ${transfer_spend:.2f}/mo cross-region/cross-AZ "
+                        f"transfer. Tightening TGW routes may cut per-GB processing, but quantifying it needs "
+                        f"actual TGW-Bytes usage (not in this query); a fraction of the transfer bill would "
+                        f"double-count the cross-region/cross-AZ recs — quantify before acting. Not counted.",
+                    }
+                )
 
         return recs
 

@@ -11,10 +11,22 @@ from typing import Any
 
 from core.scan_context import ScanContext
 
+# Advisory line single-sourced for the commitment levers (RI / Serverless
+# Reservation) so the shim never emits a fabricated per-rec dollar that would
+# disagree with the $0 the Redshift headline counts (Redshift H2). The realizable
+# saving is owned by — and quantified in — the Commitment Analysis tab.
+_RI_ADVISORY_SAVINGS: str = (
+    "$0.00/month — advisory: commitment purchase; realizable saving quantified in Commitment Analysis"
+)
+
 REDSHIFT_OPTIMIZATION_DESCRIPTIONS: dict[str, dict[str, str]] = {
     "reserved_instances": {
         "title": "Purchase Redshift Reserved Instances",
-        "description": "Save up to 24% with Redshift Reserved Instances for predictable workloads.",
+        "description": (
+            "Redshift Reserved Instances cut compute-node cost for predictable workloads "
+            "(~30% at 1-year No-Upfront, deeper at 3-year). The realizable commitment saving "
+            "is quantified in the Commitment Analysis tab."
+        ),
         "action": "Purchase 1-year or 3-year Reserved Instances",
     }
 }
@@ -58,10 +70,14 @@ def get_enhanced_redshift_checks(ctx: ScanContext) -> dict[str, Any]:
                             "NumberOfNodes": number_of_nodes,
                             "ClusterAge": f"{cluster_age_days} days",
                             "Recommendation": (
-                                f"Consider Reserved Instances for stable cluster"
-                                f" (running {cluster_age_days} days) - 24% savings potential"
+                                f"Consider Reserved Instances for this stable cluster"
+                                f" (running {cluster_age_days} days); the realizable commitment"
+                                f" saving is quantified in the Commitment Analysis tab"
                             ),
-                            "EstimatedSavings": f"${number_of_nodes * 150:.2f}/month with 1-year RI",
+                            # Advisory commitment lever — the counted dollar is owned by
+                            # commitment_analysis. No fabricated per-rec $ here (Redshift H2);
+                            # the adapter finalises this to $0 advisory.
+                            "EstimatedSavings": _RI_ADVISORY_SAVINGS,
                             "CheckCategory": "Reserved Instance Optimization",
                             "Note": "Suitable for predictable, long-running workloads",
                         }
@@ -93,9 +109,13 @@ def get_enhanced_redshift_checks(ctx: ScanContext) -> dict[str, Any]:
                             {
                                 "WorkgroupName": workgroup_name,
                                 "Recommendation": (
-                                    "Consider Serverless Reservations for 24% savings on predictable workloads"
+                                    "Consider Serverless Reservations for predictable workloads;"
+                                    " the realizable commitment saving is quantified in the"
+                                    " Commitment Analysis tab"
                                 ),
-                                "EstimatedSavings": "$150/month with reservations",
+                                # Advisory commitment lever — no fabricated per-rec $ (Redshift H2);
+                                # the adapter finalises this to $0 advisory.
+                                "EstimatedSavings": _RI_ADVISORY_SAVINGS,
                                 "CheckCategory": "Serverless Optimization",
                             }
                         )

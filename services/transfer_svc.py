@@ -47,11 +47,19 @@ def get_enhanced_transfer_checks(ctx: ScanContext) -> dict[str, Any]:
                 }
 
                 if state == "ONLINE" and len(protocols) > 1:
-                    removable = len(protocols) - 1
+                    # Surface the consolidation candidate, but do NOT bake a
+                    # fabricated `(len(protocols) - 1) × $0.30 × 730` dollar into
+                    # the rec: removing a protocol only saves money when that
+                    # protocol is actually unused, and the shim has no
+                    # per-protocol usage signal to prove it. The adapter demotes
+                    # this to a $0 advisory unless per-protocol usage evidence is
+                    # supplied (transfer H2).
                     rec["Recommendation"] = (
                         f"Review if all {len(protocols)} protocols are needed - each protocol has hourly charges"
                     )
-                    rec["EstimatedSavings"] = f"${removable * 0.30 * 730:.2f}/mo from removing {removable} protocol(s)"
+                    rec["EstimatedSavings"] = (
+                        "$0.00/month — advisory: confirm per-protocol usage before removing any protocol"
+                    )
                     rec["Note"] = (
                         f"Protocol costs vary by region ({ctx.region}) and type."
                         " Verify actual pricing in AWS Pricing Calculator before making changes."
@@ -91,13 +99,20 @@ def get_enhanced_transfer_checks(ctx: ScanContext) -> dict[str, Any]:
                         )
 
                 if state in ["STOPPED", "OFFLINE"]:
+                    # A stopped/offline server is not billing endpoint hours, so
+                    # the saving from terminating it is $0 until/unless billing is
+                    # independently evidenced. The adapter marks this advisory and
+                    # never layers a protocol-removal figure onto it (transfer H1).
                     checks["unused_servers"].append(
                         {
                             "ServerId": server_id,
                             "State": state,
                             "Protocols": protocols,
                             "Recommendation": f"Server is {state.lower()} - terminate if no longer needed",
-                            "EstimatedSavings": "Full server hourly costs",
+                            "EstimatedSavings": (
+                                "$0.00/month — advisory: stopped/offline server is not "
+                                "billing endpoint hours; termination saving not evidenced"
+                            ),
                             "CheckCategory": "Unused Transfer Servers",
                         }
                     )

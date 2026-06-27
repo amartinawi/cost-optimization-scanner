@@ -15,13 +15,24 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from core.contracts import GroupingSpec, ServiceFindings, SourceBlock, StatCardSpec
+from services._aws_errors import record_aws_error
 from services._base import BaseServiceModule
+from services.rds_logic import normalize_rds_arn
 
 logger = logging.getLogger(__name__)
 
 ACU_HOURLY_FALLBACK: float = 0.06
+# Aurora Standard per-request I/O charge that I/O-Optimized eliminates.
+# Validated live us-east-1 (Pricing API 2026-06-19): Aurora:StorageIOUsage
+# $0.0000002/IO = $0.20 per 1M I/O requests.
 IO_COST_PER_MILLION: float = 0.20
-IO_OPTIMIZED_PREMIUM_PER_GB: float = 0.025
+# Offline fallback for the Aurora I/O-Optimized STORAGE premium over Standard
+# ($/GB-Mo). Validated live us-east-1: IO-OptimizedStorageUsage $0.225 −
+# StorageUsage $0.10 = $0.125/GB-Mo (the old hardcoded 0.025 was ~5x low —
+# aurora H1). Used ONLY when no PricingEngine is available; otherwise the live
+# region-priced premium comes from
+# PricingEngine.get_aurora_io_storage_premium_per_gb().
+IO_OPTIMIZED_STORAGE_PREMIUM_FALLBACK_PER_GB: float = 0.125
 AURORA_ENGINES: tuple[str, ...] = ("aurora", "aurora-mysql", "aurora-postgresql")
 HOURS_PER_MONTH: int = 730
 
@@ -43,7 +54,7 @@ def _get_acu_hourly(ctx: Any) -> float:
     return ACU_HOURLY_FALLBACK * ctx.pricing_multiplier
 
 
-def _describe_aurora_clusters(rds: Any) -> list[dict[str, Any]]:
+def _describe_aurora_clusters(rds: Any, ctx: Any) -> list[dict[str, Any]]:
     clusters: list[dict[str, Any]] = []
     try:
         paginator = rds.get_paginator("describe_db_clusters")
@@ -54,9 +65,44 @@ def _describe_aurora_clusters(rds: Any) -> list[dict[str, Any]]:
         try:
             resp = rds.describe_db_clusters(Filters=[{"Name": "engine", "Values": list(AURORA_ENGINES)}])
             clusters = resp.get("DBClusters", [])
-        except Exception:
-            pass
+        except Exception as e:
+            # H4 — classify before swallowing: an AccessDenied/throttle here must
+            # surface (else the whole Aurora tab empties silently with no signal).
+            record_aws_error(ctx, e, service="aurora", context="rds:DescribeDBClusters failed")
     return clusters
+
+
+def _describe_aurora_instances(rds: Any, ctx: Any) -> list[dict[str, Any]]:
+    """Describe DB instances once (paginated), classifying errors before swallowing.
+
+    Shared by the I/O-tier instance-premium leg (aurora H2) and the
+    provisioned-instance rightsizing/Graviton checks so describe_db_instances is
+    called once per scan. An AccessDenied/throttle surfaces via record_aws_error
+    rather than silently emptying the instance checks.
+    """
+    instances: list[dict[str, Any]] = []
+    try:
+        paginator = rds.get_paginator("describe_db_instances")
+        for page in paginator.paginate():
+            instances.extend(page.get("DBInstances", []))
+    except Exception as e:
+        record_aws_error(ctx, e, service="aurora", context="rds:DescribeDBInstances failed")
+    return instances
+
+
+def _record_suppressed_member(ctx: Any, instance_id: str) -> None:
+    """Record an Aurora member whose heuristic rec was suppressed (RDS owns it).
+
+    Cross-adapter audit trail for aurora H3 / rds H1: the id is added to
+    ``ctx.aurora_member_suppressed_ids`` so a reviewer can see which members the
+    Aurora tab deferred to the RDS tab (Cost Optimization Hub / Compute
+    Optimizer) instead of double-counting.
+    """
+    existing = getattr(ctx, "aurora_member_suppressed_ids", None)
+    if isinstance(existing, set):
+        ctx.aurora_member_suppressed_ids = existing | {instance_id}
+    else:
+        ctx.aurora_member_suppressed_ids = {instance_id}
 
 
 _CW_PERIOD_1D: int = 86400  # AWS CloudWatch max Period for ≤15-day queries.
@@ -119,9 +165,7 @@ def _get_cloudwatch_sum(
     return None
 
 
-def _get_cloudwatch_avg_max(
-    cw: Any, metric: str, instance_id: str, days: int = 14
-) -> tuple[float, float] | None:
+def _get_cloudwatch_avg_max(cw: Any, metric: str, instance_id: str, days: int = 14) -> tuple[float, float] | None:
     """Return (avg, peak) of a per-instance RDS metric, or None when unavailable."""
     now = datetime.now(timezone.utc)
     start = now - timedelta(days=days)
@@ -145,7 +189,15 @@ def _get_cloudwatch_avg_max(
     return None
 
 
-def _check_provisioned_instances(ctx: Any, rds: Any, cw: Any, fast_mode: bool) -> list[dict[str, Any]]:
+def _check_provisioned_instances(
+    ctx: Any,
+    rds: Any,
+    cw: Any,
+    fast_mode: bool,
+    *,
+    covered: set[str] | None = None,
+    instances: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     """Rightsizing (peak-aware) + Graviton recs for provisioned Aurora instances.
 
     Aurora Serverless v2 and the cluster control plane are handled elsewhere;
@@ -154,6 +206,13 @@ def _check_provisioned_instances(ctx: Any, rds: Any, cw: Any, fast_mode: bool) -
     rightsizing moves to a smaller same-arch class, Graviton then prices the
     x86→ARM delta on that (possibly rightsized) class. Graviton on Aurora is a
     managed-engine class change (no app rebuild), so it is low-risk.
+
+    ``covered`` (aurora H3 / rds H1) is the set of normalized RDS instance ids
+    the RDS tab already counts (Cost Optimization Hub / Compute Optimizer); any
+    member in it is skipped here so the same instance is never counted on two
+    tabs (single owner = RDS, authority CoH > CO > heuristic). ``instances`` may
+    be pre-fetched by the caller to avoid a duplicate describe_db_instances call;
+    when ``None`` the instances are described internally.
     """
     from services.aurora_logic import (
         graviton_equivalent,
@@ -162,15 +221,17 @@ def _check_provisioned_instances(ctx: Any, rds: Any, cw: Any, fast_mode: bool) -
         rightsize_target_size,
     )
 
+    covered = covered or set()
     recs: list[dict[str, Any]] = []
-    try:
-        instances: list[dict[str, Any]] = []
-        paginator = rds.get_paginator("describe_db_instances")
-        for page in paginator.paginate():
-            instances.extend(page.get("DBInstances", []))
-    except Exception as e:
-        ctx.warn(f"[aurora] describe_db_instances failed: {e}", "aurora")
-        return recs
+    if instances is None:
+        try:
+            instances = []
+            paginator = rds.get_paginator("describe_db_instances")
+            for page in paginator.paginate():
+                instances.extend(page.get("DBInstances", []))
+        except Exception as e:
+            ctx.warn(f"[aurora] describe_db_instances failed: {e}", "aurora")
+            return recs
 
     if fast_mode:
         # Graviton needs no metrics, but rightsizing does; warn once and still
@@ -185,6 +246,12 @@ def _check_provisioned_instances(ctx: Any, rds: Any, cw: Any, fast_mode: bool) -
         if inst.get("DBInstanceStatus") != "available":
             continue
         instance_id = inst.get("DBInstanceIdentifier", "")
+        # H3 / rds H1: a member already counted by the RDS tab (CoH or Compute
+        # Optimizer) must not be re-counted by this heuristic. RDS (CoH > CO)
+        # outranks the Aurora heuristic, so suppress the duplicate entirely.
+        if instance_id and normalize_rds_arn(instance_id) in covered:
+            _record_suppressed_member(ctx, instance_id)
+            continue
         cls = inst.get("DBInstanceClass", "")
         parsed = parse_instance_class(cls)
         if not parsed:
@@ -299,40 +366,93 @@ def _check_serverless_v2(
     avg_util: float | None = None
     if not fast_mode:
         dims = [{"Name": "DBClusterIdentifier", "Value": cluster_id}]
-        avg_util = _get_cloudwatch_avg(cw, "AWS/RDS", "ServerlessV2CapacityUtilization", dims)
+        # Aurora Serverless v2 publishes ``ACUUtilization`` (canonical metric).
+        # The previous ``ServerlessV2CapacityUtilization`` name matched nothing.
+        avg_util = _get_cloudwatch_avg(cw, "AWS/RDS", "ACUUtilization", dims)
 
     if avg_util is None:
         return recs
 
-    waste_ratio = max(0.0, 1.0 - (avg_util / 100.0)) if max_acu > 0 else 0.0
-    wasted_acu = max_acu * waste_ratio
-    # `acu_hourly` from `_get_acu_hourly` is already region-correct (live
-    # path returns AWS Pricing API value; fallback path applies the
-    # multiplier internally). MUST NOT re-multiply by pricing_multiplier.
-    _ = pricing_multiplier  # explicit: not applied here, see helper docstring.
-    monthly_savings = wasted_acu * acu_hourly * HOURS_PER_MONTH
-
-    if monthly_savings > 1.0:
-        recs.append(
-            {
-                "cluster_id": cluster_id,
-                "engine": engine,
-                "engine_version": engine_version,
-                "check_type": "serverless_v2_acu_waste",
-                "current_value": f"Max ACU {max_acu}, Avg Utilization {avg_util:.1f}%",
-                "recommended_value": f"Reduce Max ACU to {max(int(min_acu), int(max_acu * (avg_util / 100.0) * 1.2))}",
-                "monthly_savings": round(monthly_savings, 2),
-                "reason": f"Serverless v2 cluster averaging {avg_util:.1f}% of {max_acu} max ACU "
-                f"({wasted_acu:.1f} ACU wasted)",
-            }
-        )
+    # Serverless v2 bills CONSUMED ACU (≈ utilization × MaxCapacity, floored at
+    # MinCapacity), NOT the MaxCapacity ceiling. The previous ``max_acu ×
+    # (1 − util)`` credited the unbilled ceiling-to-actual gap as savings — but
+    # lowering MaxCapacity saves $0 unless the workload continuously hits the
+    # ceiling (aurora C1). The realized lever is an over-high MinCapacity
+    # (billed unconditionally); that needs consumed-vs-Min history we don't
+    # have at scan time. Emit a $0 advisory so the flag renders without
+    # inventing a dollar.
+    recs.append(
+        {
+            "cluster_id": cluster_id,
+            "engine": engine,
+            "engine_version": engine_version,
+            "check_type": "serverless_v2_acu_waste",
+            "Counted": False,
+            "current_value": f"Max ACU {max_acu}, Min ACU {min_acu}, Avg ACUUtilization {avg_util:.1f}%",
+            "recommended_value": (
+                "Review MinCapacity vs observed consumption; lower MinCapacity if it exceeds "
+                "sustained demand (lowering MaxCapacity alone does not reduce Serverless v2 cost)"
+            ),
+            "monthly_savings": 0.0,
+            "reason": (
+                f"Serverless v2 bills consumed ACU; the Max/Util gap ({avg_util:.1f}% of "
+                f"{max_acu}) is not a realized saving without consumed-vs-Min history"
+            ),
+            "AuditBasis": {
+                "metric": "AWS/RDS ACUUtilization",
+                "observed_utilization_pct": round(avg_util, 2),
+                "billing_model": "consumed ACU (MinCapacity floor), not MaxCapacity ceiling",
+                "unmeasured_inputs": ["consumed_acu_history_vs_min"],
+                "reason": "lowering Max alone saves $0; needs consumed-vs-Min evidence",
+            },
+        }
+    )
 
     return recs
+
+
+def _io_instance_premium(pe: Any, members: list[dict[str, Any]]) -> tuple[float, int]:
+    """Σ monthly I/O-Optimized instance premium over a cluster's available members.
+
+    aurora H2: switching a cluster to I/O-Optimized raises every provisioned
+    member's instance rate by ~30% (validated db.r6g.large Aurora MySQL us-east-1:
+    $0.338 io-opt vs $0.260 std → $56.94/mo premium). Each member is priced via
+    :meth:`PricingEngine.get_aurora_io_instance_premium_monthly` (returns the
+    region-correct ``io_opt − std`` delta, or 0.0 when unresolved). Returns
+    ``(total_premium, members_priced)``; ``0.0`` when ``pe`` is None so no
+    premium is fabricated offline.
+    """
+    if pe is None:
+        return 0.0, 0
+    total = 0.0
+    count = 0
+    for m in members:
+        if (m.get("DBInstanceStatus") or "") != "available":
+            continue
+        m_engine = (m.get("Engine") or "").lower()
+        m_class = m.get("DBInstanceClass") or ""
+        if not m_engine.startswith("aurora") or not m_class:
+            continue
+        try:
+            prem = pe.get_aurora_io_instance_premium_monthly(
+                m_engine,
+                m_class,
+                multi_az=bool(m.get("MultiAZ", False)),
+                license_model=m.get("LicenseModel"),
+            )
+        except Exception:
+            prem = 0.0
+        if prem and prem > 0:
+            total += prem
+            count += 1
+    return total, count
 
 
 def _check_io_tier(
     cluster: dict[str, Any],
     cw: Any,
+    pe: Any,
+    members: list[dict[str, Any]],
     pricing_multiplier: float,
     fast_mode: bool,
 ) -> list[dict[str, Any]]:
@@ -366,8 +486,26 @@ def _check_io_tier(
     if storage_gb <= 0 or monthly_io <= 0:
         return recs
 
-    standard_io_cost = (monthly_io / 1_000_000) * IO_COST_PER_MILLION
-    optimized_premium = storage_gb * IO_OPTIMIZED_PREMIUM_PER_GB
+    # Per-request I/O charge eliminated by I/O-Optimized (Standard tier). Aurora
+    # Standard bills $0.20 / 1M I/O requests (validated us-east-1
+    # Aurora:StorageIOUsage $0.0000002/IO). Constant path → region-scale once.
+    standard_io_cost = (monthly_io / 1_000_000) * IO_COST_PER_MILLION * pricing_multiplier
+
+    # Added cost of the I/O-Optimized configuration = storage premium (H1) +
+    # instance-fleet premium (H2). Both legs are region-correct from PricingEngine
+    # and must NOT be re-multiplied by pricing_multiplier.
+    if pe is not None:
+        try:
+            storage_premium_per_gb = pe.get_aurora_io_storage_premium_per_gb()
+        except Exception:
+            storage_premium_per_gb = IO_OPTIMIZED_STORAGE_PREMIUM_FALLBACK_PER_GB * pricing_multiplier
+    else:
+        storage_premium_per_gb = IO_OPTIMIZED_STORAGE_PREMIUM_FALLBACK_PER_GB * pricing_multiplier
+    storage_premium = storage_gb * storage_premium_per_gb
+
+    instance_premium, members_repriced = _io_instance_premium(pe, members)
+
+    optimized_premium = storage_premium + instance_premium
     savings = standard_io_cost - optimized_premium
 
     if savings > 10.0:
@@ -379,9 +517,33 @@ def _check_io_tier(
                 "check_type": "io_tier_optimization",
                 "current_value": f"Standard I/O, ~{monthly_io:,.0f} ops/month, {storage_gb:.0f} GB storage",
                 "recommended_value": "Switch to I/O-Optimized storage tier",
-                "monthly_savings": round(savings * pricing_multiplier, 2),
-                "reason": f"I/O-Optimized tier saves ${savings:.2f}/mo over Standard "
-                f"({monthly_io:,.0f} I/O ops, {storage_gb:.0f} GB storage)",
+                "monthly_savings": round(savings, 2),
+                "EstimatedSavings": f"${savings:.2f}/mo",
+                "reason": (
+                    f"I/O-Optimized tier saves ${savings:.2f}/mo over Standard "
+                    f"({monthly_io:,.0f} I/O ops, {storage_gb:.0f} GB storage); nets the "
+                    f"${optimized_premium:.2f}/mo I/O-Optimized storage + instance premium"
+                ),
+                "AuditBasis": {
+                    "rate": {
+                        "io_per_million_usd": round(IO_COST_PER_MILLION * pricing_multiplier, 6),
+                        "io_opt_storage_premium_per_gb_mo": round(storage_premium_per_gb, 6),
+                        "io_opt_instance_premium_monthly": round(instance_premium, 2),
+                        "members_repriced": members_repriced,
+                    },
+                    "region_multiplier": pricing_multiplier,
+                    "metric_window": "14d AWS/RDS VolumeRead/WriteIOPs sum, scaled to 30d",
+                    "formula": (
+                        "standard_io_cost − (storage_gb × io_opt_storage_premium "
+                        "+ Σ member io_opt instance premium)"
+                    ),
+                    "inputs": {
+                        "monthly_io": round(monthly_io, 2),
+                        "storage_gb": round(storage_gb, 2),
+                        "standard_io_cost": round(standard_io_cost, 2),
+                        "storage_premium": round(storage_premium, 2),
+                    },
+                },
             }
         )
 
@@ -430,8 +592,33 @@ class AuroraModule(BaseServiceModule):
         acu_hourly = _get_acu_hourly(ctx)
         multiplier = ctx.pricing_multiplier
         fast_mode = getattr(ctx, "fast_mode", False)
+        pe = getattr(ctx, "pricing_engine", None)
 
-        clusters = _describe_aurora_clusters(rds)
+        clusters = _describe_aurora_clusters(rds, ctx)
+
+        # Describe member instances once: feeds both the I/O-tier instance
+        # premium (H2) and the provisioned-instance rightsizing/Graviton checks.
+        instances = _describe_aurora_instances(rds, ctx)
+        members_by_cluster: dict[str, list[dict[str, Any]]] = {}
+        for inst in instances:
+            cid = inst.get("DBClusterIdentifier")
+            if cid:
+                members_by_cluster.setdefault(cid, []).append(inst)
+
+        # H3 / rds H1 — single-owner dedup. Any Aurora member already counted by
+        # the RDS tab is suppressed here. Sources, both keyed by normalized id:
+        #   * Cost Optimization Hub — prefetched into ctx.cost_hub_splits['rds']
+        #     before any adapter runs (order-independent).
+        #   * RDS Compute Optimizer + CoH counted ids — published by
+        #     RdsModule.scan via ctx.rds_covered_instance_ids (RDS runs first).
+        covered: set[str] = set()
+        for r in getattr(ctx, "cost_hub_splits", {}).get("rds", []):
+            nid = normalize_rds_arn(r.get("resourceArn") or r.get("resourceId") or "")
+            if nid:
+                covered.add(nid)
+        rds_covered = getattr(ctx, "rds_covered_instance_ids", None)
+        if isinstance(rds_covered, set):
+            covered |= rds_covered
 
         serverless_recs: list[dict[str, Any]] = []
         io_recs: list[dict[str, Any]] = []
@@ -447,14 +634,22 @@ class AuroraModule(BaseServiceModule):
                     global_count += 1
 
                 serverless_recs.extend(_check_serverless_v2(cluster, rds, cw, acu_hourly, multiplier, fast_mode))
-                io_recs.extend(_check_io_tier(cluster, cw, multiplier, fast_mode))
+                cluster_id = cluster.get("DBClusterIdentifier", "")
+                io_recs.extend(
+                    _check_io_tier(
+                        cluster, cw, pe, members_by_cluster.get(cluster_id, []), multiplier, fast_mode
+                    )
+                )
             except Exception as e:
                 logger.warning(f"[aurora] cluster check failed: {e}")
                 continue
 
         # Provisioned member instances (rightsizing + Graviton) — the cluster
-        # checks above only cover Serverless v2 and the I/O tier.
-        instance_recs = _check_provisioned_instances(ctx, rds, cw, fast_mode)
+        # checks above only cover Serverless v2 and the I/O tier. Instances
+        # covered by the RDS tab are suppressed via ``covered`` (no double count).
+        instance_recs = _check_provisioned_instances(
+            ctx, rds, cw, fast_mode, covered=covered, instances=instances
+        )
 
         all_recs = serverless_recs + io_recs + instance_recs
         total_savings = sum(r.get("monthly_savings", 0.0) for r in all_recs)

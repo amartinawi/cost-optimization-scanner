@@ -6,6 +6,7 @@ import logging
 from typing import Any, Callable
 
 from core.contracts import ServiceFindings, SourceBlock
+from services._aws_errors import record_aws_error
 from services._base import BaseServiceModule
 from services._savings import mark_zero_savings_advisory, parse_dollar_savings
 from services.ec2 import get_auto_scaling_checks
@@ -50,15 +51,32 @@ def _annotate_severity(recs: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _safe_collect(label: str, fn: Callable[..., dict[str, Any]], ctx: Any) -> list[dict[str, Any]]:
-    """Run a sub-shim and return its recommendations, swallowing failures.
+    """Run a sub-shim and return its recommendations, isolating failures.
 
-    One failing sub-shim must not blank the whole network tab (audit L1-005).
+    One failing sub-shim must not blank the whole network tab (audit L1-005), but
+    the failure must still surface: a permission gap or throttle is recorded on
+    ``ctx`` (permission_issue vs warn) rather than swallowed with a logger call
+    that never reaches the report (audit H4).
     """
     try:
         return list(fn(ctx).get("recommendations", []))
     except Exception as e:
-        logger.warning(f"[network] {label} sub-check failed: {e}")
+        record_aws_error(ctx, e, service="network", context=f"{label} sub-check failed")
         return []
+
+
+def _mark_advisory(recs: list[dict[str, Any]], note: str) -> list[dict[str, Any]]:
+    """Force a recommendation list to advisory (Counted=False) with an explanatory note.
+
+    Used for the ASG block: instance rightsizing is a compute lever owned by the
+    EC2 tab (AWS Compute Optimizer + launch-template member dedup). Surfacing the
+    same dollars here too would double-count across the EC2 and Network grand
+    totals (audit H2), so Network shows them as advisory context only.
+    """
+    for rec in recs:
+        rec["Counted"] = False
+        rec.setdefault("AdvisoryNote", note)
+    return recs
 
 
 def _sum_savings(recs: list[dict[str, Any]]) -> float:
@@ -98,7 +116,12 @@ class NetworkModule(BaseServiceModule):
         nat_recs = _annotate_severity(_safe_collect("nat_gateway", get_nat_gateway_checks, ctx))
         vpc_recs = _annotate_severity(_safe_collect("vpc_endpoints", get_vpc_endpoints_checks, ctx))
         lb_recs = _annotate_severity(_safe_collect("load_balancer", get_load_balancer_checks, ctx))
-        asg_recs = _annotate_severity(_safe_collect("auto_scaling", get_auto_scaling_checks, ctx))
+        # ASG rightsizing is owned by the EC2 tab (Compute Optimizer + member dedup);
+        # surface it here as advisory only so it is visible but never double-counted.
+        asg_recs = _mark_advisory(
+            _annotate_severity(_safe_collect("auto_scaling", get_auto_scaling_checks, ctx)),
+            "ASG rightsizing is counted under the EC2 tab (Compute Optimizer); shown here for context.",
+        )
 
         all_recs = eip_recs + nat_recs + vpc_recs + lb_recs + asg_recs
         # Best-practice nudges that parse to $0 (missing endpoints, metric-gated
