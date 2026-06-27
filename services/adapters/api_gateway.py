@@ -1,4 +1,4 @@
-"""Flat-rate adapter for API Gateway."""
+"""CloudWatch-metric adapter for API Gateway."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from services.api_gateway import API_GATEWAY_OPTIMIZATION_DESCRIPTIONS, get_enha
 
 
 class ApiGatewayModule(BaseServiceModule):
-    """ServiceModule adapter for API Gateway. Keyword-rate savings strategy."""
+    """ServiceModule adapter for API Gateway. CloudWatch request-volume savings strategy."""
 
     key: str = "api_gateway"
     cli_aliases: tuple[str, ...] = ("api_gateway",)

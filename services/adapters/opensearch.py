@@ -1,4 +1,4 @@
-"""Keyword-rate adapter for OpenSearch."""
+"""Live-priced adapter for OpenSearch (node-price deltas; CoH-authoritative)."""
 
 from __future__ import annotations
 
@@ -153,7 +153,7 @@ def _graviton_node_delta(ctx: Any, instance_type: str | None) -> tuple[float, st
 
 
 class OpensearchModule(BaseServiceModule):
-    """ServiceModule adapter for OpenSearch. Keyword-rate savings strategy."""
+    """ServiceModule adapter for OpenSearch. Live node-price-delta savings strategy."""
 
     key: str = "opensearch"
     cli_aliases: tuple[str, ...] = ("opensearch",)

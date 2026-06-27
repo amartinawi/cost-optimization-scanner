@@ -32,16 +32,17 @@ Use `ctx.pricing_engine` (PricingEngine) for AWS Pricing API lookups. Fall back 
 | `step_functions.py` | CloudWatch ExecutionsStarted → $0.025/1K | CloudWatch + constant |
 | `elasticache.py` | `get_instance_monthly_price("AmazonElastiCache", node_type, engine=engine)` — engine pins the NodeUsage SKU (Redis/Memcached/Valkey share the instance type — SR-1); the engine string is normalized via `.capitalize()` to match the **case-sensitive** Pricing-API guard, else a lowercase `"redis"` silently priced $0 (**ElastiCache C2**). **Consumes Cost Hub** via `ctx.cost_hub_splits["elasticache"]` (authoritative: a CoH-covered cluster suppresses its heuristic levers). Per-category rates: Underutilized 0.30 (CloudWatch-gated), Valkey 0.20; **Graviton is NOT a flat rate** — counted as the exact `(x86 node price − Graviton node price) × NumNodes` delta (elasticache H2; the old flat 0.20 overcounted ~4.3×). `NumNodes` threaded onto every lever so multi-node clusters price like-for-like (elasticache H1). Single highest-$ lever counted per cluster, rest advisory; Reserved Nodes demoted (commitment lever). | AWS Pricing API + Cost Optimization Hub |
 
-### Parse-rate (5 adapters)
-Extract dollar amounts from recommendation text or use keyword-based estimates:
+### Parse-rate & lightweight adapters (5 adapters)
+These adapters do not route the bulk of their levers through `PricingEngine`;
+each quantifies (or honestly abstains) per the method below:
 
 | Adapter | Method |
 |---------|--------|
-| `cloudfront.py` | Fixed $25/rec |
-| `api_gateway.py` | Keyword-based |
-| `opensearch.py` | Keyword-based |
-| `ami.py` | `parse_dollar_savings()` |
-| `monitoring.py` | Fixed per-rec estimates |
+| `cloudfront.py` | **Advisory-only.** Every rec is `$0` + `PricingWarning`; the old flat $25/rec (and the $0.10/GB × 0.5 KB/request assumption) are removed — honest data-transfer savings need the CloudWatch `BytesDownloaded` metric + per-distribution `PriceClass`. |
+| `api_gateway.py` | CloudWatch `Count` metric → `(REST $3.50/M − HTTP $1.00/M) × monthly_requests`; a rec with no measured volume (`$0`, fast mode / throttled CW) is `Counted=False` advisory (the prior flat $50 fabrication is gone). |
+| `opensearch.py` | **Live-priced** via `get_instance_monthly_price("AmazonES", …)`: idle = full instance×count + gp3 storage; Underutilized = current→one-size-down node delta; Graviton = x86→same-size-Graviton node delta; storage = gp2→gp3 per-GB delta. CoH-authoritative; non-priceable levers → `$0` advisory (opensearch C2/C3, live-audit H4). |
+| `ami.py` | `parse_dollar_savings()` on the rec text. |
+| `monitoring.py` | numeric `EstimatedMonthlySavings` when the shim emits it, else `parse_dollar_savings(EstimatedSavings)`; best-practice nudges that parse to `$0` → `Counted=False` advisory. |
 
 ### Advisory-only (1 adapter)
 | Adapter | Method |

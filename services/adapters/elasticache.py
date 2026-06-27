@@ -1,4 +1,4 @@
-"""Keyword-rate adapter for ElastiCache."""
+"""Live-priced adapter for ElastiCache (node-price deltas; CoH-authoritative)."""
 
 from __future__ import annotations
 
@@ -112,7 +112,7 @@ def downsize_target(node_type: str) -> str | None:
 
 
 class ElasticacheModule(BaseServiceModule):
-    """ServiceModule adapter for ElastiCache. Keyword-rate savings strategy."""
+    """ServiceModule adapter for ElastiCache. Live node-price-delta savings strategy."""
 
     key: str = "elasticache"
     cli_aliases: tuple[str, ...] = ("elasticache",)
