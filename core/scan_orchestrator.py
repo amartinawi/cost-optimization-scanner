@@ -57,7 +57,13 @@ class ScanOrchestrator:
             "elasticache",
             "opensearch",
             "redshift",
-            "s3",
+            # NOTE: no "s3" bucket — no S3 adapter consumes cost_hub_splits["s3"],
+            # so populating it only created dead data (network_cost/s3 S3-N2). With
+            # "S3Bucket" dropped from type_map below, a CoH S3 rec now lands in
+            # unbucketed_types and surfaces the honest full-scan "dropped type"
+            # warning instead of being silently routed to a bucket nothing reads.
+            # Surfacing S3 CoH savings is a future enhancement (would need a
+            # consumer + bucket-name dedup in services/adapters/s3.py).
             # EKS Cost Optimization Hub recs are consumed by EksCostModule,
             # whose module key is "eks_cost" (NOT "eks"). The bucket name must
             # match the module key, else the gate `bucket in selected` below is
@@ -97,7 +103,6 @@ class ScanOrchestrator:
             "ElastiCacheCluster": "elasticache",
             "OpenSearchDomain": "opensearch",
             "RedshiftCluster": "redshift",
-            "S3Bucket": "s3",
             "EksCluster": "eks_cost",
             "DynamoDBTable": "dynamodb",
             # ECS / container-level

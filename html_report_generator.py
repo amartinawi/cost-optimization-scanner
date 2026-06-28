@@ -347,17 +347,6 @@ def _extract_rds_resources(rec: Dict[str, Any], resource_groups: Dict[str, list]
     )
 
 
-def _fs_rec_savings(rec: Dict[str, Any]) -> float:
-    """Monthly saving for a file-system rec — uses the real ``_savings`` field.
-
-    Counted recs carry ``_savings`` (float); advisory recs have none and resolve
-    to 0. The previous implementation read ``EstimatedMonthlyCost`` (a field
-    these recs never set) and always produced 0.
-    """
-    val = rec.get("_savings")
-    return float(val) if isinstance(val, (int, float)) else 0.0
-
-
 def _counted_advisory_counts(sources: Dict[str, Any]) -> Tuple[int, int]:
     """Split a service's recommendations into (counted, advisory).
 
@@ -378,37 +367,10 @@ def _counted_advisory_counts(sources: Dict[str, Any]) -> Tuple[int, int]:
     return counted, advisory
 
 
-def _extract_file_systems_resources(rec: Dict[str, Any], resource_groups: Dict[str, list]) -> None:
-    """Extract EFS/FSx file-system resource IDs into grouped lists. Called by: _get_affected_resources_list."""
-    if "FileSystemType" in rec:
-        fs_type = rec.get("FileSystemType", "Unknown")
-        if f"FSx {fs_type}" not in resource_groups:
-            resource_groups[f"FSx {fs_type}"] = []
-        resource_groups[f"FSx {fs_type}"].append(
-            {
-                "id": rec.get("FileSystemId", "N/A"),
-                "type": f"{rec.get('StorageCapacity', 0)} GB",
-                "savings": _fs_rec_savings(rec),
-            }
-        )
-    else:
-        if not rec.get("HasIAPolicy", True):
-            if "EFS Lifecycle Optimization" not in resource_groups:
-                resource_groups["EFS Lifecycle Optimization"] = []
-            resource_groups["EFS Lifecycle Optimization"].append(
-                {
-                    "id": rec.get("Name", rec.get("FileSystemId", "N/A")),
-                    "type": f"{rec.get('SizeGB', 0)} GB",
-                    "savings": _fs_rec_savings(rec),
-                }
-            )
-
-
 _RESOURCE_EXTRACTORS: Dict[str, Callable[..., None]] = {
     "ec2": _extract_ec2_resources,
     "ebs": _extract_ebs_resources,
     "rds": _extract_rds_resources,
-    "file_systems": _extract_file_systems_resources,
 }
 
 

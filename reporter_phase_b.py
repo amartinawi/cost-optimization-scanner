@@ -890,6 +890,8 @@ def _render_s3_enhanced_checks(recommendations: List[Rec], source_name: str, ser
 
     Called by: HTMLReportGenerator._get_detailed_recommendations.
     """
+    from services._savings import parse_dollar_savings
+
     grouped: Dict[str, List[Rec]] = {}
     for rec in recommendations:
         category = rec.get("CheckCategory", "Other")
@@ -899,14 +901,10 @@ def _render_s3_enhanced_checks(recommendations: List[Rec], source_name: str, ser
     for category, recs in grouped.items():
         total_savings = 0.0
         for r in recs:
-            savings_str = str(r.get("EstimatedSavings", ""))
-            if "$" in savings_str:
-                try:
-                    total_savings += float(
-                        savings_str.replace("$", "").split("/")[0].replace(",", "")
-                    )
-                except (ValueError, AttributeError) as e:
-                    logger.debug("Could not parse S3 savings %r: %s", savings_str, e)
+            # network_cost S3-N3: parse_dollar_savings only accepts monthly-unit
+            # figures, so a "$/GB" rate string is rejected rather than summed as a
+            # monthly dollar (the old ad-hoc split("/")[0] accepted it).
+            total_savings += parse_dollar_savings(str(r.get("EstimatedSavings", "")))
 
         content += f'<div class="rec-item{_priority_class(recs[0])}">'
         content += f"<h4>{category} ({len(recs)} buckets)</h4>"
@@ -1020,7 +1018,7 @@ def _render_containers_enhanced_checks(recommendations: List[Rec], source_name: 
         "ECS Over-Provisioned Services": [],
         "Unused ECS Clusters": [],
         "Unused EKS Clusters": [],
-        "ECR Lifecycle Missing": [],
+        "ECR Lifecycle Management": [],
         "Other Optimizations": [],
     }
 
@@ -1041,7 +1039,7 @@ def _render_containers_enhanced_checks(recommendations: List[Rec], source_name: 
                 else:
                     grouped_containers["Other Optimizations"].append(rec)
         elif "RepositoryName" in rec:
-            grouped_containers["ECR Lifecycle Missing"].append(rec)
+            grouped_containers["ECR Lifecycle Management"].append(rec)
         else:
             grouped_containers["Other Optimizations"].append(rec)
 
@@ -1063,7 +1061,7 @@ def _render_containers_enhanced_checks(recommendations: List[Rec], source_name: 
             content += "<p><strong>Recommendation:</strong> Delete unused ECS clusters with no running tasks</p>"
         elif group_name == "Unused EKS Clusters":
             content += "<p><strong>Recommendation:</strong> Delete unused EKS clusters with no node groups</p>"
-        elif group_name == "ECR Lifecycle Missing":
+        elif group_name == "ECR Lifecycle Management":
             content += "<p><strong>Recommendation:</strong> Implement lifecycle policies to automatically clean up old images and reduce storage costs</p>"
         elif group_name == "Other Optimizations":
             content += "<p><strong>Recommendation:</strong> Optimize container resources through rightsizing, Spot instances, and efficient scheduling</p>"
@@ -1787,7 +1785,7 @@ def _humanize_key(key: str) -> str:
 
 def _render_generic_other_rec(content: str, rec: Rec, source_name: str) -> str:
     """Render a generic recommendation card for any service. Called by: render_generic_per_rec."""
-    check_category = rec.get("CheckCategory", source_name.replace("_", " ").title())
+    check_category = rec.get("CheckCategory") or rec.get("check_category") or source_name.replace("_", " ").title()
     resource_id = (
         rec.get("resource_id")
         or rec.get("LoadBalancerName")
@@ -1822,6 +1820,14 @@ def _render_generic_other_rec(content: str, rec: Rec, source_name: str) -> str:
         or rec.get("ProvisionedModelId")
         or rec.get("KnowledgeBaseId")
         or rec.get("AgentId")
+        # snake_case keys emitted by the SageMaker / Bedrock adapters (sagemaker L1,
+        # bedrock L1) — without these the resource_id falls through to "Resource".
+        or rec.get("endpoint_name")
+        or rec.get("notebook_name")
+        or rec.get("job_name")
+        or rec.get("provisioned_model_id")
+        or rec.get("knowledge_base_id")
+        or rec.get("agent_id")
         or rec.get("ServerId")
         or rec.get("ClusterArn", "").split("/")[-1]
         or rec.get("ContainerName")
@@ -1847,6 +1853,9 @@ def _render_generic_other_rec(content: str, rec: Rec, source_name: str) -> str:
     # line below instead of a raw "Estimatedmonthlysavings: 5.0" dump (CoH H-render).
     _SAVINGS_KEYS = (
         "CheckCategory",
+        # snake_case header key (SageMaker / Bedrock) — drives the card title
+        # above, never dump it raw as a property row (sagemaker L1, bedrock L1).
+        "check_category",
         "Recommendation",
         "EstimatedSavings",
         "EstimatedMonthlySavings",
@@ -2432,6 +2441,12 @@ SOURCE_TYPE_MAP: Dict[Tuple[str, str], str] = {
     ("network", "vpc_endpoints"): "Audit Based",
     ("network", "load_balancers"): "Audit Based",
     ("network", "auto_scaling_groups"): "Audit Based",
+    # network_cost data-transfer/TGW recs are Cost-Explorer-derived blended-dollar
+    # audits with no per-flow metric, so they carry "Audit Based", not the generic
+    # "Metric Backed" the source names would otherwise imply (network_cost L1).
+    ("network_cost", "cross_region_transfer"): "Audit Based",
+    ("network_cost", "cross_az_transfer"): "Audit Based",
+    ("network_cost", "internet_egress"): "Audit Based",
 }
 
 _GENERIC_SOURCE_TYPES: Dict[str, str] = {
@@ -2454,7 +2469,8 @@ _GENERIC_SOURCE_TYPES: Dict[str, str] = {
     "old_amis": "Audit Based",
     "gp2_migration": "Metric Backed",
     "unattached_volumes": "Audit Based",
-    "tgw_vs_peering": "Metric Backed",
+    # TGW-vs-peering is a topology audit with no per-flow metric (network_cost L1).
+    "tgw_vs_peering": "Audit Based",
     "node_group_optimization": "Metric Backed",
     "fargate_analysis": "Metric Backed",
     "cluster_costs": "Metric Backed",
