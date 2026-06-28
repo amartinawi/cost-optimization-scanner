@@ -234,6 +234,26 @@ class TestPricingEngine:
         price = engine.get_instance_monthly_price("AmazonES", "m5.large.search")
         assert price == pytest.approx(0.20 * 730)
 
+    def test_amazones_legacy_elasticsearch_suffix_normalized(self):
+        # opensearch L1: a legacy ".elasticsearch" instance type must be looked
+        # up under the ".search" SKU the Pricing API actually publishes,
+        # otherwise it silently prices to $0.
+        mock_client = MagicMock()
+        mock_client.get_products.return_value = {
+            "PriceList": [
+                json.dumps(
+                    {"terms": {"OnDemand": {"T": {"priceDimensions": {"d": {"pricePerUnit": {"USD": "0.20"}}}}}}}
+                )
+            ]
+        }
+        engine = PricingEngine("us-east-1", mock_client)
+        price = engine.get_instance_monthly_price("AmazonES", "m5.large.elasticsearch")
+        assert price == pytest.approx(0.20 * 730)
+        # The instanceType filter sent to the API was normalized to ".search".
+        filters = mock_client.get_products.call_args.kwargs["Filters"]
+        itype = next(f["Value"] for f in filters if f["Field"] == "instanceType")
+        assert itype == "m5.large.search"
+
     def test_redshift_selects_compute_instance_not_concurrency_scaling(self):
         """SR-1 / Redshift C2 — a bare instanceType+location filter matches four
         ra3.4xlarge SKUs. The deterministic selector must pick the Compute

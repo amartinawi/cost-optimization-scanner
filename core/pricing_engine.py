@@ -1530,6 +1530,17 @@ class PricingEngine:
                 attributes_exact={"cacheEngine": engine_norm},
             )
             return hourly * 730 if hourly is not None else None
+        if (
+            service_code == "AmazonES"
+            and isinstance(instance_type, str)
+            and instance_type.endswith(".elasticsearch")
+        ):
+            # Legacy Elasticsearch-domain instance types carry the
+            # ``.elasticsearch`` suffix, but the Pricing API only publishes the
+            # ``.search`` SKU — a verbatim lookup matches nothing and silently
+            # prices to $0. Normalize so legacy (un-migrated) ES domains resolve
+            # their real instance rate (opensearch L1).
+            filters[0]["Value"] = instance_type.removesuffix(".elasticsearch") + ".search"
         price_hourly = self._call_pricing_api(service_code, filters)
         if price_hourly is not None:
             return price_hourly * 730  # hours/month
@@ -1741,7 +1752,11 @@ class PricingEngine:
             {"Type": "TERM_MATCH", "Field": "productFamily", "Value": "VpcEndpoint"},
             {"Type": "TERM_MATCH", "Field": "endpointType", "Value": "PrivateLink"},
         ]
-        hourly = self._call_pricing_api("AmazonVPC", filters)
+        # The PrivateLink filter returns BOTH the per-hour (VpcEndpoint-Hours)
+        # and per-GB (VpcEndpoint-Bytes) SKUs; select the hourly row explicitly
+        # rather than relying on MaxResults=1 returning the right one (correct
+        # only by coincidence today since both rates are $0.01) (network NET-07).
+        hourly = self._call_pricing_api_hourly("AmazonVPC", filters)
         return hourly * 730 if hourly is not None else None
 
     def _fetch_lb_base_hourly(self, product_family: str, operation: str) -> float | None:
