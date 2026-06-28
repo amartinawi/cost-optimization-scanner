@@ -41,7 +41,11 @@ snapshots are unmoved.
   deletion candidate); file_systems sums the full-precision `_savings` float and
   paginates `describe_file_caches`; sagemaker's Active-Endpoints stat excludes
   idle endpoints; ebs CO/CoH recs carry an `AuditBasis`; transfer declares its
-  CloudWatch contract; workspaces flags non-Windows bundle-rightsizing advisories.
+  CloudWatch contract; workspaces flags non-Windows bundle-rightsizing advisories;
+  quicksight (L3) now surfaces sub-50%-idle SPICE as a `$0` `Counted=False`
+  advisory (the potential figure is shown but never summed, and it is excluded
+  from the rec-count headline) instead of being dropped — partial SPICE headroom
+  is needed for dataset refreshes, so it has no concrete reclaimable dollar.
 - **Documentation.** Rewrote `services/adapters/CLAUDE.md` Pricing Models into an
   accurate six-category taxonomy covering all 34 adapters (the prior table
   documented 26 and miscounted), and corrected per-adapter pricing-strategy rows.

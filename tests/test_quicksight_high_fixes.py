@@ -324,6 +324,38 @@ def test_scan_path_standard_edition_rate() -> None:
     assert findings.total_monthly_savings == pytest.approx(70.0 * STANDARD_RATE, abs=0.01)
 
 
+# --------------------------------------------------------------------------- #
+# L3 — sub-50%-idle SPICE is a $0 Counted=False advisory, never summed
+# --------------------------------------------------------------------------- #
+def test_l3_sub_50_idle_is_advisory_not_counted() -> None:
+    # 70/100 GB used → 30% idle (< 50%): an advisory, NOT a counted reclaim.
+    client = _FakeQuickSight(edition="ENTERPRISE", used_gb=70.0, total_gb=100.0)
+    ctx = _scan_ctx(client, pricing_multiplier=1.0, region="us-east-1")
+    findings = adapter_mod.QuicksightModule().scan(ctx)
+
+    rec = findings.sources["enhanced_checks"].recommendations[0]
+    assert rec["Counted"] is False
+    assert rec["EstimatedMonthlySavings"] == 0.0
+    assert "PricingWarning" in rec
+    assert findings.total_monthly_savings == 0.0          # never summed
+    assert findings.total_recommendations == 0            # advisory excluded from count
+    # the card still surfaces the potential figure (advisory), but as $0.00 counted
+    assert rec["EstimatedSavings"].startswith("$0.00/month")
+    assert "potential" in rec["EstimatedSavings"]
+
+
+def test_l3_over_50_idle_still_counted() -> None:
+    # 30/100 GB used → 70% idle (> 50%): still a counted reclaim opportunity.
+    client = _FakeQuickSight(edition="ENTERPRISE", used_gb=30.0, total_gb=100.0)
+    ctx = _scan_ctx(client, pricing_multiplier=1.0, region="us-east-1")
+    findings = adapter_mod.QuicksightModule().scan(ctx)
+
+    rec = findings.sources["enhanced_checks"].recommendations[0]
+    assert rec.get("Counted") is not False
+    assert findings.total_monthly_savings == pytest.approx(70.0 * ENTERPRISE_RATE, abs=0.01)
+    assert findings.total_recommendations == 1
+
+
 def test_rate_helper_matches_live_validated_skus() -> None:
     assert quicksight_spice_rate("ENTERPRISE") == ENTERPRISE_RATE
     assert quicksight_spice_rate("STANDARD") == STANDARD_RATE

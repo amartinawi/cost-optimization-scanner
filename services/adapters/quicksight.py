@@ -47,6 +47,25 @@ class QuicksightModule(BaseServiceModule):
         for rec in recs:
             edition = rec.get("Edition", "")
             unused_gb = rec.get("UnusedSpiceCapacityGB", 0)
+            if rec.get("Counted") is False:
+                # quicksight L3: the shim already marked this advisory (e.g. 1–49%
+                # idle SPICE). Show the potential figure but NEVER sum it — partial
+                # headroom is not a concrete reclaim. Keep the shim's PricingWarning.
+                potential = (
+                    round(unused_gb * quicksight_spice_rate(edition) * ctx.pricing_multiplier, 2)
+                    if (unused_gb > 0 and edition)
+                    else 0.0
+                )
+                priced_recs.append(
+                    dict(
+                        rec,
+                        EstimatedMonthlySavings=0.0,
+                        EstimatedSavings=(
+                            f"$0.00/month — advisory (potential ~${potential:.2f}/month if reclaimed)"
+                        ),
+                    )
+                )
+                continue
             if unused_gb > 0 and edition:
                 rate = quicksight_spice_rate(edition)
                 # Single source of truth for the dollar: region-scaled, rounded
