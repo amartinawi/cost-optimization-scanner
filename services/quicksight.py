@@ -97,6 +97,12 @@ def get_enhanced_quicksight_checks(ctx: ScanContext) -> dict[str, Any]:
                 used_capacity = capacity_config.get("UsedCapacityInBytes", 0) / (1024**3)
                 total_capacity = capacity_config.get("TotalCapacityInBytes", 0) / (1024**3)
 
+                # The 50% threshold is intentional (quicksight L3 — kept as a
+                # deliberate non-fix): SPICE is pre-allocated capacity that needs
+                # headroom for refreshes, so sub-50% is the point where unused
+                # capacity is large enough to be a concrete reclaim opportunity.
+                # Flagging every account below 100% would be a best-practice nudge
+                # with no concrete account-specific saving, which is out of scope.
                 if total_capacity > 0 and used_capacity < total_capacity * 0.5:
                     checks["spice_optimization"].append(
                         {

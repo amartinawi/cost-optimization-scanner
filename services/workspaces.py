@@ -218,12 +218,17 @@ def get_enhanced_workspaces_checks(ctx: ScanContext) -> dict[str, Any]:
                 # rather than defaulting every rec to STANDARD.
                 compute_type = props.get("ComputeTypeName", "STANDARD")
                 # workspaces L1: the bundle price tables are us-east-1
-                # Windows+Included rates. Only a POSITIVELY non-Windows OS (the
-                # field is absent on older API versions, so an empty value is
-                # treated as the priced default) makes the bundle figure unreliable
-                # — flag it as an advisory caveat rather than imply the rate is exact.
+                # Windows+Included rates. A POSITIVELY non-Windows OS or a
+                # BRING_YOUR_OWN_LICENSE WorkSpace makes the bundle figure
+                # unreliable; absent fields (older API versions) are treated as the
+                # priced default so we never downgrade on missing data — we only
+                # flag an advisory caveat, never a counted dollar.
                 ws_os = str(props.get("OperatingSystemName", "")).upper()
-                non_windows_pricing = bool(ws_os) and "WINDOWS" not in ws_os
+                bundle_license = str(workspace.get("License", "")).upper()
+                non_windows_pricing = (
+                    (bool(ws_os) and "WINDOWS" not in ws_os)
+                    or bundle_license in ("BRING_YOUR_OWN_LICENSE", "BYOL")
+                )
 
                 if state == "AVAILABLE" and running_mode == "ALWAYS_ON":
                     # C2: gate the AutoStop projection on measured session hours.
@@ -303,11 +308,16 @@ def get_enhanced_workspaces_checks(ctx: ScanContext) -> dict[str, Any]:
                             }
                             if non_windows_pricing:
                                 # The price delta was computed from Windows+Included
-                                # tables; for a Linux/BYOL WorkSpace it is indicative
-                                # only (workspaces L1).
+                                # tables; for a Linux or BYOL WorkSpace it is
+                                # indicative only (workspaces L1).
+                                _why = (
+                                    f"runs {ws_os.title()}"
+                                    if (ws_os and "WINDOWS" not in ws_os)
+                                    else "is BRING_YOUR_OWN_LICENSE"
+                                )
                                 rightsizing_rec["PricingWarning"] = (
-                                    f"figure assumes Windows+Included rates; this WorkSpace runs "
-                                    f"{ws_os.title()} so the real delta differs"
+                                    f"figure assumes Windows+Included rates; this WorkSpace {_why} "
+                                    f"so the real delta differs"
                                 )
                             checks["bundle_rightsizing"].append(rightsizing_rec)
 

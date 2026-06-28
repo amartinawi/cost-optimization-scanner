@@ -1838,9 +1838,12 @@ def _render_generic_other_rec(content: str, rec: Rec, source_name: str) -> str:
         or rec.get("anomaly_id")
         or (f"{rec['BackupPlanCount']} backup plans" if rec.get("BackupPlanCount") else None)
         or (f"{rec['ALBCount']} ALBs" if rec.get("ALBCount") else None)
-        or rec.get("resourceArn", "").split(":")[-1]
-        if rec.get("resourceArn")
-        else "Resource"
+        # resourceArn is the Cost-Hub fallback. It MUST be a guarded term inside the
+        # or-chain, not a ternary gate on the whole chain — otherwise every rec
+        # without a resourceArn (e.g. SageMaker's endpoint_name) collapsed to the
+        # "Resource" placeholder regardless of the keys above it (sagemaker L1).
+        or (rec.get("resourceArn", "").split(":")[-1] if rec.get("resourceArn") else None)
+        or "Resource"
     )
 
     content += f"<h4>{check_category}: {resource_id}</h4>"
