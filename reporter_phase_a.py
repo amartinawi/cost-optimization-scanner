@@ -235,18 +235,6 @@ def _extract_auto_scaling_details(rec: Rec) -> Tuple[str, str]:
     return resource_id, ""
 
 
-def _extract_backup_details(rec: Rec) -> Tuple[str, str]:
-    """Extract Backup plan or vault name. Called by: render_grouped_by_category."""
-    resource_id = rec.get("BackupPlanName", rec.get("BackupVaultName", rec.get("PlanName", "Unknown")))
-    return resource_id, ""
-
-
-def _extract_route53_details(rec: Rec) -> Tuple[str, str]:
-    """Extract Route 53 hosted zone or health check ID. Called by: render_grouped_by_category."""
-    resource_id = rec.get("HostedZoneId", rec.get("HealthCheckId", rec.get("ZoneId", "Unknown")))
-    return resource_id, ""
-
-
 def _extract_monitoring_details(rec: Rec) -> Tuple[str, str]:
     """Extract CloudWatch/CloudTrail resource identifier. Called by: render_grouped_by_category."""
     resource_id = rec.get(
@@ -334,24 +322,6 @@ PHASE_A_DESCRIPTORS: Dict[str, _PhaseADescriptor] = {
         "plural": "resources",
         "list_label": "Resources",
         "fallback_category": "Auto Scaling Optimization",
-        "savings_mode": "always",
-        "close_div_location": "outer",
-    },
-    "backup": {
-        "extract_detail": _extract_backup_details,
-        "singular": "resource",
-        "plural": "resources",
-        "list_label": "Resources",
-        "fallback_category": "Backup Optimization",
-        "savings_mode": "always",
-        "close_div_location": "outer",
-    },
-    "route53": {
-        "extract_detail": _extract_route53_details,
-        "singular": "resource",
-        "plural": "resources",
-        "list_label": "Resources",
-        "fallback_category": "Route53 Optimization",
         "savings_mode": "always",
         "close_div_location": "outer",
     },

@@ -2575,8 +2575,6 @@ _PHASE_A_SERVICES = frozenset(
         "api_gateway",
         "step_functions",
         "auto_scaling",
-        "backup",
-        "route53",
     }
 )
 

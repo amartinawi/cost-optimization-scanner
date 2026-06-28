@@ -3148,8 +3148,6 @@ class HTMLReportGenerator:
             "api_gateway",
             "step_functions",
             "auto_scaling",
-            "backup",
-            "route53",
             "ami",
             "lightsail",
             "dms",
