@@ -22,7 +22,6 @@ from services.efs_fsx import (
     get_fsx_file_system_count,
     get_fsx_findings,
 )
-from services._savings import parse_dollar_savings
 from services.file_systems_logic import dedupe_counted
 
 
@@ -60,8 +59,11 @@ class FileSystemsModule(BaseServiceModule):
         fsx_counted = dedupe_counted(fsx["counted"])
         advisory = list(efs["advisory"]) + list(fsx["advisory"])
 
-        savings = sum(parse_dollar_savings(r.get("EstimatedSavings", "")) for r in efs_counted)
-        savings += sum(parse_dollar_savings(r.get("EstimatedSavings", "")) for r in fsx_counted)
+        # file_systems L4: sum the full-precision ``_savings`` float the counted
+        # recs carry (the same field the renderer reads), not a re-parse of the
+        # rounded EstimatedSavings display string — the two diverged by rounding.
+        savings = sum(float(r.get("_savings", 0.0) or 0.0) for r in efs_counted)
+        savings += sum(float(r.get("_savings", 0.0) or 0.0) for r in fsx_counted)
 
         total_recs = len(efs_counted) + len(fsx_counted)
 

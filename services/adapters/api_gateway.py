@@ -10,7 +10,13 @@ from services.api_gateway import API_GATEWAY_OPTIMIZATION_DESCRIPTIONS, get_enha
 
 
 class ApiGatewayModule(BaseServiceModule):
-    """ServiceModule adapter for API Gateway. CloudWatch request-volume savings strategy."""
+    """ServiceModule adapter for API Gateway (REST APIs only).
+
+    CloudWatch request-volume savings: a REST→HTTP migration is priced at the
+    first-tier request-rate delta ($3.50/M REST − $1.00/M HTTP = $2.50/M) ×
+    measured monthly request count; an API with no measured volume is a $0
+    advisory.
+    """
 
     key: str = "api_gateway"
     cli_aliases: tuple[str, ...] = ("api_gateway",)
@@ -25,7 +31,7 @@ class ApiGatewayModule(BaseServiceModule):
         return ("apigateway", "cloudwatch")
 
     def scan(self, ctx: Any) -> ServiceFindings:
-        """Scan API Gateway REST/HTTP APIs for cost optimization opportunities.
+        """Scan API Gateway REST APIs only for cost optimization opportunities.
 
         Consults the api_gateway service module for REST-to-HTTP migration
         and caching recommendations. Savings calculated from CloudWatch Count

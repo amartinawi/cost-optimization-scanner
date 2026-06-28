@@ -96,6 +96,18 @@ def _recs(findings) -> tuple[dict[str, Any], ...]:
 
 
 # --------------------------------------------------------------------------- #
+# L3 — the adapter's CloudWatch contract matches what the shim actually does
+# --------------------------------------------------------------------------- #
+def test_l3_adapter_declares_cloudwatch_contract() -> None:
+    """The shim gates terminate recs on CloudWatch BytesIn/BytesOut + fast_mode,
+    so the adapter must request the cloudwatch client and set both flags."""
+    mod = TransferModule()
+    assert mod.required_clients() == ("transfer", "cloudwatch")
+    assert mod.requires_cloudwatch is True
+    assert mod.reads_fast_mode is True
+
+
+# --------------------------------------------------------------------------- #
 # H1 — unused/stopped server is a $0 advisory, never an (n-1) protocol figure
 # --------------------------------------------------------------------------- #
 def test_h1_stopped_server_is_zero_advisory_not_protocol_figure(

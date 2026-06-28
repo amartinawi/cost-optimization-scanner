@@ -536,7 +536,11 @@ class SageMakerModule(BaseServiceModule):
                 ),
             },
             extras={
-                "active_endpoint_count": active_ep_count,
+                # _check_idle_endpoints counts every InService endpoint as active
+                # before the zero-invocations test, so subtract the idle ones the
+                # report breaks out separately — else the "Active Endpoints" stat
+                # double-represents an idle endpoint (sagemaker L3).
+                "active_endpoint_count": active_ep_count - len(idle_ep_recs),
                 "idle_endpoint_count": len(idle_ep_recs),
                 "running_notebook_count": notebook_count,
             },

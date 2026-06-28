@@ -360,6 +360,36 @@ def test_enhanced_over_provisioned_low_util_builds_counted_rec_with_gsi():
     assert findings.total_monthly_savings == pytest.approx(_expected_delta(500, 300, 36, 9), abs=0.01)
 
 
+_EMPTY_PROVISIONED_TABLE = {
+    "TableName": "empty-t",
+    "TableStatus": "ACTIVE",
+    "ItemCount": 0,
+    "TableSizeBytes": 0,
+    "BillingModeSummary": {"BillingMode": "PROVISIONED"},
+    "ProvisionedThroughput": {"ReadCapacityUnits": 500, "WriteCapacityUnits": 500},
+}
+
+
+def test_l2_empty_provisioned_table_is_deletion_only_not_rightsizing():
+    # An empty (ItemCount==0) PROVISIONED table with high capacity is a deletion
+    # candidate — it must NOT also emit an over-provisioned/reserved-capacity rec
+    # (which would count a ~100% rightsizing saving on a table you would delete).
+    cw = _FakeCloudWatch({})
+    ctx = _ctx(dynamodb=_FakeDynamoDB([dict(_EMPTY_PROVISIONED_TABLE)]), cloudwatch=cw)
+    result = ddb_shim.get_enhanced_dynamodb_checks(ctx)
+    cats = [r["CheckCategory"] for r in result["recommendations"]]
+
+    assert "Unused DynamoDB Tables" in cats
+    assert "DynamoDB Over-Provisioned Capacity" not in cats
+    assert "DynamoDB Reserved Capacity" not in cats
+
+    # L2: the deletion advisory carries the provisioned capacity so its full-cost
+    # saving is quantifiable rather than an un-priceable "100% of table costs".
+    unused = next(r for r in result["recommendations"] if r["CheckCategory"] == "Unused DynamoDB Tables")
+    assert unused["ReadCapacityUnits"] == 500
+    assert unused["WriteCapacityUnits"] == 500
+
+
 def test_enhanced_over_provisioned_no_datapoints_is_advisory():
     cw = _FakeCloudWatch({})  # every metric returns empty Datapoints
     ctx = _ctx(dynamodb=_FakeDynamoDB([dict(_TABLE_WITH_GSI)]), cloudwatch=cw)

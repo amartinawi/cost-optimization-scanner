@@ -171,6 +171,26 @@ class EbsModule(BaseServiceModule):
             coh_recs, co_recs_all, [unattached_volumes, gp2_recs, other_recs]
         )
 
+        # ebs L3: the gp2→gp3, unattached, and other levers below already attach an
+        # AuditBasis; do the same for the AWS-sourced CO/CoH recs so every counted
+        # EBS dollar in the report is traceable to its origin and savings path.
+        region = getattr(ctx, "region", "")
+        for rec in co_recs:
+            rec["AuditBasis"] = {
+                "source": "Compute Optimizer",
+                "savings_path": "volumeRecommendationOptions[0].savingsOpportunity."
+                "estimatedMonthlySavings.value",
+                "amount": round(compute_optimizer_savings(rec), 2),
+                "region": region,
+            }
+        for rec in coh_recs:
+            rec["AuditBasis"] = {
+                "source": "Cost Optimization Hub",
+                "savings_path": "estimatedMonthlySavings",
+                "amount": round(float(rec.get("estimatedMonthlySavings", 0.0) or 0.0), 2),
+                "region": region,
+            }
+
         # Per-volume gp2→gp3 savings: region-correct storage delta NET of the gp3
         # IOPS that a large gp2 volume (baseline > 3,000 IOPS) must provision to
         # keep its performance — so the number is not overstated for >1 TB volumes.

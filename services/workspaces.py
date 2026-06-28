@@ -217,6 +217,13 @@ def get_enhanced_workspaces_checks(ctx: ScanContext) -> dict[str, Any]:
                 # C3: carry the real bundle so scan() prices the actual ComputeType
                 # rather than defaulting every rec to STANDARD.
                 compute_type = props.get("ComputeTypeName", "STANDARD")
+                # workspaces L1: the bundle price tables are us-east-1
+                # Windows+Included rates. Only a POSITIVELY non-Windows OS (the
+                # field is absent on older API versions, so an empty value is
+                # treated as the priced default) makes the bundle figure unreliable
+                # — flag it as an advisory caveat rather than imply the rate is exact.
+                ws_os = str(props.get("OperatingSystemName", "")).upper()
+                non_windows_pricing = bool(ws_os) and "WINDOWS" not in ws_os
 
                 if state == "AVAILABLE" and running_mode == "ALWAYS_ON":
                     # C2: gate the AutoStop projection on measured session hours.
@@ -280,22 +287,29 @@ def get_enhanced_workspaces_checks(ctx: ScanContext) -> dict[str, Any]:
                             # claiming "based on utilization profile") fabricated a
                             # saving. Carry the potential figure; the adapter renders
                             # it Counted=False, never summed.
-                            checks["bundle_rightsizing"].append(
-                                {
-                                    "WorkspaceId": workspace_id,
-                                    "CurrentBundle": compute_type,
-                                    "RecommendedBundle": target_type,
-                                    "Counted": False,
-                                    "PotentialMonthlySavings": round(savings, 2),
-                                    "Recommendation": (
-                                        f"If {compute_type} is underutilized, downgrading to {target_type} "
-                                        f"would save ~${savings:.2f}/mo — verify CPU/memory utilization first "
-                                        f"(not measured: WorkSpaces does not publish utilization to CloudWatch "
-                                        f"by default)"
-                                    ),
-                                    "CheckCategory": "Bundle Rightsizing",
-                                }
-                            )
+                            rightsizing_rec: dict[str, Any] = {
+                                "WorkspaceId": workspace_id,
+                                "CurrentBundle": compute_type,
+                                "RecommendedBundle": target_type,
+                                "Counted": False,
+                                "PotentialMonthlySavings": round(savings, 2),
+                                "Recommendation": (
+                                    f"If {compute_type} is underutilized, downgrading to {target_type} "
+                                    f"would save ~${savings:.2f}/mo — verify CPU/memory utilization first "
+                                    f"(not measured: WorkSpaces does not publish utilization to CloudWatch "
+                                    f"by default)"
+                                ),
+                                "CheckCategory": "Bundle Rightsizing",
+                            }
+                            if non_windows_pricing:
+                                # The price delta was computed from Windows+Included
+                                # tables; for a Linux/BYOL WorkSpace it is indicative
+                                # only (workspaces L1).
+                                rightsizing_rec["PricingWarning"] = (
+                                    f"figure assumes Windows+Included rates; this WorkSpace runs "
+                                    f"{ws_os.title()} so the real delta differs"
+                                )
+                            checks["bundle_rightsizing"].append(rightsizing_rec)
 
     except Exception as e:
         # C1 — classify: a describe_workspaces AccessDenied is a permission gap,

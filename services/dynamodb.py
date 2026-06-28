@@ -522,11 +522,17 @@ def get_enhanced_dynamodb_checks(ctx: ScanContext) -> dict[str, Any]:
                 # the staleness is benign for dollars; operators should corroborate
                 # against CloudWatch Consumed*CapacityUnits before deleting.
                 if item_count == 0:
+                    # DynamoDB L2: carry the provisioned RCU/WCU so the deletion
+                    # advisory can quantify the full-cost saving, instead of an
+                    # un-pricable "100% of table costs" string.
+                    _empty_pt = table.get("ProvisionedThroughput", {})
                     checks["unused_tables"].append(
                         {
                             "TableName": table_name,
                             "ItemCount": item_count,
                             "TableSizeBytes": table_size_bytes,
+                            "ReadCapacityUnits": _empty_pt.get("ReadCapacityUnits", 0),
+                            "WriteCapacityUnits": _empty_pt.get("WriteCapacityUnits", 0),
                             "Recommendation": "Empty table - consider deletion if unused",
                             "EstimatedSavings": "100% of table costs",
                             "CheckCategory": "Unused DynamoDB Tables",
@@ -545,7 +551,13 @@ def get_enhanced_dynamodb_checks(ctx: ScanContext) -> dict[str, Any]:
                     total_read = base_read + gsi_read
                     total_write = base_write + gsi_write
 
-                    if total_read > _HIGH_CAPACITY_THRESHOLD or total_write > _HIGH_CAPACITY_THRESHOLD:
+                    # DynamoDB L2: an empty table is a deletion candidate (flagged
+                    # above) — skip the rightsizing/reserved levers so it does not
+                    # also emit a counted ~100% over-provisioning saving for a table
+                    # you would delete, not resize.
+                    if item_count != 0 and (
+                        total_read > _HIGH_CAPACITY_THRESHOLD or total_write > _HIGH_CAPACITY_THRESHOLD
+                    ):
                         # DynamoDB H1: carry measured utilization + a rightsized target
                         # so the adapter counts an exact current-minus-target delta,
                         # gated on low utilization, instead of a blanket factor.
@@ -553,7 +565,7 @@ def get_enhanced_dynamodb_checks(ctx: ScanContext) -> dict[str, Any]:
                             _build_over_provisioned_rec(ctx, table_name, base_read, base_write, per_gsi)
                         )
 
-                    if total_read >= _HIGH_CAPACITY_THRESHOLD and total_write >= _HIGH_CAPACITY_THRESHOLD:
+                    if item_count != 0 and total_read >= _HIGH_CAPACITY_THRESHOLD and total_write >= _HIGH_CAPACITY_THRESHOLD:
                         # DynamoDB H2: Reserved Capacity is a commitment lever. The
                         # adapter demotes it to a $0 advisory (owned by Commitment
                         # Analysis) so it is never summed into rightsizing savings.

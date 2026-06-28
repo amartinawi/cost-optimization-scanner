@@ -36,7 +36,7 @@ def _empty_findings() -> ServiceFindings:
         total_recommendations=0,
         total_monthly_savings=0.0,
         sources={},
-        extras={"pt_count": 0, "kb_count": 0, "agent_count": 0},
+        extras={"pt_count": 0, "idle_pt_count": 0, "kb_count": 0, "agent_count": 0},
     )
 
 
@@ -427,10 +427,14 @@ class BedrockModule(BaseServiceModule):
     cli_aliases: tuple[str, ...] = ("bedrock",)
     display_name: str = "Bedrock"
 
+    # Mirror the cards the HTML report renders from _SERVICE_STATS_CONFIG['bedrock']
+    # (all from extras) so this declaration does not diverge from what is shown
+    # (bedrock L2).
     stat_cards: tuple[StatCardSpec, ...] = (
         StatCardSpec(label="Provisioned Throughputs", source_path="extras.pt_count", formatter="int"),
-        StatCardSpec(label="Idle PTs", source_path="sources.idle_provisioned_throughput.count", formatter="int"),
-        StatCardSpec(label="Monthly Savings", source_path="total_monthly_savings", formatter="currency"),
+        StatCardSpec(label="Idle PTs", source_path="extras.idle_pt_count", formatter="int"),
+        StatCardSpec(label="Knowledge Bases", source_path="extras.kb_count", formatter="int"),
+        StatCardSpec(label="Agents", source_path="extras.agent_count", formatter="int"),
     )
 
     grouping = GroupingSpec(by="check_category", label_path="check_category")
@@ -499,6 +503,9 @@ class BedrockModule(BaseServiceModule):
             },
             extras={
                 "pt_count": len(pts),
+                # bedrock L2: surface the cost-relevant idle-PT count as a stat card
+                # (the idle PTs are the only Bedrock resources carrying a saving).
+                "idle_pt_count": len(idle_pt_recs),
                 "kb_count": kb_count,
                 "agent_count": agent_count,
             },

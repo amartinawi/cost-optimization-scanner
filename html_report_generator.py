@@ -146,6 +146,9 @@ _SERVICE_STATS_CONFIG: Dict[str, Dict[str, Any]] = {
     "bedrock": {
         "multi_source_cards": [
             ("Provisioned Throughputs", "extras", "pt_count"),
+            # bedrock L2: the idle-PT count is the cost-relevant figure (the only
+            # Bedrock resources carrying a saving), so surface it alongside totals.
+            ("Idle PTs", "extras", "idle_pt_count"),
             ("Knowledge Bases", "extras", "kb_count"),
             ("Agents", "extras", "agent_count"),
         ],
