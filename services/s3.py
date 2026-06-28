@@ -1102,8 +1102,16 @@ def get_s3_bucket_analysis(
             if savings > 0:
                 bucket_info["SavingsDelta"] = savings
                 bucket_info["EstimatedSavings"] = f"${savings:.2f}/month"
+                bucket_info["Counted"] = True
             else:
                 bucket_info["SavingsDelta"] = 0.0
+                # F1/F2 — a $0 bucket has no defensible counted saving. Mark it
+                # Counted=False (the standard flag every other adapter uses) so the
+                # reporter renders it as advisory and excludes it from the headline
+                # count, instead of the bespoke "Advisory" flag the reporter's
+                # count logic did not recognise (336 $0 cards were being shown as
+                # "counted" on the S3 tab header).
+                bucket_info["Counted"] = False
                 if opportunity_key == "static_website":
                     bucket_info["EstimatedSavings"] = (
                         "$0.00/month - data transfer dependent (CloudFront CDN)"

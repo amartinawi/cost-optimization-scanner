@@ -72,7 +72,11 @@ def get_enhanced_cloudfront_checks(ctx: ScanContext) -> dict[str, Any]:
                         end_time = datetime.now(UTC)
                         start_time = end_time - timedelta(days=7)
 
-                        cloudwatch = ctx.client("cloudwatch")
+                        # CloudFront publishes its CloudWatch metrics ONLY to
+                        # us-east-1 regardless of the scanned region — querying
+                        # the scan region returns zero datapoints and silently
+                        # disables this lever (F-COV-01).
+                        cloudwatch = ctx.client("cloudwatch", region="us-east-1")
                         request_metrics = cloudwatch.get_metric_statistics(
                             Namespace="AWS/CloudFront",
                             MetricName="Requests",
@@ -114,63 +118,15 @@ def get_enhanced_cloudfront_checks(ctx: ScanContext) -> dict[str, Any]:
 
                 # Disabled CloudFront distribution housekeeping finding removed: explicitly
                 # $0/month — disabled distributions incur no data-transfer cost.
-
-                try:
-                    dist_config = cloudfront.get_distribution_config(Id=dist_id)
-                    origins = dist_config.get("DistributionConfig", {}).get("Origins", {}).get("Items", [])
-
-                    should_check_origin_shield = False
-                    try:
-                        cw_end = datetime.now(UTC)
-                        cw_start = cw_end - timedelta(days=7)
-                        cloudwatch = ctx.client("cloudwatch")
-
-                        hit_metrics = cloudwatch.get_metric_statistics(
-                            Namespace="AWS/CloudFront",
-                            MetricName="CacheHitRate",
-                            Dimensions=[{"Name": "DistributionId", "Value": dist_id}],
-                            StartTime=cw_start,
-                            EndTime=cw_end,
-                            Period=86400,
-                            Statistics=["Average"],
-                        )
-                        avg_hit_rate = None
-                        dps = hit_metrics.get("Datapoints", [])
-                        if dps:
-                            avg_hit_rate = sum(dp["Average"] for dp in dps) / len(dps)
-                            if avg_hit_rate < 90:
-                                should_check_origin_shield = True
-
-                        if not should_check_origin_shield:
-                            req_metrics = cloudwatch.get_metric_statistics(
-                                Namespace="AWS/CloudFront",
-                                MetricName="Requests",
-                                Dimensions=[{"Name": "DistributionId", "Value": dist_id}],
-                                StartTime=cw_start,
-                                EndTime=cw_end,
-                                Period=60,
-                                Statistics=["Sum"],
-                            )
-                            req_dps = req_metrics.get("Datapoints", [])
-                            if req_dps:
-                                max_per_min = max(dp["Sum"] for dp in req_dps)
-                                if max_per_min > 1000:
-                                    should_check_origin_shield = True
-                    except Exception as e:
-                        # H1 — classify the CacheHitRate/Requests read failure
-                        # rather than swallowing it.
-                        record_aws_error(
-                            ctx,
-                            e,
-                            service="cloudfront",
-                            context=f"cloudwatch:GetMetricStatistics CacheHitRate/Requests failed for distribution {dist_id}",
-                        )
-
-                    # Origin Shield review finding removed: "Variable based on cache hit
-                    # improvement vs additional costs" — net effect can go either way.
-                    _ = (should_check_origin_shield, origins)
-                except Exception as e:
-                    ctx.warn(f"Error analyzing CloudFront distribution {dist_id}: {e}", "cloudfront")
+                #
+                # Origin-Shield analysis removed: the finding it gated was deleted
+                # ("net effect can go either way"), but its CloudWatch fetch was
+                # left behind — a per-distribution get_distribution_config + two
+                # GetMetricStatistics calls whose result was discarded. The Requests
+                # call used Period=60 over a 7-day window (10080 datapoints > the
+                # 1440 limit), so it raised InvalidParameterCombination for EVERY
+                # distribution: 175 dead warnings + ~350 wasted API calls per scan
+                # (LW-01). The whole dead block is deleted.
 
     except Exception as e:
         ctx.warn(f"Could not perform CloudFront checks: {e}", "cloudfront")

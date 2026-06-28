@@ -52,6 +52,16 @@ def _route_ce_error(ctx: Any, action: str, exc: Exception) -> None:
                 f"{action} blocked: {code}", "commitment_analysis", action=action
             )
             return
+        if code == "DataUnavailableException":
+            # LW-06: DataUnavailableException is the EXPECTED response when the
+            # account holds no Savings Plans / Reserved capacity for the queried
+            # window — there is simply no utilization data, not a fault. Emit an
+            # informational note rather than an error-styled warning.
+            ctx.warn(
+                f"{action}: no data — account has no active Savings Plans / Reserved capacity in the window",
+                "commitment_analysis",
+            )
+            return
     ctx.warn(f"{action} failed: {exc}", "commitment_analysis")
 
 

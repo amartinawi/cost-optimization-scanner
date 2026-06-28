@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (first real-scan audit — M360 / ap-south-1)
+The first live multi-account scan surfaced a class of issues that static review +
+mocked unit tests structurally could not: runtime AWS API errors, dead code that
+emits no finding, and report noise at real scale. All adversarially verified
+against the scan's JSON + live ap-south-1 pricing.
+
+- **CloudFront dead-code storm (175 of 181 warnings).** `services/cloudfront.py`
+  fetched `CacheHitRate`/`Requests` per distribution to compute a value that was
+  then discarded (`_ = (...)`); the `Requests` call used `Period=60` over 7 days
+  (10080 datapoints > the 1440 limit), raising `InvalidParameterCombination` on
+  every distribution. The dead block is deleted (175 fewer warnings + ~350 fewer
+  API calls). The surviving price-class lever now reads CloudWatch from
+  **us-east-1**, where CloudFront publishes its metrics.
+- **30-day forecast overstated ~2×.** `core/trend_analysis.py` called
+  `get_cost_forecast(Granularity="MONTHLY")` over a window straddling two calendar
+  months, so Cost Explorer summed two full-month buckets (a "$57k 30-day forecast"
+  against a ~$27k/mo run rate). Switched to `Granularity="DAILY"`.
+- **QuickSight non-functional against real AWS.** `describe_spice_capacity` is not
+  a boto3 operation (no read API for SPICE capacity exists) — it raised
+  `AttributeError` every scan. Guarded with `hasattr` (skips cleanly in prod;
+  unit-tested via the fake client). QuickSight identity ops (`ListUsers`) now
+  route to the **us-east-1 identity endpoint** via `ClientRegistry._GLOBAL_SERVICES`.
+- **DMS terminate safety (fidelity).** "Unused instance" terminate recs were gated
+  on CPU < 5% alone; a low-CPU instance running a CDC task is in-use, and
+  recommending its termination is dangerous. Now gated on `describe_replication_tasks`
+  — any attached task (or an unreadable task state) demotes the rec to a $0 advisory
+  instead of a counted full-cost terminate. Also removed the dead
+  `describe_replication_configs` paginator block (it crashed on a non-existent
+  paginator while discarding its result).
+- **RDS upper-bound snapshots demoted (fidelity).** Snapshot savings that could not
+  be validated against a Cost Explorer backup actual were counted at the
+  provisioned-size **upper bound** (overstatement). They are now `Counted=False`
+  advisories — rendered with the upper-bound figure but excluded from the headline.
+- **S3 count-flag consistency.** $0 bucket-analysis cards used a bespoke
+  `Advisory=True` the reporter's count logic ignored (showing 336 advisory cards as
+  "counted"). They now carry the standard `Counted=False`; savings-bearing buckets
+  carry `Counted=True`.
+- **Aurora card render parity.** Rightsizing/Graviton/IO-tier recs now carry the
+  numeric `EstimatedMonthlySavings` + `Counted` (not only `monthly_savings`), so a
+  multi-rec Aurora group's card sums correctly instead of showing the first rec only.
+- **Log hygiene.** `core/trend_analysis.py`'s 27 `print("🔍 …")` debug lines →
+  `logging`; MediaStore's unreachable-endpoint error in unsupported regions →
+  quiet debug skip; Savings Plans `DataUnavailableException` (no active plans) →
+  informational note, not an error warning; `fastest_growing` now requires a
+  ≥ $1 prior-month base (kills 52,114%-growth noise on sub-penny services).
+
 ### Fixed (cost-fidelity LOW remediation — `docs/audits/LOW_REMEDIATION_PROMPT.md`)
 Closes the LOW backlog (the ~100 REPRODUCES findings of the 34-adapter audit),
 completing the cost-fidelity sweep after CRITICAL and HIGH. The through-line is

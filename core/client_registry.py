@@ -33,6 +33,12 @@ class ClientRegistry:
             "budgets",
             "cost-optimization-hub",
             "organizations",
+            # QuickSight user/namespace (identity) operations must hit the account's
+            # QuickSight identity region — us-east-1 for the common case. Calling
+            # them from the scan region raises AccessDenied ("use the us-east-1
+            # endpoint"). Route to us-east-1 (LW-03). Accounts whose QuickSight
+            # identity region differs would still need an explicit override.
+            "quicksight",
         }
     )
 

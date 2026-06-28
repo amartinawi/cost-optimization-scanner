@@ -134,6 +134,12 @@ class DmsModule(BaseServiceModule):
                 iid = rec.get("InstanceId") or rec.get("ReplicationInstanceIdentifier", "")
                 if iid and iid in multi_az_ids:
                     continue
+                if rec.get("Counted") is False:
+                    # dms F3 — the shim already demoted this to a $0 advisory (e.g.
+                    # a low-CPU instance with attached replication tasks). Render it
+                    # but never price or count it.
+                    enriched.append(dict(rec, EstimatedMonthlySavings=0.0))
+                    continue
                 instance_class = rec.get("InstanceClass", "")
                 factor = _DMS_SAVINGS_FACTORS.get(rec.get("CheckCategory", ""))
                 per_rec_saving = 0.0
@@ -178,8 +184,15 @@ class DmsModule(BaseServiceModule):
         if multi_az_recs:
             sources["multi_az_review"] = SourceBlock(count=len(multi_az_recs), recommendations=tuple(multi_az_recs))
 
-        # Count hygiene: $0 advisory Multi-AZ recs are rendered but not counted.
-        kept_heuristic = sum(block.count for key, block in sources.items() if key != "multi_az_review")
+        # Count hygiene: $0 advisory recs (Multi-AZ review, and dms F3 low-CPU-but-
+        # task-attached instances) are rendered but excluded from the headline count.
+        kept_heuristic = sum(
+            1
+            for key, block in sources.items()
+            if key != "multi_az_review"
+            for r in block.recommendations
+            if r.get("Counted") is not False
+        )
         counted_multi_az = sum(1 for r in multi_az_recs if r.get("Counted"))
         total_count = kept_heuristic + counted_multi_az
 

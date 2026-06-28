@@ -297,6 +297,12 @@ def _check_provisioned_instances(
                                 "current_value": f"{cls} (avg CPU {avg_cpu:.0f}%, peak {peak_cpu:.0f}% / 14d)",
                                 "recommended_value": f"Downsize to {cand_class}",
                                 "monthly_savings": round(cur_price - cand_price, 2),
+                                # F4 — carry the numeric counted dollar + Counted flag
+                                # (mirrors every other counted adapter) so a multi-rec
+                                # Aurora group's card sums correctly instead of falling
+                                # back to only the first rec's free-text figure.
+                                "EstimatedMonthlySavings": round(cur_price - cand_price, 2),
+                                "Counted": True,
                                 "Recommendation": f"Downsize {cls} → {cand_class} (peak-aware)",
                                 "EstimatedSavings": f"${cur_price - cand_price:.2f}/mo",
                                 "reason": (
@@ -334,6 +340,8 @@ def _check_provisioned_instances(
                             "current_value": f"x86 {rightsized_class}",
                             "recommended_value": f"Migrate to Graviton {grav_class}",
                             "monthly_savings": round(base_price - grav_price, 2),
+                            "EstimatedMonthlySavings": round(base_price - grav_price, 2),
+                            "Counted": True,
                             "Recommendation": f"Migrate {rightsized_class} → {grav_class} (Graviton/ARM)",
                             "EstimatedSavings": f"${base_price - grav_price:.2f}/mo",
                             "reason": (
@@ -522,6 +530,8 @@ def _check_io_tier(
                 "current_value": f"Standard I/O, ~{monthly_io:,.0f} ops/month, {storage_gb:.0f} GB storage",
                 "recommended_value": "Switch to I/O-Optimized storage tier",
                 "monthly_savings": round(savings, 2),
+                "EstimatedMonthlySavings": round(savings, 2),
+                "Counted": True,
                 "EstimatedSavings": f"${savings:.2f}/mo",
                 "reason": (
                     f"I/O-Optimized tier saves ${savings:.2f}/mo over Standard "
