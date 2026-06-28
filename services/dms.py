@@ -12,6 +12,12 @@ from typing import Any
 from core.scan_context import ScanContext
 from services._aws_errors import record_aws_error
 
+# Replication-instance states in which the instance is NOT yet (or no longer)
+# billing: pre-live provisioning and terminal failure. Every other reported
+# state — ``available``, ``modifying``, ``upgrading``, ``maintenance``,
+# ``storage-full`` — continues to accrue charges and is in scope (dms L4).
+_NON_BILLABLE_STATES: frozenset[str] = frozenset({"creating", "deleting", "failed"})
+
 DMS_OPTIMIZATION_DESCRIPTIONS: dict[str, dict[str, str]] = {
     "serverless_migration": {
         "title": "DMS Serverless Migration Review",
@@ -56,7 +62,7 @@ def get_enhanced_dms_checks(ctx: ScanContext) -> dict[str, Any]:
                 # the Multi-AZ->Single-AZ per-AZ-delta lever (dms H1/H2).
                 multi_az = bool(instance.get("MultiAZ", False))
 
-                if status == "available" and instance_class:
+                if status not in _NON_BILLABLE_STATES and instance_class:
                     try:
                         end_time = datetime.now(UTC)
                         start_time = end_time - timedelta(days=7)
@@ -129,11 +135,15 @@ def get_enhanced_dms_checks(ctx: ScanContext) -> dict[str, Any]:
                 # DMS Serverless monitor finding removed: "Variable based on usage" with
                 # no per-config quantification — monitoring nudge, not a saving.
                 _ = serverless_configs
-        except Exception:
-            pass
+        except Exception as e:
+            # Don't silently swallow: a serverless AccessDenied/throttle must
+            # surface as a signal to the operator, not vanish (dms L2).
+            record_aws_error(ctx, e, service="dms", context="describe_replication_configs")
 
     except Exception as e:
-        ctx.warn(f"Could not analyze DMS resources: {e}", "dms")
+        # Promote AccessDenied/UnauthorizedOperation to ctx.permission_issue;
+        # everything else routes to ctx.warn (dms L3).
+        record_aws_error(ctx, e, service="dms", context="Could not analyze DMS resources")
 
     all_recommendations: list[dict[str, Any]] = []
     for _category, recs in checks.items():

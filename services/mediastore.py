@@ -27,8 +27,8 @@ def get_enhanced_mediastore_checks(ctx: ScanContext) -> dict[str, Any]:
 
     try:
         mediastore = ctx.client("mediastore")
-        response = mediastore.list_containers()
-        containers = response.get("Containers", [])
+        paginator = mediastore.get_paginator("list_containers")
+        containers = [c for page in paginator.paginate() for c in page.get("Containers", [])]
 
         for container in containers:
             container_name = container.get("Name")
@@ -94,24 +94,8 @@ def get_enhanced_mediastore_checks(ctx: ScanContext) -> dict[str, Any]:
                     except Exception:
                         storage_gb = 0
 
-                    try:
-                        upload_metrics = cloudwatch.get_metric_statistics(
-                            Namespace="AWS/MediaStore",
-                            MetricName="BytesUploaded",
-                            Dimensions=[{"Name": "ContainerName", "Value": container_name}],
-                            StartTime=start_time,
-                            EndTime=end_time,
-                            Period=86400,
-                            Statistics=["Sum"],
-                        )
-                        monthly_ingest_bytes = sum(dp["Sum"] for dp in upload_metrics.get("Datapoints", []))
-                        monthly_ingest_gb = monthly_ingest_bytes / (1024**3)
-                        ingest_cost = monthly_ingest_gb * 0.02
-                    except Exception:
-                        ingest_cost = 0
-
                     storage_cost_per_gb = 0.023 * ctx.pricing_multiplier
-                    estimated_savings = (storage_gb * storage_cost_per_gb) + ingest_cost
+                    estimated_savings = storage_gb * storage_cost_per_gb
                     savings_str = f"${estimated_savings:.2f}/month" if estimated_savings > 0 else "$0.00/month"
 
                     # Only flag unused when every activity read succeeded AND
@@ -123,10 +107,9 @@ def get_enhanced_mediastore_checks(ctx: ScanContext) -> dict[str, Any]:
                                 "ContainerName": container_name,
                                 "ActivityLast14Days": total_activity,
                                 "EstimatedStorageGB": storage_gb,
-                                "IngestCost": ingest_cost,
                                 "Recommendation": (
                                     f"Container shows no activity in last 14 days "
-                                    f"({storage_gb:.1f} GB stored, {ingest_cost:.2f} ingest) - consider deletion"
+                                    f"({storage_gb:.1f} GB stored) - consider deletion"
                                 ),
                                 "EstimatedSavings": savings_str,
                                 "CheckCategory": "Unused Resource Cleanup",

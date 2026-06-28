@@ -42,11 +42,27 @@ class AppRunnerModule(BaseServiceModule):
         savings = 0.0
         for rec in recs:
             instance_config = rec.get("InstanceConfiguration", {}) or {}
-            mem_str = instance_config.get("Memory", "2 GB")
+            mem_str = instance_config.get("Memory")
+            if not mem_str:
+                # No memory config to price the standing charge against — warn and
+                # emit a $0 advisory rather than fabricate a counted 2 GB dollar.
+                ctx.warn(
+                    f"App Runner '{rec.get('ServiceName')}': InstanceConfiguration.Memory "
+                    "missing; skipping counted dollar",
+                    service="apprunner",
+                )
+                rec["EstimatedMonthlySavings"] = 0.0
+                continue
             try:
                 mem_gb = float(str(mem_str).split()[0])
             except (ValueError, IndexError):
-                mem_gb = 2.0
+                ctx.warn(
+                    f"App Runner '{rec.get('ServiceName')}': InstanceConfiguration.Memory "
+                    f"'{mem_str}' unparseable; skipping counted dollar",
+                    service="apprunner",
+                )
+                rec["EstimatedMonthlySavings"] = 0.0
+                continue
             provisioned_monthly = mem_gb * APP_RUNNER_MEM_GB_HOURLY * HOURS_PER_MONTH * multiplier
             rec["EstimatedMonthlySavings"] = round(provisioned_monthly, 2)
             rec["AuditBasis"] = {

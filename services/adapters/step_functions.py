@@ -31,7 +31,7 @@ class StepFunctionsModule(BaseServiceModule):
 
     def required_clients(self) -> tuple[str, ...]:
         """Returns boto3 client names required for Step Functions scanning."""
-        return ("states", "cloudwatch")
+        return ("stepfunctions", "cloudwatch")
 
     def scan(self, ctx: Any) -> ServiceFindings:
         """Scan Step Functions state machines for cost optimization opportunities.

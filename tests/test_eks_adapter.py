@@ -167,15 +167,38 @@ def test_node_group_estimate_advisory_not_counted():
     })
     findings = EksCostModule().scan(_ctx(eks))  # ec2 price 0.10/hr -> $146/mo for 2 nodes
     ng = _recs(findings, "node_group_optimization")
-    # ON_DEMAND + x86 -> both a Spot and a Graviton advisory line.
-    assert any("Spot" in r["recommended_value"] for r in ng)
-    assert any("Graviton" in r["recommended_value"] for r in ng)
-    spot = next(r for r in ng if "Spot" in r["recommended_value"])
-    grav = next(r for r in ng if "Graviton" in r["recommended_value"])
-    assert spot["monthly_savings"] == round(146.0 * 0.70, 2)   # ~102.20 advisory estimate
-    assert grav["monthly_savings"] == round(146.0 * 0.20, 2)   # ~29.20
-    # ALL advisory — never counted in the EKS tab total (EC2 domain).
-    assert all(r["Counted"] is False for r in ng)
+    # ON_DEMAND + x86 -> ONE collapsed advisory naming BOTH mutually exclusive
+    # levers (Spot ~70% and Graviton ~20%), carrying only the larger Spot saving.
+    assert len(ng) == 1
+    rec = ng[0]
+    assert "Spot" in rec["recommended_value"]
+    assert "Graviton" in rec["recommended_value"]
+    assert rec["monthly_savings"] == round(146.0 * 0.70, 2)   # ~102.20 (larger lever only)
+    # Advisory — never counted in the EKS tab total (EC2 domain). Collapsing to one
+    # rec means even a future Counted=True promotion can never sum 0.70x + 0.20x.
+    assert rec["Counted"] is False
+    assert findings.total_monthly_savings == 0.0
+
+
+def test_spot_x86_node_group_gets_graviton_only_advisory():
+    eks = _FakeEks({
+        "prod": {
+            "cluster": {"status": "ACTIVE", "version": "1.31"},
+            "nodegroups": {"ng1": {
+                "instanceTypes": ["m5.large"], "capacityType": "SPOT",
+                "scalingConfig": {"desiredSize": 2},
+            }},
+        }
+    })
+    findings = EksCostModule().scan(_ctx(eks))  # ec2 price 0.10/hr -> $146/mo for 2 nodes
+    ng = _recs(findings, "node_group_optimization")
+    # SPOT but still x86: Spot lever already taken -> ONE Graviton-only advisory.
+    assert len(ng) == 1
+    rec = ng[0]
+    assert "Graviton" in rec["recommended_value"]
+    assert "Spot" not in rec["recommended_value"]
+    assert rec["monthly_savings"] == round(146.0 * 0.20, 2)   # ~29.20
+    assert rec["Counted"] is False
     assert findings.total_monthly_savings == 0.0
 
 

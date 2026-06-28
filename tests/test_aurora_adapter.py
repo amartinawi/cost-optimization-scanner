@@ -56,7 +56,7 @@ def _pricing():
         "db.r5.8xlarge": 3737.60, "db.r5.2xlarge": 934.40,
         "db.r6g.8xlarge": 3344.86, "db.r6g.2xlarge": 836.58,
     }
-    pe.get_rds_instance_monthly_price.side_effect = lambda engine, cls: prices.get(cls, 0.0)
+    pe.get_rds_instance_monthly_price.side_effect = lambda engine, cls, **kw: prices.get(cls, 0.0)
     return pe
 
 

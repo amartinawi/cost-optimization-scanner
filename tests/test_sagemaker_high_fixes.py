@@ -340,6 +340,57 @@ def test_total_equals_sum_of_counted_recs() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# L2 — paginator-failure fallback walks every NextToken page (no 1-page cap)
+# --------------------------------------------------------------------------- #
+class _FakeSageMakerNoPaginator:
+    """SageMaker client whose paginator is unavailable.
+
+    ``get_paginator`` raises so the adapter takes the manual fallback; the
+    fallback must then walk every ``NextToken`` page rather than capping at the
+    first ~100 endpoints.
+    """
+
+    def __init__(self, pages_by_token: dict[Any, dict[str, Any]]) -> None:
+        self._pages = pages_by_token
+        self.calls: list[Any] = []
+
+    def get_paginator(self, name: str) -> Any:  # noqa: ANN401 - boto3 shape
+        raise RuntimeError("paginator unavailable")
+
+    def list_endpoints(self, **kwargs: Any) -> dict[str, Any]:
+        token = kwargs.get("NextToken")
+        self.calls.append(token)
+        return self._pages[token]
+
+
+def test_list_endpoints_fallback_paginates_all_pages() -> None:
+    pages = {
+        None: {"Endpoints": [{"EndpointName": "ep-0"}], "NextToken": "t1"},
+        "t1": {"Endpoints": [{"EndpointName": "ep-1"}], "NextToken": "t2"},
+        "t2": {"Endpoints": [{"EndpointName": "ep-2"}]},  # no NextToken -> last
+    }
+    sm = _FakeSageMakerNoPaginator(pages)
+
+    endpoints = sm_mod._list_endpoints(sm)
+
+    # All three pages walked, not just the first (the old single-call fallback
+    # would have returned only "ep-0").
+    assert [ep["EndpointName"] for ep in endpoints] == ["ep-0", "ep-1", "ep-2"]
+    # First call has no token; subsequent calls thread the prior NextToken.
+    assert sm.calls == [None, "t1", "t2"]
+
+
+def test_list_endpoints_fallback_single_page() -> None:
+    pages = {None: {"Endpoints": [{"EndpointName": "only-ep"}]}}
+    sm = _FakeSageMakerNoPaginator(pages)
+
+    endpoints = sm_mod._list_endpoints(sm)
+
+    assert [ep["EndpointName"] for ep in endpoints] == ["only-ep"]
+    assert sm.calls == [None]  # one call, then break on absent NextToken
+
+
+# --------------------------------------------------------------------------- #
 # Fast mode: no CloudWatch reads for the idle check; no crash.
 # --------------------------------------------------------------------------- #
 def test_fast_mode_skips_idle_cloudwatch() -> None:

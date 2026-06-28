@@ -398,3 +398,102 @@ def test_enhanced_over_provisioned_access_denied_is_permission_issue():
 def _scan_with_real_shim(ctx):
     """Run the adapter against the real shims using the fake-client ctx."""
     return dynamodb_adapter.DynamoDbModule().scan(ctx)
+
+
+# --------------------------------------------------------------------------- #
+# scan() path — L3 Cost Hub index-ARN dedup
+# --------------------------------------------------------------------------- #
+def test_scan_coh_index_arn_dedupes_against_covered_table(monkeypatch):
+    """A CoH rec on a GSI of an already-covered table must not double-count.
+
+    The resourceId is an index ARN (...:table/MyTable/index/MyGSI). The table
+    "MyTable" is already covered by the enhanced over-provisioned rec, so the
+    naive split("/")[-1] would yield "MyGSI" and fail to dedupe; the fix extracts
+    "MyTable" and drops the CoH saving rather than summing it (DynamoDB L3).
+    """
+    over_rec = {
+        "TableName": "MyTable",
+        "ReadCapacityUnits": 500,
+        "WriteCapacityUnits": 300,
+        "RightsizedReadCapacity": 36,
+        "RightsizedWriteCapacity": 9,
+        "MetricsAvailable": True,
+        "LowUtilization": True,
+        "CheckCategory": "DynamoDB Over-Provisioned Capacity",
+    }
+    coh = [
+        {
+            "resourceId": "arn:aws:dynamodb:us-east-1:123456789012:table/MyTable/index/MyGSI",
+            "estimatedMonthlySavings": 99.0,
+        }
+    ]
+    monkeypatch.setattr(dynamodb_adapter, "get_dynamodb_table_analysis", lambda ctx: {"optimization_opportunities": []})
+    monkeypatch.setattr(
+        dynamodb_adapter, "get_enhanced_dynamodb_checks", lambda ctx: {"recommendations": [dict(over_rec)]}
+    )
+    findings = dynamodb_adapter.DynamoDbModule().scan(_ctx(cost_hub_splits={"dynamodb": coh}))
+    # CoH index-ARN rec is deduped against MyTable: dropped, not summed.
+    assert findings.sources["cost_optimization_hub"].count == 0
+    # Only the over-provisioned delta remains in the headline.
+    assert findings.total_monthly_savings == pytest.approx(_expected_delta(500, 300, 36, 9), abs=0.01)
+
+
+def test_scan_coh_index_arn_uncovered_table_is_kept(monkeypatch):
+    """A CoH index-ARN rec on a table not otherwise covered is kept and summed."""
+    coh = [
+        {
+            "resourceId": "arn:aws:dynamodb:us-east-1:123456789012:table/OtherTable/index/OtherGSI",
+            "estimatedMonthlySavings": 42.0,
+        }
+    ]
+    monkeypatch.setattr(dynamodb_adapter, "get_dynamodb_table_analysis", lambda ctx: {"optimization_opportunities": []})
+    monkeypatch.setattr(dynamodb_adapter, "get_enhanced_dynamodb_checks", lambda ctx: {"recommendations": []})
+    findings = dynamodb_adapter.DynamoDbModule().scan(_ctx(cost_hub_splits={"dynamodb": coh}))
+    assert findings.sources["cost_optimization_hub"].count == 1
+    assert findings.total_monthly_savings == pytest.approx(42.0, abs=0.01)
+
+
+def test_scan_coh_plain_table_arn_dedupes_against_covered_table(monkeypatch):
+    """A CoH rec with a plain table ARN still dedupes against the covered table."""
+    over_rec = {
+        "TableName": "MyTable",
+        "ReadCapacityUnits": 500,
+        "WriteCapacityUnits": 300,
+        "RightsizedReadCapacity": 36,
+        "RightsizedWriteCapacity": 9,
+        "MetricsAvailable": True,
+        "LowUtilization": True,
+        "CheckCategory": "DynamoDB Over-Provisioned Capacity",
+    }
+    coh = [
+        {
+            "resourceId": "arn:aws:dynamodb:us-east-1:123456789012:table/MyTable",
+            "estimatedMonthlySavings": 77.0,
+        }
+    ]
+    monkeypatch.setattr(dynamodb_adapter, "get_dynamodb_table_analysis", lambda ctx: {"optimization_opportunities": []})
+    monkeypatch.setattr(
+        dynamodb_adapter, "get_enhanced_dynamodb_checks", lambda ctx: {"recommendations": [dict(over_rec)]}
+    )
+    findings = dynamodb_adapter.DynamoDbModule().scan(_ctx(cost_hub_splits={"dynamodb": coh}))
+    assert findings.sources["cost_optimization_hub"].count == 0
+    assert findings.total_monthly_savings == pytest.approx(_expected_delta(500, 300, 36, 9), abs=0.01)
+
+
+# --------------------------------------------------------------------------- #
+# Shim — L4 ACTIVE gate in get_dynamodb_table_analysis
+# --------------------------------------------------------------------------- #
+def test_table_analysis_skips_non_active_tables():
+    """CREATING/DELETING/UPDATING tables produce no optimization opportunities."""
+    creating = {
+        "TableName": "pending",
+        "TableStatus": "CREATING",
+        "ItemCount": 0,
+        "TableSizeBytes": 0,
+        "ProvisionedThroughput": {"ReadCapacityUnits": 100, "WriteCapacityUnits": 100},
+    }
+    ctx = _ctx(dynamodb=_FakeDynamoDB([dict(creating), dict(_TABLE_WITH_GSI)]))
+    analysis = ddb_shim.get_dynamodb_table_analysis(ctx)
+    surfaced = {row["TableName"] for row in analysis["optimization_opportunities"]}
+    assert "pending" not in surfaced
+    assert "t1" in surfaced

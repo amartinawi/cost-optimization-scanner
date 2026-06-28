@@ -164,6 +164,8 @@ def test_single_service_alb_is_advisory_zero() -> None:
     assert "AuditBasis" in rec
     # alb_count == 1 (<=5) => no aggregate shared rec either.
     assert _category(out, "shared_alb_opportunity") == []
+    # NET-05: the never-populated zero_traffic_albs category is removed.
+    assert "zero_traffic_albs" not in out
 
 
 # --------------------------------------------------------------------------- #

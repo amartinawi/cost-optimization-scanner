@@ -38,8 +38,6 @@ def get_enhanced_redshift_checks(ctx: ScanContext) -> dict[str, Any]:
         "reserved_instances": [],
         "serverless_optimization": [],
         "cluster_rightsizing": [],
-        "pause_resume_scheduling": [],
-        "storage_optimization": [],
     }
 
     try:
@@ -58,7 +56,9 @@ def get_enhanced_redshift_checks(ctx: ScanContext) -> dict[str, Any]:
             if cluster_status == "available" and cluster.get("ClusterCreateTime") and number_of_nodes >= 2:
                 create_time = cluster.get("ClusterCreateTime")
                 if isinstance(create_time, str):  # noqa: SIM108
-                    cluster_age_days = 30
+                    cluster_age_days = (
+                        datetime.now(UTC) - datetime.fromisoformat(create_time.replace("Z", "+00:00"))
+                    ).days
                 else:
                     cluster_age_days = (datetime.now(UTC) - create_time).days  # type: ignore[operator]
 

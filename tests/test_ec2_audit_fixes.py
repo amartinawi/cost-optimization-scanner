@@ -84,7 +84,12 @@ def test_classify_utilization():
 
 
 def test_coh_is_renderable():
-    assert _coh_is_renderable({"resourceId": "i-1"}) is True
+    # A rec with an actionType and a normal resource id is rendered -> renderable.
+    assert _coh_is_renderable({"actionType": "Rightsize", "resourceId": "i-1"}) is True
+    # No actionType: the reporter skips it, so the adapter must not count it.
+    assert _coh_is_renderable({"resourceId": "i-1"}) is False
+    # finding == 'optimized': the reporter skips it too (case-insensitive).
+    assert _coh_is_renderable({"actionType": "Rightsize", "finding": "Optimized"}) is False
     assert _coh_is_renderable({"actionType": "PurchaseReservedInstances"}) is False
     assert _coh_is_renderable({"actionType": "Rightsize", "resourceId": "N/A"}) is False
     assert (
@@ -347,7 +352,8 @@ def test_spot_instances_are_skipped():
 # --------------------------------------------------------------------------- #
 def test_cross_source_dedup_counts_each_instance_once(monkeypatch):
     """Same instance in CoH + CO + heuristics is counted once; highest heuristic wins."""
-    coh = [{"resourceId": "i-AAA", "estimatedMonthlySavings": 100.0}]
+    # actionType present so the rec is renderable (mirrors a real CoH rightsizing rec).
+    coh = [{"resourceId": "i-AAA", "estimatedMonthlySavings": 100.0, "actionType": "Rightsize"}]
     co = [
         {
             "instanceArn": "arn:.../i-AAA",  # duplicate of CoH -> dropped

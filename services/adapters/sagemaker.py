@@ -88,9 +88,19 @@ def _list_endpoints(sm: Any) -> list[dict[str, Any]]:
             for ep in page.get("Endpoints", []):
                 endpoints.append(ep)
     except Exception:
+        # Paginator unavailable: fall back to a manual NextToken loop so the
+        # fallback still walks every page instead of silently capping at one
+        # (~100 endpoints).
         try:
-            resp = sm.list_endpoints()
-            endpoints = resp.get("Endpoints", [])
+            params: dict[str, Any] = {}
+            while True:
+                resp = sm.list_endpoints(**params)
+                for ep in resp.get("Endpoints", []):
+                    endpoints.append(ep)
+                token = resp.get("NextToken")
+                if not token:
+                    break
+                params["NextToken"] = token
         except Exception:
             pass
     return endpoints

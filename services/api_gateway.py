@@ -45,26 +45,6 @@ API_GATEWAY_OPTIMIZATION_DESCRIPTIONS: dict[str, dict[str, str]] = {
         "description": "REST APIs with ≤10 resources can migrate to cheaper HTTP APIs for 10-30% cost reduction.",
         "action": "Review simple REST APIs and migrate to HTTP API where feature compatibility allows",
     },
-    "unused_stages": {
-        "title": "Remove Unused API Gateway Stages",
-        "description": "Unused stages incur ongoing costs and should be cleaned up.",
-        "action": "Review and delete stages that are no longer in use",
-    },
-    "caching_opportunities": {
-        "title": "Enable API Gateway Caching",
-        "description": "Stages without cache clusters generate unnecessary backend calls that increase costs.",
-        "action": "Enable caching on stages with repetitive request patterns",
-    },
-    "throttling_optimization": {
-        "title": "Optimize API Gateway Throttling",
-        "description": "Proper throttling configuration prevents cost spikes from uncontrolled traffic.",
-        "action": "Review and configure appropriate throttling limits",
-    },
-    "request_validation": {
-        "title": "Review Request Validation Cost Impact",
-        "description": "Request validation can be tuned to reduce processing costs.",
-        "action": "Optimize request validation configurations for cost efficiency",
-    },
 }
 
 
@@ -84,14 +64,10 @@ def get_enhanced_api_gateway_checks(ctx: ScanContext) -> dict[str, Any]:
 
     Returns:
         A dict with a flat ``recommendations`` list plus one list per check
-        category (``rest_vs_http``, ``unused_stages``, …).
+        category (currently only ``rest_vs_http``).
     """
     checks: dict[str, list[dict[str, Any]]] = {
         "rest_vs_http": [],
-        "unused_stages": [],
-        "caching_opportunities": [],
-        "throttling_optimization": [],
-        "request_validation": [],
     }
 
     try:

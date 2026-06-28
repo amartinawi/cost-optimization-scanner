@@ -4,15 +4,21 @@ Analyzes AWS Cost Explorer data to surface under-utilized commitments,
 coverage gaps, expiring commitments, and purchase recommendations.
 
 AWS API cost: Cost Explorer charges $0.01 per API request. This adapter
-makes ~7 calls per scan (~$0.07/scan). The calls are:
+makes ~20 calls per scan (~$0.20/scan). The calls are:
 
-1. ``get_savings_plans_utilization`` — overall SP utilization rate
-2. ``get_savings_plans_utilization_details`` — per-SP utilization
-3. ``get_savings_plans_coverage`` — SP coverage rate by service
-4. ``get_reservation_utilization`` — RI utilization rate
-5. ``get_reservation_coverage`` — RI coverage rate by service
-6. ``get_savings_plans_purchase_recommendation`` — SP purchase recs
-7. ``get_reservation_purchase_recommendation`` — RI purchase recs
+1. ``get_savings_plans_utilization`` — overall SP utilization rate (1 call)
+2. ``get_savings_plans_utilization_details`` — per-SP utilization and the
+   expiry scan (2 calls: one in _check_sp_utilization, one in _check_expiring)
+3. ``get_savings_plans_coverage`` — SP coverage rate by service (1 call)
+4. ``get_reservation_utilization`` — RI utilization rate (1 call)
+5. ``get_reservation_coverage`` — RI coverage rate (1 call)
+6. ``get_savings_plans_purchase_recommendation`` — SP purchase matrix
+   (6 calls: COMPUTE_SP across 2 terms x 3 payment options)
+7. ``get_reservation_purchase_recommendation`` — RI purchase matrix
+   (6 calls: EC2 across 2 terms x 3 payment options)
+8. ``get_savings_plans_purchase_recommendation`` — account coverage-ratio
+   proxy for the Fargate SP view (1 call)
+9. ``get_cost_and_usage`` — SP-eligible Fargate on-demand legs (1 call)
 """
 
 from __future__ import annotations
@@ -66,7 +72,8 @@ class CommitmentAnalysisModule(BaseServiceModule):
     Uses Cost Explorer to detect under-utilized commitments, coverage gaps,
     expiring commitments, and purchase recommendations.
 
-    CE API cost: ~$0.07 per scan (7 calls at $0.01 each).
+    CE API cost: ~$0.20 per scan (~20 calls at $0.01 each including the
+    6-combination SP and RI purchase matrices).
     """
 
     key: str = "commitment_analysis"
@@ -81,7 +88,7 @@ class CommitmentAnalysisModule(BaseServiceModule):
         StatCardSpec(label="SP Utilization", source_path="extras.sp_utilization_rate", formatter="percent"),
         StatCardSpec(label="SP Coverage", source_path="extras.sp_coverage_rate", formatter="percent"),
         StatCardSpec(label="RI Utilization", source_path="extras.ri_utilization_rate", formatter="percent"),
-        StatCardSpec(label="Monthly Savings", source_path="total_monthly_savings", formatter="currency"),
+        StatCardSpec(label="RI Coverage", source_path="extras.ri_coverage_rate", formatter="percent"),
     )
 
     grouping = GroupingSpec(by="check_category")
@@ -109,6 +116,7 @@ class CommitmentAnalysisModule(BaseServiceModule):
 
         ce = ctx.client("ce")
         if not ce:
+            ctx.warn("Cost Explorer client unavailable; commitment analysis skipped", "commitment_analysis")
             return self._empty_findings()
 
         tp = _time_period()
@@ -289,7 +297,7 @@ class CommitmentAnalysisModule(BaseServiceModule):
                                 "recommended_value": f"{self.COVERAGE_GAP_THRESHOLD:.0%}+",
                                 "monthly_savings": round(potential, 2),
                                 "severity": "MEDIUM",
-                                "reason": f"{svc} has {rate:.1%} SP coverage (below {self.COVERAGE_GAP_THRESHOLD:.0%} threshold)",
+                                "reason": f"{svc} has {rate:.1%} SP coverage (below {self.COVERAGE_GAP_THRESHOLD:.0%} threshold; potential estimated using {self.AVG_SP_DISCOUNT_RATE:.0%} flat avg SP discount — verify against live offering rates)",
                             }
                         )
                 next_token = resp.get("NextToken")
@@ -365,6 +373,10 @@ class CommitmentAnalysisModule(BaseServiceModule):
 
         return recs, overall_rate
 
+    # Coverage gap (intentional): this only ever returns recs=[] plus the
+    # overall stat-card rate. GetReservationCoverage rejects a SERVICE DIMENSION
+    # groupBy, so no per-service RI coverage-gap rec is emitted — and such a rec
+    # would overlap the RI purchase recommendations anyway.
     def _check_ri_coverage(self, ctx: Any, ce: Any, tp: dict[str, str]) -> tuple[list[dict[str, Any]], float]:
         """Check Reserved Instance coverage by service.
 
@@ -392,6 +404,10 @@ class CommitmentAnalysisModule(BaseServiceModule):
 
         return recs, overall_rate
 
+    # Coverage gap (intentional): expiry detection is Savings-Plans-only.
+    # GetSavingsPlansUtilizationDetails exposes per-SP end timestamps; there is
+    # no Reserved Instance equivalent queried here, so RI expirations are not
+    # flagged.
     def _check_expiring(self, ctx: Any, ce: Any, tp: dict[str, str]) -> list[dict[str, Any]]:
         """Check for expiring Savings Plans using utilization details.
 
@@ -475,6 +491,11 @@ class CommitmentAnalysisModule(BaseServiceModule):
         ("PARTIAL_UPFRONT", "Partial Upfront"),
         ("ALL_UPFRONT", "All Upfront"),
     )
+    # Coverage gap (intentional): only Compute Savings Plans (COMPUTE_SP) and
+    # EC2 Reserved Instances are queried below. EC2-Instance / SageMaker SP
+    # types and ElastiCache / RDS / Redshift / OpenSearch RI purchase scenarios
+    # are not modelled here — those surface via the Cost Optimization Hub
+    # buckets routed into this adapter instead.
     _SP_TYPES: tuple[str, ...] = ("COMPUTE_SP",)
     # (Cost Explorer API service value, display label). The RI purchase API
     # rejects "Amazon EC2" — it requires the full "Amazon Elastic Compute Cloud
@@ -725,6 +746,10 @@ class CommitmentAnalysisModule(BaseServiceModule):
         }
         return recs, extras
 
+    # Coverage gap (intentional): the leg query filters on SERVICE = "Amazon
+    # Elastic Container Service" (ECS) only, so EKS-on-Fargate spend is excluded
+    # even though Compute Savings Plans cover both ECS and EKS Fargate (see the
+    # module-level note: "Compute Savings Plans cover Fargate (ECS + EKS)").
     def _fargate_legs(self, ctx: Any, ce: Any, tp: dict[str, str]) -> dict[str, dict[str, float]]:
         """Fetch SP-eligible Fargate on-demand cost + usage per usage type, for ctx.region."""
         legs: dict[str, dict[str, float]] = {}

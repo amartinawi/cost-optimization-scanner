@@ -420,7 +420,7 @@ def get_efs_findings(
                                     "CheckCategory": "EFS No Lifecycle", "Counted": False,
                                     "Recommendation": "Enable IA lifecycle policy for infrequently accessed data",
                                     "EstimatedSavings": (
-                                        f"up to ~${gross:.2f}/month gross before IA read-access charges "
+                                        f"up to ~${gross:.2f}/mo-gross before IA read-access charges "
                                         f"(net depends on access patterns; enable CloudWatch metrics to quantify)"
                                     ),
                                     "AuditBasis": {
@@ -450,7 +450,7 @@ def get_efs_findings(
                                 "FileSystemId": fs_id, "Name": name, "SizeGB": round(total_gb, 2),
                                 "CheckCategory": "EFS One Zone Migration", "Counted": False,
                                 "Recommendation": "Migrate to One Zone storage if Multi-AZ resilience is not required",
-                                "EstimatedSavings": f"~${oz_savings:.2f}/month if migrated (durability tradeoff)",
+                                "EstimatedSavings": f"~${oz_savings:.2f}/mo-equiv if migrated (durability tradeoff)",
                             }
                         )
 

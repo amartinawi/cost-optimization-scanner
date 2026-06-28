@@ -79,6 +79,42 @@ class _FakeDmsClient:
         return _FakePaginator([{}])
 
 
+class _RaisingPaginator:
+    """Paginator whose ``paginate`` raises — drives the shim error handlers."""
+
+    def __init__(self, error: Exception) -> None:
+        self._error = error
+
+    def paginate(self):  # noqa: ANN201 - boto3 shape
+        raise self._error
+
+
+class _ConfigurableDmsClient:
+    """DMS client whose paginators can be wired to raise (error-path tests)."""
+
+    def __init__(
+        self,
+        instances: list[dict[str, Any]] | None = None,
+        *,
+        instances_error: Exception | None = None,
+        configs_error: Exception | None = None,
+    ) -> None:
+        self._instances = instances or []
+        self._instances_error = instances_error
+        self._configs_error = configs_error
+
+    def get_paginator(self, name: str):  # noqa: ANN201 - boto3 shape
+        if name == "describe_replication_instances":
+            if self._instances_error:
+                return _RaisingPaginator(self._instances_error)
+            return _FakePaginator([{"ReplicationInstances": self._instances}])
+        if name == "describe_replication_configs":
+            if self._configs_error:
+                return _RaisingPaginator(self._configs_error)
+            return _FakePaginator([{"ReplicationConfigs": []}])
+        return _FakePaginator([{}])
+
+
 class _FakeCloudWatch:
     """Returns a canned average CPU per instance id, or raises a canned error."""
 
@@ -160,6 +196,18 @@ def _rec(iid: str, *, multi_az: bool, klass: str = "dms.t3.medium") -> dict[str,
         "Recommendation": "Low CPU utilization",
         "EstimatedSavings": "Rightsize for ~35% savings on instance cost",
         "CheckCategory": "Instance Optimization",
+    }
+
+
+def _unused_rec(iid: str, *, multi_az: bool, klass: str = "dms.t3.medium") -> dict[str, Any]:
+    return {
+        "InstanceId": iid,
+        "InstanceClass": klass,
+        "MultiAZ": multi_az,
+        "AvgCPU": "2.0%",
+        "Recommendation": "Very low CPU utilization - consider stopping if unused",
+        "EstimatedSavings": "Full instance cost if terminated",
+        "CheckCategory": "Unused DMS Instances",
     }
 
 
@@ -330,3 +378,135 @@ def test_scan_end_to_end_multi_az_dev_instance() -> None:
     assert "instance_rightsizing" not in findings.sources
     assert findings.total_monthly_savings == pytest.approx(PER_AZ_DELTA)
     assert findings.total_recommendations == 1
+
+
+# --------------------------------------------------------------------------- #
+# scan() — L1: unused vs rightsizing factor split (1.0 vs 0.35)
+# --------------------------------------------------------------------------- #
+def test_scan_unused_counts_full_instance_cost(monkeypatch: pytest.MonkeyPatch) -> None:
+    # An *unused* instance recovers its FULL cost on termination (factor 1.0),
+    # NOT 35% — the rightsizing factor must not bleed onto the unused lever.
+    rec = _unused_rec("dms-idle-1", multi_az=False)
+    _patch_shim(monkeypatch, [rec], {"unused_instances": [rec], "instance_rightsizing": [], "serverless_migration": []})
+    pricing = _FakeDmsPricing()
+    ctx = _ctx(pricing)
+
+    findings = DmsModule().scan(ctx)
+
+    assert findings.total_monthly_savings == pytest.approx(SINGLE_AZ_MONTHLY * 1.0)
+    assert findings.total_monthly_savings != pytest.approx(SINGLE_AZ_MONTHLY * 0.35)
+    assert ("dms.t3.medium", False) in pricing.calls
+    assert findings.total_recommendations == 1
+
+    # L5: the enriched rec carries the counted dollar so the card renders the
+    # same figure the headline sums.
+    enriched = findings.sources["unused_instances"].recommendations[0]
+    assert enriched["EstimatedMonthlySavings"] == pytest.approx(SINGLE_AZ_MONTHLY * 1.0)
+    assert enriched["Counted"] is True
+    assert enriched["EstimatedSavings"] == f"${SINGLE_AZ_MONTHLY * 1.0:.2f}/month"
+    assert enriched["AuditBasis"]["factor"] == 1.0
+    assert enriched["AuditBasis"]["formula"] == "full instance monthly (terminate)"
+
+
+# --------------------------------------------------------------------------- #
+# scan() — L5: rightsizing rec also carries a counted dollar (render parity)
+# --------------------------------------------------------------------------- #
+def test_scan_rightsizing_rec_renders_counted_dollar(monkeypatch: pytest.MonkeyPatch) -> None:
+    rec = _rec("dms-prod-7", multi_az=False)
+    _patch_shim(monkeypatch, [rec], {"instance_rightsizing": [rec], "unused_instances": [], "serverless_migration": []})
+    pricing = _FakeDmsPricing()
+    ctx = _ctx(pricing)
+
+    findings = DmsModule().scan(ctx)
+
+    enriched = findings.sources["instance_rightsizing"].recommendations[0]
+    assert enriched["EstimatedMonthlySavings"] == pytest.approx(SINGLE_AZ_MONTHLY * 0.35)
+    assert enriched["Counted"] is True
+    assert enriched["EstimatedSavings"] == f"${SINGLE_AZ_MONTHLY * 0.35:.2f}/month"
+    assert enriched["AuditBasis"]["factor"] == 0.35
+
+
+def test_scan_pricing_miss_renders_prose_not_counted(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Pricing returns 0 -> no counted dollar; the rec still renders (prose) but
+    # carries no EstimatedMonthlySavings and is excluded from the headline.
+    rec = _rec("dms-prod-8", multi_az=False)
+    _patch_shim(monkeypatch, [rec], {"instance_rightsizing": [rec], "unused_instances": [], "serverless_migration": []})
+    pricing = _FakeDmsPricing(zero=True)
+    ctx = _ctx(pricing)
+
+    findings = DmsModule().scan(ctx)
+
+    assert findings.total_monthly_savings == 0.0
+    enriched = findings.sources["instance_rightsizing"].recommendations[0]
+    assert "EstimatedMonthlySavings" not in enriched
+
+
+# --------------------------------------------------------------------------- #
+# shim — L4: billable non-`available` states are in scope; pre-live/terminal out
+# --------------------------------------------------------------------------- #
+def test_shim_includes_billable_modifying_state() -> None:
+    cw = _FakeCloudWatch(avg_by_id={"dms-mod": 2.0})
+    ctx = _ctx(
+        None,
+        dms_client=_FakeDmsClient([_instance("dms-mod", multi_az=False, status="modifying")]),
+        cw_client=cw,
+    )
+
+    result = get_enhanced_dms_checks(ctx)
+
+    unused = result["checks"]["unused_instances"]
+    assert len(unused) == 1
+    assert unused[0]["InstanceId"] == "dms-mod"
+
+
+def test_shim_excludes_non_billable_creating_state() -> None:
+    cw = _FakeCloudWatch(avg_by_id={"dms-new": 2.0})
+    ctx = _ctx(
+        None,
+        dms_client=_FakeDmsClient([_instance("dms-new", multi_az=False, status="creating")]),
+        cw_client=cw,
+    )
+
+    result = get_enhanced_dms_checks(ctx)
+
+    assert result["recommendations"] == []
+
+
+# --------------------------------------------------------------------------- #
+# shim — L2: serverless-configs error is classified, not silently swallowed
+# --------------------------------------------------------------------------- #
+def test_shim_classifies_serverless_configs_accessdenied() -> None:
+    client = _ConfigurableDmsClient(instances=[], configs_error=_ClientError("AccessDenied"))
+    ctx = _ctx(None, dms_client=client, cw_client=_FakeCloudWatch())
+
+    result = get_enhanced_dms_checks(ctx)
+
+    assert ctx.permissions and ctx.permissions[0][0] == "dms"
+    assert "describe_replication_configs" in ctx.permissions[0][2]
+    assert result["recommendations"] == []
+
+
+# --------------------------------------------------------------------------- #
+# shim — L3: outer error promotes AccessDenied to permission_issue, else warn
+# --------------------------------------------------------------------------- #
+def test_shim_outer_accessdenied_routes_to_permission_issue() -> None:
+    client = _ConfigurableDmsClient(instances_error=_ClientError("AccessDenied"))
+    ctx = _ctx(None, dms_client=client, cw_client=_FakeCloudWatch())
+
+    result = get_enhanced_dms_checks(ctx)
+
+    assert ctx.permissions and ctx.permissions[0][0] == "dms"
+    assert "Could not analyze DMS resources" in ctx.permissions[0][2]
+    assert ctx.warnings == []
+    assert result["recommendations"] == []
+
+
+def test_shim_outer_non_permission_routes_to_warn() -> None:
+    client = _ConfigurableDmsClient(instances_error=RuntimeError("boom"))
+    ctx = _ctx(None, dms_client=client, cw_client=_FakeCloudWatch())
+
+    result = get_enhanced_dms_checks(ctx)
+
+    assert ctx.warnings and ctx.warnings[0][0] == "dms"
+    assert ctx.permissions == []
+    assert result["recommendations"] == []

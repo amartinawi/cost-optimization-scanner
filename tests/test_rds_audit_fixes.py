@@ -610,11 +610,49 @@ def test_aurora_engine_not_scheduled():
     assert "Non-Production Scheduling" not in cats
 
 
+def test_scheduling_honors_environment_tag_on_prod_named_db():
+    # L2: a DB tagged Environment=staging but named billing-db must still be
+    # schedulable — the name-substring gate alone would miss it. Mirrors the
+    # tag-first resolution the Multi-AZ check already uses.
+    arn = "arn:aws:rds:us-east-1:123456789012:db:billing-db"
+    ctx = _EnhancedCtx(
+        _FakeRdsClient(
+            instances=[_instance(DBInstanceIdentifier="billing-db")],
+            tags={arn: [{"Key": "Environment", "Value": "staging"}]},
+        ),
+        cloudwatch=_FakeCloudWatch(avg=0.1, mx=1.0),
+    )
+    sched = next(r for r in _recs(ctx) if r["CheckCategory"] == "Non-Production Scheduling")
+    assert sched["Environment"] == "staging"
+
+
+def test_scheduling_skips_untagged_prod_named_db():
+    # A prod-named, untagged DB stays out of scheduling (no tag, no name match).
+    ctx = _EnhancedCtx(
+        _FakeRdsClient(instances=[_instance(DBInstanceIdentifier="billing-db")]),
+        cloudwatch=_FakeCloudWatch(avg=0.1, mx=1.0),
+    )
+    cats = [r["CheckCategory"] for r in _recs(ctx)]
+    assert "Non-Production Scheduling" not in cats
+
+
 def test_multiaz_suppressed_when_busy():
     inst = _instance(DBInstanceIdentifier="dev-db", MultiAZ=True)
     ctx = _EnhancedCtx(
         _FakeRdsClient(instances=[inst]),
         cloudwatch=_FakeCloudWatch(avg=50.0, mx=120.0),
+    )
+    cats = [r["CheckCategory"] for r in _recs(ctx)]
+    assert "Multi-AZ Optimization" not in cats
+
+
+def test_aurora_multiaz_not_flagged_for_disable():
+    # L3: an Aurora member reporting MultiAZ=True must not get a standard-RDS
+    # Multi-AZ-disable finding — Aurora HA is not priced via deploymentOption SKUs.
+    inst = _instance(DBInstanceIdentifier="dev-aurora", Engine="aurora-mysql", MultiAZ=True)
+    ctx = _EnhancedCtx(
+        _FakeRdsClient(instances=[inst]),
+        cloudwatch=_FakeCloudWatch(avg=0.2, mx=1.0),
     )
     cats = [r["CheckCategory"] for r in _recs(ctx)]
     assert "Multi-AZ Optimization" not in cats
@@ -658,6 +696,23 @@ def test_backup_retention_is_advisory_no_dollar():
     # No fabricated "$X/month" figure (advisory only).
     assert "/month" not in backup["EstimatedSavings"]
     assert "advisory" in backup["EstimatedSavings"].lower()
+
+
+def test_backup_retention_advisory_uses_engine_aware_rate():
+    # L1: the backup-retention advisory must quote the engine-correct $/GB rate.
+    # Aurora bills ~$0.021/GB-mo vs standard RDS ~$0.095/GB-mo; the old call
+    # passed no engine and showed every DB at the standard rate (~4.5x too high).
+    aurora = _instance(DBInstanceIdentifier="prod-aurora", Engine="aurora-mysql", BackupRetentionPeriod=30)
+    ctx = _EnhancedCtx(_FakeRdsClient(instances=[aurora]))
+    a_backup = next(r for r in _recs(ctx) if r["CheckCategory"] == "Backup Retention Optimization")
+    assert a_backup["AuditBasis"]["rate"] == pytest.approx(0.021)
+    assert "$0.0210/GB-month" in a_backup["EstimatedSavings"]
+
+    standard = _instance(DBInstanceIdentifier="prod-mysql", Engine="mysql", BackupRetentionPeriod=30)
+    ctx2 = _EnhancedCtx(_FakeRdsClient(instances=[standard]))
+    s_backup = next(r for r in _recs(ctx2) if r["CheckCategory"] == "Backup Retention Optimization")
+    assert s_backup["AuditBasis"]["rate"] == pytest.approx(0.095)
+    assert "$0.0950/GB-month" in s_backup["EstimatedSavings"]
 
 
 def test_backup_retention_excluded_from_savings_but_rendered():

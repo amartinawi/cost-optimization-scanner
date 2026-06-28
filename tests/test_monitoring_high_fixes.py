@@ -40,6 +40,7 @@ from services.monitoring import (
     CW_CUSTOM_METRIC_TIER_1,
     _cw_custom_metrics_monthly_cost,
     _stale_custom_metric_counts,
+    get_cloudtrail_checks,
     get_cloudwatch_checks,
 )
 from services.route53 import _normalize_zone_id, get_route53_checks
@@ -85,11 +86,15 @@ class _FakeCloudWatchClient:
         self._alarms = alarms or []
         self._metric_data_fn = metric_data_fn
         self.get_metric_data_calls = 0
+        self.list_metrics_paginate_calls = 0
+        self.describe_alarms_paginate_calls = 0
 
     def get_paginator(self, name: str) -> _FakePaginator:
         if name == "describe_alarms":
+            self.describe_alarms_paginate_calls += 1
             return _FakePaginator([{"MetricAlarms": self._alarms}])
         if name == "list_metrics":
+            self.list_metrics_paginate_calls += 1
             return _FakePaginator([{"Metrics": self._metrics}])
         raise KeyError(name)
 
@@ -119,6 +124,22 @@ class _FakeRoute53Client:
         if name == "list_resource_record_sets":
             return _FakeRecordPaginator(self._records_by_zone)
         raise KeyError(name)
+
+
+class _FakeCloudTrailClient:
+    """Records whether any CloudTrail API was invoked (it must not be)."""
+
+    def __init__(self) -> None:
+        self.describe_trails_calls = 0
+        self.get_event_selectors_calls = 0
+
+    def describe_trails(self, **_kwargs: Any) -> dict[str, Any]:
+        self.describe_trails_calls += 1
+        return {"trailList": [{"Name": "t1", "TrailARN": "arn", "IsMultiRegionTrail": True}]}
+
+    def get_event_selectors(self, **_kwargs: Any) -> dict[str, Any]:
+        self.get_event_selectors_calls += 1
+        return {"EventSelectors": []}
 
 
 def _shim_ctx(clients: dict[str, Any], *, fast_mode: bool = False) -> SimpleNamespace:
@@ -269,18 +290,22 @@ def test_unused_custom_metrics_no_stale_is_advisory() -> None:
     assert _counted_sum(result["recommendations"]) == 0.0
 
 
-def test_unused_custom_metrics_fast_mode_advisory_no_metric_reads() -> None:
+def test_fast_mode_skips_cloudwatch_describe_paginators() -> None:
+    # L3 — MonitoringModule declares reads_fast_mode=True, so under --fast the
+    # shim must skip the list_metrics + describe_alarms paginators (the full
+    # CloudWatch describes), not just the GetMetricData staleness probe. The
+    # custom-metrics branch therefore emits no recs and no metric reads occur.
     metrics = _custom_metrics("MyApp", 200)
-    cw = _FakeCloudWatchClient(metrics=metrics, metric_data_fn=_metric_data_fn(set()))
+    alarms = [{"AlarmName": "a", "StateReason": "x"}]
+    cw = _FakeCloudWatchClient(metrics=metrics, alarms=alarms, metric_data_fn=_metric_data_fn(set()))
     ctx = _shim_ctx({"logs": _FakeLogsClient([]), "cloudwatch": cw}, fast_mode=True)
 
     result = get_cloudwatch_checks(ctx, pricing_multiplier=1.0)
-    rec = result["unused_custom_metrics"][0]
-    assert rec["EstimatedMonthlySavings"] == 0.0
-    assert rec["Counted"] is False
-    assert rec["StaleMetricCount"] is None
-    # Fast mode must not make any GetMetricData call.
+    assert result["unused_custom_metrics"] == []
+    # No expensive CloudWatch API calls under fast mode.
     assert cw.get_metric_data_calls == 0
+    assert cw.list_metrics_paginate_calls == 0
+    assert cw.describe_alarms_paginate_calls == 0
 
 
 def test_unused_custom_metrics_get_metric_data_denied_is_permission_and_advisory() -> None:
@@ -312,6 +337,8 @@ def test_low_volume_namespace_not_probed() -> None:
     result = get_cloudwatch_checks(ctx, pricing_multiplier=1.0)
     assert result["unused_custom_metrics"] == []
     assert cw.get_metric_data_calls == 0
+    # Outside fast mode the list_metrics paginator DOES run (contrast with L3).
+    assert cw.list_metrics_paginate_calls == 1
 
 
 def test_aws_namespace_metrics_excluded() -> None:
@@ -500,3 +527,29 @@ def test_scan_excludes_advisory_dollars_from_counted_total(monkeypatch: pytest.M
 def test_tier_constant_matches_live_pricing() -> None:
     # Live AWS Pricing API (2026-06-27) tier-1 custom metric rate = $0.30.
     assert CW_CUSTOM_METRIC_TIER_1 == 0.30
+
+
+# --------------------------------------------------------------------------- #
+# monitoring L1 — CloudTrail dead-cost walk removed (zero recs, zero API calls)
+# --------------------------------------------------------------------------- #
+def test_cloudtrail_checks_makes_no_api_calls_and_emits_nothing() -> None:
+    # The walk (describe_trails + per-trail get_event_selectors) spent API quota
+    # to emit zero recommendations; it is removed. The empty source structure is
+    # retained for a stable report shape.
+    ct = _FakeCloudTrailClient()
+    ctx = _shim_ctx({"cloudtrail": ct})
+
+    result = get_cloudtrail_checks(ctx)
+
+    assert result["recommendations"] == []
+    assert ct.describe_trails_calls == 0
+    assert ct.get_event_selectors_calls == 0
+    for key in (
+        "multi_region_trails",
+        "data_events_all_s3",
+        "data_events_all_lambda",
+        "duplicate_trails",
+        "expensive_storage_trails",
+        "unused_insights",
+    ):
+        assert result[key] == []

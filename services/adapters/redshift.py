@@ -1,4 +1,4 @@
-"""Flat-rate adapter for Redshift."""
+"""Cost Optimization Hub adapter for Redshift (heuristic levers are $0 advisories)."""
 
 from __future__ import annotations
 
@@ -27,22 +27,10 @@ RI_ADVISORY_SAVINGS: str = (
     "commitment purchase (see Commitment Analysis); excluded from rightsizing savings"
 )
 
-# Per-CheckCategory savings factors for the COUNTED heuristic levers (those that
-# carry a NodeType and so can be priced from the live node rate). Reserved
-# Instances are deliberately NOT here — they are advisory (ADVISORY_CATEGORIES);
-# the realizable 1-yr RI discount on a ra3.xlplus compute node is ~30% (No
-# Upfront: on-demand $1.086/hr -> RI effective $0.7602/hr, us-east-1, AWS Pricing
-# API 2026-06), not the 52% the retired "reserved" factor asserted (~1.7x over).
-#   - Pause/Resume of inactive clusters: full compute hours saved (100%).
-#   - Default for unrecognized priced categories: conservative 0.24 midpoint.
-REDSHIFT_SAVINGS_FACTORS: dict[str, float] = {
-    "pause": 1.00,
-    "default": 0.24,
-}
-
 
 class RedshiftModule(BaseServiceModule):
-    """ServiceModule adapter for Redshift. Flat-rate savings strategy."""
+    """ServiceModule adapter for Redshift. Cost Optimization Hub is the only
+    counted source; every heuristic lever is a $0 advisory."""
 
     key: str = "redshift"
     cli_aliases: tuple[str, ...] = ("redshift",)
@@ -56,9 +44,10 @@ class RedshiftModule(BaseServiceModule):
         """Scan Redshift clusters for cost optimization opportunities.
 
         Consults enhanced Redshift checks and Cost Optimization Hub. CoH is the
-        authoritative aggregator: a cluster it covers suppresses that cluster's
-        heuristic levers (avoids double-counting). Savings calculated via
-        flat-rate heuristic per recommendation.
+        authoritative aggregator and the only counted source: a cluster it covers
+        suppresses that cluster's heuristic levers (avoids double-counting). Every
+        heuristic lever is rendered as a $0 advisory (commitment buys are owned by
+        Commitment Analysis; rightsizing hints carry no live node price).
 
         Args:
             ctx: ScanContext with region, clients, and pricing data.
@@ -80,13 +69,12 @@ class RedshiftModule(BaseServiceModule):
         coh_keys = {coh_key(r) for r in coh_recs} - {""}
         coh_total = sum(coh_savings(r) for r in coh_recs)
 
-        def _rs_factor(rec: dict[str, Any]) -> float:
-            cat = (rec.get("CheckCategory") or "").lower()
-            if "pause" in cat or "unused" in cat or "inactive" in cat:
-                return REDSHIFT_SAVINGS_FACTORS["pause"]
-            return REDSHIFT_SAVINGS_FACTORS["default"]
-
-        savings = 0.0
+        # CoH is the only counted Redshift source. Every heuristic lever the shim
+        # emits is either a commitment advisory (RI / Serverless Reservation) or an
+        # unpriceable rightsizing hint that carries no live node price / usage
+        # metric — so none is ever counted (Redshift L2: the dead per-node pricing
+        # path and its REDSHIFT_SAVINGS_FACTORS were removed).
+        savings = coh_total
         for rec in recs:
             category = rec.get("CheckCategory", "")
 
@@ -117,44 +105,16 @@ class RedshiftModule(BaseServiceModule):
                 }
                 continue
 
-            # Counted heuristic levers must carry a NodeType so they can be priced
-            # from the live node rate (no fabricated fallback).
-            node_type = rec.get("NodeType")
-            num_nodes = rec.get("NumberOfNodes", 1)
-            monthly = (
-                ctx.pricing_engine.get_instance_monthly_price("AmazonRedshift", node_type)
-                if (ctx.pricing_engine is not None and node_type)
-                else 0.0
+            # No surviving heuristic lever carries a live node price or usage
+            # metric to quantify a saving → render as an honest $0 advisory so a
+            # shim-supplied "potential" string (e.g. cluster_rightsizing's
+            # (nodes-2)x100) never renders as a counted-looking dollar while the
+            # headline counts $0.
+            rec["EstimatedMonthlySavings"] = 0.0
+            rec["Counted"] = False
+            rec["EstimatedSavings"] = (
+                "$0.00/month — advisory: no live node price / usage metric to quantify the saving"
             )
-            if monthly > 0:
-                factor = _rs_factor(rec)
-                # PricingEngine returns region-correct $/month; do NOT re-multiply
-                # by pricing_multiplier (L2.3.1).
-                rec_savings = round(monthly * num_nodes * factor, 2)
-                savings += rec_savings
-                rec["EstimatedMonthlySavings"] = rec_savings
-                rec["Counted"] = True
-                rec["EstimatedSavings"] = f"${rec_savings:,.2f}/month"
-                rec["AuditBasis"] = {
-                    "node_type": node_type,
-                    "num_nodes": num_nodes,
-                    "node_monthly_price": round(monthly, 2),
-                    "savings_factor": factor,
-                    "formula": "node_monthly_price x num_nodes x savings_factor (region-correct)",
-                    "rate_source": "PricingEngine AmazonRedshift Compute Instance",
-                }
-            else:
-                # node_type unknown or pricing unavailable → no fabricated dollar.
-                # Overwrite (not setdefault) so a shim-supplied "potential" string
-                # (e.g. cluster_rightsizing's (nodes-2)x100) never renders as a
-                # counted-looking dollar while the headline counts $0.
-                rec["EstimatedMonthlySavings"] = 0.0
-                rec["Counted"] = False
-                rec["EstimatedSavings"] = (
-                    "$0.00/month — advisory: no live node price / usage metric to quantify the saving"
-                )
-
-        savings += coh_total
 
         sources = {"enhanced_checks": SourceBlock(count=len(recs), recommendations=tuple(recs))}
         if coh_recs:

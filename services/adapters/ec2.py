@@ -29,16 +29,21 @@ _CW_LOW_UTIL_CATEGORIES: frozenset[str] = frozenset(
 def _coh_is_renderable(rec: dict[str, Any]) -> bool:
     """Mirror the reporter's EC2 Cost-Hub render filter.
 
-    The reporter (``_filter_ec2_recommendations``) drops EBS-volume recs,
+    The reporter (``_render_ec2_cost_hub``) drops recs with no ``actionType``
+    and recs whose ``finding`` is ``optimized``, plus EBS-volume recs,
     Reserved-Instance purchase recs, and N/A-resource recs from the EC2 table.
     Applying the same predicate here means the savings/count the adapter reports
     match exactly what the EC2 tab renders — no counted-but-not-shown dollars.
     """
-    if rec.get("actionType") and "ebsVolume" in (rec.get("currentResourceDetails") or {}):
+    if "actionType" not in rec:
+        return False
+    if str(rec.get("finding", "")).lower() == "optimized":
+        return False
+    if "ebsVolume" in (rec.get("currentResourceDetails") or {}):
         return False
     if rec.get("actionType") == "PurchaseReservedInstances":
         return False
-    if rec.get("actionType") and rec.get("resourceId") == "N/A":
+    if rec.get("resourceId") == "N/A":
         return False
     return True
 

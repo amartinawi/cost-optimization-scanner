@@ -340,6 +340,12 @@ def get_dynamodb_table_analysis(ctx: ScanContext) -> dict[str, Any]:
                     "OptimizationOpportunities": [],
                 }
 
+                # Mirror the enhanced_checks ACTIVE gate: CREATING/DELETING/
+                # UPDATING tables are transient and should not produce optimization
+                # opportunities (DynamoDB L4).
+                if table_info.get("TableStatus") != "ACTIVE":
+                    continue
+
                 if table_info["BillingMode"] == "PROVISIONED":
                     provisioned_throughput = table.get("ProvisionedThroughput", {})
                     base_read = provisioned_throughput.get("ReadCapacityUnits", 0)
@@ -509,6 +515,12 @@ def get_enhanced_dynamodb_checks(ctx: ScanContext) -> dict[str, Any]:
                 if table_status != "ACTIVE":
                     continue
 
+                # DynamoDB L4: DescribeTable's ItemCount is updated by DynamoDB on
+                # a ~6-hour cadence, so a value of 0 can lag an actively-written
+                # table. This "Empty table" rec is therefore advisory only — the
+                # adapter renders it as a $0 Counted=False nudge (never summed), so
+                # the staleness is benign for dollars; operators should corroborate
+                # against CloudWatch Consumed*CapacityUnits before deleting.
                 if item_count == 0:
                     checks["unused_tables"].append(
                         {

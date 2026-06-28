@@ -138,6 +138,11 @@ def _instance_recs(findings):
     return list(findings.sources["instance_optimization"].recommendations)
 
 
+def _io_ctx():
+    """Minimal ctx for the direct ``_check_io_tier`` calls (only needs ``warn``)."""
+    return SimpleNamespace(warn=lambda *a, **k: None)
+
+
 # --------------------------------------------------------------------------- #
 # aurora H1 + H2 — _check_io_tier counted dollar
 # --------------------------------------------------------------------------- #
@@ -152,7 +157,7 @@ def test_io_tier_counts_live_storage_premium_and_instance_premium():
     # 14d read sum = 14e9, write = 0 -> monthly_io = 14e9/14*30 = 30e9.
     cw = _IoCW(read_sum=14_000_000_000, write_sum=0)
 
-    recs = _check_io_tier(cluster, cw, _IoPE(), members, 1.0, fast_mode=False)
+    recs = _check_io_tier(_io_ctx(), cluster, cw, _IoPE(), members, 1.0, fast_mode=False)
     assert len(recs) == 1
     rec = recs[0]
 
@@ -190,14 +195,14 @@ def test_io_tier_instance_premium_flips_marginal_saving_to_net_loss():
     cw = _IoCW(read_sum=70_000_000, write_sum=0)
 
     # No members -> only the H1 storage premium applies: 30 - 12.5 = 17.5 (>$10).
-    no_member = _check_io_tier(cluster, cw, _IoPE(), [], 1.0, fast_mode=False)
+    no_member = _check_io_tier(_io_ctx(), cluster, cw, _IoPE(), [], 1.0, fast_mode=False)
     assert len(no_member) == 1
     assert no_member[0]["monthly_savings"] == 17.5
 
     # One provisioned member -> add the $56.94 instance premium: 30 - 12.5 -
     # 56.94 = -39.44 -> net loss -> no rec emitted (H2 prevents a false saving).
     with_member = _check_io_tier(
-        cluster, cw, _IoPE(), [_aurora_inst("m1", cls="db.r6g.large")], 1.0, fast_mode=False
+        _io_ctx(), cluster, cw, _IoPE(), [_aurora_inst("m1", cls="db.r6g.large")], 1.0, fast_mode=False
     )
     assert with_member == []
 
@@ -211,7 +216,7 @@ def test_io_tier_offline_uses_validated_fallback_not_old_constant():
         "AllocatedStorage": 1000,
     }
     cw = _IoCW(read_sum=14_000_000_000, write_sum=0)
-    recs = _check_io_tier(cluster, cw, None, [], 1.0, fast_mode=False)
+    recs = _check_io_tier(_io_ctx(), cluster, cw, None, [], 1.0, fast_mode=False)
     assert len(recs) == 1
     # 6000 - 1000*0.125 = 5875 (would be 5975 under the old 0.025 constant).
     assert recs[0]["monthly_savings"] == 5875.0

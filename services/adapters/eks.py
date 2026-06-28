@@ -325,6 +325,12 @@ class EksCostModule(BaseServiceModule):
                     "recommended_value": "Delete the failed cluster to stop control-plane charges",
                     "monthly_savings": round(monthly_control_plane, 2),
                     "severity": "HIGH",
+                    "audit_basis": {
+                        "rate": control_plane_rate,
+                        "unit": "USD/cluster-hour",
+                        "formula": f"{control_plane_rate} x {HOURS_PER_MONTH} hr",
+                        "evidence": "cluster.status == FAILED",
+                    },
                     "reason": (
                         f"EKS cluster '{name}' is in {status} state; deleting saves "
                         f"${monthly_control_plane:.2f}/mo control-plane cost"
@@ -491,30 +497,51 @@ class EksCostModule(BaseServiceModule):
                 if ng_monthly <= 0:
                     continue
 
-                # Spot opportunity (ON_DEMAND groups).
+                # Spot and Graviton are MUTUALLY EXCLUSIVE levers (switching to
+                # Spot precludes switching to Graviton and vice versa), so we emit
+                # ONE advisory rec per node group carrying the higher-saving lever
+                # — never two additive recs that would fabricate ~0.90x node cost
+                # if either were ever promoted to Counted=True.
+                is_x86 = bool(instance_types) and not _is_graviton(instance_types[0])
+                spot_saving = round(ng_monthly * SPOT_SAVINGS_FACTOR, 2)
+                grav_saving = round(ng_monthly * GRAVITON_SAVINGS_FACTOR, 2)
+
                 if capacity_type != "SPOT":
-                    spot_saving = round(ng_monthly * SPOT_SAVINGS_FACTOR, 2) if ng_monthly > 0 else 0.0
+                    # ON_DEMAND: Spot is the larger lever (~70% vs ~20% Graviton).
+                    if is_x86:
+                        recommended = (
+                            f"Use Spot (~{int(SPOT_SAVINGS_FACTOR * 100)}%) or migrate to Graviton/ARM "
+                            f"(~{int(GRAVITON_SAVINGS_FACTOR * 100)}%) — mutually exclusive alternatives"
+                        )
+                        reason = (
+                            f"Node group '{ng_name}' ({desired}x {instance_types}, ${ng_monthly:.2f}/mo on-demand): "
+                            f"~${spot_saving:.2f}/mo via Spot for fault-tolerant workloads, OR ~${grav_saving:.2f}/mo "
+                            f"via Graviton (ARM) — mutually exclusive alternatives (not additive), advisory estimate; "
+                            f"these are EC2 instances, quantified/counted in the EC2 tab (needs Compute Optimizer or ASG CO enabled)"
+                        )
+                    else:
+                        recommended = f"Use Spot for fault-tolerant workloads (~{int(SPOT_SAVINGS_FACTOR * 100)}%)"
+                        reason = (
+                            f"Node group '{ng_name}' ({desired}x {instance_types}, ${ng_monthly:.2f}/mo on-demand): "
+                            f"~${spot_saving:.2f}/mo via Spot — advisory estimate; these are EC2 instances, "
+                            f"quantified/counted in the EC2 tab (needs Compute Optimizer or ASG CO enabled)"
+                        )
                     recs.append(
                         {
                             "resource_id": resource_id,
                             "check_type": "node_group",
                             "check_category": "Node Group Optimization",
                             "current_value": f"{capacity_type} node group: {instance_types} x{desired}",
-                            "recommended_value": f"Use Spot for fault-tolerant workloads (~{int(SPOT_SAVINGS_FACTOR * 100)}%)",
+                            "recommended_value": recommended,
                             "monthly_savings": spot_saving,
                             "Counted": False,
                             "severity": "LOW",
-                            "reason": (
-                                f"Node group '{ng_name}' ({desired}x {instance_types}, ${ng_monthly:.2f}/mo on-demand): "
-                                f"~${spot_saving:.2f}/mo via Spot — advisory estimate; these are EC2 instances, "
-                                f"quantified/counted in the EC2 tab (needs Compute Optimizer or ASG CO enabled)"
-                            ),
+                            "reason": reason,
                         }
                     )
-
-                # Graviton opportunity (x86 node groups only).
-                if instance_types and not _is_graviton(instance_types[0]):
-                    grav_saving = round(ng_monthly * GRAVITON_SAVINGS_FACTOR, 2) if ng_monthly > 0 else 0.0
+                elif is_x86:
+                    # SPOT but still x86: the Spot lever is already taken, so
+                    # Graviton is the one remaining lever — Graviton-only advisory.
                     recs.append(
                         {
                             "resource_id": resource_id,
@@ -522,12 +549,12 @@ class EksCostModule(BaseServiceModule):
                             "check_category": "Node Group Optimization",
                             "current_value": f"x86 instance types: {instance_types} x{desired}",
                             "recommended_value": f"Migrate to Graviton (ARM) for ~{int(GRAVITON_SAVINGS_FACTOR * 100)}% list-price savings",
-                            "monthly_savings": round(ng_monthly * GRAVITON_SAVINGS_FACTOR, 2) if ng_monthly > 0 else 0.0,
+                            "monthly_savings": grav_saving,
                             "Counted": False,
                             "severity": "MEDIUM",
                             "reason": (
                                 f"Node group '{ng_name}' ({desired}x {instance_types}, ${ng_monthly:.2f}/mo on-demand): "
-                                f"~${grav_saving:.2f}/mo via Graviton (ARM) — advisory estimate, alternative to Spot; "
+                                f"~${grav_saving:.2f}/mo via Graviton (ARM) — advisory estimate; "
                                 f"these are EC2 instances, counted in the EC2 tab"
                             ),
                         }
@@ -555,7 +582,8 @@ class EksCostModule(BaseServiceModule):
             return 0.0
         try:
             hourly = ctx.pricing_engine.get_ec2_hourly_price(instance_types[0], quiet=True)
-        except Exception:
+        except Exception as e:
+            ctx.warn(f"EKS node-group pricing failed for {instance_types[0]}: {e}", "eks_cost")
             return 0.0
         return float(hourly or 0.0) * HOURS_PER_MONTH * desired
 

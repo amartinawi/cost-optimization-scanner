@@ -35,10 +35,8 @@ def get_vpc_endpoints_checks(ctx: ScanContext) -> dict[str, Any]:
     )
     checks: dict[str, list[dict[str, Any]]] = {
         "missing_gateway_endpoints": [],
-        "unused_interface_endpoints": [],
         "interface_endpoints_in_nonprod": [],
         "duplicate_endpoints": [],
-        "no_traffic_endpoints": [],
     }
 
     try:

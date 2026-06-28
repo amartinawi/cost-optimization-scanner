@@ -8,6 +8,10 @@ data transfer cost savings opportunities:
 - Internet egress patterns (direct vs CloudFront)
 - Transit Gateway vs VPC Peering cost comparison
 
+Scope boundary: this adapter owns CE AWS-Data-Transfer spend; network.py owns
+NAT-gateway-hours. If network ever promotes per-GB NAT savings to Counted, add a
+shared covered set across both adapters.
+
 Counted-savings policy (network_cost H1/H2).
 This adapter operates on **blended Cost Explorer dollars** grouped by usage
 type — it never sees per-flow GB, co-location, or topology. There is therefore

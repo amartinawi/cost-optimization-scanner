@@ -109,12 +109,13 @@ _PREVIOUS_GEN_TARGETS: dict[str, str] = {
 # these when the workload name does not suggest the local storage is needed.
 # Matched on the family token (text before the first dot), not a substring, so
 # "i3" no longer accidentally matches "i3en".
+# Refresh against https://aws.amazon.com/ec2/instance-types/ when new families ship.
 _INSTANCE_STORE_FAMILIES: frozenset[str] = frozenset(
     {
         "m5d", "m5ad", "m5dn", "m6gd", "m6id", "m6idn", "m7gd",
         "c5d", "c5ad", "c6gd", "c6id", "c7gd",
         "r5d", "r5ad", "r5dn", "r6gd", "r6id", "r6idn", "r7gd",
-        "i3", "i3en", "i4i", "i4g", "im4gn", "is4gen",
+        "i3", "i3en", "i4i", "i4g", "im4gn", "is4gen", "i7ie", "i8g",
         "d2", "d3", "d3en", "h1", "z1d",
         "x1", "x1e", "x2idn", "x2iedn", "x2gd",
     }
@@ -328,8 +329,15 @@ def _ec2_hourly(
     priced_os = os_name
     hourly = ctx.pricing_engine.get_ec2_hourly_price(instance_type, os_name, license_model, quiet=quiet)
     if hourly <= 0.0 and os_name != "Linux":
+        if not quiet:
+            ctx.warn(
+                f"EC2 pricing: {instance_type}/{os_name} SKU unavailable — using Linux lower-bound rate",
+                service="ec2",
+            )
         hourly = ctx.pricing_engine.get_ec2_hourly_price(instance_type, "Linux", quiet=quiet)
-        priced_os = "Linux"
+        # Mark the degraded estimate so every downstream PricingBasis string makes
+        # the Linux lower-bound fallback visible (the dollar value is unchanged).
+        priced_os = "Linux (lower bound)"
     return hourly, priced_os
 
 
@@ -869,6 +877,13 @@ def get_auto_scaling_checks(ctx: ScanContext) -> dict[str, Any]:
             desired_capacity = asg.get("DesiredCapacity", 0)
 
             tags = {tag["Key"]: tag["Value"] for tag in asg.get("Tags", [])}
+
+            # EKS node-group ASGs are sized by the cluster's node-group config and
+            # surface under the EKS tab, so skip them here to avoid redundant
+            # advisory cards (ec2 L3).
+            if _is_eks_nodegroup_asg(asg_name, tags):
+                continue
+
             environment = tags.get("Environment", "").lower()
 
             # Static ASGs / EKS static node groups: removed (each emitted $0/month with
@@ -887,6 +902,13 @@ def get_auto_scaling_checks(ctx: ScanContext) -> dict[str, Any]:
                     lt_data = lt_response["LaunchTemplateVersions"][0]["LaunchTemplateData"]
                     instance_type = lt_data.get("InstanceType")
 
+                    # Spot-backed ASGs already run at the discounted Spot rate, so a
+                    # rightsizing-delta saving against on-demand pricing would be
+                    # misleading — skip them (ec2 L3).
+                    market_type = lt_data.get("InstanceMarketOptions", {}).get("MarketType", "")
+                    if str(market_type).lower() == "spot":
+                        continue
+
                     # A scaled-to-zero ASG runs no instances, so there are no
                     # per-node dollars to save (mirror the EKS 0-node fix).
                     if (
@@ -897,16 +919,19 @@ def get_auto_scaling_checks(ctx: ScanContext) -> dict[str, Any]:
                         asg_node_savings, asg_node_basis = _compute_ec2_savings(
                             ctx, instance_type, "Rightsizing Opportunities"
                         )
-                        checks["oversized_instances"].append(
-                            {
-                                "AutoScalingGroupName": asg_name,
-                                "InstanceType": instance_type,
-                                "Recommendation": ("Large instance type in ASG - verify rightsizing"),
-                                "EstimatedSavings": (f"${asg_node_savings:.2f}/month per node if rightsized"),
-                                "PricingBasis": asg_node_basis,
-                                "CheckCategory": "Oversized ASG Instances",
-                            }
-                        )
+                        # No defensible per-node dollar (pricing unavailable) -> emit
+                        # no $0.00 advisory card (ec2 L3).
+                        if asg_node_savings > 0:
+                            checks["oversized_instances"].append(
+                                {
+                                    "AutoScalingGroupName": asg_name,
+                                    "InstanceType": instance_type,
+                                    "Recommendation": ("Large instance type in ASG - verify rightsizing"),
+                                    "EstimatedSavings": (f"${asg_node_savings:.2f}/month per node if rightsized"),
+                                    "PricingBasis": asg_node_basis,
+                                    "CheckCategory": "Oversized ASG Instances",
+                                }
+                            )
 
                 except Exception as e:
                     ctx.warn(f"Could not analyze launch template for {asg_name}: {e}", service="ec2")

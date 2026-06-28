@@ -3,9 +3,6 @@
 Analyzes Aurora DB clusters for:
     - Serverless v2 ACU waste (max vs actual utilization)
     - I/O tier analysis (Standard vs I/O-Optimized)
-    - Clone/snapshot sprawl
-    - Global DB replica lag
-    - Backtrack window cost risk
 """
 
 from __future__ import annotations
@@ -183,6 +180,7 @@ def _check_provisioned_instances(
     *,
     covered: set[str] | None = None,
     instances: list[dict[str, Any]] | None = None,
+    cluster_storage_type: dict[str, bool] | None = None,
 ) -> list[dict[str, Any]]:
     """Rightsizing (peak-aware) + Graviton recs for provisioned Aurora instances.
 
@@ -199,6 +197,11 @@ def _check_provisioned_instances(
     tabs (single owner = RDS, authority CoH > CO > heuristic). ``instances`` may
     be pre-fetched by the caller to avoid a duplicate describe_db_instances call;
     when ``None`` the instances are described internally.
+
+    ``cluster_storage_type`` maps each cluster id to whether its StorageType is
+    ``aurora-iopt1`` (I/O-Optimized). It is threaded into every member price
+    lookup so I/O-Optimized members price at the ~30%-higher I/O-Optimized
+    instance SKU rather than the Standard SKU (aurora L3).
     """
     from services.aurora_logic import (
         graviton_equivalent,
@@ -208,6 +211,7 @@ def _check_provisioned_instances(
     )
 
     covered = covered or set()
+    cluster_storage_type = cluster_storage_type or {}
     recs: list[dict[str, Any]] = []
     if instances is None:
         try:
@@ -244,8 +248,14 @@ def _check_provisioned_instances(
             continue
         family, size, vcpu = parsed
 
+        # aurora L3: I/O-Optimized clusters (StorageType=aurora-iopt1) price their
+        # member instances at the ~30%-higher I/O-Optimized SKU; Standard members
+        # at the cheaper Standard SKU. Resolve per-cluster so every price lookup
+        # below uses the matching SKU.
+        aurora_io_opt = cluster_storage_type.get(inst.get("DBClusterIdentifier", ""), False)
+
         try:
-            cur_price = pe.get_rds_instance_monthly_price(engine, cls)
+            cur_price = pe.get_rds_instance_monthly_price(engine, cls, aurora_io_optimized=aurora_io_opt)
         except Exception:
             cur_price = 0.0
         if not cur_price or cur_price <= 0:
@@ -267,7 +277,9 @@ def _check_provisioned_instances(
                 if target_size and avg_cpu < 50:
                     cand_class = f"{family}.{target_size}"
                     try:
-                        cand_price = pe.get_rds_instance_monthly_price(engine, cand_class)
+                        cand_price = pe.get_rds_instance_monthly_price(
+                            engine, cand_class, aurora_io_optimized=aurora_io_opt
+                        )
                     except Exception:
                         cand_price = 0.0
                     if cand_price and 0 < cand_price < cur_price:
@@ -300,8 +312,12 @@ def _check_provisioned_instances(
             if grav_family:
                 grav_class = f"{grav_family}.{rightsized_size}"
                 try:
-                    base_price = pe.get_rds_instance_monthly_price(engine, rightsized_class)
-                    grav_price = pe.get_rds_instance_monthly_price(engine, grav_class)
+                    base_price = pe.get_rds_instance_monthly_price(
+                        engine, rightsized_class, aurora_io_optimized=aurora_io_opt
+                    )
+                    grav_price = pe.get_rds_instance_monthly_price(
+                        engine, grav_class, aurora_io_optimized=aurora_io_opt
+                    )
                 except Exception:
                     base_price = grav_price = 0.0
                 if grav_price and 0 < grav_price < base_price:
@@ -435,6 +451,7 @@ def _io_instance_premium(pe: Any, members: list[dict[str, Any]]) -> tuple[float,
 
 
 def _check_io_tier(
+    ctx: Any,
     cluster: dict[str, Any],
     cw: Any,
     pe: Any,
@@ -444,6 +461,7 @@ def _check_io_tier(
 ) -> list[dict[str, Any]]:
     recs: list[dict[str, Any]] = []
     if fast_mode:
+        ctx.warn("fast mode: skipping Aurora I/O-tier check metric reads", "aurora")
         return recs
 
     cluster_id = cluster["DBClusterIdentifier"]
@@ -553,7 +571,7 @@ class AuroraModule(BaseServiceModule):
         StatCardSpec(label="Monthly Savings", source_path="total_monthly_savings", formatter="currency"),
     )
 
-    grouping = GroupingSpec(by="check_category", label_path="check_type")
+    grouping = GroupingSpec(by="check_type", label_path="check_type")
 
     requires_cloudwatch: bool = True
     reads_fast_mode: bool = True
@@ -580,6 +598,15 @@ class AuroraModule(BaseServiceModule):
         pe = getattr(ctx, "pricing_engine", None)
 
         clusters = _describe_aurora_clusters(rds, ctx)
+
+        # aurora L3: per-cluster I/O-Optimized flag (StorageType=aurora-iopt1) so
+        # member-instance pricing in _check_provisioned_instances uses the matching
+        # (Standard vs I/O-Optimized) instance SKU.
+        cluster_storage_type: dict[str, bool] = {
+            c["DBClusterIdentifier"]: c.get("StorageType", "") == "aurora-iopt1"
+            for c in clusters
+            if c.get("DBClusterIdentifier")
+        }
 
         # Describe member instances once: feeds both the I/O-tier instance
         # premium (H2) and the provisioned-instance rightsizing/Graviton checks.
@@ -622,18 +649,25 @@ class AuroraModule(BaseServiceModule):
                 cluster_id = cluster.get("DBClusterIdentifier", "")
                 io_recs.extend(
                     _check_io_tier(
-                        cluster, cw, pe, members_by_cluster.get(cluster_id, []), multiplier, fast_mode
+                        ctx, cluster, cw, pe, members_by_cluster.get(cluster_id, []), multiplier, fast_mode
                     )
                 )
             except Exception as e:
                 logger.warning(f"[aurora] cluster check failed: {e}")
+                ctx.warn(f"[aurora] cluster check failed: {e}", "aurora")
                 continue
 
         # Provisioned member instances (rightsizing + Graviton) — the cluster
         # checks above only cover Serverless v2 and the I/O tier. Instances
         # covered by the RDS tab are suppressed via ``covered`` (no double count).
         instance_recs = _check_provisioned_instances(
-            ctx, rds, cw, fast_mode, covered=covered, instances=instances
+            ctx,
+            rds,
+            cw,
+            fast_mode,
+            covered=covered,
+            instances=instances,
+            cluster_storage_type=cluster_storage_type,
         )
 
         all_recs = serverless_recs + io_recs + instance_recs

@@ -7,14 +7,8 @@ This module will later become MonitoringModule (T-322) implementing ServiceModul
 
 from __future__ import annotations
 
-import logging
-
-logger = logging.getLogger(__name__)
-
 from datetime import UTC, datetime, timedelta
 from typing import Any
-
-from botocore.exceptions import ClientError  # type: ignore[import-untyped]
 
 from core.scan_context import ScanContext
 from services._aws_errors import record_aws_error
@@ -191,6 +185,11 @@ def get_cloudwatch_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> 
         pricing_multiplier: Regional pricing multiplier applied to per-rec
             $ values. us-east-1 ≈ 1.0; eu-west-1 ≈ 1.08; etc.
     """
+    # The expensive part of this scan is the CloudWatch describes (list_metrics +
+    # describe_alarms) and the GetMetricData staleness probe; under --fast skip
+    # them so the adapter's reads_fast_mode declaration holds.
+    fast_mode = bool(getattr(ctx, "fast_mode", False))
+
     checks: dict[str, list[dict[str, Any]]] = {
         "never_expiring_logs": [],
         "excessive_logging": [],
@@ -259,19 +258,20 @@ def get_cloudwatch_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> 
             # level and retention" without quantifying storage savings.
 
         try:
-            cloudwatch = ctx.client("cloudwatch")
-            paginator = cloudwatch.get_paginator("describe_alarms")
-            for page in paginator.paginate():
-                alarms = page.get("MetricAlarms", [])
+            if not fast_mode:
+                cloudwatch = ctx.client("cloudwatch")
+                paginator = cloudwatch.get_paginator("describe_alarms")
+                for page in paginator.paginate():
+                    alarms = page.get("MetricAlarms", [])
 
-                for alarm in alarms:
-                    alarm_name = alarm.get("AlarmName")
-                    state_reason = alarm.get("StateReason", "")
-                    alarm_config_updated = alarm.get("AlarmConfigurationUpdatedTimestamp")
+                    for alarm in alarms:
+                        alarm_name = alarm.get("AlarmName")
+                        state_reason = alarm.get("StateReason", "")
+                        alarm_config_updated = alarm.get("AlarmConfigurationUpdatedTimestamp")
 
-                    # Unused CloudWatch Alarms finding removed: health/operational signal
-                    # with no EstimatedSavings field — not a cost recommendation.
-                    _ = (state_reason, alarm_config_updated, alarm_name)
+                        # Unused CloudWatch Alarms finding removed: health/operational
+                        # signal with no EstimatedSavings field — not a cost rec.
+                        _ = (state_reason, alarm_config_updated, alarm_name)
 
         except Exception as e:
             # H1 — classify (don't logger-only): a permission gap on DescribeAlarms
@@ -280,10 +280,11 @@ def get_cloudwatch_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> 
 
         try:
             cloudwatch = ctx.client("cloudwatch")
-            paginator = cloudwatch.get_paginator("list_metrics")
             metrics: list[dict[str, Any]] = []
-            for page in paginator.paginate():
-                metrics.extend(page.get("Metrics", []))
+            if not fast_mode:
+                paginator = cloudwatch.get_paginator("list_metrics")
+                for page in paginator.paginate():
+                    metrics.extend(page.get("Metrics", []))
 
             # Only custom (non-AWS/) metrics incur the per-metric monthly charge.
             custom_metrics = [
@@ -302,7 +303,6 @@ def get_cloudwatch_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> 
             # data is not. Probe only high-volume namespaces (bounded) and gate
             # on fast mode. No evidence (fast mode / GetMetricData failure) → $0
             # advisory, never a fabricated count.
-            fast_mode = bool(getattr(ctx, "fast_mode", False))
             stale_by_ns = None
             if high_volume and not fast_mode:
                 probe = [m for m in custom_metrics if m.get("Namespace", "") in high_volume]
@@ -442,7 +442,21 @@ def get_cloudwatch_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> 
 
 
 def get_cloudtrail_checks(ctx: ScanContext) -> dict[str, Any]:
-    """Category 10: CloudTrail optimization checks"""
+    """Category 10: CloudTrail optimization checks.
+
+    Every concrete CloudTrail finding (multi-region trails, S3/Lambda data
+    events, duplicate/expensive trails, unused Insights) was removed earlier
+    because each emitted ``$0`` with only a generic percentage-range estimate
+    rather than an account-specific dollar. The dead-cost walk that fed them
+    (un-paginated ``describe_trails`` + per-trail ``get_event_selectors``) is
+    removed with them: it spent API quota to produce zero recommendations while
+    swallowing every error through ``logger.warning``. The empty checks
+    structure is retained so the report keeps a stable source-block shape.
+
+    Args:
+        ctx: Scan context (unused; retained for signature parity with the other
+            monitoring sub-shims).
+    """
     checks: dict[str, list[dict[str, Any]]] = {
         "multi_region_trails": [],
         "data_events_all_s3": [],
@@ -451,58 +465,6 @@ def get_cloudtrail_checks(ctx: ScanContext) -> dict[str, Any]:
         "expensive_storage_trails": [],
         "unused_insights": [],
     }
-
-    try:
-        cloudtrail = ctx.client("cloudtrail")
-        trails_response = cloudtrail.describe_trails()
-        trails = trails_response.get("trailList", [])
-
-        trail_names: set[str] = set()
-
-        for trail_index, trail in enumerate(trails):
-            trail_name = trail.get("Name")
-            trail_arn = trail.get("TrailARN")
-            is_multi_region = trail.get("IsMultiRegionTrail", False)
-            s3_bucket = trail.get("S3BucketName")
-
-            trail_names.add(trail_name)
-
-            # Multi-region CloudTrail finding removed: emitted $0/month with a generic
-            # "~90% less" percentage — no concrete per-account savings.
-            _ = (is_multi_region, trail_arn, s3_bucket)
-
-            try:
-                selectors_response = cloudtrail.get_event_selectors(TrailName=trail_name)
-                event_selectors = selectors_response.get("EventSelectors", [])
-
-                for selector in event_selectors:
-                    data_resources = selector.get("DataResources", [])
-
-                    for resource in data_resources:
-                        resource_type = resource.get("Type")
-                        values = resource.get("Values", [])
-
-                        # S3 and Lambda data-events findings removed: each emitted $0/month
-                        # with percentage-range savings ("80-95%" / "significant") — no
-                        # concrete per-account quantification.
-                        _ = (resource_type, values)
-
-            except ClientError as e:
-                if e.response["Error"]["Code"] != "TrailNotFoundException":
-                    logger.warning(f"Warning: Could not analyze event selectors for {trail_name}: {e}")
-            except Exception as e:
-                logger.warning(f"Warning: Could not analyze event selectors for {trail_name}: {e}")
-
-            # CloudTrail Insights check removed: the finding it fed (a generic
-            # $0.35/100K per-event rate without per-account event-volume math)
-            # was dropped, so get_insight_selectors did nothing but emit a noisy
-            # warning whenever Insights was not enabled (the common case).
-
-        # Multiple CloudTrail Trails finding removed: emitted $0/month with a generic
-        # "consolidate overlapping trails" suggestion — no concrete savings.
-
-    except Exception as e:
-        logger.warning(f"Warning: Could not perform CloudTrail checks: {e}")
 
     recommendations: list[dict[str, Any]] = []
     for _category, items in checks.items():

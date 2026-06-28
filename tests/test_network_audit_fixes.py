@@ -244,6 +244,17 @@ def test_dev_test_nat_counted_when_sole_in_vpc() -> None:
     assert parse_dollar_savings(dev[0]["EstimatedSavings"]) == 32.85
 
 
+def test_net06_no_missing_endpoint_advisory_from_nat_shim() -> None:
+    # NET-06: a VPC with a NAT but no S3/DDB gateway endpoint must NOT emit a
+    # missing-endpoint advisory from the NAT shim — the vpc_endpoints sub-shim
+    # already owns that ($0 advisory), so the NAT-scoped duplicate is dropped.
+    nat_pages = [{"NatGateways": [_nat("nat-1", "vpc-a", "sub-1")]}]
+    ec2 = _FakeEc2(nat_pages=nat_pages, subnet_az={"sub-1": "az-a"})
+    out = get_nat_gateway_checks(_ctx(ec2, pricing_engine=_nat_engine()))
+    assert "nat_for_aws_services" not in out  # dead category removed
+    assert all(r.get("CheckCategory") != "VPC Endpoints Missing" for r in out["recommendations"])
+
+
 # --------------------------------------------------------------------------- #
 # M4 — interface endpoints priced per-AZ, gateway endpoints excluded
 # --------------------------------------------------------------------------- #
@@ -274,6 +285,17 @@ def test_gateway_endpoint_not_priced_as_duplicate() -> None:
     eng = SimpleNamespace(get_vpc_endpoint_monthly_price=lambda: 7.30)
     out = get_vpc_endpoints_checks(_ctx(ec2, pricing_engine=eng))
     assert out["duplicate_endpoints"] == []  # gateway endpoints are free
+
+
+def test_net05_dead_check_categories_removed() -> None:
+    # NET-05: never-populated check categories are dropped from the output dict.
+    ec2 = _FakeEc2(vpcs_pages=[{"Vpcs": []}], vpce_pages=[{"VpcEndpoints": []}])
+    out = get_vpc_endpoints_checks(_ctx(ec2, pricing_engine=SimpleNamespace(get_vpc_endpoint_monthly_price=lambda: 7.30)))
+    assert "unused_interface_endpoints" not in out
+    assert "no_traffic_endpoints" not in out
+    # Populated categories survive.
+    for key in ("missing_gateway_endpoints", "interface_endpoints_in_nonprod", "duplicate_endpoints"):
+        assert key in out
 
 
 # --------------------------------------------------------------------------- #

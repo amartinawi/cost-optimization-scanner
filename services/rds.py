@@ -439,6 +439,7 @@ def get_enhanced_rds_checks(
                     # mis-tagged non-prod). No signal -> skip (already warned).
                     multi_az_evidenced = (
                         is_non_prod
+                        and not (engine or "").startswith("aurora")
                         and conn_signal is not None
                         and conn_signal["avg_conn"] <= RDS_MULTI_AZ_BUSY_AVG_CONN
                     )
@@ -489,9 +490,9 @@ def get_enhanced_rds_checks(
 
                 if backup_retention > 7:
                     backup_price = (
-                        ctx.pricing_engine.get_rds_backup_storage_price_per_gb()
+                        ctx.pricing_engine.get_rds_backup_storage_price_per_gb(engine)
                         if ctx.pricing_engine
-                        else 0.095 * pricing_multiplier
+                        else (0.021 if (engine or "").startswith("aurora") else 0.095) * pricing_multiplier
                     )
                     # N-M2: the billable backup amount cannot be derived at scan
                     # time. AWS gives free backup storage = 100% of total provisioned
@@ -544,11 +545,55 @@ def get_enhanced_rds_checks(
                 # io1/io2/gp3 "review IOPS/throughput" finding likewise removed:
                 # requires workload analysis to quantify — emitted no concrete savings.
 
-                if any(env in db_instance_id.lower() for env in ["dev", "test", "staging", "qa"]):
+                # Tag-aware non-prod resolution (mirrors the Multi-AZ block above):
+                # honor an Environment/Stage/Env tag first and fall back to the
+                # name-substring heuristic only on tag-lookup failure or tag absence.
+                # A DB tagged Environment=staging but named billing-db is otherwise
+                # missed by a name-only gate (L2).
+                try:
+                    sched_tags_response = rds.list_tags_for_resource(
+                        ResourceName=(f"arn:aws:rds:{region}:{account_id}:db:{db_instance_id}")
+                    )
+                    sched_tags = {tag["Key"]: tag["Value"] for tag in sched_tags_response.get("TagList", [])}
+                    sched_env_tag = sched_tags.get(
+                        "Environment",
+                        sched_tags.get("Stage", sched_tags.get("Env", "")),
+                    ).lower()
+                    sched_is_non_prod = sched_env_tag in [
+                        "dev",
+                        "development",
+                        "test",
+                        "testing",
+                        "staging",
+                        "qa",
+                        "non-prod",
+                        "nonprod",
+                    ]
+                    if not sched_is_non_prod:
+                        sched_is_non_prod = any(
+                            env in db_instance_id.lower() for env in ["dev", "test", "staging", "qa"]
+                        )
+                        env_name = next(
+                            (env for env in ["dev", "test", "staging", "qa"] if env in db_instance_id.lower()),
+                            "non-prod",
+                        )
+                    else:
+                        env_name = sched_env_tag or "non-prod"
+                except Exception as sched_tag_exc:
+                    logger.debug(
+                        "RDS tag lookup failed for %s; falling back to name-substring heuristic: %s",
+                        db_instance_id,
+                        sched_tag_exc,
+                    )
+                    sched_is_non_prod = any(
+                        env in db_instance_id.lower() for env in ["dev", "test", "staging", "qa"]
+                    )
                     env_name = next(
                         (env for env in ["dev", "test", "staging", "qa"] if env in db_instance_id.lower()),
                         "non-prod",
                     )
+
+                if sched_is_non_prod:
                     # N-M4: any non-Aurora RDS instance can be stopped/started on a
                     # schedule (Aurora stops at the cluster level, handled elsewhere).
                     # N-M3: require CloudWatch evidence the DB is genuinely idle on

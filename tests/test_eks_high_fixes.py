@@ -407,6 +407,49 @@ def test_h2_idle_demoted_when_no_ec2_client():
     assert findings.total_monthly_savings == 0.0
 
 
+# --------------------------------------------------------------------------- #
+# L1 — counted failed-cluster rec carries audit_basis (parity with the other
+#      two counted cluster recs: extended_support and idle_cluster)
+# --------------------------------------------------------------------------- #
+def _failed_cluster() -> dict[str, Any]:
+    return {"cluster": {"status": "FAILED", "version": "1.31"}, "nodegroups": {}, "fargate": []}
+
+
+def test_l1_failed_cluster_rec_carries_audit_basis():
+    """A counted failed-cluster rec must carry audit_basis (rate/unit/formula/evidence)."""
+    eks = _FakeEks({"broken": _failed_cluster()})
+    findings = EksCostModule().scan(_ctx(eks, _FakeEc2(owned=0)))
+
+    failed = [r for r in _recs(findings, "cluster_costs") if r["check_type"] == "failed_cluster"]
+    assert len(failed) == 1
+    basis = failed[0]["audit_basis"]
+    assert basis["rate"] == CP_RATE
+    assert basis["unit"] == "USD/cluster-hour"
+    assert basis["formula"] == f"{CP_RATE} x {HOURS_PER_MONTH} hr"
+    assert basis["evidence"] == "cluster.status == FAILED"
+    # The rec is counted (no Counted=False): its dollar feeds the headline.
+    assert failed[0]["monthly_savings"] == IDLE_MONTHLY  # 0.10 x 730 = 73.00
+    assert findings.total_monthly_savings == IDLE_MONTHLY
+
+
+# --------------------------------------------------------------------------- #
+# L2 — node-group pricing failure must warn (never silently swallow)
+# --------------------------------------------------------------------------- #
+def test_l2_node_group_pricing_failure_warns():
+    """A pricing-API failure in node-group costing emits a ctx.warn (never silent)."""
+    ctx = _ctx(_FakeEks({}))
+
+    def _boom(_t: str, quiet: bool = False) -> float:
+        raise RuntimeError("pricing api down")
+
+    ctx.pricing_engine.get_ec2_hourly_price = _boom
+
+    cost = EksCostModule()._node_group_monthly_cost(ctx, ["m5.large"], 2)
+
+    assert cost == 0.0
+    assert any(svc == "eks_cost" and "m5.large" in msg for svc, msg in ctx.warnings)
+
+
 def test_h2_cluster_with_managed_nodegroup_skips_corroboration_and_is_not_idle():
     """A cluster with a managed node group is not a candidate idle: no idle rec."""
     eks = _FakeEks(
