@@ -1815,6 +1815,7 @@ def _render_generic_other_rec(content: str, rec: Rec, source_name: str) -> str:
         or rec.get("dbClusterIdentifier")
         or rec.get("dbInstanceIdentifier")
         or rec.get("ClusterName")
+        or rec.get("ClusterIdentifier")
         or rec.get("DomainName")
         or rec.get("EndpointName")
         or rec.get("NotebookInstanceName")

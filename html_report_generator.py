@@ -2709,7 +2709,13 @@ class HTMLReportGenerator:
     def _get_amis_content(self, amis_data: Dict[str, Any]) -> str:
         """Generate content for AMIs tab"""
         # Group AMIs by age range
-        age_groups = {"90-180 days": [], "180-365 days": [], "1-2 years": [], "2+ years": []}
+        age_groups = {
+            "30-90 days": [],
+            "90-180 days": [],
+            "180-365 days": [],
+            "1-2 years": [],
+            "2+ years": [],
+        }
 
         # Dedupe by ImageId — the same AMI can surface from multiple sources
         # (EBS enhanced checks + the AMI service adapter). Prefer the entry with the
@@ -2733,7 +2739,9 @@ class HTMLReportGenerator:
 
         for rec in deduped_recs:
             age_days = rec.get("AgeDays", 0)
-            if age_days <= 180:
+            if age_days <= 90:
+                age_groups["30-90 days"].append(rec)
+            elif age_days <= 180:
                 age_groups["90-180 days"].append(rec)
             elif age_days <= 365:
                 age_groups["180-365 days"].append(rec)

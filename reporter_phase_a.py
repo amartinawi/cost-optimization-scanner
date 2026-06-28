@@ -133,7 +133,10 @@ def _extract_cloudfront_details(rec: Rec) -> Tuple[str, str]:
     dist_id = rec.get("DistributionId", "Unknown")
     domain_name = rec.get("DomainName", "")
     status = rec.get("Status", "")
-    price_class = rec.get("PriceClass", "")
+    # CloudFront recs emit "CurrentPriceClass" (services/cloudfront.py); the old
+    # "PriceClass" lookup always returned "" so the Price Class line never
+    # rendered (cloudfront L1).
+    price_class = rec.get("CurrentPriceClass") or rec.get("PriceClass", "")
 
     details = []
     if domain_name:
