@@ -61,6 +61,24 @@ def _report_aws_error(
             return
     ctx.warn(f"{message}: {exc}", service=service)
 
+
+def _list_file_caches(fsx: Any) -> list[dict[str, Any]]:
+    """Return all FSx file caches, following NextToken pages.
+
+    ``describe_file_caches`` has no boto3 paginator, so a one-shot call silently
+    caps the file-cache count at the first page on accounts with many caches
+    (file_systems L3). The caller wraps this in its own try/except.
+    """
+    caches: list[dict[str, Any]] = []
+    token: str | None = None
+    while True:
+        resp = fsx.describe_file_caches(**({"NextToken": token} if token else {}))
+        caches.extend(resp.get("FileCaches", []))
+        token = resp.get("NextToken")
+        if not token:
+            return caches
+
+
 FILE_SYSTEM_OPTIMIZATION_DESCRIPTIONS: dict[str, dict[str, str]] = {
     "efs_lifecycle_policies": {
         "title": "Configure EFS Lifecycle Policies",
@@ -222,7 +240,7 @@ def get_fsx_file_system_count(ctx: ScanContext) -> dict[str, Any]:
         for page in fs_paginator.paginate():
             file_systems.extend(page.get("FileSystems", []))
         try:
-            caches = fsx.describe_file_caches().get("FileCaches", [])
+            caches = _list_file_caches(fsx)
         except Exception as e:
             _report_aws_error(ctx, e, "Could not list FSx file caches", "fsx", "fsx:DescribeFileCaches")
             caches = []
@@ -420,7 +438,7 @@ def get_efs_findings(
                                     "CheckCategory": "EFS No Lifecycle", "Counted": False,
                                     "Recommendation": "Enable IA lifecycle policy for infrequently accessed data",
                                     "EstimatedSavings": (
-                                        f"up to ~${gross:.2f}/month gross before IA read-access charges "
+                                        f"up to ~${gross:.2f}/mo-gross before IA read-access charges "
                                         f"(net depends on access patterns; enable CloudWatch metrics to quantify)"
                                     ),
                                     "AuditBasis": {
@@ -450,7 +468,7 @@ def get_efs_findings(
                                 "FileSystemId": fs_id, "Name": name, "SizeGB": round(total_gb, 2),
                                 "CheckCategory": "EFS One Zone Migration", "Counted": False,
                                 "Recommendation": "Migrate to One Zone storage if Multi-AZ resilience is not required",
-                                "EstimatedSavings": f"~${oz_savings:.2f}/month if migrated (durability tradeoff)",
+                                "EstimatedSavings": f"~${oz_savings:.2f}/mo-equiv if migrated (durability tradeoff)",
                             }
                         )
 
@@ -566,7 +584,7 @@ def get_fsx_findings(ctx: ScanContext, pricing_multiplier: float) -> dict[str, l
                 )
 
         try:
-            for cache in fsx.describe_file_caches().get("FileCaches", []):
+            for cache in _list_file_caches(fsx):
                 advisory.append(
                     {
                         "FileCacheId": cache["FileCacheId"], "FileSystemType": "FILE_CACHE",

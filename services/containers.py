@@ -221,8 +221,8 @@ def get_ecr_analysis(ctx: ScanContext) -> dict[str, Any]:
     try:
         ecr = ctx.client("ecr")
 
-        repos_response = ecr.describe_repositories()
-        repositories = repos_response.get("repositories", [])
+        paginator = ecr.get_paginator("describe_repositories")
+        repositories = [r for page in paginator.paginate() for r in page.get("repositories", [])]
 
         analysis: dict[str, Any] = {
             "total_repositories": len(repositories),
@@ -239,7 +239,7 @@ def get_ecr_analysis(ctx: ScanContext) -> dict[str, Any]:
                 for page in paginator.paginate(repositoryName=repo_name):
                     image_count += len(page.get("imageIds", []))
             except Exception as e:
-                logger.warning(f"\u26a0\ufe0f Error getting image count for ECR repo {repo_name}: {str(e)}")
+                _ecr_failure(ctx, f"list_images({repo_name})", e)
                 image_count = 0
 
             repo_info: dict[str, Any] = {

@@ -146,6 +146,9 @@ _SERVICE_STATS_CONFIG: Dict[str, Dict[str, Any]] = {
     "bedrock": {
         "multi_source_cards": [
             ("Provisioned Throughputs", "extras", "pt_count"),
+            # bedrock L2: the idle-PT count is the cost-relevant figure (the only
+            # Bedrock resources carrying a saving), so surface it alongside totals.
+            ("Idle PTs", "extras", "idle_pt_count"),
             ("Knowledge Bases", "extras", "kb_count"),
             ("Agents", "extras", "agent_count"),
         ],
@@ -347,17 +350,6 @@ def _extract_rds_resources(rec: Dict[str, Any], resource_groups: Dict[str, list]
     )
 
 
-def _fs_rec_savings(rec: Dict[str, Any]) -> float:
-    """Monthly saving for a file-system rec — uses the real ``_savings`` field.
-
-    Counted recs carry ``_savings`` (float); advisory recs have none and resolve
-    to 0. The previous implementation read ``EstimatedMonthlyCost`` (a field
-    these recs never set) and always produced 0.
-    """
-    val = rec.get("_savings")
-    return float(val) if isinstance(val, (int, float)) else 0.0
-
-
 def _counted_advisory_counts(sources: Dict[str, Any]) -> Tuple[int, int]:
     """Split a service's recommendations into (counted, advisory).
 
@@ -378,37 +370,10 @@ def _counted_advisory_counts(sources: Dict[str, Any]) -> Tuple[int, int]:
     return counted, advisory
 
 
-def _extract_file_systems_resources(rec: Dict[str, Any], resource_groups: Dict[str, list]) -> None:
-    """Extract EFS/FSx file-system resource IDs into grouped lists. Called by: _get_affected_resources_list."""
-    if "FileSystemType" in rec:
-        fs_type = rec.get("FileSystemType", "Unknown")
-        if f"FSx {fs_type}" not in resource_groups:
-            resource_groups[f"FSx {fs_type}"] = []
-        resource_groups[f"FSx {fs_type}"].append(
-            {
-                "id": rec.get("FileSystemId", "N/A"),
-                "type": f"{rec.get('StorageCapacity', 0)} GB",
-                "savings": _fs_rec_savings(rec),
-            }
-        )
-    else:
-        if not rec.get("HasIAPolicy", True):
-            if "EFS Lifecycle Optimization" not in resource_groups:
-                resource_groups["EFS Lifecycle Optimization"] = []
-            resource_groups["EFS Lifecycle Optimization"].append(
-                {
-                    "id": rec.get("Name", rec.get("FileSystemId", "N/A")),
-                    "type": f"{rec.get('SizeGB', 0)} GB",
-                    "savings": _fs_rec_savings(rec),
-                }
-            )
-
-
 _RESOURCE_EXTRACTORS: Dict[str, Callable[..., None]] = {
     "ec2": _extract_ec2_resources,
     "ebs": _extract_ebs_resources,
     "rds": _extract_rds_resources,
-    "file_systems": _extract_file_systems_resources,
 }
 
 
@@ -2709,7 +2674,13 @@ class HTMLReportGenerator:
     def _get_amis_content(self, amis_data: Dict[str, Any]) -> str:
         """Generate content for AMIs tab"""
         # Group AMIs by age range
-        age_groups = {"90-180 days": [], "180-365 days": [], "1-2 years": [], "2+ years": []}
+        age_groups = {
+            "30-90 days": [],
+            "90-180 days": [],
+            "180-365 days": [],
+            "1-2 years": [],
+            "2+ years": [],
+        }
 
         # Dedupe by ImageId — the same AMI can surface from multiple sources
         # (EBS enhanced checks + the AMI service adapter). Prefer the entry with the
@@ -2733,7 +2704,9 @@ class HTMLReportGenerator:
 
         for rec in deduped_recs:
             age_days = rec.get("AgeDays", 0)
-            if age_days <= 180:
+            if age_days <= 90:
+                age_groups["30-90 days"].append(rec)
+            elif age_days <= 180:
                 age_groups["90-180 days"].append(rec)
             elif age_days <= 365:
                 age_groups["180-365 days"].append(rec)
@@ -3140,8 +3113,6 @@ class HTMLReportGenerator:
             "api_gateway",
             "step_functions",
             "auto_scaling",
-            "backup",
-            "route53",
             "ami",
             "lightsail",
             "dms",

@@ -29,6 +29,24 @@ logger = logging.getLogger(__name__)
 
 HOURS_PER_MONTH: int = 730
 
+# Cluster-level check types whose saving is INDEPENDENT of a COMPUTE-class CoH
+# EksCluster recommendation, so they must NOT be demoted as a CoH duplicate when
+# CoH only rightsizes/migrates the cluster's compute (eks dedup check_type
+# awareness). A compute CoH rec prices the nodes; the Extended Support surcharge
+# is a Kubernetes-version control-plane charge removed by upgrading the version —
+# an additive saving CoH's compute recs never include — so demoting it against a
+# compute rec would silently understate savings (~$365/mo per cluster).
+_COH_INDEPENDENT_CLUSTER_CHECK_TYPES: frozenset[str] = frozenset({"extended_support"})
+
+# CoH actionTypes that ELIMINATE the whole cluster (Stop / Delete / Terminate).
+# Their estimatedMonthlySavings already prices every per-cluster charge —
+# control plane, compute, AND the Extended Support surcharge — so under one of
+# these even the otherwise-independent surcharge IS demoted, else it is
+# double-counted (counted both in the CoH elimination total and the heuristic
+# surcharge rec). Any other action (Rightsize / Graviton / commitment) leaves
+# the cluster running, so the surcharge stays additive and counted.
+_COH_FULL_CLUSTER_ELIMINATION_ACTIONS: frozenset[str] = frozenset({"Stop", "Delete", "Terminate"})
+
 PREV_GEN_PREFIXES: tuple[str, ...] = ("m3.", "m4.", "c3.", "c4.", "r3.", "r4.", "t2.")
 # AWS Graviton EC2 list-price delta vs x86 (m5→m6g, c5→c6g, etc.) ≈ 20%.
 GRAVITON_SAVINGS_FACTOR: float = 0.20
@@ -307,6 +325,12 @@ class EksCostModule(BaseServiceModule):
                     "recommended_value": "Delete the failed cluster to stop control-plane charges",
                     "monthly_savings": round(monthly_control_plane, 2),
                     "severity": "HIGH",
+                    "audit_basis": {
+                        "rate": control_plane_rate,
+                        "unit": "USD/cluster-hour",
+                        "formula": f"{control_plane_rate} x {HOURS_PER_MONTH} hr",
+                        "evidence": "cluster.status == FAILED",
+                    },
                     "reason": (
                         f"EKS cluster '{name}' is in {status} state; deleting saves "
                         f"${monthly_control_plane:.2f}/mo control-plane cost"
@@ -473,30 +497,51 @@ class EksCostModule(BaseServiceModule):
                 if ng_monthly <= 0:
                     continue
 
-                # Spot opportunity (ON_DEMAND groups).
+                # Spot and Graviton are MUTUALLY EXCLUSIVE levers (switching to
+                # Spot precludes switching to Graviton and vice versa), so we emit
+                # ONE advisory rec per node group carrying the higher-saving lever
+                # — never two additive recs that would fabricate ~0.90x node cost
+                # if either were ever promoted to Counted=True.
+                is_x86 = bool(instance_types) and not _is_graviton(instance_types[0])
+                spot_saving = round(ng_monthly * SPOT_SAVINGS_FACTOR, 2)
+                grav_saving = round(ng_monthly * GRAVITON_SAVINGS_FACTOR, 2)
+
                 if capacity_type != "SPOT":
-                    spot_saving = round(ng_monthly * SPOT_SAVINGS_FACTOR, 2) if ng_monthly > 0 else 0.0
+                    # ON_DEMAND: Spot is the larger lever (~70% vs ~20% Graviton).
+                    if is_x86:
+                        recommended = (
+                            f"Use Spot (~{int(SPOT_SAVINGS_FACTOR * 100)}%) or migrate to Graviton/ARM "
+                            f"(~{int(GRAVITON_SAVINGS_FACTOR * 100)}%) — mutually exclusive alternatives"
+                        )
+                        reason = (
+                            f"Node group '{ng_name}' ({desired}x {instance_types}, ${ng_monthly:.2f}/mo on-demand): "
+                            f"~${spot_saving:.2f}/mo via Spot for fault-tolerant workloads, OR ~${grav_saving:.2f}/mo "
+                            f"via Graviton (ARM) — mutually exclusive alternatives (not additive), advisory estimate; "
+                            f"these are EC2 instances, quantified/counted in the EC2 tab (needs Compute Optimizer or ASG CO enabled)"
+                        )
+                    else:
+                        recommended = f"Use Spot for fault-tolerant workloads (~{int(SPOT_SAVINGS_FACTOR * 100)}%)"
+                        reason = (
+                            f"Node group '{ng_name}' ({desired}x {instance_types}, ${ng_monthly:.2f}/mo on-demand): "
+                            f"~${spot_saving:.2f}/mo via Spot — advisory estimate; these are EC2 instances, "
+                            f"quantified/counted in the EC2 tab (needs Compute Optimizer or ASG CO enabled)"
+                        )
                     recs.append(
                         {
                             "resource_id": resource_id,
                             "check_type": "node_group",
                             "check_category": "Node Group Optimization",
                             "current_value": f"{capacity_type} node group: {instance_types} x{desired}",
-                            "recommended_value": f"Use Spot for fault-tolerant workloads (~{int(SPOT_SAVINGS_FACTOR * 100)}%)",
+                            "recommended_value": recommended,
                             "monthly_savings": spot_saving,
                             "Counted": False,
                             "severity": "LOW",
-                            "reason": (
-                                f"Node group '{ng_name}' ({desired}x {instance_types}, ${ng_monthly:.2f}/mo on-demand): "
-                                f"~${spot_saving:.2f}/mo via Spot — advisory estimate; these are EC2 instances, "
-                                f"quantified/counted in the EC2 tab (needs Compute Optimizer or ASG CO enabled)"
-                            ),
+                            "reason": reason,
                         }
                     )
-
-                # Graviton opportunity (x86 node groups only).
-                if instance_types and not _is_graviton(instance_types[0]):
-                    grav_saving = round(ng_monthly * GRAVITON_SAVINGS_FACTOR, 2) if ng_monthly > 0 else 0.0
+                elif is_x86:
+                    # SPOT but still x86: the Spot lever is already taken, so
+                    # Graviton is the one remaining lever — Graviton-only advisory.
                     recs.append(
                         {
                             "resource_id": resource_id,
@@ -504,12 +549,12 @@ class EksCostModule(BaseServiceModule):
                             "check_category": "Node Group Optimization",
                             "current_value": f"x86 instance types: {instance_types} x{desired}",
                             "recommended_value": f"Migrate to Graviton (ARM) for ~{int(GRAVITON_SAVINGS_FACTOR * 100)}% list-price savings",
-                            "monthly_savings": round(ng_monthly * GRAVITON_SAVINGS_FACTOR, 2) if ng_monthly > 0 else 0.0,
+                            "monthly_savings": grav_saving,
                             "Counted": False,
                             "severity": "MEDIUM",
                             "reason": (
                                 f"Node group '{ng_name}' ({desired}x {instance_types}, ${ng_monthly:.2f}/mo on-demand): "
-                                f"~${grav_saving:.2f}/mo via Graviton (ARM) — advisory estimate, alternative to Spot; "
+                                f"~${grav_saving:.2f}/mo via Graviton (ARM) — advisory estimate; "
                                 f"these are EC2 instances, counted in the EC2 tab"
                             ),
                         }
@@ -537,7 +582,8 @@ class EksCostModule(BaseServiceModule):
             return 0.0
         try:
             hourly = ctx.pricing_engine.get_ec2_hourly_price(instance_types[0], quiet=True)
-        except Exception:
+        except Exception as e:
+            ctx.warn(f"EKS node-group pricing failed for {instance_types[0]}: {e}", "eks_cost")
             return 0.0
         return float(hourly or 0.0) * HOURS_PER_MONTH * desired
 
@@ -643,15 +689,42 @@ class EksCostModule(BaseServiceModule):
         and returns a NEW list where any overlapping heuristic rec is copied with
         ``Counted=False`` (so its dollar is not summed twice). Non-overlapping
         recs pass through unchanged. Inputs are not mutated in place.
+
+        Demotion is ``check_type`` + ``actionType``-aware (eks dedup check_type
+        awareness): a COMPUTE-class CoH rec (Rightsize / Graviton / commitment)
+        prices only the nodes, so a cluster-level rec whose saving is an
+        independent dimension (the Extended Support version surcharge —
+        ``_COH_INDEPENDENT_CLUSTER_CHECK_TYPES``) is left counted, else an
+        additive saving is silently dropped. But a full-cluster-elimination CoH
+        action (``_COH_FULL_CLUSTER_ELIMINATION_ACTIONS`` — Stop/Delete/Terminate)
+        already prices the surcharge in its total, so under one of those the
+        surcharge IS demoted to avoid double-counting it.
         """
         covered = {coh_key(rec) for rec in hub_recs}
         covered.discard("")
         if not covered:
             return cluster_recs
+        # Subset of covered clusters whose CoH coverage is a whole-cluster
+        # elimination (its savings already includes the surcharge).
+        covered_full = {
+            coh_key(rec)
+            for rec in hub_recs
+            if str(rec.get("actionType", "")) in _COH_FULL_CLUSTER_ELIMINATION_ACTIONS
+        }
+        covered_full.discard("")
         deduped: list[dict[str, Any]] = []
         for rec in cluster_recs:
+            check_type = str(rec.get("check_type", ""))
             key = normalize_resource_id(str(rec.get("resource_id", "")))
-            if key and key in covered:
+            # An independent surcharge is superseded ONLY by a full-cluster
+            # elimination; every other cluster rec is superseded by any CoH
+            # coverage of the cluster.
+            covering = (
+                covered_full
+                if check_type in _COH_INDEPENDENT_CLUSTER_CHECK_TYPES
+                else covered
+            )
+            if key and key in covering:
                 superseded = dict(rec)
                 superseded["Counted"] = False
                 superseded["dedup_basis"] = "CoH > heuristic (EksCluster)"

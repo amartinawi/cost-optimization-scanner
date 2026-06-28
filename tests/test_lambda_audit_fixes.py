@@ -60,6 +60,25 @@ class _FakePaginator:
         return iter(self._pages)
 
 
+class _FakePCPaginator:
+    """Paginator for list_provisioned_concurrency_configs.
+
+    Emits one PC config per page so tests can prove the shim walks every page;
+    raises for functions in ``pc_error`` to exercise the read-failure path.
+    """
+
+    def __init__(self, pc: dict[str, list[dict[str, Any]]], pc_error: set[str]) -> None:
+        self._pc = pc
+        self._pc_error = pc_error
+
+    def paginate(self, FunctionName: str):  # noqa: ANN201, N803 - boto3 shape
+        if FunctionName in self._pc_error:
+            raise Exception("ServiceException: transient")
+        configs = self._pc.get(FunctionName, [])
+        pages = [{"ProvisionedConcurrencyConfigs": [c]} for c in configs]
+        return iter(pages or [{"ProvisionedConcurrencyConfigs": []}])
+
+
 class _FakeLambdaClient:
     """Minimal boto3 Lambda client driving the enhanced-checks shim."""
 
@@ -73,16 +92,13 @@ class _FakeLambdaClient:
         self._pc = pc or {}
         self._pc_error = pc_error or set()
 
-    def get_paginator(self, _name: str) -> _FakePaginator:
+    def get_paginator(self, name: str):  # noqa: ANN201 - boto3 shape
+        if name == "list_provisioned_concurrency_configs":
+            return _FakePCPaginator(self._pc, self._pc_error)
         return _FakePaginator([{"Functions": self._functions}])
 
     def get_function_configuration(self, FunctionName: str) -> dict[str, Any]:  # noqa: N803
         return {"VpcConfig": {}, "ReservedConcurrentExecutions": None}
-
-    def list_provisioned_concurrency_configs(self, FunctionName: str) -> dict[str, Any]:  # noqa: N803
-        if FunctionName in self._pc_error:
-            raise Exception("ServiceException: transient")
-        return {"ProvisionedConcurrencyConfigs": self._pc.get(FunctionName, [])}
 
 
 class _FakeCloudWatch:
@@ -359,3 +375,28 @@ def test_pc_utilization_attached_when_metric_present() -> None:
     pc = [r for r in result["recommendations"] if r["CheckCategory"] == "Lambda Provisioned Concurrency"]
     assert pc[0]["MaxUtilization"] == 0.4
     assert pc[0]["Architecture"] == "x86_64"
+
+
+# --------------------------------------------------------------------------- #
+# L3 — ListProvisionedConcurrencyConfigs is paginated (no silent truncation)
+# --------------------------------------------------------------------------- #
+def test_pc_configs_collected_across_all_pages() -> None:
+    # 'a' has two PC configs returned on separate pages; the shim must walk
+    # every page rather than reading only the first.
+    lam = _FakeLambdaClient(
+        functions=[_func("a")],
+        pc={"a": [
+            {"AllocatedProvisionedConcurrentExecutions": 2},
+            {"AllocatedProvisionedConcurrentExecutions": 5},
+        ]},
+    )
+    cw = _FakeCloudWatch(pc_util_max=0.4)
+    ctx = _recording_ctx()
+    ctx.client = _client_factory(lam, cw)
+
+    result = shim_mod.get_enhanced_lambda_checks(ctx)
+    pc = [r for r in result["recommendations"] if r["CheckCategory"] == "Lambda Provisioned Concurrency"]
+
+    # One rec per PC config across both pages — neither page is dropped.
+    assert len(pc) == 2
+    assert {r["ProvisionedConcurrency"] for r in pc} == {2, 5}

@@ -1,4 +1,4 @@
-"""Flat-rate adapter for CloudFront."""
+"""Advisory-only adapter for CloudFront."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from services.cloudfront import get_enhanced_cloudfront_checks
 
 
 class CloudfrontModule(BaseServiceModule):
-    """ServiceModule adapter for CloudFront. Flat-rate savings strategy."""
+    """ServiceModule adapter for CloudFront. Advisory-only ($0 + PricingWarning)."""
 
     key: str = "cloudfront"
     cli_aliases: tuple[str, ...] = ("cloudfront",)
@@ -24,7 +24,9 @@ class CloudfrontModule(BaseServiceModule):
         """Scan CloudFront distributions for cost optimization opportunities.
 
         Consults the cloudfront service module for price class optimization,
-        disabled distributions, and origin shield review. Traffic-based savings.
+        disabled distributions, and origin shield review. Emits $0 advisories
+        with a PricingWarning — honest data-transfer savings need the CloudWatch
+        BytesDownloaded metric + per-distribution PriceClass.
 
         Args:
             ctx: ScanContext with region, clients, and pricing data.

@@ -9,10 +9,15 @@
 > (34/34 adapters, 342 findings, adversarially verified). Remediation is tracked
 > per severity in `CRITICAL_/HIGH_/MEDIUM_/LOW_REMEDIATION_PROMPT.md`. **All 29
 > CRITICAL findings are remediated** (cost-fidelity batch, 2026-06-27 — see the
-> CHANGELOG "cost-fidelity CRITICAL remediation" entry), and **all 83 actionable
-> HIGH findings are remediated** (2026-06-28 — see the CHANGELOG "cost-fidelity
-> HIGH remediation" entry; every remediated service carries a
-> `tests/test_<svc>_high_fixes.py`). MEDIUM/LOW remain.
+> CHANGELOG "cost-fidelity CRITICAL remediation" entry); **all 83 actionable
+> HIGH findings are remediated** (2026-06-28 — every remediated service carries a
+> `tests/test_<svc>_high_fixes.py`); and **the LOW backlog (~100 REPRODUCES
+> findings) is remediated** (2026-06-28 — see the CHANGELOG "cost-fidelity LOW
+> remediation" entry). Each LOW finding was re-verified read-only against the
+> integrated tree. **No LOW finding remains flagged** — the last open item
+> (quicksight L3, sub-50%-idle SPICE) is now emitted as a `$0` `Counted=False`
+> advisory (rendered, never summed), so it is consistent with the rest of the
+> count-hygiene model rather than an intentional skip. MEDIUM remains.
 
 ---
 

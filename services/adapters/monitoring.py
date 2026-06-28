@@ -20,6 +20,10 @@ class MonitoringModule(BaseServiceModule):
     # Shim hits cloudwatch.describe_alarms + list_metrics for custom-metrics
     # tier pricing; flag must reflect that.
     requires_cloudwatch: bool = True
+    # Those CloudWatch describes (list_metrics + describe_alarms) and the
+    # GetMetricData staleness probe are skipped under --fast, so the module
+    # must declare that it honours fast mode.
+    reads_fast_mode: bool = True
 
     def required_clients(self) -> tuple[str, ...]:
         """Returns boto3 client names required for monitoring and logging scanning."""

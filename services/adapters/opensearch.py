@@ -1,4 +1,4 @@
-"""Keyword-rate adapter for OpenSearch."""
+"""Live-priced adapter for OpenSearch (node-price deltas; CoH-authoritative)."""
 
 from __future__ import annotations
 
@@ -19,9 +19,26 @@ from services.opensearch import (
 # Service Volume"): ES:GP3-Storage = $0.122/GB-Mo, ES:GP2-Storage = $0.135/GB-Mo.
 GP3_PRICE_PER_GB_MONTH: float = 0.122
 GP2_PRICE_PER_GB_MONTH: float = 0.135
-# Graviton price-performance proxy (advisory-grade reduction factor; an exact
-# x86->Graviton node-price delta would need a family map, out of scope here).
-GRAVITON_RATE: float = 0.25
+
+# x86/Intel OpenSearch (AmazonES) instance family -> its same-size Graviton
+# (ARM) equivalent. The realizable Graviton saving is the exact per-node price
+# delta, NOT a flat 20-40% / 0.25 price-performance figure (that is a
+# perf-per-dollar metric, not a cost reduction — the real node-price delta is
+# ~5-10%). The old flat GRAVITON_RATE=0.25 overstated it ~3-5x (live-audit H4).
+# Families with no clean same-size Graviton counterpart (storage i3/i2, etc.)
+# are omitted so the caller emits a $0 advisory instead of guessing a target.
+_X86_TO_GRAVITON_FAMILY: dict[str, str] = {
+    "m3": "m6g",
+    "m4": "m6g",
+    "m5": "m6g",
+    "c4": "c6g",
+    "c5": "c6g",
+    "r3": "r6g",
+    "r4": "r6g",
+    "r5": "r6g",
+    "t2": "t4g",
+    "t3": "t4g",
+}
 
 # Standard OpenSearch instance size ladder (ascending). Used to derive the
 # one-size-down downsize target for an underutilized domain (OpenSearch C3).
@@ -90,8 +107,53 @@ def _downsize_node_delta(ctx: Any, instance_type: str | None) -> tuple[float, st
     return current - smaller, target
 
 
+def _graviton_equivalent(instance_type: str | None) -> str | None:
+    """Map an x86 OpenSearch instance type to its same-size Graviton equivalent.
+
+    ``r5.xlarge.search`` -> ``r6g.xlarge.search``. Returns ``None`` when the
+    family has no known Graviton counterpart, so the caller demotes the Graviton
+    rec to a $0 advisory rather than fabricating a delta against an unknown
+    node price (live-audit H4).
+    """
+    if not instance_type:
+        return None
+    parts = instance_type.split(".")
+    if len(parts) < 2:
+        return None
+    graviton_family = _X86_TO_GRAVITON_FAMILY.get(parts[0])
+    if graviton_family is None:
+        return None
+    parts[0] = graviton_family
+    return ".".join(parts)
+
+
+def _graviton_node_delta(ctx: Any, instance_type: str | None) -> tuple[float, str | None]:
+    """Per-node $/month saved by migrating one OpenSearch node x86 -> Graviton.
+
+    Concrete current -> same-size Graviton node-price delta (replaces the flat
+    0.25 price-performance proxy -- live-audit H4). Returns ``(0.0, None)``
+    (caller emits a $0 advisory) when pricing is unavailable, the family has no
+    Graviton counterpart, or the delta is non-positive -- we never assert a
+    migration saving we cannot substantiate from two live prices.
+
+    Returns:
+        Tuple of (per-node monthly delta, target instance type) -- the target is
+        None whenever the delta is 0.0.
+    """
+    if ctx.pricing_engine is None or not instance_type:
+        return 0.0, None
+    target = _graviton_equivalent(instance_type)
+    if target is None:
+        return 0.0, None
+    current = ctx.pricing_engine.get_instance_monthly_price("AmazonES", instance_type)
+    graviton = ctx.pricing_engine.get_instance_monthly_price("AmazonES", target)
+    if current <= 0 or graviton <= 0 or graviton >= current:
+        return 0.0, None
+    return current - graviton, target
+
+
 class OpensearchModule(BaseServiceModule):
-    """ServiceModule adapter for OpenSearch. Keyword-rate savings strategy."""
+    """ServiceModule adapter for OpenSearch. Live node-price-delta savings strategy."""
 
     key: str = "opensearch"
     cli_aliases: tuple[str, ...] = ("opensearch",)
@@ -190,15 +252,21 @@ class OpensearchModule(BaseServiceModule):
                         "metric": f"CloudWatch AWS/ES CPUUtilization avg < {LOW_CPU_THRESHOLD}% over 14d",
                         "formula": "(current_node_monthly - one_size_down_node_monthly) x count",
                     }
-            elif category == "Graviton Migration" and ctx.pricing_engine is not None and instance_type:
-                monthly = ctx.pricing_engine.get_instance_monthly_price("AmazonES", instance_type)
-                value = monthly * instance_count * GRAVITON_RATE
-                audit_basis = {
-                    "instance_rate_monthly": round(monthly, 4),
-                    "instance_count": instance_count,
-                    "graviton_rate": GRAVITON_RATE,
-                    "formula": "instance_rate x count x graviton_rate (price-performance proxy)",
-                }
+            elif category == "Graviton Migration":
+                # Concrete current -> same-size Graviton node-price delta
+                # (live-audit H4): replaces the flat 0.25 price-performance
+                # proxy, which overstated the real ~5-10% node delta ~3-5x.
+                # Abstains to a $0 advisory when no Graviton counterpart prices.
+                per_node_delta, target = _graviton_node_delta(ctx, instance_type)
+                value = per_node_delta * instance_count
+                if value > 0:
+                    audit_basis = {
+                        "current_type": instance_type,
+                        "target_type": target,
+                        "per_node_delta_monthly": round(per_node_delta, 4),
+                        "instance_count": instance_count,
+                        "formula": "(current_node_monthly - same_size_graviton_node_monthly) x count",
+                    }
             rec["EstimatedMonthlySavings"] = round(value, 2)
             if audit_basis is not None:
                 rec["AuditBasis"] = audit_basis

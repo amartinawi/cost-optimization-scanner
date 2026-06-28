@@ -25,7 +25,6 @@ def get_enhanced_transfer_checks(ctx: ScanContext) -> dict[str, Any]:
     checks: dict[str, list[dict[str, Any]]] = {
         "unused_servers": [],
         "protocol_optimization": [],
-        "endpoint_optimization": [],
     }
 
     try:
@@ -87,15 +86,20 @@ def get_enhanced_transfer_checks(ctx: ScanContext) -> dict[str, Any]:
                                     uploaded += dp.get("Sum", 0)
                                 else:
                                     downloaded += dp.get("Sum", 0)
-                        total_gb = (uploaded + downloaded) / (1024**3)
+                        upload_gb = uploaded / (1024**3)
+                        download_gb = downloaded / (1024**3)
+                        total_gb = upload_gb + download_gb
                         if total_gb > 0:
                             rec["DataTransferCostGB"] = round(total_gb, 2)
-                            rec["DataTransferCostNote"] = f"~${total_gb * 0.09:.2f}/mo S3 data transfer"
+                            rec["DataTransferCostNote"] = (
+                                f"~${upload_gb * 0.04:.2f} upload + ${download_gb * 0.04:.2f} download"
+                                " (14-day; Transfer Family $0.04/GB each way)"
+                            )
                     except Exception:
                         rec["DataTransferCostNote"] = (
                             "CloudWatch unavailable — consider monitoring"
                             " BytesUploaded/BytesDownloaded for S3 transfer cost"
-                            " (~$0.09/GB) awareness"
+                            " ($0.04/GB upload + $0.04/GB download — Transfer Family fee) awareness"
                         )
 
                 if state in ["STOPPED", "OFFLINE"]:

@@ -264,6 +264,22 @@ def test_cost_hub_commitment_recs_are_advisory_not_counted():
     assert f.total_monthly_savings == 0.0  # no existing-commitment waste on this account
 
 
+def test_scan_warns_when_ce_client_unavailable():
+    # A missing or IAM-blocked Cost Explorer client must emit a warning rather
+    # than silently returning an empty report.
+    ctx = SimpleNamespace(region="us-east-1")
+    ctx.client = lambda name, region=None: None
+    ctx.warn = MagicMock()
+    ctx.permission_issue = MagicMock()
+    findings = CommitmentAnalysisModule().scan(ctx)
+    assert findings.total_recommendations == 0
+    assert findings.total_monthly_savings == 0.0
+    ctx.warn.assert_called_once()
+    msg, svc = ctx.warn.call_args.args[0], ctx.warn.call_args.args[1]
+    assert "Cost Explorer client unavailable" in msg
+    assert svc == "commitment_analysis"
+
+
 def test_render_fargate_sp_matrix():
     from reporter_phase_b import _render_fargate_savings_plan
     recs = [

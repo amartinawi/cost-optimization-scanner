@@ -181,12 +181,26 @@ def test_scan_does_not_mutate_source_recs(monkeypatch: pytest.MonkeyPatch) -> No
 # --------------------------------------------------------------------------- #
 # scan() path through the REAL shim with fake boto3 clients
 # --------------------------------------------------------------------------- #
-class _FakeMediaStore:
-    def __init__(self, containers):
-        self._containers = containers
+class _FakePaginator:
+    """Minimal boto3-style paginator yielding one page dict per page."""
 
-    def list_containers(self):
-        return {"Containers": self._containers}
+    def __init__(self, pages):
+        self._pages = pages
+
+    def paginate(self):
+        for page in self._pages:
+            yield {"Containers": page}
+
+
+class _FakeMediaStore:
+    def __init__(self, containers, *, pages=None):
+        # `pages` spans multiple paginator pages; default is a single page so
+        # existing single-page call sites keep working (mediastore L1).
+        self._pages = pages if pages is not None else [containers]
+
+    def get_paginator(self, operation_name):
+        assert operation_name == "list_containers"
+        return _FakePaginator(self._pages)
 
 
 class _FakeCloudWatch:
@@ -250,6 +264,30 @@ def test_scan_path_demotes_zero_storage_container() -> None:
     # ...and H1 keeps it out of the headline count and dollar total.
     assert findings.total_recommendations == 0
     assert findings.total_monthly_savings == 0.0
+
+
+# --------------------------------------------------------------------------- #
+# mediastore L1: paginate list_containers — containers beyond page 1 are kept
+# --------------------------------------------------------------------------- #
+def test_scan_path_follows_pagination_across_pages() -> None:
+    # Two paginator pages, each a distinct storage-backed confirmed-idle
+    # container; before the fix only the first page was read, silently dropping
+    # the second container's realizable saving.
+    ms = _FakeMediaStore(
+        [],
+        pages=[
+            [{"Name": "page1-c", "Status": "ACTIVE"}],
+            [{"Name": "page2-c", "Status": "ACTIVE"}],
+        ],
+    )
+    cw = _FakeCloudWatch(size_average_gb=10.0)  # 10 GB stored per container
+    ctx = _ctx(client=_client_factory(ms, cw))
+    findings = mediastore_adapter.MediastoreModule().scan(ctx)
+    names = {r["ContainerName"] for r in findings.sources["enhanced_checks"].recommendations}
+    assert names == {"page1-c", "page2-c"}  # second page is NOT dropped
+    per_container = round(10.0 * S3_STANDARD_RATE, 2)  # $0.23
+    assert findings.total_recommendations == 2
+    assert findings.total_monthly_savings == pytest.approx(2 * per_container, abs=0.001)
 
 
 if __name__ == "__main__":  # pragma: no cover

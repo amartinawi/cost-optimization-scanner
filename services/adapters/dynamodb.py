@@ -174,7 +174,16 @@ class DynamoDbModule(BaseServiceModule):
         coh_kept: list[dict[str, Any]] = []
         for rec in cost_hub_recs:
             resource_id = str(rec.get("resourceId", "") or "")
-            table_name = resource_id.split("/")[-1] if resource_id else ""
+            # Extract the table-name segment for both plain table ARNs
+            # (...:table/Name) and index ARNs (...:table/Name/index/GSI). A naive
+            # split("/")[-1] yields the GSI name for index ARNs, so a CoH rec
+            # targeting an index on an already-covered table would not dedupe and
+            # its savings would be double-counted (DynamoDB L3).
+            table_name = (
+                resource_id.split(":table/")[-1].split("/")[0]
+                if ":table/" in resource_id
+                else resource_id.split("/")[-1]
+            )
             if table_name and table_name in covered_tables:
                 continue
             coh_kept.append(rec)

@@ -12,8 +12,9 @@ from typing import Any
 from core.scan_context import ScanContext
 from services._aws_errors import record_aws_error
 
-APP_RUNNER_MEM_GB_HOURLY: float = 0.007
-HOURS_PER_MONTH: int = 730
+# The idle-service dollar (mem_gb x $0.007/hr x 730) is priced in the adapter
+# (services/adapters/apprunner.py), which owns those constants; this checks
+# module only emits the flagged service + its InstanceConfiguration.
 IDLE_REQUEST_LOOKBACK_DAYS: int = 30
 SECONDS_PER_DAY: int = 86400
 

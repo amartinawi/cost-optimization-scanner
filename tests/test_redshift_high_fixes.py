@@ -217,11 +217,13 @@ def test_serverless_reservation_is_advisory(monkeypatch: pytest.MonkeyPatch) -> 
 
 
 # --------------------------------------------------------------------------- #
-# H2 — counted == rendered for every surviving lever
+# L2 — the dead per-node heuristic pricing path is removed; no non-advisory
+#      heuristic lever is ever counted (CoH is the only counted source)
 # --------------------------------------------------------------------------- #
-def test_counted_priced_lever_dollar_is_exact(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A non-advisory, priceable lever (pause/resume) is counted at the live node
-    rate; the card string equals the counted dollar (counted == rendered)."""
+def test_pause_lever_is_zero_advisory_not_counted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """L2: a pause-named lever that carries a priceable NodeType is NOT counted —
+    the dead REDSHIFT_SAVINGS_FACTORS 'pause' path (which would have counted
+    100 x 2 x 1.00 = 200) was removed; the rec is now a $0 advisory."""
     _patch_checks(
         monkeypatch,
         [
@@ -235,18 +237,19 @@ def test_counted_priced_lever_dollar_is_exact(monkeypatch: pytest.MonkeyPatch) -
     )
     findings = RedshiftModule().scan(_ctx(pricing_monthly=100.0))
     rec = findings.sources["enhanced_checks"].recommendations[0]
-    # pause factor = 1.00 -> 100 * 2 * 1.00 = 200.00
-    assert rec["Counted"] is True
-    assert rec["EstimatedMonthlySavings"] == pytest.approx(200.0)
-    assert rec["EstimatedSavings"] == "$200.00/month"
-    assert parse_dollar_savings(rec["EstimatedSavings"]) == pytest.approx(200.0)
-    assert findings.total_monthly_savings == pytest.approx(200.0)
-    assert rec["AuditBasis"]["savings_factor"] == 1.00
-    assert rec["AuditBasis"]["node_monthly_price"] == 100.0
+    assert rec["Counted"] is False
+    assert rec["EstimatedMonthlySavings"] == 0.0
+    assert rec["EstimatedSavings"].startswith("$0.00/month — advisory")
+    assert parse_dollar_savings(rec["EstimatedSavings"]) == pytest.approx(0.0)
+    assert findings.total_monthly_savings == pytest.approx(0.0)
+    # No fabricated AuditBasis / counted factor survives the L2 removal.
+    assert "AuditBasis" not in rec
 
 
-def test_default_factor_priced_lever(monkeypatch: pytest.MonkeyPatch) -> None:
-    """An unrecognized-but-priceable category uses the conservative 0.24 factor."""
+def test_rightsizing_lever_with_node_type_is_zero_advisory(monkeypatch: pytest.MonkeyPatch) -> None:
+    """L2: a non-advisory category carrying a NodeType is no longer priced by the
+    removed 0.24 'default' factor (which would have counted 100 x 2 x 0.24 = 48) —
+    it renders as a $0 advisory."""
     _patch_checks(
         monkeypatch,
         [
@@ -260,10 +263,10 @@ def test_default_factor_priced_lever(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     findings = RedshiftModule().scan(_ctx(pricing_monthly=100.0))
     rec = findings.sources["enhanced_checks"].recommendations[0]
-    # default factor 0.24 -> 100 * 2 * 0.24 = 48.00
-    assert rec["EstimatedMonthlySavings"] == pytest.approx(48.0)
-    assert rec["EstimatedSavings"] == "$48.00/month"
-    assert findings.total_monthly_savings == pytest.approx(48.0)
+    assert rec["Counted"] is False
+    assert rec["EstimatedMonthlySavings"] == 0.0
+    assert parse_dollar_savings(rec["EstimatedSavings"]) == pytest.approx(0.0)
+    assert findings.total_monthly_savings == pytest.approx(0.0)
 
 
 def test_unpriceable_lever_is_zero_advisory(monkeypatch: pytest.MonkeyPatch) -> None:

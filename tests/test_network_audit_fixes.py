@@ -244,6 +244,17 @@ def test_dev_test_nat_counted_when_sole_in_vpc() -> None:
     assert parse_dollar_savings(dev[0]["EstimatedSavings"]) == 32.85
 
 
+def test_net06_no_missing_endpoint_advisory_from_nat_shim() -> None:
+    # NET-06: a VPC with a NAT but no S3/DDB gateway endpoint must NOT emit a
+    # missing-endpoint advisory from the NAT shim — the vpc_endpoints sub-shim
+    # already owns that ($0 advisory), so the NAT-scoped duplicate is dropped.
+    nat_pages = [{"NatGateways": [_nat("nat-1", "vpc-a", "sub-1")]}]
+    ec2 = _FakeEc2(nat_pages=nat_pages, subnet_az={"sub-1": "az-a"})
+    out = get_nat_gateway_checks(_ctx(ec2, pricing_engine=_nat_engine()))
+    assert "nat_for_aws_services" not in out  # dead category removed
+    assert all(r.get("CheckCategory") != "VPC Endpoints Missing" for r in out["recommendations"])
+
+
 # --------------------------------------------------------------------------- #
 # M4 — interface endpoints priced per-AZ, gateway endpoints excluded
 # --------------------------------------------------------------------------- #
@@ -276,6 +287,17 @@ def test_gateway_endpoint_not_priced_as_duplicate() -> None:
     assert out["duplicate_endpoints"] == []  # gateway endpoints are free
 
 
+def test_net05_dead_check_categories_removed() -> None:
+    # NET-05: never-populated check categories are dropped from the output dict.
+    ec2 = _FakeEc2(vpcs_pages=[{"Vpcs": []}], vpce_pages=[{"VpcEndpoints": []}])
+    out = get_vpc_endpoints_checks(_ctx(ec2, pricing_engine=SimpleNamespace(get_vpc_endpoint_monthly_price=lambda: 7.30)))
+    assert "unused_interface_endpoints" not in out
+    assert "no_traffic_endpoints" not in out
+    # Populated categories survive.
+    for key in ("missing_gateway_endpoints", "interface_endpoints_in_nonprod", "duplicate_endpoints"):
+        assert key in out
+
+
 # --------------------------------------------------------------------------- #
 # L1 — fallback region scaling when pricing_engine is None
 # --------------------------------------------------------------------------- #
@@ -287,6 +309,43 @@ def test_eip_fallback_region_scaled() -> None:
     out = get_elastic_ip_checks(_ctx(ec2, pricing_engine=None, pricing_multiplier=2.0))
     rec = out["unassociated_eips"][0]
     assert parse_dollar_savings(rec["EstimatedSavings"]) == pytest.approx(FALLBACK_EIP_MONTH * 2.0)
+
+
+def _eng_eip(rate: float = 3.65) -> SimpleNamespace:
+    return SimpleNamespace(get_eip_monthly_price=lambda: rate)
+
+
+def test_net03_stopped_instance_eips_not_double_counted() -> None:
+    # NET-03: two EIPs on a STOPPED instance are counted once (in
+    # eips_on_stopped_instances); the instance must NOT also appear under
+    # multiple_eips_per_instance (which would attribute $3.65/EIP twice).
+    addresses = [
+        {"AllocationId": "eipalloc-1", "PublicIp": "1.1.1.1", "InstanceId": "i-stopped"},
+        {"AllocationId": "eipalloc-2", "PublicIp": "1.1.1.2", "InstanceId": "i-stopped"},
+    ]
+    instances_pages = [
+        {"Reservations": [{"Instances": [{"InstanceId": "i-stopped", "State": {"Name": "stopped"}}]}]}
+    ]
+    ec2 = _FakeEc2(addresses=addresses, instances_pages=instances_pages)
+    out = get_elastic_ip_checks(_ctx(ec2, pricing_engine=_eng_eip()))
+    assert len(out["eips_on_stopped_instances"]) == 2
+    assert out["multiple_eips_per_instance"] == []  # excluded — no double count
+
+
+def test_net03_running_instance_multiple_eips_still_flagged() -> None:
+    # Contrast: a RUNNING instance with >1 EIP is NOT on the stopped list, so the
+    # multiple-EIPs lever still fires (the dedup only suppresses stopped ones).
+    addresses = [
+        {"AllocationId": "eipalloc-1", "PublicIp": "1.1.1.1", "InstanceId": "i-run"},
+        {"AllocationId": "eipalloc-2", "PublicIp": "1.1.1.2", "InstanceId": "i-run"},
+    ]
+    instances_pages = [
+        {"Reservations": [{"Instances": [{"InstanceId": "i-run", "State": {"Name": "running"}}]}]}
+    ]
+    ec2 = _FakeEc2(addresses=addresses, instances_pages=instances_pages)
+    out = get_elastic_ip_checks(_ctx(ec2, pricing_engine=_eng_eip()))
+    assert out["eips_on_stopped_instances"] == []
+    assert len(out["multiple_eips_per_instance"]) == 1
 
 
 def test_nat_fallback_region_scaled() -> None:
@@ -365,4 +424,55 @@ def test_network_detail_renders_counted_and_advisory() -> None:
     detail = gen._get_detailed_recommendations("network", net)
     assert "Unassociated EIPs" in detail  # counted card rendered
     assert "Low Throughput NAT Gateway" in detail  # advisory card rendered
-    assert "$3.65/month per EIP" in detail
+    # H2: the card now shows the group's counted sum ($3.65 for the single EIP),
+    # reconciling to the tab headline, instead of echoing the per-unit rate string.
+    assert "$3.65/month" in detail
+    # The metric-gated NAT card is advisory and must show the $0.00 advisory line.
+    assert "$0.00/month — advisory" in detail
+
+
+# --------------------------------------------------------------------------- #
+# NET-04 — get_auto_scaling_checks classifies ASG errors (permission vs warn)
+# --------------------------------------------------------------------------- #
+class _RaisingAsg:
+    """Autoscaling client whose paginator raises a caller-supplied error."""
+
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+
+    def get_paginator(self, name: str) -> Any:
+        raise self._exc
+
+
+def _asg_ctx(exc: Exception) -> SimpleNamespace:
+    ctx = _ctx(_FakeEc2())
+    clients = {"ec2": _FakeEc2(), "autoscaling": _RaisingAsg(exc)}
+    ctx.client = lambda name, region=None: clients.get(name)
+    return ctx
+
+
+def test_net04_asg_access_denied_is_permission_issue() -> None:
+    from services.ec2 import get_auto_scaling_checks
+
+    ctx = _asg_ctx(_client_error("AccessDenied"))
+    out = get_auto_scaling_checks(ctx)
+
+    assert out["recommendations"] == []  # scan still completes, no crash
+    assert ctx.permissions, "AccessDenied on ASG must record a permission_issue"
+    service, action, msg = ctx.permissions[0]
+    assert service == "ec2"
+    assert action == "AccessDenied"
+    assert not ctx.warnings, "permission gap must NOT be logged as a bare warning"
+
+
+def test_net04_asg_generic_error_is_warning() -> None:
+    from services.ec2 import get_auto_scaling_checks
+
+    ctx = _asg_ctx(_client_error("Throttling"))
+    out = get_auto_scaling_checks(ctx)
+
+    assert out["recommendations"] == []
+    assert ctx.warnings, "a non-permission ASG failure must surface as a warn"
+    assert not ctx.permissions
+    service, msg = ctx.warnings[0]
+    assert service == "ec2"

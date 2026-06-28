@@ -55,16 +55,20 @@ def test_elasticache_one_counted_lever_per_cluster():
         {"ClusterId": "c1", "NodeType": "cache.r6g.xlarge", "NumNodes": 1, "CheckCategory": "Underutilized Cluster", "EstimatedSavings": "30-50%"},
         {"ClusterId": "c1", "NodeType": "cache.r6g.xlarge", "NumNodes": 1, "CheckCategory": "Reserved Nodes Opportunity", "EstimatedSavings": "30-60%"},
     ]
-    pe = MagicMock(); pe.get_instance_monthly_price.return_value = 267.47
+    # Underutilized (H3) is the live current->one-size-down delta:
+    # cache.r6g.xlarge $200 -> cache.r6g.large $100 = $100; Valkey is $200*0.20=$40.
+    prices = {"cache.r6g.xlarge": 200.0, "cache.r6g.large": 100.0}
+    pe = MagicMock()
+    pe.get_instance_monthly_price.side_effect = lambda svc, itype, *, engine=None: prices.get(itype, 0.0)
     ctx = SimpleNamespace(pricing_engine=pe, pricing_multiplier=1.0)
     ec_mod.get_enhanced_elasticache_checks = lambda c: {"recommendations": recs}
     f = ElasticacheModule().scan(ctx)
     counted = [r for r in f.sources["enhanced_checks"].recommendations if r.get("Counted") is True]
     # Only ONE lever counted on the single cluster (the best non-commitment one).
     assert len(counted) == 1
-    # Reserved is advisory; total = one lever (Underutilized 0.30 > Valkey 0.20).
+    # Reserved is advisory; total = one lever (Underutilized $100 > Valkey $40).
     assert counted[0]["CheckCategory"] == "Underutilized Cluster"
-    assert f.total_monthly_savings == round(267.47 * 0.30, 2)
+    assert f.total_monthly_savings == round(200.0 - 100.0, 2)
     reserved = [r for r in f.sources["enhanced_checks"].recommendations if "Reserved" in r["CheckCategory"]][0]
     assert reserved["Counted"] is False
 
@@ -77,12 +81,16 @@ def test_opensearch_reserved_advisory_storage_counted():
     from services.adapters.opensearch import OpensearchModule
 
     recs = [
-        {"DomainName": "d1", "InstanceType": "r6g.large.search", "InstanceCount": 2, "CheckCategory": "Graviton Migration", "EstimatedSavings": "Graviton"},
+        {"DomainName": "d1", "InstanceType": "r5.large.search", "InstanceCount": 2, "CheckCategory": "Graviton Migration", "EstimatedSavings": "Graviton"},
         {"DomainName": "d1", "InstanceType": None, "CheckCategory": "Underutilized Domain", "EstimatedSavings": "30-50%"},
         {"DomainName": "d1", "EBSVolumeSize": 150, "CheckCategory": "Storage Optimization", "EstimatedSavings": "20%"},
-        {"DomainName": "d1", "InstanceType": "r6g.large.search", "InstanceCount": 2, "CheckCategory": "Reserved Instances Opportunity", "EstimatedSavings": "30-60%"},
+        {"DomainName": "d1", "InstanceType": "r5.large.search", "InstanceCount": 2, "CheckCategory": "Reserved Instances Opportunity", "EstimatedSavings": "30-60%"},
     ]
-    pe = MagicMock(); pe.get_instance_monthly_price.return_value = 100.0
+    # Graviton (H4) is the live x86->Graviton node delta:
+    # r5.large.search $100 -> r6g.large.search $90 = $10/node x 2 = $20.
+    prices = {"r5.large.search": 100.0, "r6g.large.search": 90.0}
+    pe = MagicMock()
+    pe.get_instance_monthly_price.side_effect = lambda svc, itype, *, engine=None: prices.get(itype, 0.0)
     ctx = SimpleNamespace(pricing_engine=pe, pricing_multiplier=1.0)
     os_mod.get_enhanced_opensearch_checks = lambda c: {"recommendations": recs}
     f = OpensearchModule().scan(ctx)
@@ -91,8 +99,7 @@ def test_opensearch_reserved_advisory_storage_counted():
     assert rs["Underutilized Domain"]["Counted"] is False            # $0 (no InstanceType)
     assert rs["Graviton Migration"]["Counted"] is True               # instance lever
     assert rs["Storage Optimization"]["Counted"] is True             # separate axis
-    # total = graviton (100*2*0.25=50) + storage gp2->gp3 delta
-    # (150 * (0.135-0.122) = 1.95) = 51.95. Storage now uses the real
-    # (gp2_rate - gp3_rate) migration delta, not the old flat 20% of gp3 base
-    # (OpenSearch H3).
-    assert f.total_monthly_savings == round(100.0 * 2 * 0.25 + 150 * (0.135 - 0.122), 2)
+    # total = graviton node delta ((100-90)*2=20) + storage gp2->gp3 delta
+    # (150 * (0.135-0.122) = 1.95) = 21.95. Graviton now uses the real x86->Graviton
+    # node-price delta, not the old flat 0.25 proxy (live-audit H4).
+    assert f.total_monthly_savings == round((100.0 - 90.0) * 2 + 150 * (0.135 - 0.122), 2)

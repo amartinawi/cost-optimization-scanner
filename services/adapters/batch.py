@@ -1,4 +1,4 @@
-"""Flat-rate adapter for Batch."""
+"""Advisory-only adapter for Batch."""
 
 from __future__ import annotations
 
@@ -8,11 +8,9 @@ from core.contracts import ServiceFindings, SourceBlock
 from services._base import BaseServiceModule
 from services.batch_svc import BATCH_OPTIMIZATION_DESCRIPTIONS, get_enhanced_batch_checks
 
-BATCH_COMPUTE_FALLBACK_MONTHLY: float = 150.0
-
 
 class BatchModule(BaseServiceModule):
-    """ServiceModule adapter for AWS Batch. Flat-rate savings strategy."""
+    """ServiceModule adapter for AWS Batch. Advisory-only savings strategy."""
 
     key: str = "batch"
     cli_aliases: tuple[str, ...] = ("batch",)
@@ -25,10 +23,12 @@ class BatchModule(BaseServiceModule):
     def scan(self, ctx: Any) -> ServiceFindings:
         """Scan Batch compute environments for cost optimization opportunities.
 
-        Detects Fargate vs EC2 compute environments. Fargate CEs get Fargate Spot
-        recommendations (70% savings); EC2 CEs get Spot + Graviton recommendations.
-        Type-specific savings rates: Spot=0.70, Graviton=0.10, default=0.30.
-        All savings multiplied by ctx.pricing_multiplier for regional adjustment.
+        Detects Spot / Fargate-Spot / Graviton opportunities on Batch compute
+        environments. Batch CEs are bursty (minvCpus->maxvCpus) and the scanner
+        has no per-CE run-hours signal, so every recommendation is emitted as a
+        $0 ``Counted=False`` advisory (it renders, but no invented dollar enters
+        the headline). The prior flat per-rec rates (Spot=0.70, Graviton=0.10,
+        default=0.30 x a hardcoded 730) are removed (batch C1/C2).
 
         Args:
             ctx: ScanContext with region, clients, and pricing data.
@@ -58,10 +58,13 @@ class BatchModule(BaseServiceModule):
         savings = 0.0
 
         sources = {"enhanced_checks": SourceBlock(count=len(recs), recommendations=tuple(recs))}
+        # Count hygiene (mirror mediastore H1 / lambda): advisory ($0 Counted=False)
+        # recs render but are excluded from the rec-count headline.
+        counted_recs = sum(1 for r in recs if r.get("Counted") is not False)
 
         return ServiceFindings(
             service_name="Batch",
-            total_recommendations=len(recs),
+            total_recommendations=counted_recs,
             total_monthly_savings=savings,
             sources=sources,
             optimization_descriptions=BATCH_OPTIMIZATION_DESCRIPTIONS,

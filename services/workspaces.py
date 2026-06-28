@@ -217,6 +217,18 @@ def get_enhanced_workspaces_checks(ctx: ScanContext) -> dict[str, Any]:
                 # C3: carry the real bundle so scan() prices the actual ComputeType
                 # rather than defaulting every rec to STANDARD.
                 compute_type = props.get("ComputeTypeName", "STANDARD")
+                # workspaces L1: the bundle price tables are us-east-1
+                # Windows+Included rates. A POSITIVELY non-Windows OS or a
+                # BRING_YOUR_OWN_LICENSE WorkSpace makes the bundle figure
+                # unreliable; absent fields (older API versions) are treated as the
+                # priced default so we never downgrade on missing data — we only
+                # flag an advisory caveat, never a counted dollar.
+                ws_os = str(props.get("OperatingSystemName", "")).upper()
+                bundle_license = str(workspace.get("License", "")).upper()
+                non_windows_pricing = (
+                    (bool(ws_os) and "WINDOWS" not in ws_os)
+                    or bundle_license in ("BRING_YOUR_OWN_LICENSE", "BYOL")
+                )
 
                 if state == "AVAILABLE" and running_mode == "ALWAYS_ON":
                     # C2: gate the AutoStop projection on measured session hours.
@@ -273,19 +285,41 @@ def get_enhanced_workspaces_checks(ctx: ScanContext) -> dict[str, Any]:
                         savings = max(current_price - target_price, 0.0)
 
                         if savings > 0:
-                            checks["bundle_rightsizing"].append(
-                                {
-                                    "WorkspaceId": workspace_id,
-                                    "CurrentBundle": compute_type,
-                                    "RecommendedBundle": target_type,
-                                    "Recommendation": (
-                                        f"Downgrade from {compute_type} to {target_type} based on utilization profile"
-                                    ),
-                                    "EstimatedSavings": f"${savings:.2f}/month",
-                                    "EstimatedSavingsAmount": savings,
-                                    "CheckCategory": "Bundle Rightsizing",
-                                }
-                            )
+                            # Advisory only: a high bundle tier is NOT evidence the
+                            # WorkSpace is over-provisioned, and WorkSpaces publishes
+                            # no default CPU/memory utilization metric to CloudWatch
+                            # to gate on — so counting the current->target delta (and
+                            # claiming "based on utilization profile") fabricated a
+                            # saving. Carry the potential figure; the adapter renders
+                            # it Counted=False, never summed.
+                            rightsizing_rec: dict[str, Any] = {
+                                "WorkspaceId": workspace_id,
+                                "CurrentBundle": compute_type,
+                                "RecommendedBundle": target_type,
+                                "Counted": False,
+                                "PotentialMonthlySavings": round(savings, 2),
+                                "Recommendation": (
+                                    f"If {compute_type} is underutilized, downgrading to {target_type} "
+                                    f"would save ~${savings:.2f}/mo — verify CPU/memory utilization first "
+                                    f"(not measured: WorkSpaces does not publish utilization to CloudWatch "
+                                    f"by default)"
+                                ),
+                                "CheckCategory": "Bundle Rightsizing",
+                            }
+                            if non_windows_pricing:
+                                # The price delta was computed from Windows+Included
+                                # tables; for a Linux or BYOL WorkSpace it is
+                                # indicative only (workspaces L1).
+                                _why = (
+                                    f"runs {ws_os.title()}"
+                                    if (ws_os and "WINDOWS" not in ws_os)
+                                    else "is BRING_YOUR_OWN_LICENSE"
+                                )
+                                rightsizing_rec["PricingWarning"] = (
+                                    f"figure assumes Windows+Included rates; this WorkSpace {_why} "
+                                    f"so the real delta differs"
+                                )
+                            checks["bundle_rightsizing"].append(rightsizing_rec)
 
     except Exception as e:
         # C1 — classify: a describe_workspaces AccessDenied is a permission gap,

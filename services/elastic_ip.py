@@ -81,8 +81,14 @@ def get_elastic_ip_checks(ctx: ScanContext) -> dict[str, Any]:
                         }
                     )
 
+        # An EIP on a stopped instance is already counted in
+        # eips_on_stopped_instances; counting its instance again under
+        # multiple_eips_per_instance attributes the same $/EIP twice across two
+        # categories. Exclude stopped instances from the multiple-EIPs lever so
+        # the saving is counted once (network_cost NET-03 double-count).
+        stopped_ids = {r["InstanceId"] for r in checks["eips_on_stopped_instances"]}
         for instance_id, eip_count in instance_eip_count.items():
-            if eip_count > 1:
+            if eip_count > 1 and instance_id not in stopped_ids:
                 instance = instances.get(instance_id, {})
                 checks["multiple_eips_per_instance"].append(
                     {

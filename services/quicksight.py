@@ -97,30 +97,45 @@ def get_enhanced_quicksight_checks(ctx: ScanContext) -> dict[str, Any]:
                 used_capacity = capacity_config.get("UsedCapacityInBytes", 0) / (1024**3)
                 total_capacity = capacity_config.get("TotalCapacityInBytes", 0) / (1024**3)
 
-                if total_capacity > 0 and used_capacity < total_capacity * 0.5:
-                    checks["spice_optimization"].append(
-                        {
-                            "UserCount": total_users,
-                            "UsedCapacityGB": round(used_capacity, 2),
-                            "TotalCapacityGB": round(total_capacity, 2),
-                            "UtilizationPercent": round((used_capacity / total_capacity) * 100, 1),
-                            "UnusedSpiceCapacityGB": round(total_capacity - used_capacity, 2),
-                            "Edition": account_edition,
-                            "Recommendation": (
-                                f"SPICE capacity underutilized"
-                                f" ({round(used_capacity, 1)}/{round(total_capacity, 1)}"
-                                " GB) - consider reducing"
-                            ),
-                            # H3 — the dollar (string + number) is single-sourced in
-                            # the adapter from quicksight_spice_rate × pricing_multiplier
-                            # so the card string and the counted number always agree and
-                            # are region-scaled. The shim deliberately carries no
-                            # ``EstimatedSavings`` dollar (it had a non-region-scaled,
-                            # whole-dollar string that disagreed with the counted number
-                            # in any non-us-east-1 region).
-                            "CheckCategory": "SPICE Optimization",
-                        }
-                    )
+                # The 50% threshold splits a COUNTED reclaim opportunity from an
+                # ADVISORY one (quicksight L3). Below 50% used (>50% idle), the
+                # unused capacity is large enough to be a concrete reclaim — counted.
+                # Between 50% and 100% used (1–49% idle), the headroom is too small
+                # to safely reclaim (SPICE needs refresh headroom), so it is a $0
+                # ``Counted=False`` advisory: surfaced, never summed.
+                if total_capacity > 0 and used_capacity < total_capacity:
+                    unused_gb = round(total_capacity - used_capacity, 2)
+                    util_pct = round((used_capacity / total_capacity) * 100, 1)
+                    is_advisory = used_capacity >= total_capacity * 0.5
+                    rec = {
+                        "UserCount": total_users,
+                        "UsedCapacityGB": round(used_capacity, 2),
+                        "TotalCapacityGB": round(total_capacity, 2),
+                        "UtilizationPercent": util_pct,
+                        "UnusedSpiceCapacityGB": unused_gb,
+                        "Edition": account_edition,
+                        "Recommendation": (
+                            f"SPICE capacity underutilized"
+                            f" ({round(used_capacity, 1)}/{round(total_capacity, 1)}"
+                            " GB) - consider reducing"
+                        ),
+                        # H3 — the dollar (string + number) is single-sourced in
+                        # the adapter from quicksight_spice_rate × pricing_multiplier
+                        # so the card string and the counted number always agree and
+                        # are region-scaled. The shim deliberately carries no
+                        # ``EstimatedSavings`` dollar (it had a non-region-scaled,
+                        # whole-dollar string that disagreed with the counted number
+                        # in any non-us-east-1 region).
+                        "CheckCategory": "SPICE Optimization",
+                    }
+                    if is_advisory:
+                        # quicksight L3: 1–49% idle — advisory only, never counted.
+                        rec["Counted"] = False
+                        rec["PricingWarning"] = (
+                            "SPICE idle < 50% — advisory only; partial headroom is needed for "
+                            "dataset refreshes and is not a concrete reclaim opportunity"
+                        )
+                    checks["spice_optimization"].append(rec)
             except Exception as e:
                 # H1 — classify the SPICE-capacity read failure (the only
                 # revenue-producing QuickSight check); never swallow it.

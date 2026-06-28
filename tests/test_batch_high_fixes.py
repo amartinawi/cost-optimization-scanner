@@ -191,6 +191,11 @@ def test_scan_fargate_rec_is_zero_advisory() -> None:
         assert rec["EstimatedSavings"].startswith("$0.00/month")
         assert "AuditBasis" in rec
 
+    # Count hygiene: advisory recs render (SourceBlock has them) but are excluded
+    # from the rec-count headline.
+    assert findings.sources["enhanced_checks"].count == len(recs)
+    assert findings.total_recommendations == 0
+
 
 # --------------------------------------------------------------------------- #
 # Safe-fail — AccessDenied surfaces a permission gap, no fabricated dollar

@@ -44,11 +44,17 @@ class TestEvidenceGatedSavingsClasses:
     """Audit S3-B — only transition-gap classes are savings-eligible."""
 
     def test_gap_classes_are_the_transitionable_ones(self):
+        # S3-N4: a bucket that already has a lifecycle policy ("intelligent_tiering"
+        # class) is excluded — its existing rule may already transition the bytes,
+        # so crediting the full Standard->IA delta would overstate the saving.
         assert _GAP_OPPORTUNITY_CLASSES == {
             "both_missing",
             "lifecycle_missing",
-            "intelligent_tiering",
         }
+
+    def test_intelligent_tiering_is_not_a_gap_class(self):
+        # S3-N4: existing-lifecycle buckets must not receive the IA-delta saving.
+        assert "intelligent_tiering" not in _GAP_OPPORTUNITY_CLASSES
 
     def test_static_website_is_not_a_gap_class(self):
         assert "static_website" not in _GAP_OPPORTUNITY_CLASSES
@@ -106,6 +112,38 @@ class TestColdnessAssessment:
         cw.get_metric_statistics.return_value = {"Datapoints": [{"Sum": 4200.0}]}
         monkeypatch.setattr("services.s3._bucket_cloudwatch_client", lambda *a, **k: cw)
         assert _assess_bucket_coldness(self._ctx(), "b", s3_client, "us-east-1") == "warm"
+
+    def test_getrequests_access_denied_records_permission_issue(self, monkeypatch):
+        """S3-N1: a denied CloudWatch GetMetricStatistics is classified, not just debug-logged."""
+        from unittest.mock import MagicMock
+        s3_client = MagicMock()
+        s3_client.list_bucket_metrics_configurations.return_value = {
+            "MetricsConfigurationList": [{"Id": "EntireBucket"}]
+        }
+        cw = MagicMock()
+        cw.get_metric_statistics.side_effect = Exception("AccessDenied")
+        monkeypatch.setattr("services.s3._bucket_cloudwatch_client", lambda *a, **k: cw)
+        ctx = self._ctx()
+        assert _assess_bucket_coldness(ctx, "b", s3_client, "us-east-1") == "unknown"
+        ctx.permission_issue.assert_called_once()
+        assert ctx.permission_issue.call_args.kwargs["service"] == "cloudwatch"
+        assert ctx.permission_issue.call_args.kwargs["action"] == "cloudwatch:GetMetricStatistics"
+        ctx.warn.assert_not_called()
+
+    def test_getrequests_throttling_records_warning(self, monkeypatch):
+        """S3-N1: a throttled CloudWatch GetMetricStatistics is surfaced as a warning, not silently dropped."""
+        from unittest.mock import MagicMock
+        s3_client = MagicMock()
+        s3_client.list_bucket_metrics_configurations.return_value = {
+            "MetricsConfigurationList": [{"Id": "EntireBucket"}]
+        }
+        cw = MagicMock()
+        cw.get_metric_statistics.side_effect = Exception("ThrottlingException")
+        monkeypatch.setattr("services.s3._bucket_cloudwatch_client", lambda *a, **k: cw)
+        ctx = self._ctx()
+        assert _assess_bucket_coldness(ctx, "b", s3_client, "us-east-1") == "unknown"
+        ctx.warn.assert_called_once()
+        ctx.permission_issue.assert_not_called()
 
 
 class TestClassifyOpportunities:

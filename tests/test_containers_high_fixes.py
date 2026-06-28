@@ -25,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import services.adapters.containers as containers_adapter
 from services.adapters.containers import ContainersModule
-from services.containers_logic import normalize_resource_name
+from services.containers_logic import ecs_dedup_key, normalize_resource_name
 
 
 # --------------------------------------------------------------------------- #
@@ -82,10 +82,69 @@ def _fargate_heuristic(service: str) -> dict:
 # Pure dedup key — CoH ARN and CO resource_id converge
 # --------------------------------------------------------------------------- #
 def test_coh_arn_and_co_resource_id_converge_on_same_key():
-    # The whole H1 fix relies on these normalizing to the same string.
-    coh_key = normalize_resource_name("arn:aws:ecs:us-east-1:1:service/clu/web")
-    co_key = normalize_resource_name("clu/web")
-    assert coh_key == co_key == "web"
+    # The whole H1 fix relies on these reducing to the same cluster-qualified
+    # string. A CoH service ARN, a CO resource_id, and a heuristic's
+    # cluster/service all converge on "clu/web".
+    coh_key = ecs_dedup_key("arn:aws:ecs:us-east-1:1:service/clu/web")
+    co_key = ecs_dedup_key("clu/web")
+    heuristic_key = ecs_dedup_key("clu/web")
+    assert coh_key == co_key == heuristic_key == "clu/web"
+
+
+def test_ecs_dedup_key_keeps_cluster_distinct():
+    # The cross-cluster fix: two services named "web" in different clusters must
+    # NOT collapse to one key (the old normalize_resource_name returned "web" for
+    # both, over-deduping a genuinely separate service).
+    a = ecs_dedup_key("arn:aws:ecs:::service/clusterA/web")
+    b = ecs_dedup_key("clusterB/web")
+    assert a == "clusterA/web"
+    assert b == "clusterB/web"
+    assert a != b
+    # Regression guard on the old behaviour: bare-name normalization collides.
+    assert normalize_resource_name("clusterA/web") == normalize_resource_name("clusterB/web") == "web"
+
+
+def test_ecs_dedup_key_single_segment_passthrough():
+    # ECR repos / EKS clusters have no cluster prefix — single names pass through.
+    assert ecs_dedup_key("my-repo") == "my-repo"
+    assert ecs_dedup_key("arn:aws:ecs:::service/web") == "web"  # classic cluster-less ARN
+    assert ecs_dedup_key("") == ""
+
+
+def test_ecs_dedup_key_cluster_arn_matches_clustername():
+    # An EcsCluster ARN tail (cluster/<name>) must reduce to the bare cluster
+    # name so it matches a ClusterName-only heuristic key (containers N1).
+    assert ecs_dedup_key("arn:aws:ecs:us-east-1:1:cluster/prod-cluster") == "prod-cluster"
+    assert ecs_dedup_key("cluster/prod-cluster") == "prod-cluster"
+    assert ecs_dedup_key("prod-cluster") == "prod-cluster"
+
+
+def test_same_name_services_in_different_clusters_not_over_deduped(monkeypatch):
+    # Cross-cluster fix end-to-end: CoH covers clusterA/web; a CO rec for
+    # clusterB/web is a DIFFERENT service and must survive (not be dropped as a
+    # false duplicate). Pre-fix both normalized to "web" and the CO rec was lost.
+    coh = [{"resourceArn": "arn:aws:ecs:::service/clusterA/web", "estimatedMonthlySavings": 100.0}]
+    co = [{"resource_id": "clusterB/web", "resource_name": "web", "estimatedMonthlySavings": 42.5}]
+    _patch_sources(monkeypatch, [], co=co)
+    findings = ContainersModule().scan(_ctx(cost_hub_splits={"containers": coh}))
+
+    # The clusterB/web CO rec survives — it is a separate service.
+    assert findings.sources["compute_optimizer"].count == 1
+    assert findings.total_monthly_savings == pytest.approx(142.5)
+    assert findings.total_recommendations == 2
+
+
+def test_same_name_service_same_cluster_still_deduped(monkeypatch):
+    # Authority still holds when the cluster matches: clusterA/web from CoH wins,
+    # the clusterA/web CO duplicate is dropped (no double count).
+    coh = [{"resourceArn": "arn:aws:ecs:::service/clusterA/web", "estimatedMonthlySavings": 100.0}]
+    co = [{"resource_id": "clusterA/web", "resource_name": "web", "estimatedMonthlySavings": 42.5}]
+    _patch_sources(monkeypatch, [], co=co)
+    findings = ContainersModule().scan(_ctx(cost_hub_splits={"containers": coh}))
+
+    assert findings.sources["compute_optimizer"].count == 0
+    assert findings.total_monthly_savings == pytest.approx(100.0)
+    assert findings.total_recommendations == 1
 
 
 # --------------------------------------------------------------------------- #

@@ -6,6 +6,7 @@ and generic fallback renderers used by ``HTMLReportGenerator``.
 
 import html
 import logging
+import re
 from typing import Any, Callable, Dict, List, Tuple
 
 logger = logging.getLogger(__name__)
@@ -53,6 +54,39 @@ def _counted_savings_line(group: List[Rec]) -> str:
     if savings_str:
         return f'<p class="savings"><strong>Estimated Savings:</strong> {savings_str}</p>'
     return ""
+
+
+def _grouped_text_savings_line(group: List[Rec]) -> str:
+    """Card savings line for free-text-savings renderers (network, monitoring).
+
+    Sums each rec's *counted* monthly dollar — the numeric
+    ``EstimatedMonthlySavings`` when present, else the value parsed from the
+    ``EstimatedSavings`` free-text — excluding advisory (``Counted is False``)
+    recs. This mirrors the per-rec savings basis the network / monitoring
+    adapters use for their tab headline, so a multi-resource card reconciles to
+    the headline instead of showing only the first resource's rate (live-audit
+    H2). Returns ``$0.00/month — advisory`` for an advisory-only group and the
+    empty string for a group with no savings signal at all.
+    """
+    from services._savings import parse_dollar_savings
+
+    total = 0.0
+    saw_signal = False
+    for rec in group:
+        if rec.get("EstimatedMonthlySavings") is not None or rec.get("EstimatedSavings"):
+            saw_signal = True
+        if rec.get("Counted") is False:
+            continue
+        numeric = rec.get("EstimatedMonthlySavings")
+        if isinstance(numeric, (int, float)) and not isinstance(numeric, bool):
+            total += float(numeric)
+        else:
+            total += parse_dollar_savings(rec.get("EstimatedSavings", ""))
+    if not saw_signal:
+        return ""
+    if total > 0:
+        return f'<p class="savings"><strong>Estimated Savings:</strong> ${total:,.2f}/month</p>'
+    return '<p class="savings"><strong>Estimated Savings:</strong> $0.00/month — advisory</p>'
 
 
 def _render_ec2_enhanced_checks(recommendations: List[Rec], source_name: str, service_data: Dict) -> str:
@@ -451,6 +485,8 @@ def _render_ebs_compute_optimizer(recommendations: List[Rec], source_name: str, 
             grouped_findings[finding] = []
         grouped_findings[finding].append(rec)
 
+    from services._savings import compute_optimizer_savings
+
     content = ""
     for finding, recs in grouped_findings.items():
         content += f'<div class="rec-item{_priority_class(recs[0])}">'
@@ -463,7 +499,13 @@ def _render_ebs_compute_optimizer(recommendations: List[Rec], source_name: str, 
             volume_size_data = current_config.get("volumeSize", 0)
             volume_size = volume_size_data.get("value", 0) if isinstance(volume_size_data, dict) else volume_size_data
 
-            content += f"<li>{volume_id}: {volume_type} ({volume_size} GB)</li>"
+            # Surface the per-volume saving the headline already counts, so the
+            # card is defensible instead of showing a bare volume id (ebs L3).
+            vol_savings = compute_optimizer_savings(rec)
+            savings_html = (
+                f' &mdash; <span class="savings">${vol_savings:,.2f}/month</span>' if vol_savings > 0 else ""
+            )
+            content += f"<li>{volume_id}: {volume_type} ({volume_size} GB){savings_html}</li>"
         content += "</ul></div>"
     return content
 
@@ -848,6 +890,8 @@ def _render_s3_enhanced_checks(recommendations: List[Rec], source_name: str, ser
 
     Called by: HTMLReportGenerator._get_detailed_recommendations.
     """
+    from services._savings import parse_dollar_savings
+
     grouped: Dict[str, List[Rec]] = {}
     for rec in recommendations:
         category = rec.get("CheckCategory", "Other")
@@ -857,14 +901,10 @@ def _render_s3_enhanced_checks(recommendations: List[Rec], source_name: str, ser
     for category, recs in grouped.items():
         total_savings = 0.0
         for r in recs:
-            savings_str = str(r.get("EstimatedSavings", ""))
-            if "$" in savings_str:
-                try:
-                    total_savings += float(
-                        savings_str.replace("$", "").split("/")[0].replace(",", "")
-                    )
-                except (ValueError, AttributeError) as e:
-                    logger.debug("Could not parse S3 savings %r: %s", savings_str, e)
+            # network_cost S3-N3: parse_dollar_savings only accepts monthly-unit
+            # figures, so a "$/GB" rate string is rejected rather than summed as a
+            # monthly dollar (the old ad-hoc split("/")[0] accepted it).
+            total_savings += parse_dollar_savings(str(r.get("EstimatedSavings", "")))
 
         content += f'<div class="rec-item{_priority_class(recs[0])}">'
         content += f"<h4>{category} ({len(recs)} buckets)</h4>"
@@ -978,7 +1018,7 @@ def _render_containers_enhanced_checks(recommendations: List[Rec], source_name: 
         "ECS Over-Provisioned Services": [],
         "Unused ECS Clusters": [],
         "Unused EKS Clusters": [],
-        "ECR Lifecycle Missing": [],
+        "ECR Lifecycle Management": [],
         "Other Optimizations": [],
     }
 
@@ -999,7 +1039,7 @@ def _render_containers_enhanced_checks(recommendations: List[Rec], source_name: 
                 else:
                     grouped_containers["Other Optimizations"].append(rec)
         elif "RepositoryName" in rec:
-            grouped_containers["ECR Lifecycle Missing"].append(rec)
+            grouped_containers["ECR Lifecycle Management"].append(rec)
         else:
             grouped_containers["Other Optimizations"].append(rec)
 
@@ -1021,7 +1061,7 @@ def _render_containers_enhanced_checks(recommendations: List[Rec], source_name: 
             content += "<p><strong>Recommendation:</strong> Delete unused ECS clusters with no running tasks</p>"
         elif group_name == "Unused EKS Clusters":
             content += "<p><strong>Recommendation:</strong> Delete unused EKS clusters with no node groups</p>"
-        elif group_name == "ECR Lifecycle Missing":
+        elif group_name == "ECR Lifecycle Management":
             content += "<p><strong>Recommendation:</strong> Implement lifecycle policies to automatically clean up old images and reduce storage costs</p>"
         elif group_name == "Other Optimizations":
             content += "<p><strong>Recommendation:</strong> Optimize container resources through rightsizing, Spot instances, and efficient scheduling</p>"
@@ -1178,9 +1218,10 @@ def _render_network_enhanced_checks(recommendations: List[Rec], source_name: str
         content += f"<h4>{category} ({len(resources)} resources)</h4>"
         content += f"<p><strong>Recommendation:</strong> {resources[0].get('Recommendation', 'Optimize resource')}</p>"
 
-        savings_str = resources[0].get("EstimatedSavings", "")
-        if savings_str:
-            content += f'<p class="savings"><strong>Estimated Savings:</strong> {savings_str}</p>'
+        # Sum the group's counted savings rather than echoing the first
+        # resource's per-unit rate, so the card reconciles to the tab headline
+        # (live-audit H2).
+        content += _grouped_text_savings_line(resources)
 
         content += "<p><strong>Resources:</strong></p><ul>"
         for res in resources:
@@ -1259,9 +1300,9 @@ def _render_monitoring_enhanced_checks(recommendations: List[Rec], source_name: 
         content += f"<h4>{category} ({len(resources)} resources)</h4>"
         content += f"<p><strong>Recommendation:</strong> {resources[0].get('Recommendation', 'Optimize resource')}</p>"
 
-        savings_str = resources[0].get("EstimatedSavings", "")
-        if savings_str:
-            content += f'<p class="savings"><strong>Estimated Savings:</strong> {savings_str}</p>'
+        # Sum the group's counted savings rather than echoing the first
+        # resource's rate, so the card reconciles to the tab headline (live-audit H2).
+        content += _grouped_text_savings_line(resources)
 
         content += "<p><strong>Resources:</strong></p><ul>"
         for res in resources:
@@ -1279,41 +1320,6 @@ def _render_monitoring_enhanced_checks(recommendations: List[Rec], source_name: 
                     or (f"{res['BackupPlanCount']} backup plans" if res.get("BackupPlanCount") else None)
                     or "Unknown"
                 )
-            content += f"<li>{resource_id}</li>"
-        content += "</ul></div>"
-    return content
-
-
-def _render_additional_services(recommendations: List[Rec], source_name: str, service_data: Dict) -> str:
-    """Renders miscellaneous service recommendations grouped by category. Called by: HTMLReportGenerator._get_detailed_recommendations."""
-    grouped_additional: Dict[str, List[Rec]] = {}
-    for rec in recommendations:
-        category = rec.get("CheckCategory", "Other")
-        if category not in grouped_additional:
-            grouped_additional[category] = []
-        grouped_additional[category].append(rec)
-
-    content = ""
-    for category, resources in grouped_additional.items():
-        if not resources:
-            continue
-
-        content += f'<div class="rec-item{_priority_class(resources[0])}">'
-        content += f"<h4>{category} ({len(resources)} resources)</h4>"
-        content += f"<p><strong>Recommendation:</strong> {resources[0].get('Recommendation', 'Optimize resource')}</p>"
-
-        savings_str = resources[0].get("EstimatedSavings", "")
-        if savings_str:
-            content += f'<p class="savings"><strong>Estimated Savings:</strong> {savings_str}</p>'
-
-        content += "<p><strong>Resources:</strong></p><ul>"
-        for res in resources:
-            resource_id = res.get(
-                "DistributionId",
-                res.get("ApiId", res.get("StateMachineArn", res.get("FunctionName", "Unknown"))),
-            )
-            if isinstance(resource_id, str) and ":" in resource_id:
-                resource_id = resource_id.split(":")[-1]
             content += f"<li>{resource_id}</li>"
         content += "</ul></div>"
     return content
@@ -1396,8 +1402,6 @@ def render_generic_per_rec(service_key: str, recommendations: List[Rec], source_
             should_skip, content = _render_generic_rds_rec(content, rec)
             if should_skip:
                 continue
-        elif service_key == "file_systems":
-            content = _render_generic_file_systems_rec(content, rec)
         elif service_key == "s3":
             should_skip, content = _render_generic_s3_rec(content, rec)
             if should_skip:
@@ -1612,82 +1616,6 @@ def _render_generic_rds_rec(content: str, rec: Rec) -> Tuple[bool, str]:
     return False, content
 
 
-def _render_generic_file_systems_rec(content: str, rec: Rec) -> str:
-    """Render a single file-system recommendation card. Called by: render_generic_per_rec."""
-    if "FileSystemId" in rec and rec.get("FileSystemType"):
-        fs_id = rec.get("FileSystemId", "N/A")
-        fs_type = rec.get("FileSystemType", "N/A")
-        content += f"<h4>FSx {fs_type}: {fs_id}</h4>"
-        content += f"<p>Capacity: {rec.get('StorageCapacity', 0)} GB</p>"
-        content += f"<p>Storage Type: {rec.get('StorageType', 'N/A')}</p>"
-        content += f'<p class="savings">Monthly Cost: ${rec.get("EstimatedMonthlyCost", 0):.2f}</p>'
-
-        opportunities = rec.get("OptimizationOpportunities", [])
-        if opportunities:
-            content += "<p><strong>Recommended Actions:</strong></p><ul>"
-            for opp in opportunities:
-                content += f"<li>{opp}</li>"
-            content += "</ul>"
-
-        potential_savings = rec.get("EstimatedMonthlyCost", 0) * 0.3
-        if fs_type.upper() == "ONTAP":
-            content += "<p><strong>ONTAP Optimizations:</strong></p><ul>"
-            content += (
-                f"<li>Enable data deduplication and compression (Save ~${potential_savings * 0.5:.2f}/month)</li>"
-            )
-            content += f"<li>Configure capacity pool for cold data (Save ~${potential_savings * 0.3:.2f}/month)</li>"
-            content += "<li>Use SnapMirror for efficient replication</li>"
-            content += "</ul>"
-        elif fs_type.upper() == "LUSTRE":
-            content += "<p><strong>Lustre Optimizations:</strong></p><ul>"
-            content += f"<li>Consider scratch file systems for temporary workloads (Save ~${potential_savings * 0.6:.2f}/month)</li>"
-            content += f"<li>Enable LZ4 data compression (Save ~${potential_savings * 0.2:.2f}/month)</li>"
-            content += "<li>Optimize metadata configuration</li>"
-            content += "</ul>"
-        elif fs_type.upper() == "OPENZFS":
-            content += "<p><strong>OpenZFS Optimizations:</strong></p><ul>"
-            content += f"<li>Enable Intelligent-Tiering (Save ~${potential_savings * 0.5:.2f}/month)</li>"
-            content += "<li>Use zero-copy snapshots and clones</li>"
-            content += "<li>Configure user/group quotas</li>"
-            content += "</ul>"
-
-    else:
-        fs_name = rec.get("Name") or rec.get("FileSystemId", "N/A")
-        if fs_name == "Unnamed":
-            fs_name = rec.get("FileSystemId", fs_name)
-        content += f"<h4>EFS: {fs_name}</h4>"
-        size_gb = rec.get("SizeGB", 0)
-        size_display = f"{size_gb:.2f} GB" if isinstance(size_gb, float) else f"{size_gb} GB"
-        if size_gb == 0 or (isinstance(size_gb, float) and size_gb < 0.1):
-            size_display = "Nearly empty (< 0.1 GB)"
-        content += f"<p>Size: {size_display}</p>"
-        content += f"<p>Storage Class: {rec.get('StorageClass', 'N/A')}</p>"
-        content += f"<p>Mount Targets: {rec.get('MountTargets', 0)}</p>"
-        content += f'<p class="savings">Monthly Cost: ${rec.get("EstimatedMonthlyCost", 0):.2f}</p>'
-
-        content += "<p><strong>Recommended Actions:</strong></p><ul>"
-
-        if not rec.get("HasIAPolicy", True):
-            ia_savings = rec.get("EstimatedMonthlyCost", 0) * 0.8
-            content += f"<li>Enable Transition to IA after 30 days (Save ~${ia_savings:.2f}/month)</li>"
-
-        if not rec.get("HasArchivePolicy", True):
-            archive_savings = rec.get("EstimatedMonthlyCost", 0) * 0.9
-            content += f"<li>Enable Transition to Archive after 90 days (Save ~${archive_savings:.2f}/month)</li>"
-
-        if rec.get("StorageClass") == "Standard" and rec.get("SizeGB", 0) > 1:
-            one_zone_savings = rec.get("EstimatedMonthlyCost", 0) * 0.47
-            content += (
-                f"<li>Consider One Zone storage if Multi-AZ not required (Save ~${one_zone_savings:.2f}/month)</li>"
-            )
-
-        if rec.get("MountTargets", 0) == 0 and rec.get("SizeGB", 0) < 0.1:
-            content += f"<li>Delete unused file system (Save ${rec.get('EstimatedMonthlyCost', 0):.2f}/month)</li>"
-
-        content += "</ul>"
-    return content
-
-
 def _render_generic_s3_rec(content: str, rec: Rec) -> Tuple[bool, str]:
     """Render a single S3 bucket recommendation card. Called by: render_generic_per_rec."""
     bucket_name = rec.get("Name") or rec.get("BucketName", "Unknown")
@@ -1840,9 +1768,24 @@ def _render_generic_lambda_rec(content: str, rec: Rec) -> str:
     return content
 
 
+def _humanize_key(key: str) -> str:
+    """Turn a rec key into a human label for a property row.
+
+    snake_case keys keep their existing rendering (``cluster_id`` -> "Cluster
+    Id"); camelCase / PascalCase keys are split on case boundaries with acronyms
+    preserved (``DBInstanceIdentifier`` -> "DB Instance Identifier",
+    ``CurrentSize`` -> "Current Size") instead of being collapsed to one word by
+    ``.title()`` ("Dbinstanceidentifier") (live-audit H6).
+    """
+    s = key.replace("_", " ")
+    s = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", s)  # fooBar -> foo Bar
+    s = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", " ", s)  # DBInstance -> DB Instance
+    return " ".join(w if w.isupper() else w.capitalize() for w in s.split())
+
+
 def _render_generic_other_rec(content: str, rec: Rec, source_name: str) -> str:
     """Render a generic recommendation card for any service. Called by: render_generic_per_rec."""
-    check_category = rec.get("CheckCategory", source_name.replace("_", " ").title())
+    check_category = rec.get("CheckCategory") or rec.get("check_category") or source_name.replace("_", " ").title()
     resource_id = (
         rec.get("resource_id")
         or rec.get("LoadBalancerName")
@@ -1870,12 +1813,21 @@ def _render_generic_other_rec(content: str, rec: Rec, source_name: str) -> str:
         or rec.get("dbClusterIdentifier")
         or rec.get("dbInstanceIdentifier")
         or rec.get("ClusterName")
+        or rec.get("ClusterIdentifier")
         or rec.get("DomainName")
         or rec.get("EndpointName")
         or rec.get("NotebookInstanceName")
         or rec.get("ProvisionedModelId")
         or rec.get("KnowledgeBaseId")
         or rec.get("AgentId")
+        # snake_case keys emitted by the SageMaker / Bedrock adapters (sagemaker L1,
+        # bedrock L1) — without these the resource_id falls through to "Resource".
+        or rec.get("endpoint_name")
+        or rec.get("notebook_name")
+        or rec.get("job_name")
+        or rec.get("provisioned_model_id")
+        or rec.get("knowledge_base_id")
+        or rec.get("agent_id")
         or rec.get("ServerId")
         or rec.get("ClusterArn", "").split("/")[-1]
         or rec.get("ContainerName")
@@ -1886,21 +1838,45 @@ def _render_generic_other_rec(content: str, rec: Rec, source_name: str) -> str:
         or rec.get("anomaly_id")
         or (f"{rec['BackupPlanCount']} backup plans" if rec.get("BackupPlanCount") else None)
         or (f"{rec['ALBCount']} ALBs" if rec.get("ALBCount") else None)
-        or rec.get("resourceArn", "").split(":")[-1]
-        if rec.get("resourceArn")
-        else "Resource"
+        # resourceArn is the Cost-Hub fallback. It MUST be a guarded term inside the
+        # or-chain, not a ternary gate on the whole chain — otherwise every rec
+        # without a resourceArn (e.g. SageMaker's endpoint_name) collapsed to the
+        # "Resource" placeholder regardless of the keys above it (sagemaker L1).
+        or (rec.get("resourceArn", "").split(":")[-1] if rec.get("resourceArn") else None)
+        or "Resource"
     )
 
     content += f"<h4>{check_category}: {resource_id}</h4>"
 
     # SR-2 — these drive the savings line (below) or are internal bookkeeping;
     # never dump them as raw property rows (e.g. "Estimatedmonthlysavings: 5.0").
-    _SAVINGS_KEYS = ("CheckCategory", "Recommendation", "EstimatedSavings", "EstimatedMonthlySavings", "Counted", "MetricReadFailed")
+    # The lowercase camelCase keys are the Cost Optimization Hub schema
+    # (elasticache / opensearch / redshift inline-render their CoH bucket through
+    # this generic path); suppress them here so they render as the clean savings
+    # line below instead of a raw "Estimatedmonthlysavings: 5.0" dump (CoH H-render).
+    _SAVINGS_KEYS = (
+        "CheckCategory",
+        # snake_case header key (SageMaker / Bedrock) — drives the card title
+        # above, never dump it raw as a property row (sagemaker L1, bedrock L1).
+        "check_category",
+        "Recommendation",
+        "EstimatedSavings",
+        "EstimatedMonthlySavings",
+        "Counted",
+        "MetricReadFailed",
+        "estimatedMonthlySavings",
+        "estimatedSavingsPercentage",
+        # snake_case savings key (Aurora et al.) — drives the savings line below,
+        # never dump it raw as "Monthly Savings: 214.62" (live-audit H7).
+        "monthly_savings",
+        # internal diagnostic surfaced as a savings-line qualifier, not a raw
+        # "Pricingwarning:" property row (live-audit M1).
+        "PricingWarning",
+    )
     for key, value in rec.items():
         if key not in _SAVINGS_KEYS and not key.endswith("Arn"):
             if isinstance(value, (str, int, float)) and not isinstance(value, bool) and value:
-                formatted_key = key.replace("_", " ").title()
-                content += f"<p><strong>{formatted_key}:</strong> {value}</p>"
+                content += f"<p><strong>{_humanize_key(key)}:</strong> {value}</p>"
 
     if "Recommendation" in rec:
         content += f"<p><strong>Recommendation:</strong> {rec['Recommendation']}</p>"
@@ -1920,8 +1896,38 @@ def _render_generic_other_rec(content: str, rec: Rec, source_name: str) -> str:
         except (TypeError, ValueError):
             ems = 0.0
         content += f'<p class="savings"><strong>Estimated Savings:</strong> ${ems:,.2f}/month</p>'
+    elif "estimatedMonthlySavings" in rec:
+        # Cost Optimization Hub schema (lowercase camelCase). These recs are the
+        # counted authority for their resource, so render the CoH-reported dollar
+        # as a clean savings line (CoH H-render) — never the raw property dump.
+        try:
+            ems = float(rec.get("estimatedMonthlySavings") or 0.0)
+        except (TypeError, ValueError):
+            ems = 0.0
+        pct = rec.get("estimatedSavingsPercentage")
+        try:
+            pct_val = float(pct) if pct is not None else None
+        except (TypeError, ValueError):
+            pct_val = None
+        suffix = f" ({pct_val:.1f}%)" if pct_val else ""
+        content += f'<p class="savings"><strong>Estimated Savings:</strong> ${ems:,.2f}/month{suffix}</p>'
+    elif "monthly_savings" in rec:
+        # snake_case savings (Aurora et al.) — render the canonical numeric line
+        # instead of the verbatim "/mo" string and never the raw suppressed
+        # "Monthly Savings: 214.62" property row (live-audit H7/M2).
+        try:
+            ms = float(rec.get("monthly_savings") or 0.0)
+        except (TypeError, ValueError):
+            ms = 0.0
+        content += f'<p class="savings"><strong>Estimated Savings:</strong> ${ms:,.2f}/month</p>'
     elif "EstimatedSavings" in rec:
         content += f'<p class="savings"><strong>Estimated Savings:</strong> {rec["EstimatedSavings"]}</p>'
+
+    # Surface a metric-gap diagnostic as a small qualifier on the card rather
+    # than dumping it as a raw "Pricingwarning:" property row (live-audit M1).
+    pricing_warning = rec.get("PricingWarning")
+    if pricing_warning:
+        content += f'<p class="muted"><small>{html.escape(str(pricing_warning))}</small></p>'
     return content
 
 
@@ -2327,7 +2333,13 @@ def _render_cost_hub_source(recommendations: List[Rec], source_name: str, servic
 
     content = ""
     for action_type, recs in grouped.items():
-        total_savings = sum(r.get("estimatedMonthlySavings", 0) for r in recs)
+        # Only COUNTED recs contribute to the card sum — an advisory
+        # (Counted=False) CoH rec (e.g. a commitment_analysis RI recommendation
+        # surfaced for visibility) must not render a positive card dollar that
+        # contradicts its $0 tab headline (live-audit C3).
+        total_savings = sum(
+            r.get("estimatedMonthlySavings", 0) for r in recs if r.get("Counted") is not False
+        )
         label = "recommendation" if len(recs) == 1 else "recommendations"
         content += f'<div class="rec-item{_priority_class(recs[0])}">'
 
@@ -2336,6 +2348,11 @@ def _render_cost_hub_source(recommendations: List[Rec], source_name: str, servic
 
         if total_savings > 0:
             content += f'<p class="savings"><strong>Estimated Monthly Savings:</strong> ${total_savings:.2f}</p>'
+        elif any(r.get("Counted") is False for r in recs):
+            content += (
+                '<p class="savings muted"><strong>Estimated Monthly Savings:</strong> '
+                "$0.00/month — advisory (not added to the tab total)</p>"
+            )
 
         effort = recs[0].get("implementationEffort", "")
         if effort:
@@ -2415,7 +2432,6 @@ SOURCE_TYPE_MAP: Dict[Tuple[str, str], str] = {
     ("cost_optimization_hub", "cross_service"): "Cost Hub",
     # CO recs that now flow through per-service adapters after the standalone
     # Compute Optimizer tab retirement.
-    ("lambda", "compute_optimizer"): "ML Backed",
     ("containers", "compute_optimizer"): "ML Backed",
     ("ec2", "asg_compute_optimizer"): "ML Backed",
     # S3 enhanced checks are config-pattern (no CloudWatch). Override the
@@ -2428,6 +2444,12 @@ SOURCE_TYPE_MAP: Dict[Tuple[str, str], str] = {
     ("network", "vpc_endpoints"): "Audit Based",
     ("network", "load_balancers"): "Audit Based",
     ("network", "auto_scaling_groups"): "Audit Based",
+    # network_cost data-transfer/TGW recs are Cost-Explorer-derived blended-dollar
+    # audits with no per-flow metric, so they carry "Audit Based", not the generic
+    # "Metric Backed" the source names would otherwise imply (network_cost L1).
+    ("network_cost", "cross_region_transfer"): "Audit Based",
+    ("network_cost", "cross_az_transfer"): "Audit Based",
+    ("network_cost", "internet_egress"): "Audit Based",
 }
 
 _GENERIC_SOURCE_TYPES: Dict[str, str] = {
@@ -2450,7 +2472,8 @@ _GENERIC_SOURCE_TYPES: Dict[str, str] = {
     "old_amis": "Audit Based",
     "gp2_migration": "Metric Backed",
     "unattached_volumes": "Audit Based",
-    "tgw_vs_peering": "Metric Backed",
+    # TGW-vs-peering is a topology audit with no per-flow metric (network_cost L1).
+    "tgw_vs_peering": "Audit Based",
     "node_group_optimization": "Metric Backed",
     "fargate_analysis": "Metric Backed",
     "cluster_costs": "Metric Backed",
@@ -2501,7 +2524,6 @@ PHASE_B_HANDLERS: Dict[Tuple[str, str], Callable] = {
     # Compute Optimizer tab retirement. Each binding reuses the unified
     # renderer because the rec schema is identical (resource_name, finding,
     # current_config, recommended_config, estimatedMonthlySavings).
-    ("lambda", "compute_optimizer"): _render_compute_optimizer_source,
     ("containers", "compute_optimizer"): _render_compute_optimizer_source,
     ("ec2", "asg_compute_optimizer"): _render_compute_optimizer_source,
     # Legacy bindings retained for any in-flight scan JSON that predates
@@ -2532,6 +2554,14 @@ PHASE_B_HANDLERS: Dict[Tuple[str, str], Callable] = {
     ("dynamodb", "cost_optimization_hub"): _render_cost_hub_source,
     ("containers", "enhanced_checks"): _render_containers_enhanced_checks,
     ("elasticache", "enhanced_checks"): _render_elasticache_enhanced_checks,
+    # CoH buckets the orchestrator routes into these per-service tabs. Bind to the
+    # purpose-built CoH renderer (grouped action table) consistent with rds /
+    # dynamodb / containers — without this the cost_optimization_hub SourceBlock
+    # fell through to the generic renderer and dumped a raw "Estimatedmonthlysavings:
+    # 5.0" property row with no clean savings line (CoH H-render).
+    ("elasticache", "cost_optimization_hub"): _render_cost_hub_source,
+    ("opensearch", "cost_optimization_hub"): _render_cost_hub_source,
+    ("redshift", "cost_optimization_hub"): _render_cost_hub_source,
     ("opensearch", "enhanced_checks"): _render_opensearch_enhanced_checks,
     # Network emits five per-domain sources (NOT a single enhanced_checks bucket).
     # Each must map to the renderer or the tab body renders empty while savings
@@ -2564,8 +2594,6 @@ _PHASE_A_SERVICES = frozenset(
         "api_gateway",
         "step_functions",
         "auto_scaling",
-        "backup",
-        "route53",
     }
 )
 

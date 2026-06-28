@@ -71,7 +71,6 @@ def get_load_balancer_checks(ctx: ScanContext) -> dict[str, Any]:
     # as an ALB (audit M3).
     lb_rate_by_type = {"application": alb_monthly, "network": nlb_monthly, "gateway": gwlb_monthly}
     checks: dict[str, list[dict[str, Any]]] = {
-        "zero_traffic_albs": [],
         "single_service_albs": [],
         "idle_listeners": [],
         "excessive_rules": [],

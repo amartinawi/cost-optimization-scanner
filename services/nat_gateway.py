@@ -35,7 +35,6 @@ def get_nat_gateway_checks(ctx: ScanContext) -> dict[str, Any]:
     checks: dict[str, list[dict[str, Any]]] = {
         "low_throughput_nat_gateways": [],
         "unnecessary_nat_per_az": [],
-        "nat_for_aws_services": [],
         "nat_in_dev_test": [],
         "multiple_nat_gateways": [],
     }
@@ -47,11 +46,6 @@ def get_nat_gateway_checks(ctx: ScanContext) -> dict[str, Any]:
         nat_gateways: list[dict[str, Any]] = []
         for page in paginator.paginate():
             nat_gateways.extend(page.get("NatGateways", []))
-
-        endpoints_paginator = ec2.get_paginator("describe_vpc_endpoints")
-        vpc_endpoints: list[dict[str, Any]] = []
-        for page in endpoints_paginator.paginate():
-            vpc_endpoints.extend(page.get("VpcEndpoints", []))
 
         # First pass: resolve each available NAT's VPC, AZ, and environment.
         available: list[dict[str, Any]] = []
@@ -120,32 +114,10 @@ def get_nat_gateway_checks(ctx: ScanContext) -> dict[str, Any]:
                     }
                 )
 
-        # Missing S3/DynamoDB gateway endpoints: data-processing savings are a
-        # per-GB rate, not a quantified monthly total → advisory ($0).
-        for vpc_id, nats in vpc_nats.items():
-            vpc_has_s3_endpoint = any(
-                ep.get("VpcId") == vpc_id and ep.get("ServiceName", "").endswith(".s3") for ep in vpc_endpoints
-            )
-            vpc_has_dynamodb_endpoint = any(
-                ep.get("VpcId") == vpc_id and ep.get("ServiceName", "").endswith(".dynamodb") for ep in vpc_endpoints
-            )
-            if vpc_has_s3_endpoint and vpc_has_dynamodb_endpoint:
-                continue
-            missing_endpoints = []
-            if not vpc_has_s3_endpoint:
-                missing_endpoints.append("S3")
-            if not vpc_has_dynamodb_endpoint:
-                missing_endpoints.append("DynamoDB")
-            checks["nat_for_aws_services"].append(
-                {
-                    "NatGatewayId": nats[0]["nat_id"],
-                    "VpcId": vpc_id,
-                    "MissingEndpoints": missing_endpoints,
-                    "Recommendation": f"Create VPC endpoints for {', '.join(missing_endpoints)} to reduce NAT data-processing costs",
-                    "EstimatedSavings": "$0.01/GB data processing savings",
-                    "CheckCategory": "VPC Endpoints Missing",
-                }
-            )
+        # Missing S3/DynamoDB gateway endpoints are NOT emitted here: the
+        # vpc_endpoints sub-shim already iterates all VPCs and emits the same
+        # ($0 advisory) recommendation, so a NAT-gateway-scoped duplicate would
+        # be redundant advisory noise for every VPC with a NAT (audit NET-06).
 
         # Dev/test NATs: count the base only when the NAT is the sole NAT in its
         # VPC (no consolidation finding owns the dollars). When the VPC has >1 NAT,

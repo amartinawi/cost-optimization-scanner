@@ -159,8 +159,18 @@ def get_enhanced_lightsail_checks(ctx: ScanContext) -> dict[str, Any]:
                     }
                 )
 
-        static_ips_response = lightsail.get_static_ips()
-        static_ips = static_ips_response.get("staticIps", [])
+        # get_static_ips has no boto3 paginator; follow nextPageToken manually
+        # (mirrors the get_instances paginator above) so accounts with more
+        # static IPs than one page are fully reported, not silently truncated.
+        static_ips: list[dict[str, Any]] = []
+        page_token = None
+        while True:
+            kwargs = {"pageToken": page_token} if page_token else {}
+            static_ips_response = lightsail.get_static_ips(**kwargs)
+            static_ips.extend(static_ips_response.get("staticIps", []))
+            page_token = static_ips_response.get("nextPageToken")
+            if not page_token:
+                break
 
         for static_ip in static_ips:
             if not static_ip.get("attachedTo"):

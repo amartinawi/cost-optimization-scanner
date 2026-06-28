@@ -72,21 +72,27 @@ class AthenaModule(BaseServiceModule):
                     rec["EstimatedMonthlySavings"] = round(rec_savings, 2)
                     savings += rec_savings
                 else:
-                    # CW returned no data; emit 0 + warning rather than
-                    # fabricate $50 fallback constant.
+                    # CW returned no data; emit a $0 advisory (Counted=False) so
+                    # the metric-gap zero is not mistaken for a genuine "no
+                    # savings" and is not summed/counted (live-audit H5).
                     rec["EstimatedMonthlySavings"] = 0.0
+                    rec["Counted"] = False
                     rec["PricingWarning"] = "CW ProcessedBytes metric returned no data"
             else:
-                # fast_mode: skip CW lookup. Emit 0 + warning so a full
-                # scan re-runs the metric query.
+                # fast_mode: skip CW lookup. Emit a $0 advisory so a full scan
+                # re-runs the metric query (live-audit H5).
                 rec["EstimatedMonthlySavings"] = 0.0
+                rec["Counted"] = False
                 rec["PricingWarning"] = "fast mode skipped CW; re-run without --fast"
 
         sources = {"enhanced_checks": SourceBlock(count=len(recs), recommendations=tuple(recs))}
+        # Count hygiene: $0 advisory recs render but are excluded from the
+        # rec-count headline (mirror lambda / batch / msk).
+        counted_recs = sum(1 for r in recs if r.get("Counted") is not False)
 
         return ServiceFindings(
             service_name="Athena",
-            total_recommendations=len(recs),
+            total_recommendations=counted_recs,
             total_monthly_savings=savings,
             sources=sources,
             optimization_descriptions=ATHENA_OPTIMIZATION_DESCRIPTIONS,

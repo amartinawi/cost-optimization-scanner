@@ -50,13 +50,18 @@ ARM_SUPPORTED_RUNTIMES: tuple[str, ...] = (
     "python3.10",
     "python3.11",
     "python3.12",
+    "python3.13",
     "nodejs18.x",
     "nodejs20.x",
+    "nodejs22.x",
+    "ruby3.4",
     "java11",
     "java17",
     "java21",
     "dotnet6",
     "dotnet8",
+    "dotnet9",
+    "provided.al2023",
 )
 
 EXCESSIVE_MEMORY_THRESHOLD: int = 3008
@@ -174,6 +179,10 @@ def get_enhanced_lambda_checks(ctx: ScanContext) -> dict[str, Any]:
                 memory_size = function["MemorySize"]
                 _timeout = function["Timeout"]
                 runtime = function.get("Runtime", "Unknown")
+                # Container-image functions report no Runtime (it stays "Unknown")
+                # but still support arm64, so the ARM advisory keys off PackageType
+                # for them rather than the runtime allow-list.
+                package_type = function.get("PackageType", "Zip")
                 architectures = function.get("Architectures", ["x86_64"])
                 architecture = "arm64" if "arm64" in architectures else "x86_64"
 
@@ -204,8 +213,13 @@ def get_enhanced_lambda_checks(ctx: ScanContext) -> dict[str, Any]:
                 # ~$0 and there is nothing to save by deleting them.
 
                 try:
-                    provisioned = lambda_client.list_provisioned_concurrency_configs(FunctionName=function_name)
-                    pc_configs = provisioned.get("ProvisionedConcurrencyConfigs", [])
+                    # ListProvisionedConcurrencyConfigs paginates across a
+                    # function's aliases/versions; walk every page so functions
+                    # with many PC configs are not silently truncated.
+                    pc_configs = []
+                    pc_paginator = lambda_client.get_paginator("list_provisioned_concurrency_configs")
+                    for pc_page in pc_paginator.paginate(FunctionName=function_name):
+                        pc_configs.extend(pc_page.get("ProvisionedConcurrencyConfigs", []))
                 except Exception as e:
                     # A PC-config read failure must NOT skip the ARM check below;
                     # record once and treat this function as having no PC.
@@ -244,7 +258,11 @@ def get_enhanced_lambda_checks(ctx: ScanContext) -> dict[str, Any]:
                 # needs" — reserved concurrency itself has no cost (unlike provisioned).
                 _ = (vpc_config, reserved_concurrency)
 
-                if not fast_mode and "x86_64" in architectures and runtime in ARM_SUPPORTED_RUNTIMES:
+                if (
+                    not fast_mode
+                    and "x86_64" in architectures
+                    and (runtime in ARM_SUPPORTED_RUNTIMES or package_type == "Image")
+                ):
                     try:
                         end_time = datetime.now(UTC)
                         start_time = end_time - timedelta(days=7)

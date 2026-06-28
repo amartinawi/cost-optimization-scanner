@@ -379,6 +379,53 @@ def test_shim_no_medium_fallback_and_windows_detection() -> None:
     assert len(result["checks"]["unused_static_ips"]) == 1
 
 
+class _PaginatingStaticIpClient:
+    """Fake Lightsail client whose ``get_static_ips`` returns multiple pages.
+
+    Each page index doubles as its own ``nextPageToken`` so the test can assert
+    the shim followed the token chain rather than reading only the first page.
+    """
+
+    def __init__(self, instances: list[dict[str, Any]], static_ip_pages: list[list[dict[str, Any]]]) -> None:
+        self._instances = instances
+        self._pages = static_ip_pages
+        self.calls: list[str | None] = []
+
+    def get_paginator(self, name: str) -> _FakePaginator:
+        assert name == "get_instances"
+        return _FakePaginator([{"instances": self._instances}])
+
+    def get_static_ips(self, **kwargs: Any) -> dict[str, Any]:
+        token = kwargs.get("pageToken")
+        self.calls.append(token)
+        idx = 0 if token is None else int(token)
+        resp: dict[str, Any] = {"staticIps": self._pages[idx]}
+        if idx + 1 < len(self._pages):
+            resp["nextPageToken"] = str(idx + 1)
+        return resp
+
+
+def test_shim_static_ips_paginated() -> None:
+    # L1: get_static_ips follows nextPageToken so multi-page accounts are fully
+    # reported instead of silently truncated to the first page.
+    pages = [
+        [{"name": "ip1", "ipAddress": "1.1.1.1", "attachedTo": None}],
+        [{"name": "ip2", "ipAddress": "2.2.2.2", "attachedTo": None}],
+        [{"name": "ip3", "ipAddress": "3.3.3.3", "attachedTo": None}],
+    ]
+    client = _PaginatingStaticIpClient([], pages)
+    ctx = _ctx()
+    ctx.client = lambda name: client
+
+    result = shim_mod.get_enhanced_lightsail_checks(ctx)
+    unused = result["checks"]["unused_static_ips"]
+
+    # All three pages' static IPs collected, not just the first.
+    assert {r["StaticIpName"] for r in unused} == {"ip1", "ip2", "ip3"}
+    # First call sends no pageToken; subsequent calls follow the returned token.
+    assert client.calls == [None, "1", "2"]
+
+
 def test_shim_end_to_end_through_adapter(monkeypatch: pytest.MonkeyPatch) -> None:
     # Full shim → adapter path: the no-bundle stopped instance becomes a $0
     # advisory (H3), the static IP is counted at $3.65 (H4).

@@ -303,6 +303,24 @@ def test_idle_endpoint_excluded_but_consolidation_still_fires_on_non_idle() -> N
 
 
 # --------------------------------------------------------------------------- #
+# L3 — the "Active Endpoints" stat excludes endpoints already flagged idle
+# --------------------------------------------------------------------------- #
+def test_l3_active_endpoint_count_excludes_idle() -> None:
+    # Two InService endpoints, one idle (0 invocations). The idle one is broken
+    # out under idle_endpoints, so the Active Endpoints stat must show 1, not 2.
+    ep_a, cfg_a = _endpoint("idle-ep", "ml.m5.xlarge")
+    ep_b, cfg_b = _endpoint("busy-ep", "ml.m5.xlarge")
+    sm = _FakeSageMaker(endpoints=[ep_a, ep_b], endpoint_configs={**cfg_a, **cfg_b})
+    cw = _FakeCloudWatch({"idle-ep": 0.0, "busy-ep": 5000.0})
+    ctx = _ctx(sm, cw, prices={"ml.m5.xlarge": M5_XLARGE_MONTHLY})
+
+    findings = SageMakerModule().scan(ctx)
+
+    assert findings.extras["idle_endpoint_count"] == 1
+    assert findings.extras["active_endpoint_count"] == 1  # 2 InService − 1 idle
+
+
+# --------------------------------------------------------------------------- #
 # counted == rendered: the headline equals the sum of Counted!=False dollars
 # --------------------------------------------------------------------------- #
 def test_total_equals_sum_of_counted_recs() -> None:
@@ -337,6 +355,57 @@ def test_total_equals_sum_of_counted_recs() -> None:
     assert findings.total_recommendations == counted_n
     # advisory recs (notebook + spot) are present but excluded.
     assert any(r.get("Counted") is False for r in all_recs)
+
+
+# --------------------------------------------------------------------------- #
+# L2 — paginator-failure fallback walks every NextToken page (no 1-page cap)
+# --------------------------------------------------------------------------- #
+class _FakeSageMakerNoPaginator:
+    """SageMaker client whose paginator is unavailable.
+
+    ``get_paginator`` raises so the adapter takes the manual fallback; the
+    fallback must then walk every ``NextToken`` page rather than capping at the
+    first ~100 endpoints.
+    """
+
+    def __init__(self, pages_by_token: dict[Any, dict[str, Any]]) -> None:
+        self._pages = pages_by_token
+        self.calls: list[Any] = []
+
+    def get_paginator(self, name: str) -> Any:  # noqa: ANN401 - boto3 shape
+        raise RuntimeError("paginator unavailable")
+
+    def list_endpoints(self, **kwargs: Any) -> dict[str, Any]:
+        token = kwargs.get("NextToken")
+        self.calls.append(token)
+        return self._pages[token]
+
+
+def test_list_endpoints_fallback_paginates_all_pages() -> None:
+    pages = {
+        None: {"Endpoints": [{"EndpointName": "ep-0"}], "NextToken": "t1"},
+        "t1": {"Endpoints": [{"EndpointName": "ep-1"}], "NextToken": "t2"},
+        "t2": {"Endpoints": [{"EndpointName": "ep-2"}]},  # no NextToken -> last
+    }
+    sm = _FakeSageMakerNoPaginator(pages)
+
+    endpoints = sm_mod._list_endpoints(sm)
+
+    # All three pages walked, not just the first (the old single-call fallback
+    # would have returned only "ep-0").
+    assert [ep["EndpointName"] for ep in endpoints] == ["ep-0", "ep-1", "ep-2"]
+    # First call has no token; subsequent calls thread the prior NextToken.
+    assert sm.calls == [None, "t1", "t2"]
+
+
+def test_list_endpoints_fallback_single_page() -> None:
+    pages = {None: {"Endpoints": [{"EndpointName": "only-ep"}]}}
+    sm = _FakeSageMakerNoPaginator(pages)
+
+    endpoints = sm_mod._list_endpoints(sm)
+
+    assert [ep["EndpointName"] for ep in endpoints] == ["only-ep"]
+    assert sm.calls == [None]  # one call, then break on absent NextToken
 
 
 # --------------------------------------------------------------------------- #

@@ -8,6 +8,16 @@ from core.contracts import ServiceFindings, SourceBlock
 from services._base import BaseServiceModule
 from services.dms import DMS_OPTIMIZATION_DESCRIPTIONS, get_enhanced_dms_checks
 
+# Per-check-category savings factor against the AZ-correct instance monthly
+# price. An *unused* instance recovers its FULL cost on termination (factor
+# 1.0); a *rightsizing* candidate recovers ~35% by moving one size down. The
+# factor is keyed off the rec's ``CheckCategory`` so the two levers are never
+# collapsed under a single flat multiplier (dms L1).
+_DMS_SAVINGS_FACTORS: dict[str, float] = {
+    "Unused DMS Instances": 1.0,
+    "Instance Optimization": 0.35,
+}
+
 
 class DmsModule(BaseServiceModule):
     """ServiceModule adapter for DMS.
@@ -108,46 +118,68 @@ class DmsModule(BaseServiceModule):
             if name:
                 multi_az_ids.add(name)
 
-        # --- Instance rightsizing / unused (35% of the AZ-correct price) ----- #
-        # An instance already owned by the Multi-AZ lever above is excluded here
-        # so the same compute is never counted twice (per-AZ delta + 35%).
+        # --- Instance rightsizing / unused: per-rec counted dollar ----------- #
+        # Each heuristic rec is enriched (immutable copy) with the exact dollar
+        # the tab headline sums, so the card renders the same figure (dms L5).
+        # The factor is category-specific: an unused instance recovers its FULL
+        # cost on termination (1.0); a rightsizing candidate recovers ~35% by
+        # downsizing (dms L1). An instance already owned by the Multi-AZ lever
+        # above is excluded so the same compute is never counted twice
+        # (per-AZ delta + 35%).
         savings = 0.0
-        for rec in recs:
-            iid = rec.get("InstanceId") or rec.get("ReplicationInstanceIdentifier", "")
-            if iid and iid in multi_az_ids:
-                continue
-            instance_class = rec.get("InstanceClass", "")
-            if ctx.pricing_engine is not None and instance_class:
-                monthly = ctx.pricing_engine.get_dms_instance_monthly_price(
-                    instance_class, multi_az=bool(rec.get("MultiAZ"))
-                )
-                if monthly > 0:
-                    savings += monthly * 0.35
-                # else: pricing miss; skip rather than fabricate a $50 fallback.
-            # else: instance_class unknown; skip rather than fabricate a fallback.
+        sources: dict[str, SourceBlock] = {}
+        for category, category_recs in checks.items():
+            enriched: list[dict[str, Any]] = []
+            for rec in category_recs:
+                iid = rec.get("InstanceId") or rec.get("ReplicationInstanceIdentifier", "")
+                if iid and iid in multi_az_ids:
+                    continue
+                instance_class = rec.get("InstanceClass", "")
+                factor = _DMS_SAVINGS_FACTORS.get(rec.get("CheckCategory", ""))
+                per_rec_saving = 0.0
+                audit_basis: dict[str, Any] | None = None
+                if ctx.pricing_engine is not None and instance_class and factor is not None:
+                    monthly = ctx.pricing_engine.get_dms_instance_monthly_price(
+                        instance_class, multi_az=bool(rec.get("MultiAZ"))
+                    )
+                    if monthly > 0:
+                        per_rec_saving = monthly * factor
+                        savings += per_rec_saving
+                        audit_basis = {
+                            "rate_source": "AWS Pricing API AWSDatabaseMigrationSvc / Replication Server",
+                            "instance_monthly": round(monthly, 2),
+                            "factor": factor,
+                            "region": getattr(ctx, "region", "unknown"),
+                            "formula": (
+                                "full instance monthly (terminate)"
+                                if factor >= 1.0
+                                else f"{factor:.0%} of instance monthly (one-size-down)"
+                            ),
+                        }
+                    # else: pricing miss; render prose, count nothing.
+                # else: instance class / category unknown; render prose, count nothing.
+                if per_rec_saving > 0:
+                    enriched.append(
+                        {
+                            **rec,
+                            "EstimatedMonthlySavings": per_rec_saving,
+                            "Counted": True,
+                            "EstimatedSavings": f"${per_rec_saving:.2f}/month",
+                            "AuditBasis": audit_basis,
+                        }
+                    )
+                else:
+                    enriched.append(dict(rec))
+            if enriched:
+                sources[category] = SourceBlock(count=len(enriched), recommendations=tuple(enriched))
 
         savings += sum(r["EstimatedMonthlySavings"] for r in multi_az_recs if r.get("Counted"))
 
-        # --- sources: drop Multi-AZ-owned instances from the heuristic blocks - #
-        sources = {}
-        for category, category_recs in checks.items():
-            kept = tuple(
-                r
-                for r in category_recs
-                if (r.get("InstanceId") or r.get("ReplicationInstanceIdentifier", "")) not in multi_az_ids
-            )
-            if kept:
-                sources[category] = SourceBlock(count=len(kept), recommendations=kept)
         if multi_az_recs:
             sources["multi_az_review"] = SourceBlock(count=len(multi_az_recs), recommendations=tuple(multi_az_recs))
 
         # Count hygiene: $0 advisory Multi-AZ recs are rendered but not counted.
-        kept_heuristic = sum(
-            1
-            for category_recs in checks.values()
-            for r in category_recs
-            if (r.get("InstanceId") or r.get("ReplicationInstanceIdentifier", "")) not in multi_az_ids
-        )
+        kept_heuristic = sum(block.count for key, block in sources.items() if key != "multi_az_review")
         counted_multi_az = sum(1 for r in multi_az_recs if r.get("Counted"))
         total_count = kept_heuristic + counted_multi_az
 

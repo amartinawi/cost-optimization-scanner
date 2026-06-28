@@ -22,10 +22,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from reporter_phase_b import (
+    PHASE_B_HANDLERS,
+    _render_cost_hub_source,
     _render_eks_source,
     _render_generic_other_rec,
     _render_opensearch_enhanced_checks,
     render_generic_per_rec,
+    should_use_handler,
 )
 
 
@@ -111,3 +114,50 @@ def test_redshift_ri_advisory_via_per_rec_dispatch() -> None:
     html = render_generic_per_rec("redshift", recs, "enhanced_checks")
     assert "advisory (not added to the tab total)" in html
     assert "$300.00/month" not in html
+
+
+# --------------------------------------------------------------------------- #
+# CoH H-render — elasticache / opensearch / redshift cost_optimization_hub
+# SourceBlocks bind to the purpose-built CoH renderer (was: fell through to the
+# generic renderer and dumped a raw "Estimatedmonthlysavings: 5.0" property row
+# with no clean savings line). Mirrors the rds / dynamodb / containers bindings.
+# --------------------------------------------------------------------------- #
+def test_coh_source_bound_for_elasticache_opensearch_redshift() -> None:
+    for svc in ("elasticache", "opensearch", "redshift"):
+        assert should_use_handler(svc, "cost_optimization_hub"), svc
+        assert PHASE_B_HANDLERS[(svc, "cost_optimization_hub")] is _render_cost_hub_source, svc
+
+
+def test_coh_source_renders_clean_savings_no_raw_dump() -> None:
+    # A real CoH rec carries the lowercase camelCase schema.
+    recs = [
+        {
+            "actionType": "Rightsize",
+            "resourceId": "arn:aws:elasticache:us-east-1:1:cluster/c1",
+            "currentResourceType": "ElastiCacheReservedInstances",
+            "region": "us-east-1",
+            "estimatedMonthlySavings": 5.0,
+            "estimatedSavingsPercentage": 30.0,
+            "implementationEffort": "Low",
+        }
+    ]
+    html = _render_cost_hub_source(recs, "cost_optimization_hub", {})
+    assert "$5.00" in html
+    # The grouped CoH renderer never emits the title-cased raw property dump.
+    assert "Estimatedmonthlysavings" not in html
+
+
+def test_generic_other_rec_lowercase_coh_savings_renders_clean() -> None:
+    # Defense-in-depth: even if a CoH rec reaches the generic renderer, the
+    # lowercase estimatedMonthlySavings must render as a clean savings line and
+    # never as a raw "Estimatedmonthlysavings: 5.0" property row.
+    rec = {
+        "actionType": "Rightsize",
+        "resourceId": "arn:aws:redshift:us-east-1:1:cluster/rs1",
+        "estimatedMonthlySavings": 5.0,
+        "estimatedSavingsPercentage": 30.0,
+    }
+    html = _render_generic_other_rec("", rec, "cost_optimization_hub")
+    assert "$5.00/month" in html
+    assert "30.0%" in html
+    assert "Estimatedmonthlysavings" not in html

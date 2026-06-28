@@ -88,9 +88,19 @@ def _list_endpoints(sm: Any) -> list[dict[str, Any]]:
             for ep in page.get("Endpoints", []):
                 endpoints.append(ep)
     except Exception:
+        # Paginator unavailable: fall back to a manual NextToken loop so the
+        # fallback still walks every page instead of silently capping at one
+        # (~100 endpoints).
         try:
-            resp = sm.list_endpoints()
-            endpoints = resp.get("Endpoints", [])
+            params: dict[str, Any] = {}
+            while True:
+                resp = sm.list_endpoints(**params)
+                for ep in resp.get("Endpoints", []):
+                    endpoints.append(ep)
+                token = resp.get("NextToken")
+                if not token:
+                    break
+                params["NextToken"] = token
         except Exception:
             pass
     return endpoints
@@ -526,7 +536,11 @@ class SageMakerModule(BaseServiceModule):
                 ),
             },
             extras={
-                "active_endpoint_count": active_ep_count,
+                # _check_idle_endpoints counts every InService endpoint as active
+                # before the zero-invocations test, so subtract the idle ones the
+                # report breaks out separately — else the "Active Endpoints" stat
+                # double-represents an idle endpoint (sagemaker L3).
+                "active_endpoint_count": active_ep_count - len(idle_ep_recs),
                 "idle_endpoint_count": len(idle_ep_recs),
                 "running_notebook_count": notebook_count,
             },

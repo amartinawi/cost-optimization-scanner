@@ -1,4 +1,4 @@
-"""Keyword-rate adapter for ElastiCache."""
+"""Live-priced adapter for ElastiCache (node-price deltas; CoH-authoritative)."""
 
 from __future__ import annotations
 
@@ -62,8 +62,57 @@ def graviton_equivalent(node_type: str) -> str | None:
     return f"cache.{graviton_family}.{size}"
 
 
+# ElastiCache node size ladder (smallest -> largest), within a family. Used to
+# derive the one-size-down rightsizing target for an underutilized cluster. A
+# size token outside this ladder (e.g. an unusual ``18xlarge``) maps to None so
+# the caller demotes the lever to a $0 advisory rather than guess a target.
+_NODE_SIZE_ORDER: tuple[str, ...] = (
+    "micro",
+    "small",
+    "medium",
+    "large",
+    "xlarge",
+    "2xlarge",
+    "4xlarge",
+    "8xlarge",
+    "12xlarge",
+    "16xlarge",
+    "24xlarge",
+)
+
+
+def downsize_target(node_type: str) -> str | None:
+    """Return the one-size-smaller ElastiCache node type within the same family.
+
+    ``cache.r5.xlarge`` -> ``cache.r5.large``. Returns ``None`` for the smallest
+    size, an unparseable type, or a size token not on ``_NODE_SIZE_ORDER`` so the
+    caller can demote the downsize lever to a $0 advisory instead of fabricating
+    a delta against an unknown target. One-size-down is the conservative,
+    defensible rightsizing target (mirrors the EC2 rightsizing approach).
+
+    Args:
+        node_type: An ElastiCache node type, e.g. ``cache.r5.xlarge``.
+
+    Returns:
+        The one-size-smaller node type, or ``None`` if unmappable.
+    """
+    if not node_type.startswith("cache."):
+        return None
+    family_size = node_type[len("cache.") :]
+    if "." not in family_size:
+        return None
+    family, size = family_size.split(".", 1)
+    try:
+        idx = _NODE_SIZE_ORDER.index(size)
+    except ValueError:
+        return None
+    if idx == 0:
+        return None
+    return f"cache.{family}.{_NODE_SIZE_ORDER[idx - 1]}"
+
+
 class ElasticacheModule(BaseServiceModule):
-    """ServiceModule adapter for ElastiCache. Keyword-rate savings strategy."""
+    """ServiceModule adapter for ElastiCache. Live node-price-delta savings strategy."""
 
     key: str = "elasticache"
     cli_aliases: tuple[str, ...] = ("elasticache",)
@@ -107,13 +156,13 @@ class ElasticacheModule(BaseServiceModule):
         coh_total = sum(coh_savings(r) for r in coh_recs)
 
         # Per-category discount rates keyed on the structured CheckCategory (not
-        # fragile EstimatedSavings substrings — the old "Underutilized" branch was
-        # dead because that rec's text is "30-50%"). Reserved Nodes is a COMMITMENT
+        # fragile EstimatedSavings substrings). Reserved Nodes is a COMMITMENT
         # lever (overlaps the commitment tab) → advisory, never counted here.
-        # Graviton Migration is NOT a flat rate: its counted dollar is the exact
-        # (x86 node price − Graviton node price) × NumNodes delta (elasticache H2).
+        # Graviton Migration and Underutilized Cluster are NOT flat rates: each
+        # counted dollar is an exact live node-price delta (see the per-branch
+        # logic below). Valkey is AWS's published ~20% Redis→Valkey list-price
+        # discount, a uniform real delta.
         rate_by_category = {
-            "Underutilized Cluster": 0.30,  # evidence-gated (CloudWatch CPU)
             "Valkey Migration": 0.20,
         }
 
@@ -168,6 +217,43 @@ class ElasticacheModule(BaseServiceModule):
                     # No Graviton counterpart / non-positive delta → cannot
                     # quantify a concrete saving → $0 advisory (keep "20-40%"
                     # only as qualitative wording).
+                    rec["EstimatedMonthlySavings"] = 0.0
+                    rec["Counted"] = False
+            elif category == "Underutilized Cluster":
+                # Exact realizable saving = (current node price − one-size-down
+                # node price) × node count, NOT a flat 0.30 of node cost (a
+                # fabricated proxy). The lever is already CloudWatch-CPU gated
+                # upstream; here we ground its dollar in account-specific node
+                # prices and one-size-down as the conservative target
+                # (live-audit H3).
+                target_type = downsize_target(node_type or "")
+                target_node = 0.0
+                if target_type and ctx.pricing_engine is not None:
+                    target_node = ctx.pricing_engine.get_instance_monthly_price(
+                        "AmazonElastiCache", target_type, engine=engine
+                    )
+                delta = round((monthly_node - target_node) * num_nodes, 2)
+                if target_type and target_node > 0 and delta > 0:
+                    rec["EstimatedMonthlySavings"] = delta
+                    rec["AuditBasis"] = {
+                        "lever": "Underutilized cluster downsizing",
+                        "rate": (
+                            f"{node_type} ${round(monthly_node, 2)}/mo − "
+                            f"{target_type} ${round(target_node, 2)}/mo per node "
+                            "(AmazonElastiCache NodeUsage, On-Demand)"
+                        ),
+                        "region": region,
+                        "metric_window": "CloudWatch CPUUtilization (underutilized)",
+                        "formula": (
+                            f"({round(monthly_node, 2)} − {round(target_node, 2)}) × "
+                            f"{num_nodes} node(s) = ${delta}/mo"
+                        ),
+                        "num_nodes": num_nodes,
+                        "engine": engine,
+                    }
+                else:
+                    # Smallest size, unmappable target, or unpriceable target →
+                    # cannot quantify a concrete downsizing delta → $0 advisory.
                     rec["EstimatedMonthlySavings"] = 0.0
                     rec["Counted"] = False
             else:

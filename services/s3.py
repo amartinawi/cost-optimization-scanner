@@ -104,10 +104,14 @@ S3_INTELLIGENT_TIERING_MONITORING_FEE: float = 0.0025
 # rather than inventing a dollar figure.
 COLD_LOOKBACK_DAYS: int = 30
 
-# Opportunity classes that represent a transition gap a lifecycle policy or
-# Intelligent-Tiering could close (and therefore may carry real savings).
+# Opportunity classes that represent a transition gap a NEW lifecycle policy
+# could close (and therefore may carry real savings). A bucket that already has
+# a lifecycle policy (the "intelligent_tiering" class: has_lifecycle=True,
+# has_tiering=False) is excluded — its existing rule may already be performing
+# the transition, so crediting the full Standard->Standard-IA delta would
+# overstate / double-count the saving (network_cost / s3 S3-N4).
 _GAP_OPPORTUNITY_CLASSES: frozenset[str] = frozenset(
-    {"both_missing", "lifecycle_missing", "intelligent_tiering"}
+    {"both_missing", "lifecycle_missing"}
 )
 
 # Bucket-error classifier — used by all bucket-level S3 calls to route
@@ -791,6 +795,21 @@ def _assess_bucket_coldness(
         except Exception as e:  # noqa: BLE001
             if _is_endpoint_unreachable(e):
                 _mark_region_dead(ctx, bucket_region, f"S3 request metrics for {bucket_name}")
+            elif (
+                _is_access_denied(e)
+                or "AccessDenied" in str(e)
+                or "Unauthorized" in str(e)
+            ):
+                ctx.permission_issue(
+                    f"cloudwatch:GetMetricStatistics denied on {bucket_name}",
+                    service="cloudwatch",
+                    action="cloudwatch:GetMetricStatistics",
+                )
+            elif "Throttling" in str(e) or "RequestLimitExceeded" in str(e):
+                ctx.warn(
+                    f"cloudwatch:GetMetricStatistics throttled on {bucket_name}",
+                    service="cloudwatch",
+                )
             else:
                 logger.debug("S3 GetRequests metric error on %s: %s", bucket_name, e)
             return "unknown"
@@ -828,8 +847,15 @@ def get_s3_bucket_analysis(
     s3 = ctx.client("s3")
 
     try:
+        # Paginate list_buckets: since the 2024 API change it returns at most
+        # 10k buckets per page behind a ContinuationToken, so a single call
+        # silently under-enumerates large accounts.
+        buckets = []
         response = s3.list_buckets()
-        buckets = response.get("Buckets", [])
+        buckets.extend(response.get("Buckets", []))
+        while response.get("ContinuationToken"):
+            response = s3.list_buckets(ContinuationToken=response["ContinuationToken"])
+            buckets.extend(response.get("Buckets", []))
         logger.debug("Analyzing %d S3 buckets (%s)", len(buckets), "fast" if fast_mode else "full")
 
         analysis: dict[str, Any] = {
@@ -951,12 +977,28 @@ def get_s3_bucket_analysis(
                                 )
                                 region_dead_mid_loop = True
                                 break  # Stop iterating storage classes for this bucket.
-                            logger.debug(
-                                "Error getting S3 metrics for %s/%s: %s",
-                                bucket_name,
-                                cw_storage_type,
-                                e,
-                            )
+                            if (
+                                _is_access_denied(e)
+                                or "AccessDenied" in str(e)
+                                or "Unauthorized" in str(e)
+                            ):
+                                ctx.permission_issue(
+                                    f"cloudwatch:GetMetricStatistics denied on {bucket_name}",
+                                    service="cloudwatch",
+                                    action="cloudwatch:GetMetricStatistics",
+                                )
+                            elif "Throttling" in str(e) or "RequestLimitExceeded" in str(e):
+                                ctx.warn(
+                                    f"cloudwatch:GetMetricStatistics throttled on {bucket_name}",
+                                    service="cloudwatch",
+                                )
+                            else:
+                                logger.debug(
+                                    "Error getting S3 metrics for %s/%s: %s",
+                                    bucket_name,
+                                    cw_storage_type,
+                                    e,
+                                )
                             continue
 
                     if region_dead_mid_loop:
@@ -1154,8 +1196,15 @@ def get_enhanced_s3_checks(
         return static_cache[name]
 
     try:
+        # Paginate list_buckets: since the 2024 API change it returns at most
+        # 10k buckets per page behind a ContinuationToken, so a single call
+        # silently under-enumerates large accounts.
+        buckets = []
         response = s3.list_buckets()
-        buckets = response.get("Buckets", [])
+        buckets.extend(response.get("Buckets", []))
+        while response.get("ContinuationToken"):
+            response = s3.list_buckets(ContinuationToken=response["ContinuationToken"])
+            buckets.extend(response.get("Buckets", []))
 
         for bucket in buckets:
             bucket_name = bucket["Name"]

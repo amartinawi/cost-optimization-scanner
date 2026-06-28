@@ -17,20 +17,12 @@ STEP_FUNCTIONS_OPTIMIZATION_DESCRIPTIONS: dict[str, dict[str, str]] = {
         "description": "Express Workflows cost less per execution and per state transition for high-volume workloads.",
         "action": "Migrate Standard state machines with >100 daily executions to Express type",
     },
-    "nonprod_24x7": {
-        "title": "Schedule Non-Production State Machines",
-        "description": "Non-prod state machines running 24/7 incur transition costs during idle hours.",
-        "action": "Implement shutdown schedules for dev/test/staging state machines",
-    },
 }
 
 
 def get_enhanced_step_functions_checks(ctx: ScanContext) -> dict[str, Any]:
     checks: dict[str, list[dict[str, Any]]] = {
         "standard_vs_express": [],
-        "excessive_transitions": [],
-        "polling_workflows": [],
-        "nonprod_24x7": [],
     }
 
     try:
@@ -42,6 +34,11 @@ def get_enhanced_step_functions_checks(ctx: ScanContext) -> dict[str, Any]:
                 sm_name = sm.get("name", "Unknown")
                 sm_type = sm.get("type", "STANDARD")
 
+                # EXPRESS state machines are intentionally out of scope: Express
+                # bills per request + GB-s (duration x memory consumed), and Step
+                # Functions exposes no CloudWatch metric for states-per-execution
+                # or memory consumed, so any Express saving is unmeasurable at
+                # scan time. Only STANDARD machines carry a quantifiable signal.
                 if sm_type == "STANDARD":
                     try:
                         end_time = datetime.now(UTC)

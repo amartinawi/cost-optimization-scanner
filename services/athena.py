@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import Any
 
 from core.scan_context import ScanContext
+from services._aws_errors import record_aws_error
 
 ATHENA_OPTIMIZATION_DESCRIPTIONS: dict[str, dict[str, str]] = {
     "query_optimization": {
@@ -49,7 +50,7 @@ def get_enhanced_athena_checks(ctx: ScanContext) -> dict[str, Any]:
                 }
             )
     except Exception as e:
-        ctx.warn(f"Could not analyze Athena resources: {e}", "athena")
+        record_aws_error(ctx, e, service="athena", context="list_work_groups")
 
     recommendations: list[dict[str, Any]] = []
     for _category, items in checks.items():

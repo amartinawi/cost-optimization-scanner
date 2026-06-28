@@ -10,7 +10,7 @@ from services.advisor import get_ecs_compute_optimizer_recommendations
 from services.containers import get_container_services_analysis, get_enhanced_container_checks
 from services.containers_logic import (
     dedupe_by_authority,
-    normalize_resource_name,
+    ecs_dedup_key,
     quantify_fargate_rightsizing,
 )
 
@@ -93,18 +93,20 @@ class ContainersModule(BaseServiceModule):
         # source. Build the CoH-covered set and drop those CO duplicates BEFORE
         # summing/counting so one Fargate service never contributes savings
         # twice (mirrors lambda_svc.py:113-131). A CoH ARN
-        # (...:service/cluster/web) and a CO resource_id (cluster/web) both
-        # normalize to "web", so they converge.
+        # (...:service/clusterA/web) and a CO resource_id (clusterA/web) both
+        # reduce to the cluster-qualified key "clusterA/web", so they converge —
+        # while two services named "web" in different clusters stay distinct and
+        # are not over-deduped (containers cross-cluster dedup).
         covered: set[str] = set()
         for rec in cost_hub_recs:
-            name = normalize_resource_name(
+            name = ecs_dedup_key(
                 rec.get("resourceArn") or rec.get("ResourceArn") or rec.get("resourceId") or ""
             )
             if name:
                 covered.add(name)
         deduped_co: list[dict[str, Any]] = []
         for rec in co_recs:
-            name = normalize_resource_name(rec.get("resource_id") or rec.get("resource_name") or "")
+            name = ecs_dedup_key(rec.get("resource_id") or rec.get("resource_name") or "")
             if name and name in covered:
                 continue  # already counted by Cost Hub — drop the CO duplicate
             deduped_co.append(rec)
@@ -122,6 +124,7 @@ class ContainersModule(BaseServiceModule):
             coh_key=lambda r: r.get("resourceArn") or r.get("ResourceArn") or r.get("resourceId") or "",
             co_key=lambda r: r.get("resource_id") or "",
             heuristic_key=_heuristic_resource_key,
+            normalizer=ecs_dedup_key,
         )
 
         # Quantify each surviving heuristic rec. A rec that quantifies to a real
@@ -315,9 +318,21 @@ def _fmt_fargate_size(vcpu: float, mem_gb: float) -> str:
 
 
 def _heuristic_resource_key(rec: dict[str, Any]) -> str:
-    """Normalized resource name for an enhanced-check rec, for dedup."""
+    """Raw cluster-qualified resource identifier for an enhanced-check rec.
+
+    For an ECS service rec (carries both ClusterName and ServiceName) returns
+    ``cluster/service`` so two services with the same name in different clusters
+    do not collapse to one dedup key and over-dedup against a single CoH /
+    Compute Optimizer finding (containers cross-cluster dedup). Other resource
+    types fall back to their single identifying name. The caller normalizes the
+    result via ``ecs_dedup_key``.
+    """
+    cluster = rec.get("ClusterName")
+    service = rec.get("ServiceName")
+    if cluster and service:
+        return f"{cluster}/{service}"
     for marker in ("ServiceName", "ClusterName", "TaskDefinitionArn", "RepositoryName"):
         val = rec.get(marker)
         if val:
-            return normalize_resource_name(str(val))
+            return str(val)
     return ""

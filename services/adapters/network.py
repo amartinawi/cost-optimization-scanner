@@ -166,7 +166,7 @@ class NetworkModule(BaseServiceModule):
                 },
                 "vpc_endpoints": {
                     "title": "VPC Endpoint Optimization",
-                    "description": "Unused VPC endpoints and consolidation opportunities",
+                    "description": "Missing S3/DynamoDB gateway endpoints, non-prod interface endpoints, and duplicate interface-endpoint consolidation opportunities",
                 },
                 "load_balancers": {
                     "title": "Load Balancer Optimization",

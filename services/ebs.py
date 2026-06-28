@@ -554,7 +554,11 @@ def compute_ebs_checks(
     """
     ec2 = ctx.client("ec2")
     checks: dict[str, Any] = {
-        "unattached_volumes": get_unattached_volumes(ctx, pricing_multiplier),
+        # The EBS adapter owns the authoritative unattached-volume source
+        # (adapters/ebs.py calls get_unattached_volumes directly); seeding the
+        # check here only triggers a redundant describe_instances+describe_volumes
+        # pagination whose recs partition_enhanced_recs discards. Leave empty.
+        "unattached_volumes": [],
         "gp2_migration": [],
         "old_snapshots": [],
         "over_provisioned_iops": [],

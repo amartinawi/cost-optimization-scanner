@@ -8,6 +8,10 @@ data transfer cost savings opportunities:
 - Internet egress patterns (direct vs CloudFront)
 - Transit Gateway vs VPC Peering cost comparison
 
+Scope boundary: this adapter owns CE AWS-Data-Transfer spend; network.py owns
+NAT-gateway-hours. If network ever promotes per-GB NAT savings to Counted, add a
+shared covered set across both adapters.
+
 Counted-savings policy (network_cost H1/H2).
 This adapter operates on **blended Cost Explorer dollars** grouped by usage
 type — it never sees per-flow GB, co-location, or topology. There is therefore
@@ -70,9 +74,14 @@ class NetworkCostModule(BaseServiceModule):
     cli_aliases: tuple[str, ...] = ("network_cost", "data_transfer")
     display_name: str = "Data Transfer"
 
+    # Mirror the cards the HTML report renders from _SERVICE_STATS_CONFIG
+    # ['network_cost'] (all from extras) so this declaration does not diverge from
+    # what is shown. No "Monthly Savings" card — network_cost is advisory-only, so
+    # it is always $0, and the multi_source_cards renderer cannot read a top-level
+    # scalar (network_cost L1).
     stat_cards: tuple[StatCardSpec, ...] = (
         StatCardSpec(
-            label="Transfer Spend (30d)",
+            label="30-Day Transfer Spend",
             source_path="extras.total_data_transfer_spend_30d",
             formatter="currency",
         ),
@@ -81,11 +90,8 @@ class NetworkCostModule(BaseServiceModule):
             source_path="extras.cross_region_spend_30d",
             formatter="currency",
         ),
-        StatCardSpec(
-            label="Monthly Savings",
-            source_path="total_monthly_savings",
-            formatter="currency",
-        ),
+        StatCardSpec(label="VPC Peerings", source_path="extras.peering_count", formatter="int"),
+        StatCardSpec(label="TGW Attachments", source_path="extras.tgw_count", formatter="int"),
     )
 
     grouping = GroupingSpec(by="check_category")

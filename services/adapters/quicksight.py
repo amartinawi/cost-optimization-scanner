@@ -47,6 +47,25 @@ class QuicksightModule(BaseServiceModule):
         for rec in recs:
             edition = rec.get("Edition", "")
             unused_gb = rec.get("UnusedSpiceCapacityGB", 0)
+            if rec.get("Counted") is False:
+                # quicksight L3: the shim already marked this advisory (e.g. 1–49%
+                # idle SPICE). Show the potential figure but NEVER sum it — partial
+                # headroom is not a concrete reclaim. Keep the shim's PricingWarning.
+                potential = (
+                    round(unused_gb * quicksight_spice_rate(edition) * ctx.pricing_multiplier, 2)
+                    if (unused_gb > 0 and edition)
+                    else 0.0
+                )
+                priced_recs.append(
+                    dict(
+                        rec,
+                        EstimatedMonthlySavings=0.0,
+                        EstimatedSavings=(
+                            f"$0.00/month — advisory (potential ~${potential:.2f}/month if reclaimed)"
+                        ),
+                    )
+                )
+                continue
             if unused_gb > 0 and edition:
                 rate = quicksight_spice_rate(edition)
                 # Single source of truth for the dollar: region-scaled, rounded
@@ -92,10 +111,13 @@ class QuicksightModule(BaseServiceModule):
         sources = {
             "enhanced_checks": SourceBlock(count=len(priced_recs), recommendations=tuple(priced_recs))
         }
+        # Count hygiene (mirror mediastore H1 / lambda): advisory ($0 Counted=False)
+        # recs render but are excluded from the rec-count headline.
+        counted_recs = sum(1 for r in priced_recs if r.get("Counted") is not False)
 
         return ServiceFindings(
             service_name="QuickSight",
-            total_recommendations=len(priced_recs),
+            total_recommendations=counted_recs,
             total_monthly_savings=savings,
             sources=sources,
             optimization_descriptions=QUICKSIGHT_OPTIMIZATION_DESCRIPTIONS,

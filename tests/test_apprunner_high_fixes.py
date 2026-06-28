@@ -178,6 +178,50 @@ def test_pricing_multiplier_applied_once() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# L2 — unresolvable Memory config warns + $0 advisory (no fabricated 2 GB dollar)
+# --------------------------------------------------------------------------- #
+def test_missing_memory_warns_and_emits_zero_advisory() -> None:
+    """An idle service whose config has no Memory key must NOT fabricate a 2 GB dollar."""
+    svc = _svc(name="no-mem", service_id="sid-nm")
+    ar = _FakeAppRunner([svc], configs={svc["ServiceArn"]: {"Cpu": "1 vCPU"}})
+    cw = _FakeCloudWatch(requests_sum=0.0)
+    ctx = _ctx(ar, cw)
+
+    findings = AppRunnerModule().scan(ctx)
+
+    # Rec still renders, but as a $0 advisory — nothing summed into the headline.
+    assert findings.total_recommendations == 1
+    assert findings.total_monthly_savings == 0.0
+    rec = findings.sources["enhanced_checks"].recommendations[0]
+    assert rec["EstimatedMonthlySavings"] == 0.0
+    assert "AuditBasis" not in rec  # never priced
+    assert ctx.warnings, "missing Memory config must surface as a warn"
+    service, msg = ctx.warnings[0]
+    assert service == "apprunner"
+    assert "missing" in msg and "no-mem" in msg
+
+
+def test_unparseable_memory_warns_and_emits_zero_advisory() -> None:
+    """An idle service whose Memory string is unparseable abstains, not a 2 GB guess."""
+    svc = _svc(name="bad-mem", service_id="sid-bm")
+    ar = _FakeAppRunner([svc], configs={svc["ServiceArn"]: {"Memory": "bogus"}})
+    cw = _FakeCloudWatch(requests_sum=0.0)
+    ctx = _ctx(ar, cw)
+
+    findings = AppRunnerModule().scan(ctx)
+
+    assert findings.total_recommendations == 1
+    assert findings.total_monthly_savings == 0.0
+    rec = findings.sources["enhanced_checks"].recommendations[0]
+    assert rec["EstimatedMonthlySavings"] == 0.0
+    assert "AuditBasis" not in rec
+    assert ctx.warnings, "unparseable Memory config must surface as a warn"
+    service, msg = ctx.warnings[0]
+    assert service == "apprunner"
+    assert "unparseable" in msg and "bad-mem" in msg
+
+
+# --------------------------------------------------------------------------- #
 # Idle gating / fail-safe ordering
 # --------------------------------------------------------------------------- #
 def test_active_service_not_flagged() -> None:

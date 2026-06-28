@@ -53,8 +53,12 @@ def _ctx(*, pricing_multiplier: float = 1.0, client: Any = None) -> SimpleNamesp
         region="us-east-1",
         fast_mode=False,
         warnings=[],
+        permission_issues=[],
     )
     ctx.warn = lambda msg, service=None, **k: ctx.warnings.append((service, msg))
+    ctx.permission_issue = lambda msg, service=None, action=None, **k: ctx.permission_issues.append(
+        (service, msg, action)
+    )
     ctx.client = client or (lambda name, **kw: None)
     return ctx
 
@@ -299,3 +303,80 @@ def test_integration_shim_to_adapter_counts_dev_endpoint() -> None:
     assert dev["EstimatedSavings"] == "$1,606.00/month"
     job = findings.sources["job_rightsizing"].recommendations[0]
     assert job["Counted"] is False
+
+
+# --------------------------------------------------------------------------- #
+# Shim — per-API error isolation + classification (glue L1)
+# --------------------------------------------------------------------------- #
+class _ClientError(Exception):
+    """Minimal botocore-style ClientError carrying an Error.Code."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.response = {"Error": {"Code": code}}
+
+
+class _RaisingGlueClient(_FakeGlueClient):
+    """Glue client whose named operation raises, others behave normally."""
+
+    def __init__(self, *, fail_op: str, error: Exception, **kw: Any) -> None:
+        super().__init__(**kw)
+        self._fail_op = fail_op
+        self._error = error
+
+    def get_paginator(self, name: str) -> _FakeGluePaginator:
+        if name == self._fail_op:
+            raise self._error
+        return super().get_paginator(name)
+
+    def get_dev_endpoints(self) -> dict[str, Any]:
+        if self._fail_op == "get_dev_endpoints":
+            raise self._error
+        return super().get_dev_endpoints()
+
+
+def test_get_jobs_access_denied_isolated_and_classified() -> None:
+    # GetJobs AccessDenied must not abort the remaining APIs and must be routed
+    # to ctx.permission_issue (IAM gap), never silently swallowed.
+    glue_client = _RaisingGlueClient(
+        fail_op="get_jobs",
+        error=_ClientError("AccessDenied"),
+        dev_endpoints=[{"EndpointName": "ep1", "Status": "READY", "WorkerType": "G.1X", "NumberOfWorkers": 5}],
+        crawlers=[{"Name": "c1", "Schedule": {"ScheduleExpression": "cron(0 1 * * ? *)"}}],
+    )
+    ctx = _ctx(client=lambda name, **kw: glue_client)
+
+    result = glue_shim.get_enhanced_glue_checks(ctx)
+
+    # The denial landed on permission_issue with the GetJobs context, not warn.
+    assert ctx.warnings == []
+    assert len(ctx.permission_issues) == 1
+    svc, msg, action = ctx.permission_issues[0]
+    assert svc == "glue"
+    assert "GetJobs" in msg
+    assert action == "AccessDenied"
+    # The dev-endpoint API still ran: its READY endpoint reached the result.
+    dev = [r for r in result["recommendations"] if r["CheckCategory"] == _DEV_CATEGORY]
+    assert len(dev) == 1
+
+
+def test_get_dev_endpoints_failure_isolated_and_warned() -> None:
+    # A non-permission failure on GetDevEndpoints routes to ctx.warn and leaves
+    # the GetJobs results intact (per-block isolation in the other direction).
+    glue_client = _RaisingGlueClient(
+        fail_op="get_dev_endpoints",
+        error=RuntimeError("boom"),
+        jobs=[{"Name": "big-job", "MaxCapacity": 20, "WorkerType": None, "NumberOfWorkers": 0}],
+    )
+    ctx = _ctx(client=lambda name, **kw: glue_client)
+
+    result = glue_shim.get_enhanced_glue_checks(ctx)
+
+    assert ctx.permission_issues == []
+    assert len(ctx.warnings) == 1
+    svc, msg = ctx.warnings[0]
+    assert svc == "glue"
+    assert "GetDevEndpoints" in msg
+    # GetJobs ran before the failing call and its rightsizing rec survived.
+    jobs = [r for r in result["recommendations"] if r["CheckCategory"] == _JOB_CATEGORY]
+    assert len(jobs) == 1

@@ -58,8 +58,10 @@ class WorkspacesModule(BaseServiceModule):
           fee, so termination saves only that residual fee. An unknown running
           mode abstains (a termination rec must not assert a saving it cannot
           prove).
-        - Bundle Rightsizing: the shim already computed a concrete current->target
-          price delta — counted as-is.
+        - Bundle Rightsizing: $0 advisory (Counted=False). A high bundle tier is
+          not evidence of over-provisioning and WorkSpaces publishes no default
+          utilization metric, so the current->target delta is shown as a potential
+          figure but never counted.
 
         Args:
             ctx: ScanContext with region, clients, and pricing data.
@@ -78,15 +80,19 @@ class WorkspacesModule(BaseServiceModule):
             always_on = WORKSPACE_BUNDLE_MONTHLY.get(compute_type, 0.0)
 
             if category == "Bundle Rightsizing":
-                # Shim already computed the concrete current->target bundle delta
-                # (region-scaled). Count it as-is; single-source the display string.
-                amount = rec.get("EstimatedSavingsAmount")
-                if isinstance(amount, (int, float)) and amount > 0:
-                    rec["EstimatedMonthlySavings"] = round(float(amount), 2)
-                    rec["EstimatedSavings"] = f"${float(amount):.2f}/month"
-                    savings += float(amount)
+                # Advisory only: a high-tier bundle is not evidence of
+                # over-provisioning, and WorkSpaces publishes no default CPU/memory
+                # utilization metric to gate on, so the current->target delta is
+                # shown as a potential figure but never counted (Counted=False).
+                potential = rec.get("PotentialMonthlySavings")
+                rec["EstimatedMonthlySavings"] = 0.0
+                rec["Counted"] = False
+                if isinstance(potential, (int, float)) and potential > 0:
+                    rec["EstimatedSavings"] = (
+                        f"$0.00/month — advisory: ~${float(potential):.2f}/mo if downsized "
+                        f"(verify utilization first)"
+                    )
                 else:
-                    rec["EstimatedMonthlySavings"] = 0.0
                     rec["EstimatedSavings"] = "$0.00/month — advisory: no bundle price delta"
                 continue
 

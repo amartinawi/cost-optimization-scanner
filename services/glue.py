@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import Any
 
 from core.scan_context import ScanContext
+from services._aws_errors import record_aws_error
 
 GLUE_OPTIMIZATION_DESCRIPTIONS: dict[str, dict[str, str]] = {
     "job_optimization": {
@@ -23,9 +24,12 @@ def get_enhanced_glue_checks(ctx: ScanContext) -> dict[str, Any]:
     """Get enhanced Glue cost optimization checks"""
     checks: dict[str, list[dict[str, Any]]] = {"job_rightsizing": [], "dev_endpoints": [], "crawler_optimization": []}
 
-    try:
-        glue = ctx.client("glue")
+    glue = ctx.client("glue")
 
+    # Each AWS API is wrapped in its own try/except so an AccessDenied (or
+    # throttle) on one call is classified via record_aws_error and never
+    # silently aborts the remaining calls (glue L1).
+    try:
         paginator = glue.get_paginator("get_jobs")
         for page in paginator.paginate():
             for job in page.get("Jobs", []):
@@ -46,7 +50,10 @@ def get_enhanced_glue_checks(ctx: ScanContext) -> dict[str, Any]:
                             "CheckCategory": "Glue Job Rightsizing",
                         }
                     )
+    except Exception as e:
+        record_aws_error(ctx, e, service="glue", context="glue:GetJobs")
 
+    try:
         dev_endpoints = glue.get_dev_endpoints()
         for endpoint in dev_endpoints.get("DevEndpoints", []):
             endpoint_name = endpoint.get("EndpointName")
@@ -74,7 +81,10 @@ def get_enhanced_glue_checks(ctx: ScanContext) -> dict[str, Any]:
                         "CheckCategory": "Glue Dev Endpoints",
                     }
                 )
+    except Exception as e:
+        record_aws_error(ctx, e, service="glue", context="glue:GetDevEndpoints")
 
+    try:
         paginator = glue.get_paginator("get_crawlers")
         for page in paginator.paginate():
             for crawler in page.get("Crawlers", []):
@@ -85,7 +95,7 @@ def get_enhanced_glue_checks(ctx: ScanContext) -> dict[str, Any]:
                 # no concrete per-crawler quantification.
                 _ = (crawler_name, schedule)
     except Exception as e:
-        ctx.warn(f"Could not analyze Glue resources: {e}", "glue")
+        record_aws_error(ctx, e, service="glue", context="glue:GetCrawlers")
 
     all_recommendations: list[dict[str, Any]] = []
     for _category, recs in checks.items():

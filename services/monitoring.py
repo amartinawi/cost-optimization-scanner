@@ -7,14 +7,8 @@ This module will later become MonitoringModule (T-322) implementing ServiceModul
 
 from __future__ import annotations
 
-import logging
-
-logger = logging.getLogger(__name__)
-
 from datetime import UTC, datetime, timedelta
 from typing import Any
-
-from botocore.exceptions import ClientError  # type: ignore[import-untyped]
 
 from core.scan_context import ScanContext
 from services._aws_errors import record_aws_error
@@ -32,12 +26,17 @@ CW_LOGS_GB_MONTH: float = 0.03
 CW_CUSTOM_METRIC_TIER_1: float = 0.30
 CW_CUSTOM_METRIC_TIER_2: float = 0.10
 CW_CUSTOM_METRIC_TIER_3: float = 0.05
+CW_CUSTOM_METRIC_TIER_4: float = 0.02
 CW_CUSTOM_METRIC_TIER_1_LIMIT: int = 10_000
 CW_CUSTOM_METRIC_TIER_2_LIMIT: int = 250_000
+CW_CUSTOM_METRIC_TIER_3_LIMIT: int = 1_000_000
 
 # Tiered custom-metric rates re-verified against the AWS Pricing API on
 # 2026-06-27 (AmazonCloudWatch SKU KG586CTNGQ4VRZKZ, usagetype
-# CW:MetricMonitorUsage): $0.30 first 10k / $0.10 to 250k / $0.05 to 1M.
+# CW:MetricMonitorUsage): $0.30 first 10k / $0.10 to 250k / $0.05 to 1M /
+# $0.02 above 1M. The 4th tier was previously observed but never coded, so
+# tier_3 covered everything above 250k at $0.05 — overstating the marginal
+# rate (and the saving) for any account with >1M custom metrics (monitoring L2).
 
 # A custom metric that published NO datapoints over this trailing window is
 # treated as stale (removable). Drives the H3 removable quantity from a
@@ -60,8 +59,12 @@ def _cw_custom_metrics_monthly_cost(count: int) -> float:
         0,
         min(count, CW_CUSTOM_METRIC_TIER_2_LIMIT) - CW_CUSTOM_METRIC_TIER_1_LIMIT,
     ) * CW_CUSTOM_METRIC_TIER_2
-    tier_3 = max(0, count - CW_CUSTOM_METRIC_TIER_2_LIMIT) * CW_CUSTOM_METRIC_TIER_3
-    return tier_1 + tier_2 + tier_3
+    tier_3 = max(
+        0,
+        min(count, CW_CUSTOM_METRIC_TIER_3_LIMIT) - CW_CUSTOM_METRIC_TIER_2_LIMIT,
+    ) * CW_CUSTOM_METRIC_TIER_3
+    tier_4 = max(0, count - CW_CUSTOM_METRIC_TIER_3_LIMIT) * CW_CUSTOM_METRIC_TIER_4
+    return tier_1 + tier_2 + tier_3 + tier_4
 
 
 def _stale_custom_metric_counts(
@@ -182,6 +185,11 @@ def get_cloudwatch_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> 
         pricing_multiplier: Regional pricing multiplier applied to per-rec
             $ values. us-east-1 ≈ 1.0; eu-west-1 ≈ 1.08; etc.
     """
+    # The expensive part of this scan is the CloudWatch describes (list_metrics +
+    # describe_alarms) and the GetMetricData staleness probe; under --fast skip
+    # them so the adapter's reads_fast_mode declaration holds.
+    fast_mode = bool(getattr(ctx, "fast_mode", False))
+
     checks: dict[str, list[dict[str, Any]]] = {
         "never_expiring_logs": [],
         "excessive_logging": [],
@@ -250,19 +258,20 @@ def get_cloudwatch_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> 
             # level and retention" without quantifying storage savings.
 
         try:
-            cloudwatch = ctx.client("cloudwatch")
-            paginator = cloudwatch.get_paginator("describe_alarms")
-            for page in paginator.paginate():
-                alarms = page.get("MetricAlarms", [])
+            if not fast_mode:
+                cloudwatch = ctx.client("cloudwatch")
+                paginator = cloudwatch.get_paginator("describe_alarms")
+                for page in paginator.paginate():
+                    alarms = page.get("MetricAlarms", [])
 
-                for alarm in alarms:
-                    alarm_name = alarm.get("AlarmName")
-                    state_reason = alarm.get("StateReason", "")
-                    alarm_config_updated = alarm.get("AlarmConfigurationUpdatedTimestamp")
+                    for alarm in alarms:
+                        alarm_name = alarm.get("AlarmName")
+                        state_reason = alarm.get("StateReason", "")
+                        alarm_config_updated = alarm.get("AlarmConfigurationUpdatedTimestamp")
 
-                    # Unused CloudWatch Alarms finding removed: health/operational signal
-                    # with no EstimatedSavings field — not a cost recommendation.
-                    _ = (state_reason, alarm_config_updated, alarm_name)
+                        # Unused CloudWatch Alarms finding removed: health/operational
+                        # signal with no EstimatedSavings field — not a cost rec.
+                        _ = (state_reason, alarm_config_updated, alarm_name)
 
         except Exception as e:
             # H1 — classify (don't logger-only): a permission gap on DescribeAlarms
@@ -271,10 +280,11 @@ def get_cloudwatch_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> 
 
         try:
             cloudwatch = ctx.client("cloudwatch")
-            paginator = cloudwatch.get_paginator("list_metrics")
             metrics: list[dict[str, Any]] = []
-            for page in paginator.paginate():
-                metrics.extend(page.get("Metrics", []))
+            if not fast_mode:
+                paginator = cloudwatch.get_paginator("list_metrics")
+                for page in paginator.paginate():
+                    metrics.extend(page.get("Metrics", []))
 
             # Only custom (non-AWS/) metrics incur the per-metric monthly charge.
             custom_metrics = [
@@ -293,7 +303,6 @@ def get_cloudwatch_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> 
             # data is not. Probe only high-volume namespaces (bounded) and gate
             # on fast mode. No evidence (fast mode / GetMetricData failure) → $0
             # advisory, never a fabricated count.
-            fast_mode = bool(getattr(ctx, "fast_mode", False))
             stale_by_ns = None
             if high_volume and not fast_mode:
                 probe = [m for m in custom_metrics if m.get("Namespace", "") in high_volume]
@@ -308,6 +317,14 @@ def get_cloudwatch_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> 
                         ctx, e, service="monitoring", context="cloudwatch:GetMetricData failed"
                     )
                     stale_by_ns = None
+
+            # AWS custom-metric tiering is account-wide per region ($0.30 first 10k,
+            # then $0.10, then $0.05), so the removable (stale) metrics come off the
+            # TOP of the account's metric stack. Anchor the marginal-rate computation
+            # on the total custom-metric count and walk it down as each namespace's
+            # stale metrics are attributed — pricing per-namespace from 0 overstated
+            # the saving once the account exceeds the 10k tier-1 limit.
+            running_account_count = len(custom_metrics)
 
             for namespace in sorted(high_volume):
                 count = namespace_counts[namespace]
@@ -367,11 +384,12 @@ def get_cloudwatch_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> 
                     )
                     continue
 
-                # Counted: removable = measured stale metrics. Saving = tiered
-                # cost(count) - tiered cost(count - stale), region-scaled.
-                current_cost = _cw_custom_metrics_monthly_cost(count)
-                reduced_cost = _cw_custom_metrics_monthly_cost(count - stale)
+                # Counted: removable = measured stale metrics, priced at the
+                # account-wide MARGINAL tier (top of the stack), region-scaled.
+                current_cost = _cw_custom_metrics_monthly_cost(running_account_count)
+                reduced_cost = _cw_custom_metrics_monthly_cost(running_account_count - stale)
                 monthly_savings = (current_cost - reduced_cost) * pricing_multiplier
+                running_account_count -= stale
                 checks["unused_custom_metrics"].append(
                     {
                         "Namespace": namespace,
@@ -397,8 +415,10 @@ def get_cloudwatch_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> 
                                 "(no datapoints = stale)"
                             ),
                             "region_multiplier": round(pricing_multiplier, 4),
+                            "account_marginal_anchor": running_account_count + stale,
                             "formula": (
-                                "(tiered_cost(count) - tiered_cost(count - stale)) x region_multiplier"
+                                "(tiered_cost(account_anchor) - tiered_cost(account_anchor - stale)) "
+                                "x region_multiplier  [account-wide marginal tier]"
                             ),
                         },
                     }
@@ -422,7 +442,21 @@ def get_cloudwatch_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> 
 
 
 def get_cloudtrail_checks(ctx: ScanContext) -> dict[str, Any]:
-    """Category 10: CloudTrail optimization checks"""
+    """Category 10: CloudTrail optimization checks.
+
+    Every concrete CloudTrail finding (multi-region trails, S3/Lambda data
+    events, duplicate/expensive trails, unused Insights) was removed earlier
+    because each emitted ``$0`` with only a generic percentage-range estimate
+    rather than an account-specific dollar. The dead-cost walk that fed them
+    (un-paginated ``describe_trails`` + per-trail ``get_event_selectors``) is
+    removed with them: it spent API quota to produce zero recommendations while
+    swallowing every error through ``logger.warning``. The empty checks
+    structure is retained so the report keeps a stable source-block shape.
+
+    Args:
+        ctx: Scan context (unused; retained for signature parity with the other
+            monitoring sub-shims).
+    """
     checks: dict[str, list[dict[str, Any]]] = {
         "multi_region_trails": [],
         "data_events_all_s3": [],
@@ -431,58 +465,6 @@ def get_cloudtrail_checks(ctx: ScanContext) -> dict[str, Any]:
         "expensive_storage_trails": [],
         "unused_insights": [],
     }
-
-    try:
-        cloudtrail = ctx.client("cloudtrail")
-        trails_response = cloudtrail.describe_trails()
-        trails = trails_response.get("trailList", [])
-
-        trail_names: set[str] = set()
-
-        for trail_index, trail in enumerate(trails):
-            trail_name = trail.get("Name")
-            trail_arn = trail.get("TrailARN")
-            is_multi_region = trail.get("IsMultiRegionTrail", False)
-            s3_bucket = trail.get("S3BucketName")
-
-            trail_names.add(trail_name)
-
-            # Multi-region CloudTrail finding removed: emitted $0/month with a generic
-            # "~90% less" percentage — no concrete per-account savings.
-            _ = (is_multi_region, trail_arn, s3_bucket)
-
-            try:
-                selectors_response = cloudtrail.get_event_selectors(TrailName=trail_name)
-                event_selectors = selectors_response.get("EventSelectors", [])
-
-                for selector in event_selectors:
-                    data_resources = selector.get("DataResources", [])
-
-                    for resource in data_resources:
-                        resource_type = resource.get("Type")
-                        values = resource.get("Values", [])
-
-                        # S3 and Lambda data-events findings removed: each emitted $0/month
-                        # with percentage-range savings ("80-95%" / "significant") — no
-                        # concrete per-account quantification.
-                        _ = (resource_type, values)
-
-            except ClientError as e:
-                if e.response["Error"]["Code"] != "TrailNotFoundException":
-                    logger.warning(f"Warning: Could not analyze event selectors for {trail_name}: {e}")
-            except Exception as e:
-                logger.warning(f"Warning: Could not analyze event selectors for {trail_name}: {e}")
-
-            # CloudTrail Insights check removed: the finding it fed (a generic
-            # $0.35/100K per-event rate without per-account event-volume math)
-            # was dropped, so get_insight_selectors did nothing but emit a noisy
-            # warning whenever Insights was not enabled (the common case).
-
-        # Multiple CloudTrail Trails finding removed: emitted $0/month with a generic
-        # "consolidate overlapping trails" suggestion — no concrete savings.
-
-    except Exception as e:
-        logger.warning(f"Warning: Could not perform CloudTrail checks: {e}")
 
     recommendations: list[dict[str, Any]] = []
     for _category, items in checks.items():

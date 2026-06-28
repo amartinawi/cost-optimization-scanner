@@ -7,6 +7,7 @@ This module will later become OpenSearchModule (T-321) implementing ServiceModul
 from __future__ import annotations
 
 import logging
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -16,6 +17,19 @@ from typing import Any
 from core.scan_context import ScanContext
 
 LOW_CPU_THRESHOLD: int = 20
+
+
+def _is_graviton_search_type(instance_type: str) -> bool:
+    """True if an OpenSearch instance type is a Graviton (ARM) family.
+
+    Graviton families carry a generation digit immediately followed by 'g'
+    (m6g, r7g, c8g, t4g, m8g, and future gens). Detect by token pattern, not a
+    static allowlist — the old list omitted 8th-gen m8g/r8g/c8g and so flagged
+    already-Graviton nodes for a fabricated x86->Graviton migration (live-audit C1).
+    """
+    family = str(instance_type).split(".")[0]
+    return bool(re.search(r"[0-9]g", family))
+
 
 OPENSEARCH_OPTIMIZATION_DESCRIPTIONS: dict[str, dict[str, str]] = {
     "reserved_instances": {
@@ -91,10 +105,7 @@ def get_enhanced_opensearch_checks(ctx: ScanContext) -> dict[str, Any]:
                         }
                     )
 
-                graviton_families = ["m7g", "r7g", "m6g", "r6g", "c7g", "c6g", "t4g"]
-                is_graviton = any(instance_type.startswith(family) for family in graviton_families)
-
-                if not is_graviton:
+                if not _is_graviton_search_type(instance_type):
                     checks["graviton_migration"].append(
                         {
                             "DomainName": domain_name,

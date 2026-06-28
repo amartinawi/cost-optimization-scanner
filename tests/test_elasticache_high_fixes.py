@@ -31,7 +31,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import services.adapters.elasticache as adapter_mod
 import services.elasticache as shim_mod
-from services.adapters.elasticache import ElasticacheModule, graviton_equivalent
+from services.adapters.elasticache import (
+    ElasticacheModule,
+    downsize_target,
+    graviton_equivalent,
+)
 
 # Live-validated monthly node prices (us-east-1, Redis, NodeUsage On-Demand).
 R5_LARGE_MONTHLY = 157.68  # cache.r5.large  $0.216/hr × 730
@@ -247,8 +251,25 @@ def test_graviton_unmappable_family_is_zero_advisory(monkeypatch: pytest.MonkeyP
     assert "advisory" in emitted["EstimatedSavings"].lower()
 
 
+@pytest.mark.parametrize(
+    ("node_type", "expected"),
+    [
+        ("cache.r5.xlarge", "cache.r5.large"),
+        ("cache.m6g.2xlarge", "cache.m6g.xlarge"),
+        ("cache.r6g.large", "cache.r6g.medium"),
+        ("cache.t3.micro", None),  # smallest size — no target
+        ("cache.r5", None),  # unparseable (no size)
+        ("r5.large", None),  # not a cache. node type
+        ("cache.c5.18xlarge", None),  # size token off the ladder
+    ],
+)
+def test_downsize_target(node_type: str, expected: str | None) -> None:
+    assert downsize_target(node_type) == expected
+
+
 def test_underutilized_lever_prices_every_node(monkeypatch: pytest.MonkeyPatch) -> None:
-    # H1 for the downsize lever: 0.30 factor applied across NumNodes, not 1 node.
+    # H3: the downsize lever is the live current→one-size-down node-price delta
+    # across NumNodes, NOT a flat 0.30 factor. cache.r5.xlarge -> cache.r5.large.
     rec = {
         "ClusterId": "c1",
         "Engine": "redis",
@@ -262,12 +283,42 @@ def test_underutilized_lever_prices_every_node(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr(
         adapter_mod, "get_enhanced_elasticache_checks", lambda c: {"recommendations": [dict(rec)]}
     )
-    pricing = _FakePricing({"cache.r5.xlarge": 100.0})
+    pricing = _FakePricing({"cache.r5.xlarge": 100.0, "cache.r5.large": 50.0})
 
     findings = ElasticacheModule().scan(_ctx(pricing_engine=pricing))
 
-    # 0.30 × 100 × 2 nodes = $60.00 (would be $30 if priced for 1 node).
-    assert findings.total_monthly_savings == pytest.approx(60.0, abs=0.01)
+    # (100 − 50) × 2 nodes = $100.00 (the real one-size-down delta, priced per node).
+    assert findings.total_monthly_savings == pytest.approx(100.0, abs=0.01)
+    emitted = findings.sources["enhanced_checks"].recommendations[0]
+    assert emitted["Counted"] is True
+    assert emitted["AuditBasis"]["lever"] == "Underutilized cluster downsizing"
+    assert emitted["AuditBasis"]["num_nodes"] == 2
+
+
+def test_underutilized_lever_advisory_when_target_unpriceable(monkeypatch: pytest.MonkeyPatch) -> None:
+    # H3: no priceable one-size-down target → $0 advisory, never a fabricated
+    # delta against an unknown (here, missing cache.r5.large) target price.
+    rec = {
+        "ClusterId": "c1",
+        "Engine": "redis",
+        "NodeType": "cache.r5.xlarge",
+        "NumNodes": 2,
+        "AvgCPU": 5.0,
+        "Recommendation": "Downsize node type",
+        "EstimatedSavings": "30-50%",
+        "CheckCategory": "Underutilized Cluster",
+    }
+    monkeypatch.setattr(
+        adapter_mod, "get_enhanced_elasticache_checks", lambda c: {"recommendations": [dict(rec)]}
+    )
+    pricing = _FakePricing({"cache.r5.xlarge": 100.0})  # target price absent
+
+    findings = ElasticacheModule().scan(_ctx(pricing_engine=pricing))
+
+    assert findings.total_monthly_savings == 0.0
+    emitted = findings.sources["enhanced_checks"].recommendations[0]
+    assert emitted["Counted"] is False
+    assert emitted["EstimatedMonthlySavings"] == 0.0
 
 
 def test_per_cluster_dedup_compares_like_for_like(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -15,10 +15,14 @@ class TransferModule(BaseServiceModule):
     key: str = "transfer"
     cli_aliases: tuple[str, ...] = ("transfer",)
     display_name: str = "Transfer Family"
+    # The shim gates terminate recs on CloudWatch BytesIn/BytesOut and honors
+    # ctx.fast_mode (services/transfer_svc.py:68-75) — transfer L3.
+    requires_cloudwatch: bool = True
+    reads_fast_mode: bool = True
 
     def required_clients(self) -> tuple[str, ...]:
         """Returns boto3 client names required for Transfer Family scanning."""
-        return ("transfer",)
+        return ("transfer", "cloudwatch")
 
     def scan(self, ctx: Any) -> ServiceFindings:
         """Scan Transfer Family servers for cost optimization opportunities.
