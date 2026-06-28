@@ -13,6 +13,7 @@ from typing import Any
 from botocore.exceptions import ClientError  # type: ignore[import-untyped]
 
 from core.scan_context import ScanContext
+from services._aws_errors import record_aws_error
 
 logger = logging.getLogger(__name__)
 
@@ -934,7 +935,7 @@ def get_auto_scaling_checks(ctx: ScanContext) -> dict[str, Any]:
                             )
 
                 except Exception as e:
-                    ctx.warn(f"Could not analyze launch template for {asg_name}: {e}", service="ec2")
+                    record_aws_error(ctx, e, service="ec2", context=f"launch template analysis for {asg_name}")
 
             try:
                 policies_response = autoscaling.describe_policies(AutoScalingGroupName=asg_name)
@@ -948,10 +949,10 @@ def get_auto_scaling_checks(ctx: ScanContext) -> dict[str, Any]:
                 _ = scale_in_policies
 
             except Exception as e:
-                ctx.warn(f"Could not get Auto Scaling policies for {asg_name}: {e}", service="ec2")
+                record_aws_error(ctx, e, service="ec2", context=f"Auto Scaling policies for {asg_name}")
 
     except Exception as e:
-        ctx.warn(f"Could not perform Auto Scaling checks: {e}", service="ec2")
+        record_aws_error(ctx, e, service="ec2", context="Auto Scaling checks")
 
     recommendations: list[dict[str, Any]] = []
     for _category, items in checks.items():

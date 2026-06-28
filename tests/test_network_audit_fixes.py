@@ -429,3 +429,50 @@ def test_network_detail_renders_counted_and_advisory() -> None:
     assert "$3.65/month" in detail
     # The metric-gated NAT card is advisory and must show the $0.00 advisory line.
     assert "$0.00/month — advisory" in detail
+
+
+# --------------------------------------------------------------------------- #
+# NET-04 — get_auto_scaling_checks classifies ASG errors (permission vs warn)
+# --------------------------------------------------------------------------- #
+class _RaisingAsg:
+    """Autoscaling client whose paginator raises a caller-supplied error."""
+
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+
+    def get_paginator(self, name: str) -> Any:
+        raise self._exc
+
+
+def _asg_ctx(exc: Exception) -> SimpleNamespace:
+    ctx = _ctx(_FakeEc2())
+    clients = {"ec2": _FakeEc2(), "autoscaling": _RaisingAsg(exc)}
+    ctx.client = lambda name, region=None: clients.get(name)
+    return ctx
+
+
+def test_net04_asg_access_denied_is_permission_issue() -> None:
+    from services.ec2 import get_auto_scaling_checks
+
+    ctx = _asg_ctx(_client_error("AccessDenied"))
+    out = get_auto_scaling_checks(ctx)
+
+    assert out["recommendations"] == []  # scan still completes, no crash
+    assert ctx.permissions, "AccessDenied on ASG must record a permission_issue"
+    service, action, msg = ctx.permissions[0]
+    assert service == "ec2"
+    assert action == "AccessDenied"
+    assert not ctx.warnings, "permission gap must NOT be logged as a bare warning"
+
+
+def test_net04_asg_generic_error_is_warning() -> None:
+    from services.ec2 import get_auto_scaling_checks
+
+    ctx = _asg_ctx(_client_error("Throttling"))
+    out = get_auto_scaling_checks(ctx)
+
+    assert out["recommendations"] == []
+    assert ctx.warnings, "a non-permission ASG failure must surface as a warn"
+    assert not ctx.permissions
+    service, msg = ctx.warnings[0]
+    assert service == "ec2"
