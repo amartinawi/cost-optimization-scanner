@@ -9,10 +9,14 @@
 > (34/34 adapters, 342 findings, adversarially verified). Remediation is tracked
 > per severity in `CRITICAL_/HIGH_/MEDIUM_/LOW_REMEDIATION_PROMPT.md`. **All 29
 > CRITICAL findings are remediated** (cost-fidelity batch, 2026-06-27 — see the
-> CHANGELOG "cost-fidelity CRITICAL remediation" entry), and **all 83 actionable
-> HIGH findings are remediated** (2026-06-28 — see the CHANGELOG "cost-fidelity
-> HIGH remediation" entry; every remediated service carries a
-> `tests/test_<svc>_high_fixes.py`). MEDIUM/LOW remain.
+> CHANGELOG "cost-fidelity CRITICAL remediation" entry); **all 83 actionable
+> HIGH findings are remediated** (2026-06-28 — every remediated service carries a
+> `tests/test_<svc>_high_fixes.py`); and **the LOW backlog (~100 REPRODUCES
+> findings) is remediated** (2026-06-28 — see the CHANGELOG "cost-fidelity LOW
+> remediation" entry). Each LOW finding was re-verified read-only against the
+> integrated tree. Remaining intentional non-fixes are the adversarially-rejected
+> items (e.g. quicksight sub-50%-idle SPICE, which would add a non-actionable `$0`
+> advisory). MEDIUM remains.
 
 ---
 

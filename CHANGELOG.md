@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (cost-fidelity LOW remediation — `docs/audits/LOW_REMEDIATION_PROMPT.md`)
+Closes the LOW backlog (the ~100 REPRODUCES findings of the 34-adapter audit),
+completing the cost-fidelity sweep after CRITICAL and HIGH. The through-line is
+unchanged — a rendered dollar must be **counted, account-specific, and
+defensible**; anything speculative is a `$0` `Counted=False` advisory (rendered,
+never summed); AWS errors are classified via `services/_aws_errors.record_aws_error`,
+never swallowed. Every finding was re-verified read-only against the integrated
+tree (a per-service verification pass); the static regression and reporter
+snapshots are unmoved.
+
+- **Service-local fixes (24 services).** Per-service savings grounding, dedup
+  keys, count hygiene, pagination, and error classification — e.g. api_gateway
+  drops four never-rendered dead descriptions; apprunner stops pricing a missing
+  Memory config at a fabricated 2 GB; athena/containers paginate
+  `list_work_groups`/`describe_repositories`; aurora/dms/ec2/rds/redshift/
+  dynamodb/eks/commitment_analysis/monitoring/network/s3/lambda/step_functions/
+  sagemaker/mediastore/glue/ebs/file_systems/lightsail/transfer each land their
+  verified items.
+- **Error classification.** ec2 `get_auto_scaling_checks` and containers ECR
+  `list_images` failures now route through `record_aws_error` (AccessDenied →
+  `permission_issue`) instead of a bare warning (NET-04, containers L3).
+- **Render correctness.** SageMaker/Bedrock recs match their snake_case keys in
+  the generic renderer (right card header + resource id, no raw-property dump);
+  ECR recs land in the correctly-named group; network_cost transfer recs carry
+  the honest "Audit Based" badge; the S3 enhanced-check total rejects non-monthly
+  unit strings via `parse_dollar_savings`.
+- **Dead code / dead wiring.** Removed the unreachable `backup`/`route53`
+  Phase-A descriptors, the unreachable `_extract_file_systems_resources`
+  extractor, and the unconsumed `s3` Cost Optimization Hub bucket
+  (`cost_hub_splits["s3"]` was populated but read by no adapter).
+- **Adapter precision.** dynamodb suppresses rightsizing on empty tables (a
+  deletion candidate); file_systems sums the full-precision `_savings` float and
+  paginates `describe_file_caches`; sagemaker's Active-Endpoints stat excludes
+  idle endpoints; ebs CO/CoH recs carry an `AuditBasis`; transfer declares its
+  CloudWatch contract; workspaces flags non-Windows bundle-rightsizing advisories.
+- **Documentation.** Rewrote `services/adapters/CLAUDE.md` Pricing Models into an
+  accurate six-category taxonomy covering all 34 adapters (the prior table
+  documented 26 and miscounted), and corrected per-adapter pricing-strategy rows.
+
 ### Fixed (cost-fidelity HIGH remediation — `docs/audits/UNIFIED_AUDIT_FINDINGS.md` / `HIGH_REMEDIATION_PROMPT.md`)
 Closes the 83 actionable HIGH findings across the 34-adapter audit. Same
 through-line as the CRITICAL batch: a rendered dollar must be **counted,
