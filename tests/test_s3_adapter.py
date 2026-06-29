@@ -199,11 +199,12 @@ class TestDedicatedCategoriesDedup:
         assert "Static Website Optimization" in _DEDICATED_CATEGORIES
 
     def test_non_dedicated_categories_pass_through(self):
+        # Replication/Logging "Optimization" were removed entirely (out-of-scope
+        # best-practice nudges with no concrete saving); the remaining enhanced
+        # categories are cost-relevant and pass through the dedup filter.
         for category in [
             "Incomplete Multipart Uploads",
             "Versioning Optimization",
-            "Replication Optimization",
-            "Logging Optimization",
             "Unused Resources",
         ]:
             assert category not in _DEDICATED_CATEGORIES
