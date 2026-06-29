@@ -348,6 +348,37 @@ def test_net03_running_instance_multiple_eips_still_flagged() -> None:
     assert len(out["multiple_eips_per_instance"]) == 1
 
 
+def test_public_ip_should_be_private_is_advisory_not_counted() -> None:
+    # A running instance in a private subnet with a public IP (e.g. a VPN/bastion)
+    # is an architectural "should be private" nudge: the $ is recoverable only if
+    # the IP can be removed, which a VPN server cannot. So it is a $0 advisory,
+    # never a counted saving (distinct from an unassociated/unused EIP).
+    instances_pages = [
+        {
+            "Reservations": [
+                {
+                    "Instances": [
+                        {
+                            "InstanceId": "i-vpn",
+                            "State": {"Name": "running"},
+                            "PublicIpAddress": "1.2.3.4",
+                            "SubnetId": "sub-priv",
+                            "Tags": [{"Key": "Name", "Value": "pritunl-vpn-server"}],
+                        }
+                    ]
+                }
+            ]
+        }
+    ]
+    ec2 = _FakeEc2(addresses=[], instances_pages=instances_pages)
+    out = get_elastic_ip_checks(_ctx(ec2, pricing_engine=_eng_eip()))
+    recs = out["public_ips_should_be_private"]
+    assert len(recs) == 1
+    assert recs[0]["Counted"] is False
+    assert recs[0]["EstimatedMonthlySavings"] == 0.0
+    assert parse_dollar_savings(recs[0]["EstimatedSavings"]) == 0.0  # not summed
+
+
 def test_nat_fallback_region_scaled() -> None:
     from core.pricing_engine import FALLBACK_NAT_MONTH
 

@@ -95,8 +95,10 @@ class CostOptimizer:
         self.fast_mode = fast_mode
         self.pricing_multiplier = self.get_regional_pricing_multiplier(region)
 
-        self.scan_warnings: list[Any] = []
-        self.permission_issues: list[Any] = []
+        # Scan warnings and permission issues are recorded on the ScanContext
+        # (ctx._warnings / ctx._permission_issues) and serialized to the JSON by
+        # ScanResultBuilder; the optimizer holds no duplicate (the prior dead
+        # self.scan_warnings/self.permission_issues lists were never written).
 
         if self.fast_mode:
             print("🚀 Fast mode enabled - skipping CloudWatch metrics for faster analysis")

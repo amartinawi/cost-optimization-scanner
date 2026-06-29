@@ -7,6 +7,121 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (deep-audit remediation — eu-central-1 / Jarir-M2 + eu-west-1 / level-Shoes-prod)
+Two adversarially-verified deep audits of live multi-account scans (account
+071985014680 / 315 recs and 019903302182 / 92 recs) surfaced a fresh class of
+dollar-fidelity defects that mocked tests did not. Same through-line: a counted
+dollar must be account-specific and defensible, `counted == rendered` at the
+per-rec level, double-counting is the cardinal sin, and anything speculative is a
+`$0` `Counted=False` advisory (rendered, never summed). All fixes verified against
+the scans' JSON + live regional pricing; the regression + reporter snapshots are
+unmoved.
+
+- **Aurora I/O-tier sized on phantom storage (fidelity).** `_check_io_tier` read
+  `AllocatedStorage`, which `describe_db_clusters` always reports as `1` for Aurora
+  (storage is auto-managed) — so the I/O-tier saving was computed against ~1 GB.
+  Now uses the CloudWatch `VolumeBytesUsed` average (bytes/1e9 = GB) for real
+  storage, prices the I/O rate from a new **live** `PricingEngine.get_aurora_io_rate_per_million()`
+  (us-east-1 $0.20/M, eu rates ~$0.22/M; region-scaled fallback), skips cleanly when
+  storage is unmeasurable, and short-circuits `aurora-iopt1` clusters (already I/O-optimized).
+- **Aurora Graviton card misrepresented the deployed class (counted == rendered).**
+  When a reader was also a rightsizing candidate, the Graviton rec showed
+  `CurrentSize` = the hypothetical *post-rightsize* class (e.g. `db.r5.2xlarge`) as if
+  deployed, while the instance was actually `db.r5.8xlarge`. The dollar is correctly
+  priced on the rightsized class (so it never overlaps the rightsizing rec); that
+  basis is now disclosed via a new `PricingBasisSize` field and the card shows the
+  real deployed class.
+- **OpenSearch counted ≠ rendered + irreversible-delete safety.** Synced each rec's
+  `EstimatedSavings` string to its counted dollar (no more headline/card divergence);
+  gated idle-domain full-cost DELETE recs on a CloudWatch corroboration flag
+  (`SearchRate`/`IndexingRate` < 1) — uncorroborated idle domains demote to `$0`
+  advisory rather than recommending an irreversible deletion; and suppressed the
+  storage-lever dollar on a domain already counted as an idle-delete (double-count).
+- **EC2 CO/CoH ASG dedup gap (double-count).** Cost Optimization Hub surfaces ASG
+  recs under the **ASG name** while Compute Optimizer surfaces the same capacity under
+  the bare **instance id**, so an ASG could be counted twice. CO recs are now deduped
+  against both the instance id and the ASG-name tag, and `UNDER_PROVISIONED` /
+  non-running CO recs (which carry no cost saving) are dropped from the count.
+- **Route53 / API Gateway rate over-scaling (fidelity).** Route53 hosted-zone pricing
+  is globally flat ($0.50/zone) and the API Gateway REST request rate is already
+  regional — both were being multiplied by `ctx.pricing_multiplier` a second time,
+  inflating non-us regions. Removed the extra multiply; both now satisfy
+  `counted == rendered`, and Route53 recs carry explicit `Counted` flags.
+- **ElastiCache EMV hygiene.** The advisory branch of the EstimatedSavings sync now
+  zeros `EstimatedMonthlySavings` (keeping the figure in `PotentialMonthlySavings`),
+  and the enhanced-checks card renderer sums the group's `Counted`-bearing EMV instead
+  of echoing `clusters[0]`'s string.
+- **Public-IP "should be private" is advisory, not counted.**
+  `services/elastic_ip.py`'s `public_ips_should_be_private` on a *running* instance is
+  now a `$0` `Counted=False` advisory: the public IPv4 is billed, but the saving is
+  realizable only if the IP can be removed (NAT/VPN/bastion legitimately need it).
+  Unassociated/stopped-instance EIP releases remain definite counted savings.
+- **AMI size never fabricated (fidelity).** When `describe_snapshots` fails, the
+  backing size falls back to the AMI block-device-mapping `VolumeSize` and the rec is
+  flagged `SizeEstimated` with an `AuditBasis` disclosure; the old magic `8` GB default
+  is gone — with no defensible size the AMI is skipped rather than emitting a guessed
+  dollar.
+- **RDS advisory count hygiene.** Reserved-Instance and backup-retention advisories
+  (`Counted=False`) are excluded from the adapter's `total_recommendations`, aligning
+  RDS with the S3 convention (`counted == rendered` headline).
+- **Scan diagnostics surfaced in the report.** `scan_warnings` + `permission_issues`
+  were serialized to the JSON but never rendered; the HTML executive summary now
+  includes a collapsible diagnostics disclosure. Removed the dead
+  `self.scan_warnings`/`self.permission_issues` fields from `cost_optimizer.py`
+  (warnings live on `ctx._warnings`).
+- **Pricing fallbacks are no longer silent.** When a live Pricing-API lookup fails,
+  `PricingEngine` substitutes a region-scaled constant; those events stayed on the
+  engine's own `warnings` list and never reached the report. The orchestrator now
+  drains them (deduplicated with an occurrence count, across region siblings) into
+  `ctx` scan warnings via a new `PricingEngine.drain_warnings()`, so the diagnostics
+  disclose exactly which rates were estimated rather than fetched live.
+
+### Fixed (first real-scan audit — M360 / ap-south-1)
+The first live multi-account scan surfaced a class of issues that static review +
+mocked unit tests structurally could not: runtime AWS API errors, dead code that
+emits no finding, and report noise at real scale. All adversarially verified
+against the scan's JSON + live ap-south-1 pricing.
+
+- **CloudFront dead-code storm (175 of 181 warnings).** `services/cloudfront.py`
+  fetched `CacheHitRate`/`Requests` per distribution to compute a value that was
+  then discarded (`_ = (...)`); the `Requests` call used `Period=60` over 7 days
+  (10080 datapoints > the 1440 limit), raising `InvalidParameterCombination` on
+  every distribution. The dead block is deleted (175 fewer warnings + ~350 fewer
+  API calls). The surviving price-class lever now reads CloudWatch from
+  **us-east-1**, where CloudFront publishes its metrics.
+- **30-day forecast overstated ~2×.** `core/trend_analysis.py` called
+  `get_cost_forecast(Granularity="MONTHLY")` over a window straddling two calendar
+  months, so Cost Explorer summed two full-month buckets (a "$57k 30-day forecast"
+  against a ~$27k/mo run rate). Switched to `Granularity="DAILY"`.
+- **QuickSight non-functional against real AWS.** `describe_spice_capacity` is not
+  a boto3 operation (no read API for SPICE capacity exists) — it raised
+  `AttributeError` every scan. Guarded with `hasattr` (skips cleanly in prod;
+  unit-tested via the fake client). QuickSight identity ops (`ListUsers`) now
+  route to the **us-east-1 identity endpoint** via `ClientRegistry._GLOBAL_SERVICES`.
+- **DMS terminate safety (fidelity).** "Unused instance" terminate recs were gated
+  on CPU < 5% alone; a low-CPU instance running a CDC task is in-use, and
+  recommending its termination is dangerous. Now gated on `describe_replication_tasks`
+  — any attached task (or an unreadable task state) demotes the rec to a $0 advisory
+  instead of a counted full-cost terminate. Also removed the dead
+  `describe_replication_configs` paginator block (it crashed on a non-existent
+  paginator while discarding its result).
+- **RDS upper-bound snapshots demoted (fidelity).** Snapshot savings that could not
+  be validated against a Cost Explorer backup actual were counted at the
+  provisioned-size **upper bound** (overstatement). They are now `Counted=False`
+  advisories — rendered with the upper-bound figure but excluded from the headline.
+- **S3 count-flag consistency.** $0 bucket-analysis cards used a bespoke
+  `Advisory=True` the reporter's count logic ignored (showing 336 advisory cards as
+  "counted"). They now carry the standard `Counted=False`; savings-bearing buckets
+  carry `Counted=True`.
+- **Aurora card render parity.** Rightsizing/Graviton/IO-tier recs now carry the
+  numeric `EstimatedMonthlySavings` + `Counted` (not only `monthly_savings`), so a
+  multi-rec Aurora group's card sums correctly instead of showing the first rec only.
+- **Log hygiene.** `core/trend_analysis.py`'s 27 `print("🔍 …")` debug lines →
+  `logging`; MediaStore's unreachable-endpoint error in unsupported regions →
+  quiet debug skip; Savings Plans `DataUnavailableException` (no active plans) →
+  informational note, not an error warning; `fastest_growing` now requires a
+  ≥ $1 prior-month base (kills 52,114%-growth noise on sub-penny services).
+
 ### Fixed (cost-fidelity LOW remediation — `docs/audits/LOW_REMEDIATION_PROMPT.md`)
 Closes the LOW backlog (the ~100 REPRODUCES findings of the 34-adapter audit),
 completing the cost-fidelity sweep after CRITICAL and HIGH. The through-line is

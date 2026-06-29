@@ -126,8 +126,22 @@ def get_elastic_ip_checks(ctx: ScanContext) -> dict[str, Any]:
                                     "InstanceType": instance.get("InstanceType", "unknown"),
                                     "PublicIp": instance.get("PublicIpAddress"),
                                     "SubnetId": subnet_id,
-                                    "Recommendation": "Instance in private subnet has public IP - review necessity",
-                                    "EstimatedSavings": f"${eip_monthly:.2f}/month per public IP if removed",
+                                    "Recommendation": (
+                                        "Instance in a private subnet has a public IP — review necessity. "
+                                        "Recoverable only if the instance does not need public reachability "
+                                        "(NAT/VPN/bastion hosts legitimately require it)."
+                                    ),
+                                    # Advisory, NOT a counted saving: this is an architectural "should be
+                                    # private" nudge on a RUNNING instance whose public IP may be required by
+                                    # design (e.g. a VPN server). The $ is realizable only if the user removes
+                                    # the IP, so it is rendered as a $0 advisory, never summed (network public-IP
+                                    # fix). Distinct from an unassociated/unused EIP, which IS a definite saving.
+                                    "EstimatedSavings": (
+                                        f"$0.00/month — advisory: ${eip_monthly:.2f}/mo recoverable only "
+                                        "if the public IP can be removed"
+                                    ),
+                                    "EstimatedMonthlySavings": 0.0,
+                                    "Counted": False,
                                     "CheckCategory": "Public IP Optimization",
                                 }
                             )

@@ -68,10 +68,14 @@ def get_route53_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> dic
 
     Args:
         ctx: Scan context with route53 client.
-        pricing_multiplier: Regional pricing multiplier applied to per-rec
-            $ values. Route 53 is a global service so multiplier is usually
-            1.0 but kept for consistency with sibling adapters.
+        pricing_multiplier: Accepted for signature parity with sibling adapters,
+            but intentionally NOT applied — Route 53 hosted zones are billed at a
+            single global rate ($0.50/$0.10 per zone-month) with no regional
+            premium. Callers previously passed the regional multiplier (e.g.
+            1.12), overstating every zone saving ~12% (route53 global-rate fix).
     """
+    # Route 53 is globally flat-priced — collapse any regional multiplier to 1.0.
+    pricing_multiplier = 1.0
     checks: dict[str, list[dict[str, Any]]] = {
         "unused_hosted_zones": [],
         "unnecessary_health_checks": [],
@@ -114,6 +118,7 @@ def get_route53_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> dic
                         "Recommendation": "Hosted zone has minimal records - verify if still needed",
                         "EstimatedSavings": f"${zone_savings:.2f}/month per zone if deleted",
                         "EstimatedMonthlySavings": round(zone_savings, 2),
+                        "Counted": True,
                         "CheckCategory": "Unused Hosted Zones",
                         "AuditBasis": {
                             "removable_zones": 1,
@@ -203,6 +208,7 @@ def get_route53_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> dic
                     "ZoneIds": zone_ids,
                     "Recommendation": "Multiple private zones with same name - check VPC associations",
                     "EstimatedMonthlySavings": round(consolidate_savings, 2),
+                    "Counted": consolidate_savings > 0,
                     "CheckCategory": "Duplicate Private Zones",
                     "AuditBasis": {
                         "duplicate_zone_count": len(zone_ids),

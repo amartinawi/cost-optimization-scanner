@@ -202,3 +202,51 @@ def test_adapter_renders_advisory_advanced_recs_without_counting(monkeypatch) ->
     assert cats == {"Cron Job Instances", "Batch Job Instances"}
     advisory = next(r for r in advanced_recs if r["CheckCategory"] == "Cron Job Instances")
     assert advisory["Counted"] is False
+
+
+# --------------------------------------------------------------------------- #
+# EC2 ASG-dedup + strict-cost scope filter for Compute Optimizer recs
+# --------------------------------------------------------------------------- #
+def _co_ec2(instance_id, *, finding="OVER_PROVISIONED", state="running", savings=0.0, asg=None):
+    rec = {
+        "instanceArn": f"arn:aws:ec2:eu-west-1:1:instance/{instance_id}",
+        "finding": finding,
+        "instanceState": state,
+        "recommendationOptions": [{"savingsOpportunity": {"estimatedMonthlySavings": {"value": savings}}}],
+    }
+    if asg:
+        rec["tags"] = [{"key": "aws:autoscaling:groupName", "value": asg}]
+    return rec
+
+
+def test_co_recs_dedup_against_coh_asg_and_drop_noncost(monkeypatch) -> None:
+    """CO dedup + strict-cost scope:
+    - a CO rec for a member of a CoH-covered ASG is dropped (no double-count
+      vs the CoH ASG saving — the prior $0.13 leak);
+    - UNDER_PROVISIONED (performance upsize) and non-running instances are dropped;
+    - a clean OVER_PROVISIONED running rec is still counted.
+    """
+    coh = [{"resourceId": "asg-web", "actionType": "MigrateToGraviton", "estimatedMonthlySavings": 35.0}]
+    co = [
+        _co_ec2("i-member", savings=0.13, asg="asg-web"),  # member of CoH-covered ASG -> drop
+        _co_ec2("i-under", finding="UNDER_PROVISIONED", savings=2.0),  # performance -> drop
+        _co_ec2("i-stopped", state="stopped", savings=3.0),  # not running -> drop
+        _co_ec2("i-clean", savings=50.0),  # real downsize -> count
+    ]
+    monkeypatch.setattr(ec2_adapter, "get_ec2_compute_optimizer_recommendations", lambda ctx: co)
+    monkeypatch.setattr(ec2_adapter, "get_asg_compute_optimizer_recommendations", lambda ctx: [])
+    monkeypatch.setattr(ec2_adapter, "get_enhanced_ec2_checks", lambda *a, **k: {"recommendations": []})
+    monkeypatch.setattr(ec2_adapter, "get_advanced_ec2_checks", lambda *a, **k: {"recommendations": []})
+    monkeypatch.setattr(ec2_adapter, "get_ec2_instance_count", lambda ctx: 4)
+
+    ctx = _adapter_ctx()
+    ctx.cost_hub_splits = {"ec2": coh}
+    findings = EC2Module().scan(ctx)
+
+    # CoH $35 + CO clean $50 = $85 — NOT the member $0.13, under, or stopped recs.
+    assert findings.total_monthly_savings == pytest.approx(85.0)
+    co_ids = {
+        r.get("instanceArn", "").split("/")[-1]
+        for r in findings.sources["compute_optimizer"].recommendations
+    }
+    assert co_ids == {"i-clean"}

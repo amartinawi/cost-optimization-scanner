@@ -297,6 +297,12 @@ def _check_provisioned_instances(
                                 "current_value": f"{cls} (avg CPU {avg_cpu:.0f}%, peak {peak_cpu:.0f}% / 14d)",
                                 "recommended_value": f"Downsize to {cand_class}",
                                 "monthly_savings": round(cur_price - cand_price, 2),
+                                # F4 — carry the numeric counted dollar + Counted flag
+                                # (mirrors every other counted adapter) so a multi-rec
+                                # Aurora group's card sums correctly instead of falling
+                                # back to only the first rec's free-text figure.
+                                "EstimatedMonthlySavings": round(cur_price - cand_price, 2),
+                                "Counted": True,
                                 "Recommendation": f"Downsize {cls} → {cand_class} (peak-aware)",
                                 "EstimatedSavings": f"${cur_price - cand_price:.2f}/mo",
                                 "reason": (
@@ -321,6 +327,18 @@ def _check_provisioned_instances(
                 except Exception:
                     base_price = grav_price = 0.0
                 if grav_price and 0 < grav_price < base_price:
+                    # The Graviton $ delta is priced on the (possibly rightsized)
+                    # class so it never overlaps the separate rightsizing rec. But
+                    # the CARD must show the ACTUAL deployed class — labeling the
+                    # hypothetical post-rightsize size as "current" misrepresents the
+                    # instance (aurora graviton CurrentSize fix). Disclose the basis.
+                    was_rightsized = rightsized_class != cls
+                    basis_note = (
+                        f" (delta priced on the rightsized {rightsized_class}; "
+                        "rightsizing is recommended first)"
+                        if was_rightsized
+                        else ""
+                    )
                     recs.append(
                         {
                             "cluster_id": instance_id,
@@ -329,16 +347,21 @@ def _check_provisioned_instances(
                             "engine": engine,
                             "check_type": "instance_graviton",
                             "CheckCategory": "Aurora Graviton Migration",
-                            "CurrentSize": rightsized_class,
+                            "CurrentSize": cls,
+                            "PricingBasisSize": rightsized_class,
                             "TargetSize": grav_class,
-                            "current_value": f"x86 {rightsized_class}",
+                            "current_value": (
+                                f"x86 {cls}" + (f" → rightsize to {rightsized_class}" if was_rightsized else "")
+                            ),
                             "recommended_value": f"Migrate to Graviton {grav_class}",
                             "monthly_savings": round(base_price - grav_price, 2),
-                            "Recommendation": f"Migrate {rightsized_class} → {grav_class} (Graviton/ARM)",
+                            "EstimatedMonthlySavings": round(base_price - grav_price, 2),
+                            "Counted": True,
+                            "Recommendation": f"Migrate {cls} → {grav_class} (Graviton/ARM){basis_note}",
                             "EstimatedSavings": f"${base_price - grav_price:.2f}/mo",
                             "reason": (
                                 f"{instance_id}: Aurora Graviton ({grav_class}) is a managed-engine class change "
-                                f"(no app rebuild) — saves ${base_price - grav_price:.2f}/mo vs {rightsized_class}"
+                                f"(no app rebuild) — saves ${base_price - grav_price:.2f}/mo{basis_note}"
                             ),
                         }
                     )
@@ -469,6 +492,12 @@ def _check_io_tier(
     engine_version = cluster.get("EngineVersion", "")
     dims = [{"Name": "DBClusterIdentifier", "Value": cluster_id}]
 
+    # aurora AUR-02: a cluster already on the I/O-Optimized tier has no
+    # Standard→I/O-Optimized transition to recommend; emitting one would be a
+    # fabricated Counted=True dollar with a wrong "Standard I/O" current_value.
+    if (cluster.get("StorageType") or "") == "aurora-iopt1":
+        return recs
+
     read_io = _get_cloudwatch_sum(cw, "AWS/RDS", "VolumeReadIOPs", dims)
     write_io = _get_cloudwatch_sum(cw, "AWS/RDS", "VolumeWriteIOPs", dims)
 
@@ -479,21 +508,31 @@ def _check_io_tier(
     daily_io_avg = total_io / 14.0 if total_io > 0 else 0
     monthly_io = daily_io_avg * 30.0
 
-    storage_gb = 0.0
-    try:
-        allocated = cluster.get("AllocatedStorage", 0)
-        if allocated:
-            storage_gb = float(allocated)
-    except (TypeError, ValueError):
-        pass
+    # aurora AUR-01: Aurora manages storage automatically, so
+    # describe_db_clusters returns the fixed placeholder AllocatedStorage=1.
+    # The billed storage (which sizes the I/O-Optimized storage premium that is
+    # *subtracted* from the saving) must come from CloudWatch VolumeBytesUsed
+    # (bytes → GB at 1e9). Without it the premium cannot be bounded, so the
+    # lever is skipped (fail safe — never credit a saving against a 1 GB guess).
+    vol_bytes = _get_cloudwatch_avg(cw, "AWS/RDS", "VolumeBytesUsed", dims)
+    storage_gb = (vol_bytes / 1_000_000_000.0) if vol_bytes else 0.0
 
     if storage_gb <= 0 or monthly_io <= 0:
         return recs
 
-    # Per-request I/O charge eliminated by I/O-Optimized (Standard tier). Aurora
-    # Standard bills $0.20 / 1M I/O requests (validated us-east-1
-    # Aurora:StorageIOUsage $0.0000002/IO). Constant path → region-scale once.
-    standard_io_cost = (monthly_io / 1_000_000) * IO_COST_PER_MILLION * pricing_multiplier
+    # Per-request I/O charge eliminated by I/O-Optimized (Standard tier). The
+    # Aurora Standard I/O rate is region-correct from PricingEngine (live
+    # <region>-Aurora:StorageIOUsage: $0.20/M us-east-1, $0.22/M Frankfurt/
+    # Ireland) and must NOT be re-multiplied by pricing_multiplier; the constant
+    # path is the region-scaled fallback only (aurora AUR-03).
+    if pe is not None:
+        try:
+            io_rate_per_million = pe.get_aurora_io_rate_per_million()
+        except Exception:
+            io_rate_per_million = IO_COST_PER_MILLION * pricing_multiplier
+    else:
+        io_rate_per_million = IO_COST_PER_MILLION * pricing_multiplier
+    standard_io_cost = (monthly_io / 1_000_000) * io_rate_per_million
 
     # Added cost of the I/O-Optimized configuration = storage premium (H1) +
     # instance-fleet premium (H2). Both legs are region-correct from PricingEngine
@@ -522,6 +561,8 @@ def _check_io_tier(
                 "current_value": f"Standard I/O, ~{monthly_io:,.0f} ops/month, {storage_gb:.0f} GB storage",
                 "recommended_value": "Switch to I/O-Optimized storage tier",
                 "monthly_savings": round(savings, 2),
+                "EstimatedMonthlySavings": round(savings, 2),
+                "Counted": True,
                 "EstimatedSavings": f"${savings:.2f}/mo",
                 "reason": (
                     f"I/O-Optimized tier saves ${savings:.2f}/mo over Standard "
@@ -530,13 +571,16 @@ def _check_io_tier(
                 ),
                 "AuditBasis": {
                     "rate": {
-                        "io_per_million_usd": round(IO_COST_PER_MILLION * pricing_multiplier, 6),
+                        "io_per_million_usd": round(io_rate_per_million, 6),
                         "io_opt_storage_premium_per_gb_mo": round(storage_premium_per_gb, 6),
                         "io_opt_instance_premium_monthly": round(instance_premium, 2),
                         "members_repriced": members_repriced,
                     },
                     "region_multiplier": pricing_multiplier,
-                    "metric_window": "14d AWS/RDS VolumeRead/WriteIOPs sum, scaled to 30d",
+                    "metric_window": (
+                        "14d AWS/RDS VolumeRead/WriteIOPs sum scaled to 30d; "
+                        "storage from 14d VolumeBytesUsed avg"
+                    ),
                     "formula": (
                         "standard_io_cost − (storage_gb × io_opt_storage_premium "
                         "+ Σ member io_opt instance premium)"

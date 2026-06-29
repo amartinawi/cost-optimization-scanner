@@ -42,13 +42,24 @@ IO_PER_MILLION = 0.20  # Aurora:StorageIOUsage $0.0000002/IO
 # Fakes
 # --------------------------------------------------------------------------- #
 class _IoCW:
-    """CloudWatch fake returning a single Sum datapoint per metric name."""
+    """CloudWatch fake: Sum datapoints for the IOPs metrics, an Average
+    datapoint for VolumeBytesUsed (the billed-storage gauge read by AUR-01).
 
-    def __init__(self, read_sum: float, write_sum: float) -> None:
+    ``vol_bytes=None`` models the metric being unavailable (no datapoints), which
+    the adapter treats as "storage unmeasurable -> skip the lever" (fail safe).
+    """
+
+    def __init__(self, read_sum: float, write_sum: float, vol_bytes: float | None = None) -> None:
         self._sums = {"VolumeReadIOPs": read_sum, "VolumeWriteIOPs": write_sum}
+        self._vol_bytes = vol_bytes
 
     def get_metric_statistics(self, **kw):
-        return {"Datapoints": [{"Sum": self._sums.get(kw["MetricName"], 0.0)}]}
+        metric = kw["MetricName"]
+        if metric == "VolumeBytesUsed":
+            if self._vol_bytes is None:
+                return {"Datapoints": []}
+            return {"Datapoints": [{"Average": self._vol_bytes}]}
+        return {"Datapoints": [{"Sum": self._sums.get(metric, 0.0)}]}
 
 
 class _EmptyCW:
@@ -61,6 +72,9 @@ class _IoPE:
 
     def get_aurora_io_storage_premium_per_gb(self) -> float:
         return IO_OPT_STORAGE_PREMIUM_PER_GB
+
+    def get_aurora_io_rate_per_million(self) -> float:
+        return IO_PER_MILLION
 
     def get_aurora_io_instance_premium_monthly(
         self, engine, instance_class, *, multi_az=False, license_model=None
@@ -81,6 +95,9 @@ class _ScanPE:
 
     def get_aurora_io_storage_premium_per_gb(self) -> float:
         return IO_OPT_STORAGE_PREMIUM_PER_GB
+
+    def get_aurora_io_rate_per_million(self) -> float:
+        return IO_PER_MILLION
 
     def get_aurora_io_instance_premium_monthly(self, engine, instance_class, *a, **k) -> float:
         return 0.0
@@ -151,11 +168,12 @@ def test_io_tier_counts_live_storage_premium_and_instance_premium():
         "DBClusterIdentifier": "c1",
         "Engine": "aurora-mysql",
         "EngineVersion": "8.0",
-        "AllocatedStorage": 1000,
+        "AllocatedStorage": 1,  # AUR-01: placeholder, must be ignored.
     }
     members = [_aurora_inst("m1", cls="db.r6g.large")]
     # 14d read sum = 14e9, write = 0 -> monthly_io = 14e9/14*30 = 30e9.
-    cw = _IoCW(read_sum=14_000_000_000, write_sum=0)
+    # Billed storage = 1,000 GB from VolumeBytesUsed (1e12 bytes), NOT AllocatedStorage.
+    cw = _IoCW(read_sum=14_000_000_000, write_sum=0, vol_bytes=1_000_000_000_000)
 
     recs = _check_io_tier(_io_ctx(), cluster, cw, _IoPE(), members, 1.0, fast_mode=False)
     assert len(recs) == 1
@@ -188,11 +206,11 @@ def test_io_tier_instance_premium_flips_marginal_saving_to_net_loss():
         "DBClusterIdentifier": "c1",
         "Engine": "aurora-mysql",
         "EngineVersion": "8.0",
-        "AllocatedStorage": 100,
+        "AllocatedStorage": 1,  # AUR-01 placeholder, ignored.
     }
     # monthly_io = 70e6/14*30 = 150e6 -> standard_io_cost = $30.
-    # storage_premium = 100*0.125 = $12.5.
-    cw = _IoCW(read_sum=70_000_000, write_sum=0)
+    # storage_premium = 100*0.125 = $12.5 (100 GB from VolumeBytesUsed = 1e11 bytes).
+    cw = _IoCW(read_sum=70_000_000, write_sum=0, vol_bytes=100_000_000_000)
 
     # No members -> only the H1 storage premium applies: 30 - 12.5 = 17.5 (>$10).
     no_member = _check_io_tier(_io_ctx(), cluster, cw, _IoPE(), [], 1.0, fast_mode=False)
@@ -213,14 +231,91 @@ def test_io_tier_offline_uses_validated_fallback_not_old_constant():
         "DBClusterIdentifier": "c1",
         "Engine": "aurora-mysql",
         "EngineVersion": "8.0",
-        "AllocatedStorage": 1000,
+        "AllocatedStorage": 1,  # AUR-01 placeholder, ignored.
     }
-    cw = _IoCW(read_sum=14_000_000_000, write_sum=0)
+    cw = _IoCW(read_sum=14_000_000_000, write_sum=0, vol_bytes=1_000_000_000_000)
     recs = _check_io_tier(_io_ctx(), cluster, cw, None, [], 1.0, fast_mode=False)
     assert len(recs) == 1
     # 6000 - 1000*0.125 = 5875 (would be 5975 under the old 0.025 constant).
+    # pe=None -> io rate falls back to IO_COST_PER_MILLION * multiplier = 0.20.
     assert recs[0]["monthly_savings"] == 5875.0
     assert recs[0]["AuditBasis"]["rate"]["io_opt_storage_premium_per_gb_mo"] == 0.125
+
+
+# --------------------------------------------------------------------------- #
+# AUR-01/02/03 — storage from VolumeBytesUsed, iopt1 guard, live regional I/O rate
+# --------------------------------------------------------------------------- #
+def test_io_tier_uses_volume_bytes_used_not_allocated_storage():
+    """AUR-01: storage_gb comes from CloudWatch VolumeBytesUsed, never from the
+    AllocatedStorage=1 placeholder AWS returns for Aurora auto-managed storage.
+
+    The old bug priced the I/O-Optimized storage premium on 1 GB ($0.15),
+    under-subtracting it and overstating the saving. With 150 GB measured the
+    premium is 150 * 0.125 = $18.75, not $0.125."""
+    cluster = {
+        "DBClusterIdentifier": "c1",
+        "Engine": "aurora-mysql",
+        "EngineVersion": "8.0",
+        "AllocatedStorage": 1,  # the misleading placeholder
+    }
+    # monthly_io = 14e9/14*30 = 30e9 -> standard_io_cost = $6,000.
+    cw = _IoCW(read_sum=14_000_000_000, write_sum=0, vol_bytes=150_000_000_000)  # 150 GB
+    recs = _check_io_tier(_io_ctx(), cluster, cw, _IoPE(), [], 1.0, fast_mode=False)
+    assert len(recs) == 1
+    rec = recs[0]
+    assert rec["AuditBasis"]["inputs"]["storage_gb"] == 150.0
+    assert rec["AuditBasis"]["inputs"]["storage_premium"] == round(150 * 0.125, 2) == 18.75
+    # saving = 6000 - 18.75 = 5981.25 (the old 1 GB bug gave 5999.85, +$18.60 too high).
+    assert rec["monthly_savings"] == 5981.25
+
+
+def test_io_tier_skips_when_storage_unmeasurable():
+    """AUR-01 fail-safe: no VolumeBytesUsed datapoint -> no rec (never credit a
+    saving against an unbounded I/O-Optimized storage premium)."""
+    cluster = {
+        "DBClusterIdentifier": "c1",
+        "Engine": "aurora-mysql",
+        "EngineVersion": "8.0",
+        "AllocatedStorage": 1000,  # present, but must NOT be used as a fallback
+    }
+    cw = _IoCW(read_sum=14_000_000_000, write_sum=0, vol_bytes=None)
+    assert _check_io_tier(_io_ctx(), cluster, cw, _IoPE(), [], 1.0, fast_mode=False) == []
+
+
+def test_io_tier_skips_already_io_optimized_cluster():
+    """AUR-02: a cluster already on StorageType=aurora-iopt1 has no
+    Standard->I/O-Optimized transition to recommend."""
+    cluster = {
+        "DBClusterIdentifier": "c1",
+        "Engine": "aurora-mysql",
+        "EngineVersion": "8.0",
+        "StorageType": "aurora-iopt1",
+    }
+    cw = _IoCW(read_sum=14_000_000_000, write_sum=0, vol_bytes=1_000_000_000_000)
+    assert _check_io_tier(_io_ctx(), cluster, cw, _IoPE(), [], 1.0, fast_mode=False) == []
+
+
+def test_io_tier_uses_live_regional_io_rate_not_scaled_constant():
+    """AUR-03: standard I/O priced at the live regional rate from PricingEngine
+    ($0.22/M Frankfurt), not the us-east-1 $0.20 constant * pricing_multiplier
+    (which over-scaled to $0.224 at multiplier 1.12)."""
+
+    class _FrankfurtPE(_IoPE):
+        def get_aurora_io_rate_per_million(self) -> float:
+            return 0.22  # live EUC1-Aurora:StorageIOUsage
+
+    cluster = {
+        "DBClusterIdentifier": "c1",
+        "Engine": "aurora-mysql",
+        "EngineVersion": "8.0",
+        "AllocatedStorage": 1,
+    }
+    # monthly_io = 30e9 -> standard_io_cost = 30000 * 0.22 = $6,600 (not 30000*0.224=$6,720).
+    cw = _IoCW(read_sum=14_000_000_000, write_sum=0, vol_bytes=1_000_000_000_000)
+    recs = _check_io_tier(_io_ctx(), cluster, cw, _FrankfurtPE(), [], 1.12, fast_mode=False)
+    assert len(recs) == 1
+    assert recs[0]["AuditBasis"]["rate"]["io_per_million_usd"] == 0.22
+    assert recs[0]["AuditBasis"]["inputs"]["standard_io_cost"] == 6600.0
 
 
 # --------------------------------------------------------------------------- #

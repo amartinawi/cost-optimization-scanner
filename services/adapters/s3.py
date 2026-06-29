@@ -25,6 +25,14 @@ _DEDICATED_CATEGORIES: frozenset[str] = frozenset({
     "Static Website Optimization",
 })
 
+# F2 — render-noise floor for the bucket_analysis source. A bucket with no counted
+# saving and less than this much Standard storage has negligible optimization
+# potential (e.g. a 4 MB bucket flagged "no lifecycle configured"). Such advisory
+# cards are suppressed from the rendered source — they stay in the bucket_counts
+# summary stats and the suppressed tally — while every counted bucket and every
+# advisory bucket at or above the floor is still rendered.
+_ADVISORY_RENDER_MIN_GB: float = 1.0
+
 
 class S3Module(BaseServiceModule):
     """ServiceModule adapter for S3. Multi-source savings strategy."""
@@ -68,8 +76,13 @@ class S3Module(BaseServiceModule):
         enhanced_recs = enhanced_result.get("recommendations", [])
 
         opt_opps = s3_data.get("optimization_opportunities", [])
+        # F1 — tag each enhanced rec with the standard Counted flag (True only when
+        # its EstimatedSavings parses to a positive dollar) so the reporter and any
+        # count-hygiene consumer treat the $0 informational rows as advisory, not
+        # counted (matches the bucket_analysis source and every other adapter).
         other_recs = [
-            r for r in enhanced_recs
+            dict(r, Counted=(parse_dollar_savings(r.get("EstimatedSavings", "")) > 0))
+            for r in enhanced_recs
             if r.get("CheckCategory") not in _DEDICATED_CATEGORIES
         ]
 
@@ -96,14 +109,25 @@ class S3Module(BaseServiceModule):
             len(other_recs) - savings_bearing_enhanced
         )
 
+        # F2 render-noise floor: drop sub-threshold $0 advisory buckets from the
+        # rendered cards (they remain in the bucket_counts summary + the suppressed
+        # tally). Counted buckets and advisory buckets >= the floor always render.
+        def _render_bucket(rec: dict[str, Any]) -> bool:
+            if float(rec.get("SavingsDelta", 0.0) or 0.0) > 0:
+                return True
+            return float(rec.get("SizeGB", 0.0) or 0.0) >= _ADVISORY_RENDER_MIN_GB
+
+        rendered_opps = [r for r in opt_opps if _render_bucket(r)]
+        suppressed_small = len(opt_opps) - len(rendered_opps)
+
         return ServiceFindings(
             service_name="S3",
             total_recommendations=total_recs,
             total_monthly_savings=savings,
             sources={
                 "s3_bucket_analysis": SourceBlock(
-                    count=len(opt_opps),
-                    recommendations=tuple(opt_opps),
+                    count=len(rendered_opps),
+                    recommendations=tuple(rendered_opps),
                     extras={
                         "top_cost_buckets": s3_data.get("top_cost_buckets", []),
                         "top_size_buckets": s3_data.get("top_size_buckets", []),
@@ -127,5 +151,9 @@ class S3Module(BaseServiceModule):
                 # total_recommendations because they carry no concrete $ saving
                 # (audit S3-C).
                 "advisory_count": advisory_count,
+                # F2 — count of sub-threshold $0 advisory buckets not individually
+                # rendered (still reflected in the bucket_counts above).
+                "suppressed_small_advisory_buckets": suppressed_small,
+                "advisory_render_floor_gb": _ADVISORY_RENDER_MIN_GB,
             },
         )

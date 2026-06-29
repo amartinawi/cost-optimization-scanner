@@ -278,3 +278,24 @@ def test_canonical_savings_passed_through(reporter: HTMLReportGenerator) -> None
     """A non-zero counted total is returned verbatim (never re-derived/inflated)."""
     service_data = {"total_monthly_savings": 1234.56, "sources": {}}
     assert reporter._calculate_service_savings("ec2", service_data) == pytest.approx(1234.56)
+
+
+def test_scan_diagnostics_rendered_when_present(scan_results: dict) -> None:
+    """scan_warnings + permission_issues surface in the HTML (they were JSON-only
+    before, so a reader could not see suppressed/degraded operations)."""
+    enriched = {
+        **scan_results,
+        "scan_warnings": ["Cost Hub recommends deleting vol-abc but attached — dropping.", "ce: no data"],
+        "permission_issues": [{"message": "missing iam:GetMetricStatistics"}],
+    }
+    out = HTMLReportGenerator(enriched)._render_scan_diagnostics()
+    assert "<details" in out
+    assert "3 scan diagnostics" in out and "1 permission issue" in out
+    assert "vol-abc" in out and "missing iam:GetMetricStatistics" in out
+
+
+def test_scan_diagnostics_silent_when_clean(scan_results: dict) -> None:
+    """A clean scan (no warnings/permission issues) renders nothing — the report
+    is byte-for-byte unchanged from before this disclosure was added."""
+    clean = {**scan_results, "scan_warnings": [], "permission_issues": []}
+    assert HTMLReportGenerator(clean)._render_scan_diagnostics() == ""

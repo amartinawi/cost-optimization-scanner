@@ -301,6 +301,14 @@ class ElasticacheModule(BaseServiceModule):
         # slot — it is a price-performance figure, not a $ saving.
         for rec in recs:
             if rec.get("Counted") is False:
+                # Zero the numeric saving on advisory recs (mirrors s3.py / dms.py)
+                # so a consumer reading EstimatedMonthlySavings without also
+                # checking Counted cannot sum phantom advisory dollars; the
+                # pre-demotion figure is kept under PotentialMonthlySavings for
+                # transparency (elasticache EMV hygiene).
+                if rec.get("EstimatedMonthlySavings", 0.0):
+                    rec["PotentialMonthlySavings"] = rec["EstimatedMonthlySavings"]
+                rec["EstimatedMonthlySavings"] = 0.0
                 rec["EstimatedSavings"] = "$0.00/month — advisory (not counted toward total)"
             else:
                 rec["EstimatedSavings"] = f"${rec.get('EstimatedMonthlySavings', 0.0):.2f}/month"

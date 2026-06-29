@@ -199,11 +199,12 @@ class TestDedicatedCategoriesDedup:
         assert "Static Website Optimization" in _DEDICATED_CATEGORIES
 
     def test_non_dedicated_categories_pass_through(self):
+        # Replication/Logging "Optimization" were removed entirely (out-of-scope
+        # best-practice nudges with no concrete saving); the remaining enhanced
+        # categories are cost-relevant and pass through the dedup filter.
         for category in [
             "Incomplete Multipart Uploads",
             "Versioning Optimization",
-            "Replication Optimization",
-            "Logging Optimization",
             "Unused Resources",
         ]:
             assert category not in _DEDICATED_CATEGORIES
@@ -323,6 +324,45 @@ class TestAdapterSavingsAggregation:
         assert findings.total_monthly_savings == 0.0
         # And a $0 bucket is not a counted recommendation (audit S3-C).
         assert findings.total_recommendations == 0
+
+    def test_small_advisory_buckets_suppressed_from_render(self, monkeypatch):
+        """F2 — sub-1GB $0 advisory buckets are dropped from the rendered cards
+        (kept in the suppressed tally); counted buckets and >=1GB advisory buckets
+        always render."""
+        bucket_analysis_result = {
+            "total_buckets": 3,
+            "optimization_opportunities": [
+                # counted, tiny -> still rendered (a real saving beats the size floor)
+                {"Name": "counted-small", "SavingsDelta": 12.0, "EstimatedSavings": "$12.00/month",
+                 "SizeGB": 0.004, "OpportunityClass": "lifecycle_missing"},
+                # advisory, >= 1GB -> rendered
+                {"Name": "big-advisory", "SavingsDelta": 0.0,
+                 "EstimatedSavings": "$0.00/month - no evidence", "SizeGB": 820.0,
+                 "OpportunityClass": "both_missing"},
+                # advisory, < 1GB -> suppressed
+                {"Name": "tiny-advisory", "SavingsDelta": 0.0,
+                 "EstimatedSavings": "$0.00/month - no evidence", "SizeGB": 0.004,
+                 "OpportunityClass": "both_missing"},
+            ],
+            "buckets_without_lifecycle": [], "buckets_without_intelligent_tiering": [],
+            "top_cost_buckets": [], "top_size_buckets": [],
+        }
+        monkeypatch.setattr(
+            "services.adapters.s3.get_s3_bucket_analysis", lambda *_a, **_k: bucket_analysis_result
+        )
+        monkeypatch.setattr(
+            "services.adapters.s3.get_enhanced_s3_checks", lambda *_a, **_k: {"recommendations": []}
+        )
+        findings = S3Module().scan(self._ctx())
+
+        rendered = findings.sources["s3_bucket_analysis"].recommendations
+        names = {r["Name"] for r in rendered}
+        assert names == {"counted-small", "big-advisory"}
+        assert "tiny-advisory" not in names
+        assert findings.extras["suppressed_small_advisory_buckets"] == 1
+        # Render suppression must not change the counted dollar or the count.
+        assert findings.total_monthly_savings == pytest.approx(12.0)
+        assert findings.total_recommendations == 1
 
 
 class TestEnhancedSavingsStringsParse:

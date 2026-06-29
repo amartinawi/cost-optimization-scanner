@@ -94,8 +94,13 @@ def test_idle_reader_rightsized_then_graviton():
     by = {r["check_type"]: r for r in recs}
     assert by["instance_rightsizing"]["TargetSize"] == "db.r5.2xlarge"
     assert by["instance_rightsizing"]["monthly_savings"] == round(3737.60 - 934.40, 2)
-    # Graviton priced on the RIGHTSIZED class (2xlarge), not the original 8xlarge.
-    assert by["instance_graviton"]["CurrentSize"] == "db.r5.2xlarge"
+    # CurrentSize must show the ACTUAL deployed class (8xlarge), never the
+    # hypothetical post-rightsize 2xlarge — that would misrepresent the instance.
+    assert by["instance_graviton"]["CurrentSize"] == "db.r5.8xlarge"
+    # The $ is still priced on the rightsized 2xlarge (so it never overlaps the
+    # rightsizing rec); that basis is disclosed via PricingBasisSize, not by
+    # mislabeling CurrentSize.
+    assert by["instance_graviton"]["PricingBasisSize"] == "db.r5.2xlarge"
     assert by["instance_graviton"]["monthly_savings"] == round(934.40 - 836.58, 2)
 
 

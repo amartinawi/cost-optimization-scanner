@@ -106,7 +106,11 @@ def partition_enhanced(
     advisory: list[dict[str, Any]] = []
     for rec in recs:
         if is_advisory_rec(rec):
-            advisory.append(rec)
+            # Both RI and Backup-Retention advisory cards carry an explicit
+            # Counted=False so they render but are excluded from the savings
+            # total AND the recommendation count (previously only RI was flagged,
+            # so the 7 Backup-Retention cards padded the count — RDS count fix).
+            advisory.append(dict(rec, Counted=False))
         elif is_snapshot_rec(rec):
             snaps.append(rec)
         else:
@@ -170,7 +174,19 @@ def reconcile_snapshot_savings(
             elif cap is not None and cap > 0:
                 basis["reconciliation"] = "not capped — upper bound <= actual billed backup"
             else:
-                basis["reconciliation"] = "no Cost Explorer actual available — upper bound retained"
+                # F5 — there is no Cost Explorer actual to validate the
+                # provisioned-size upper bound, so counting it would overstate the
+                # saving (actual backup bytes are typically well below provisioned
+                # size). Demote to a $0 advisory that still surfaces the upper-bound
+                # figure for manual review but is never summed into the headline.
+                basis["reconciliation"] = (
+                    "no Cost Explorer actual available — upper bound retained as advisory (not counted)"
+                )
+                new_rec["Counted"] = False
+                new_rec["EstimatedSavings"] = (
+                    f"up to ${sv:.2f}/month — advisory (provisioned-size upper bound; "
+                    "grant ce:GetCostAndUsage backup actuals to quantify)"
+                )
             new_rec["AuditBasis"] = basis
             out.append(new_rec)
     return out
@@ -245,11 +261,19 @@ def resolve_rds_findings(
     kept_concrete = [v[3] for v in best.values() if v[2] == "enh"]
     cost_savings = sum(v[1] for v in best.values())
 
-    snap_savings = sum(enhanced_savings(r) for r in snaps)
+    # F5 — only reconciled / actual-validated snapshot savings are summed; an
+    # unreconciled provisioned-size upper bound (Counted=False) renders but is not
+    # counted toward the savings headline.
+    snap_savings = sum(enhanced_savings(r) for r in snaps if r.get("Counted") is not False)
     coh_savings = sum(float(r.get("estimatedMonthlySavings", 0.0) or 0.0) for r in coh_recs)
 
     total_savings = coh_savings + cost_savings + snap_savings  # advisory excluded by design
     kept_enhanced = kept_concrete + snaps + advisory
-    total_recs = len(coh_recs) + len(kept_co) + len(kept_enhanced)
+    # Count hygiene: only recs that carry a real saving count toward the headline
+    # opportunity count. Every Counted=False rec — upper-bound snaps (F5), RI and
+    # Backup-Retention advisories — renders but is excluded (RDS count fix).
+    total_recs = sum(
+        1 for r in (list(coh_recs) + kept_co + kept_enhanced) if r.get("Counted") is not False
+    )
 
     return list(coh_recs), kept_co, kept_enhanced, total_savings, total_recs

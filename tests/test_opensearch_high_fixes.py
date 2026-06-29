@@ -379,8 +379,12 @@ def test_shim_to_adapter_end_to_end_prices_every_lever(monkeypatch: pytest.Monke
     # Underutilized downsize delta: (400 - 200) * 4 = 800 (the counted instance lever).
     assert cats["Underutilized Domain"]["EstimatedMonthlySavings"] == pytest.approx(800.0)
     assert cats["Underutilized Domain"]["Counted"] is True
+    # counted == rendered: the rendered EstimatedSavings string is the counted
+    # dollar, NOT a stale "30-50%" price-performance figure (opensearch fix).
+    assert cats["Underutilized Domain"]["EstimatedSavings"] == "$800.00/month"
     # Graviton node delta: (400 - 380) * 4 = 80 -> superseded by the downsize lever.
     assert cats["Graviton Migration"]["Counted"] is False
+    assert cats["Graviton Migration"]["EstimatedSavings"].startswith("$0.00/month")
     # Storage delta is a separate axis: 1000 * 0.013 = 13.00, counted.
     assert cats["Storage Optimization"]["EstimatedMonthlySavings"] == pytest.approx(13.0)
     assert cats["Storage Optimization"]["Counted"] is True

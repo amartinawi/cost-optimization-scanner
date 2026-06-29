@@ -157,6 +157,43 @@ def get_enhanced_opensearch_checks(ctx: ScanContext) -> dict[str, Any]:
                         )
 
                         if avg_cpu < 5:
+                            # Low CPU alone does NOT prove a domain is idle: a
+                            # low-QPS search or log-analytics cluster sits at low
+                            # CPU while still serving. Corroborate the irreversible
+                            # DELETE with request-level activity (SearchRate +
+                            # IndexingRate). Only a domain also doing ~no searches
+                            # and ~no indexing is safely idle; otherwise the saving
+                            # is rendered as a $0 advisory (adapter demotes on
+                            # IdleCorroborated=False). No metric -> not corroborated
+                            # (fail safe — never count a delete we cannot confirm).
+                            def _es_avg(metric: str) -> float | None:
+                                try:
+                                    resp = cloudwatch.get_metric_statistics(
+                                        Namespace="AWS/ES",
+                                        MetricName=metric,
+                                        Dimensions=[
+                                            {"Name": "DomainName", "Value": domain_name},
+                                            {"Name": "ClientId", "Value": ctx.account_id},
+                                        ],
+                                        StartTime=start_time,
+                                        EndTime=end_time,
+                                        Period=3600,
+                                        Statistics=["Average"],
+                                    )
+                                    dps = resp.get("Datapoints", [])
+                                    return (sum(d["Average"] for d in dps) / len(dps)) if dps else None
+                                except Exception:
+                                    return None
+
+                            search_avg = _es_avg("SearchRate")
+                            indexing_avg = _es_avg("IndexingRate")
+                            # < 1 op/min averaged over 14d ≈ effectively unused.
+                            corroborated = (
+                                search_avg is not None
+                                and indexing_avg is not None
+                                and search_avg < 1.0
+                                and indexing_avg < 1.0
+                            )
                             checks["idle_domains"].append(
                                 {
                                     "DomainName": domain_name,
@@ -164,7 +201,15 @@ def get_enhanced_opensearch_checks(ctx: ScanContext) -> dict[str, Any]:
                                     "InstanceCount": instance_count,
                                     "EBSVolumeSize": ebs_volume_size,
                                     "AvgCPU": round(avg_cpu, 2),
-                                    "Recommendation": "Delete idle domain",
+                                    "AvgSearchRate": round(search_avg, 3) if search_avg is not None else None,
+                                    "AvgIndexingRate": round(indexing_avg, 3) if indexing_avg is not None else None,
+                                    "IdleCorroborated": corroborated,
+                                    "Recommendation": (
+                                        "Delete idle domain"
+                                        if corroborated
+                                        else "Low CPU but search/indexing activity (or no metric) "
+                                        "detected — verify the domain is unused before deleting"
+                                    ),
                                     "EstimatedSavings": "100% of domain cost",
                                     "CheckCategory": "Idle Domain",
                                 }

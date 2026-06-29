@@ -89,7 +89,19 @@ def get_enhanced_quicksight_checks(ctx: ScanContext) -> dict[str, Any]:
 
         # H2 — proceed when enumeration failed so a ListUsers permission gap does
         # not masquerade as "0 users → no SPICE finding".
-        if total_users > 0 or user_enum_failed:
+        spice_supported = hasattr(quicksight, "describe_spice_capacity")
+        if (total_users > 0 or user_enum_failed) and not spice_supported:
+            # LW-02: AWS exposes no read API for account-level SPICE capacity in
+            # boto3 (only the write-side UpdateSPICECapacityConfiguration), so this
+            # lever is not implementable against real AWS — the call raised
+            # AttributeError on every scan. Skip cleanly instead of warning. Unit
+            # tests inject a fake client that DOES expose describe_spice_capacity,
+            # so the SPICE accounting below (quicksight L3/H1/H3) stays exercised.
+            logger.info(
+                "QuickSight SPICE capacity is not exposed by the AWS API "
+                "(no read operation in boto3) - skipping SPICE optimization check"
+            )
+        elif total_users > 0 or user_enum_failed:
             try:
                 spice_capacity = quicksight.describe_spice_capacity(AwsAccountId=ctx.account_id)
                 capacity_config = spice_capacity.get("SpiceCapacityConfiguration", {})

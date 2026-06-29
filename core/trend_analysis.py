@@ -7,12 +7,20 @@ to track recommendation and savings deltas.
 
 from __future__ import annotations
 
-import traceback
-from dataclasses import dataclass, field
+import logging
+from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Any
 
 from botocore.exceptions import ClientError  # type: ignore[import-untyped]
+
+logger = logging.getLogger(__name__)
+
+# fastest_growing noise floor (F-TREND-02): a service spending fractions of a
+# dollar in the prior month produces meaningless growth percentages (e.g. a
+# $0.001 → $0.05 jump reads as 5000% growth). Require a defensible prior-month
+# base before reporting a growth rate.
+_FASTEST_GROWING_MIN_PRIOR_SPEND = 1.0
 
 
 @dataclass(frozen=True)
@@ -24,7 +32,8 @@ class TrendAnalysisResult:
         total_spend: Total unblended cost across all services in the period.
         daily_spend_series: List of ``{"date": ..., "amount": ...}`` dicts for each day.
         top_services: Top 10 services by total spend as ``{"service": ..., "amount": ...}`` dicts.
-        spend_change_pct: Percentage change comparing last 30 days vs previous 30 days.
+        spend_change_pct: Percentage change, second half of the window vs the
+            first half (~45d vs ~45d for a 90-day window).
         forecast: Projected next-30-day spend from Cost Explorer, or ``None`` if unavailable.
         fastest_growing: Services sorted by month-over-month % increase (min 2 months data).
     """
@@ -95,21 +104,15 @@ def analyze_spend_trends(ctx: Any, days_back: int = 90) -> TrendAnalysisResult:
     try:
         ce = ctx.client("ce")
         if ce is None:
-            print("🔍 [core/trend_analysis.py] Cost Explorer client is None — ctx.client('ce') returned None")
-            print(
-                "🔍 [core/trend_analysis.py] This usually means the 'ce' service is not in the client registry or IAM denies ce:*"
+            logger.warning(
+                "Cost Explorer client is None (ce:* may be denied or 'ce' absent from the registry)"
             )
             return _empty_trend(days_back)
-
-        print(f"🔍 [core/trend_analysis.py] CE client obtained successfully: type={type(ce).__name__}")
 
         end_date = date.today()
         start_date = end_date - timedelta(days=days_back)
         period_label = f"{start_date.isoformat()} to {end_date.isoformat()}"
-        print(f"🔍 [core/trend_analysis.py] Fetching {days_back}-day spend trend ({period_label})")
-        print(
-            f"🔍 [core/trend_analysis.py] Date range query: start={start_date.isoformat()}, end={end_date.isoformat()}"
-        )
+        logger.debug("Fetching %d-day spend trend (%s)", days_back, period_label)
 
         daily_series: list[dict[str, Any]] = []
         service_totals: dict[str, float] = {}
@@ -126,20 +129,15 @@ def analyze_spend_trends(ctx: Any, days_back: int = 90) -> TrendAnalysisResult:
             }
             if next_token:
                 kwargs["NextPageToken"] = next_token
-                print(f"🔍 [core/trend_analysis.py] Paginating — fetching page {page_count + 2} with NextPageToken")
 
             resp = ce.get_cost_and_usage(**kwargs)
             page_count += 1
 
             results_by_time = resp.get("ResultsByTime", [])
-            groups_in_page = sum(len(page.get("Groups", [])) for page in results_by_time)
-            print(
-                f"🔍 [core/trend_analysis.py] API page {page_count}: {len(results_by_time)} ResultsByTime entries, {groups_in_page} total groups"
-            )
 
             if page_count == 1 and len(results_by_time) == 0:
-                print(
-                    "🔍 [core/trend_analysis.py] WARNING: First page returned 0 ResultsByTime — Cost Explorer may not be activated or account may be too new"
+                logger.warning(
+                    "Cost Explorer returned 0 ResultsByTime — CE may not be activated or the account is too new"
                 )
 
             for page in results_by_time:
@@ -166,22 +164,19 @@ def analyze_spend_trends(ctx: Any, days_back: int = 90) -> TrendAnalysisResult:
             if not next_token:
                 break
 
-        if next_token is None and page_count > 0:
-            print(f"🔍 [core/trend_analysis.py] Pagination complete: {page_count} page(s) fetched")
-
         total_spend = sum(service_totals.values())
-        print(
-            f"🔍 [core/trend_analysis.py] Computed total_spend=${total_spend:,.2f} from {len(service_totals)} unique services across {len(daily_series)} days"
+        logger.debug(
+            "Computed total_spend=$%.2f from %d services across %d days",
+            total_spend,
+            len(service_totals),
+            len(daily_series),
         )
 
         if total_spend == 0.0:
-            print("🔍 [core/trend_analysis.py] WARNING: total_spend is $0.00 — possible causes:")
-            print("🔍 [core/trend_analysis.py]   1. Cost Explorer not activated (enable in Billing console)")
-            print("🔍 [core/trend_analysis.py]   2. IAM missing ce:GetCostAndUsage permission")
-            print("🔍 [core/trend_analysis.py]   3. Account has no spend in the queried date range")
-            print(f"🔍 [core/trend_analysis.py]   4. Date range may be in the future or before account creation")
-            print(
-                f"🔍 [core/trend_analysis.py]   daily_series length={len(daily_series)}, service_totals keys={list(service_totals.keys())[:10]}"
+            logger.warning(
+                "Cost Explorer spend-trend total is $0.00 (CE not activated, ce:GetCostAndUsage denied, "
+                "or no spend in range %s)",
+                period_label,
             )
 
         top_services = sorted(
@@ -194,26 +189,32 @@ def analyze_spend_trends(ctx: Any, days_back: int = 90) -> TrendAnalysisResult:
 
         forecast: float | None = None
         try:
-            tomorrow = end_date + timedelta(days=1)
-            forecast_end = tomorrow + timedelta(days=30)
-            print(
-                f"🔍 [core/trend_analysis.py] Requesting forecast: {tomorrow.isoformat()} to {forecast_end.isoformat()}"
-            )
+            forecast_start = end_date + timedelta(days=1)
+            forecast_end = forecast_start + timedelta(days=30)
+            # F-TREND-01: use DAILY granularity, NOT MONTHLY. A 30-day window
+            # (e.g. 2026-06-30 → 2026-07-30) straddles two calendar months; with
+            # MONTHLY granularity Cost Explorer returns one full-month bucket per
+            # month touched and Total.Amount sums them — roughly DOUBLING the
+            # figure (a reported "$57k 30-day forecast" against a ~$27k/mo run
+            # rate). DAILY returns one bucket per day, so Total.Amount is the true
+            # 30-day projection.
             fc_resp = ce.get_cost_forecast(
-                TimePeriod={"Start": tomorrow.isoformat(), "End": forecast_end.isoformat()},
-                Granularity="MONTHLY",
+                TimePeriod={"Start": forecast_start.isoformat(), "End": forecast_end.isoformat()},
+                Granularity="DAILY",
                 Metric="UNBLENDED_COST",
             )
             forecast = round(float(fc_resp["Total"]["Amount"]), 2)
-            print(f"🔍 [core/trend_analysis.py] 30-day forecast: ${forecast:,.2f}")
+            logger.debug("30-day forecast: $%.2f", forecast)
         except Exception as fc_exc:
-            print(f"🔍 [core/trend_analysis.py] Cost forecast failed: {type(fc_exc).__name__}: {fc_exc}")
-            print(f"🔍 [core/trend_analysis.py] Forecast traceback: {traceback.format_exc()}")
+            logger.debug("Cost forecast failed: %s: %s", type(fc_exc).__name__, fc_exc, exc_info=True)
 
         fastest_growing = _compute_fastest_growing(monthly_service_totals)
 
-        print(
-            f"🔍 [core/trend_analysis.py] Trend analysis complete: ${total_spend:,.2f} over {len(daily_series)} days, {len(top_services)} top services"
+        logger.debug(
+            "Trend analysis complete: $%.2f over %d days, %d top services",
+            total_spend,
+            len(daily_series),
+            len(top_services),
         )
 
         return TrendAnalysisResult(
@@ -228,8 +229,7 @@ def analyze_spend_trends(ctx: Any, days_back: int = 90) -> TrendAnalysisResult:
 
     except ClientError as exc:
         code = exc.response.get("Error", {}).get("Code", "")
-        print(f"🔍 [core/trend_analysis.py] Trend analysis failed: {type(exc).__name__}: {exc}")
-        print(f"🔍 [core/trend_analysis.py] Full traceback:\n{traceback.format_exc()}")
+        logger.debug("Trend analysis failed: %s: %s", type(exc).__name__, exc, exc_info=True)
         # Record the failure so the missing spend trend is visible in the report
         # and scan_doctor rather than only printed to the console.
         if code in ("AccessDenied", "AccessDeniedException", "UnauthorizedOperation"):
@@ -246,14 +246,16 @@ def analyze_spend_trends(ctx: Any, days_back: int = 90) -> TrendAnalysisResult:
         return _empty_trend(days_back)
 
     except Exception as exc:
-        print(f"🔍 [core/trend_analysis.py] Trend analysis failed: {type(exc).__name__}: {exc}")
-        print(f"🔍 [core/trend_analysis.py] Full traceback:\n{traceback.format_exc()}")
+        logger.debug("Trend analysis failed: %s: %s", type(exc).__name__, exc, exc_info=True)
         ctx.warn(f"Cost Explorer spend-trend unavailable ({type(exc).__name__})", service="trend_analysis")
         return _empty_trend(days_back)
 
 
 def _compute_spend_change(daily_series: list[dict[str, Any]]) -> float:
-    """Compute percentage spend change: last 30 days vs previous 30 days.
+    """Compute percentage spend change: second half of the window vs the first half.
+
+    Splits the daily series at its midpoint, so for the default 90-day window this
+    compares the most recent ~45 days against the prior ~45 days (not 30 vs 30).
 
     Args:
         daily_series: List of ``{"date": ..., "amount": ...}`` dicts sorted chronologically.
@@ -297,10 +299,13 @@ def _compute_fastest_growing(monthly_service_totals: dict[str, dict[str, float]]
         latest_spend = latest_month[1]
         previous_spend = previous_month[1]
 
-        if previous_spend > 0:
-            growth_pct = ((latest_spend - previous_spend) / previous_spend) * 100.0
-        else:
-            growth_pct = 0.0
+        # F-TREND-02: skip services whose prior-month spend is below the floor.
+        # Dividing a tiny base produces absurd, misleading growth percentages
+        # (e.g. CodeArtifact at 52,114% on $0.00 latest spend).
+        if previous_spend < _FASTEST_GROWING_MIN_PRIOR_SPEND:
+            continue
+
+        growth_pct = ((latest_spend - previous_spend) / previous_spend) * 100.0
 
         growing.append(
             {
@@ -331,7 +336,7 @@ def compare_scan_results(current: dict[str, Any], previous: dict[str, Any] | Non
         Returns a baseline result with ``is_baseline=True`` when previous is None.
     """
     if previous is None:
-        print("🔍 [core/trend_analysis.py] No previous scan — establishing baseline")
+        logger.debug("No previous scan — establishing baseline")
         return OpportunityTrend(
             total_recommendations_delta=0,
             total_savings_delta=0.0,
@@ -357,8 +362,11 @@ def compare_scan_results(current: dict[str, Any], previous: dict[str, Any] | Non
     if prev_savings > 0 and savings_delta < 0:
         savings_realized = round(abs(savings_delta) / prev_savings, 4)
 
-    print(
-        f"🔍 [core/trend_analysis.py] Scan delta: recs {recs_delta:+d}, savings ${savings_delta:+,.2f}, realization {savings_realized:.1%}"
+    logger.debug(
+        "Scan delta: recs %+d, savings $%+.2f, realization %.1f%%",
+        recs_delta,
+        savings_delta,
+        savings_realized * 100.0,
     )
 
     return OpportunityTrend(

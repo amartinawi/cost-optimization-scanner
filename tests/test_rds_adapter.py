@@ -106,8 +106,8 @@ class TestResolveRdsSavings:
         ]
         _coh, _co, kept_enh, savings, count = resolve_rds_findings(co, enhanced)
         assert savings == 0.0          # excluded from the headline
-        assert len(kept_enh) == 1      # but still rendered/counted
-        assert count == 1
+        assert len(kept_enh) == 1      # but still rendered
+        assert count == 0              # advisory: excluded from the opportunity count
 
     def test_counted_equals_rendered(self):
         # The recommendation count equals the number of emitted (rendered) recs.

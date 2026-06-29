@@ -59,6 +59,39 @@ def _co_instance_id(rec: dict[str, Any]) -> str:
     return arn.split("/")[-1] if "/" in arn else arn
 
 
+def _co_asg_name(rec: dict[str, Any]) -> str:
+    """Auto Scaling Group name of a Compute Optimizer EC2 rec, from its tags.
+
+    Cost Optimization Hub surfaces ASG-backed findings under the ASG *name*
+    (``_coh_instance_id``), while Compute Optimizer surfaces each member under
+    its bare instance id. Without comparing the CO rec's ``aws:autoscaling:
+    groupName`` tag against the CoH-covered ASG names, a member of an
+    already-covered ASG slips past the dedup and double-counts (EC2 ASG-dedup).
+    """
+    for tag in rec.get("tags", []) or []:
+        if tag.get("key") == "aws:autoscaling:groupName":
+            return str(tag.get("value", "") or "")
+    return ""
+
+
+def _co_is_cost_actionable(rec: dict[str, Any]) -> bool:
+    """True only for Compute Optimizer EC2 recs that yield a realizable saving.
+
+    Strict-cost scope: ``UNDER_PROVISIONED`` is a performance upsize (the
+    instance is resource-starved and CO recommends a *larger* type) — not a cost
+    reduction, so it is excluded even when a recommended option is marginally
+    cheaper. A non-``running`` instance has no live compute cost, so its
+    rightsizing saving is not realizable. Only downsizes on running instances
+    are cost recommendations.
+    """
+    if str(rec.get("finding", "")).upper() == "UNDER_PROVISIONED":
+        return False
+    state = str(rec.get("instanceState", "") or "").lower()
+    if state and state != "running":
+        return False
+    return True
+
+
 def _asg_member_instance_ids(ctx: Any) -> set[str]:
     """Instance ids that belong to an Auto Scaling Group.
 
@@ -135,7 +168,13 @@ class EC2Module(BaseServiceModule):
                 "Compute Optimizer are unavailable (enable it for additional savings detection).",
                 service="ec2",
             )
-        co_recs_all = [r for r in co_raw if r.get("ResourceId") != "compute-optimizer-service"]
+        # Strict-cost scope: keep only realizable downsizes (drop UNDER_PROVISIONED
+        # performance upsizes and non-running instances — EC2 scope filter).
+        co_recs_all = [
+            r
+            for r in co_raw
+            if r.get("ResourceId") != "compute-optimizer-service" and _co_is_cost_actionable(r)
+        ]
         asg_co_recs = get_asg_compute_optimizer_recommendations(ctx)
         enhanced_recs = get_enhanced_ec2_checks(ctx, ctx.pricing_multiplier, ctx.fast_mode).get(
             "recommendations", []
@@ -162,12 +201,31 @@ class EC2Module(BaseServiceModule):
         # instance. Authority order: Cost Hub > Compute Optimizer > heuristics.
         covered: set[str] = {_coh_instance_id(r) for r in cost_hub_recs if _coh_instance_id(r)}
 
-        co_recs = [r for r in co_recs_all if _co_instance_id(r) not in covered]
+        # Drop CO recs already owned by CoH — by bare instance id AND by the rec's
+        # ASG name (CoH surfaces ASG findings under the group name, so a CO rec for
+        # a member of a CoH-covered ASG must defer; previously it slipped past the
+        # id-only check and double-counted — EC2 ASG-dedup).
+        co_recs = [
+            r
+            for r in co_recs_all
+            if _co_instance_id(r) not in covered and _co_asg_name(r) not in covered
+        ]
         covered |= {_co_instance_id(r) for r in co_recs if _co_instance_id(r)}
 
         # ASG members defer to ASG Compute Optimizer / launch-template sizing —
         # never rightsize a managed instance individually.
         covered |= _asg_member_instance_ids(ctx)
+
+        # ASG CO recs: drop the non-actionable ones (NOT_OPTIMIZED / $0, which
+        # carry no opportunity yet inflate the count) and any whose ASG is already
+        # owned by CoH (the resource_id is the ASG name — same key as `covered`),
+        # so the ASG block neither double-counts nor pads the headline count.
+        asg_co_recs = [
+            r
+            for r in asg_co_recs
+            if float(r.get("estimatedMonthlySavings", 0.0) or 0.0) > 0
+            and r.get("resource_id", "") not in covered
+        ]
 
         # Heuristic recs (enhanced + advanced): drop any instance already covered
         # by an AWS source, then keep at most ONE finding per instance — the

@@ -65,11 +65,22 @@ class _FakePaginator:
 
 
 class _FakeDmsClient:
-    """Minimal boto3 DMS client driving the enhanced-checks shim."""
+    """Minimal boto3 DMS client driving the enhanced-checks shim.
 
-    def __init__(self, instances: list[dict[str, Any]], serverless: list[dict[str, Any]] | None = None) -> None:
+    ``tasks_by_arn`` maps a replication-instance ARN to the list of replication
+    tasks attached to it (drives the dms F3 terminate-safety gate). Default empty
+    => no tasks attached => an unused instance is a counted terminate candidate.
+    """
+
+    def __init__(
+        self,
+        instances: list[dict[str, Any]],
+        serverless: list[dict[str, Any]] | None = None,
+        tasks_by_arn: dict[str, list[dict[str, Any]]] | None = None,
+    ) -> None:
         self._instances = instances
         self._serverless = serverless or []
+        self._tasks_by_arn = tasks_by_arn or {}
 
     def get_paginator(self, name: str) -> _FakePaginator:
         if name == "describe_replication_instances":
@@ -77,6 +88,13 @@ class _FakeDmsClient:
         if name == "describe_replication_configs":
             return _FakePaginator([{"ReplicationConfigs": self._serverless}])
         return _FakePaginator([{}])
+
+    def describe_replication_tasks(self, **kw: Any) -> dict[str, Any]:
+        arn = None
+        for f in kw.get("Filters", []):
+            if f.get("Name") == "replication-instance-arn":
+                arn = (f.get("Values") or [None])[0]
+        return {"ReplicationTasks": list(self._tasks_by_arn.get(arn, []))}
 
 
 class _RaisingPaginator:
@@ -184,6 +202,7 @@ def _instance(iid: str, *, multi_az: bool, klass: str = "dms.t3.medium", status:
         "ReplicationInstanceClass": klass,
         "ReplicationInstanceStatus": status,
         "MultiAZ": multi_az,
+        "ReplicationInstanceArn": f"arn:aws:dms:us-east-1:123456789012:rep:{iid}",
     }
 
 
@@ -245,6 +264,61 @@ def test_shim_propagates_multi_az_on_unused_rec() -> None:
     assert len(unused) == 1
     assert unused[0]["MultiAZ"] is False
     assert result["checks"]["instance_rightsizing"] == []
+
+
+# --------------------------------------------------------------------------- #
+# dms F3 — terminate is only counted when NO replication task is attached
+# --------------------------------------------------------------------------- #
+def test_shim_unused_no_tasks_is_counted_terminate() -> None:
+    cw = _FakeCloudWatch(avg_by_id={"dms-idle": 2.0})
+    client = _FakeDmsClient([_instance("dms-idle", multi_az=False)])  # no tasks attached
+    ctx = _ctx(None, dms_client=client, cw_client=cw)
+
+    result = get_enhanced_dms_checks(ctx)
+
+    unused = result["checks"]["unused_instances"]
+    assert len(unused) == 1
+    assert unused[0].get("Counted") is not False  # countable terminate candidate
+    assert "no replication tasks" in unused[0]["Recommendation"].lower()
+
+
+def test_shim_unused_with_attached_task_is_advisory() -> None:
+    cw = _FakeCloudWatch(avg_by_id={"prod-dms": 2.0})
+    arn = "arn:aws:dms:us-east-1:123456789012:rep:prod-dms"
+    client = _FakeDmsClient(
+        [_instance("prod-dms", multi_az=False)],
+        tasks_by_arn={arn: [{"ReplicationTaskIdentifier": "cdc-1", "Status": "running"}]},
+    )
+    ctx = _ctx(None, dms_client=client, cw_client=cw)
+
+    result = get_enhanced_dms_checks(ctx)
+
+    unused = result["checks"]["unused_instances"]
+    assert len(unused) == 1
+    # dms F3: low CPU but a task is attached -> $0 advisory, never a counted terminate.
+    assert unused[0]["Counted"] is False
+    assert "PricingWarning" in unused[0]
+    assert "replication task" in unused[0]["Recommendation"].lower()
+
+
+def test_scan_unused_with_attached_task_not_summed() -> None:
+    cw = _FakeCloudWatch(avg_by_id={"prod-dms2": 2.0})
+    arn = "arn:aws:dms:us-east-1:123456789012:rep:prod-dms2"
+    client = _FakeDmsClient(
+        [_instance("prod-dms2", multi_az=False)],
+        tasks_by_arn={arn: [{"ReplicationTaskIdentifier": "cdc-2", "Status": "running"}]},
+    )
+    pricing = _FakeDmsPricing()
+    ctx = _ctx(pricing, dms_client=client, cw_client=cw)
+
+    findings = DmsModule().scan(ctx)
+
+    # The advisory renders but contributes no counted dollar and no headline count.
+    assert findings.total_monthly_savings == 0.0
+    assert findings.total_recommendations == 0
+    enriched = findings.sources["unused_instances"].recommendations[0]
+    assert enriched["Counted"] is False
+    assert enriched["EstimatedMonthlySavings"] == 0.0
 
 
 def test_shim_abstains_when_no_datapoints() -> None:
@@ -473,16 +547,20 @@ def test_shim_excludes_non_billable_creating_state() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# shim — L2: serverless-configs error is classified, not silently swallowed
+# shim — LW-04: the dead DMS Serverless describe_replication_configs block was
+# removed (it discarded its result and crashed on a non-existent paginator), so
+# a configs error no longer produces any warning/permission_issue.
 # --------------------------------------------------------------------------- #
-def test_shim_classifies_serverless_configs_accessdenied() -> None:
+def test_shim_no_serverless_configs_call() -> None:
+    # configs_error is wired but must never fire — the block that called
+    # describe_replication_configs is gone.
     client = _ConfigurableDmsClient(instances=[], configs_error=_ClientError("AccessDenied"))
     ctx = _ctx(None, dms_client=client, cw_client=_FakeCloudWatch())
 
     result = get_enhanced_dms_checks(ctx)
 
-    assert ctx.permissions and ctx.permissions[0][0] == "dms"
-    assert "describe_replication_configs" in ctx.permissions[0][2]
+    assert ctx.permissions == []
+    assert ctx.warnings == []
     assert result["recommendations"] == []
 
 

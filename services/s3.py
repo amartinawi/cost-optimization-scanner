@@ -1102,8 +1102,16 @@ def get_s3_bucket_analysis(
             if savings > 0:
                 bucket_info["SavingsDelta"] = savings
                 bucket_info["EstimatedSavings"] = f"${savings:.2f}/month"
+                bucket_info["Counted"] = True
             else:
                 bucket_info["SavingsDelta"] = 0.0
+                # F1/F2 — a $0 bucket has no defensible counted saving. Mark it
+                # Counted=False (the standard flag every other adapter uses) so the
+                # reporter renders it as advisory and excludes it from the headline
+                # count, instead of the bespoke "Advisory" flag the reporter's
+                # count logic did not recognise (336 $0 cards were being shown as
+                # "counted" on the S3 tab header).
+                bucket_info["Counted"] = False
                 if opportunity_key == "static_website":
                     bucket_info["EstimatedSavings"] = (
                         "$0.00/month - data transfer dependent (CloudFront CDN)"
@@ -1181,8 +1189,6 @@ def get_enhanced_s3_checks(
         "intelligent_tiering_missing": [],
         "unused_buckets": [],
         "versioning_growth": [],
-        "cross_region_replication": [],
-        "server_access_logs": [],
         "request_heavy_buckets": [],
         "static_website_optimization": [],
     }
@@ -1298,47 +1304,13 @@ def get_enhanced_s3_checks(
             except Exception as e:
                 _route_bucket_error(ctx, bucket_name, e, action="s3:GetBucketVersioning")
 
-            try:
-                replication_response = bucket_s3_client.get_bucket_replication(Bucket=bucket_name)
-                if replication_response.get("ReplicationConfiguration"):
-                    checks["cross_region_replication"].append(
-                        {
-                            "BucketName": bucket_name,
-                            "HasReplication": True,
-                            "Recommendation": (
-                                "Review cross-region replication necessity and destination usage"
-                            ),
-                            "CheckCategory": "Replication Optimization",
-                            "EstimatedSavings": (
-                                "$0.00/month - depends on replicated-bytes volume and destination region"
-                            ),
-                        }
-                    )
-            except Exception as e:
-                _route_bucket_error(
-                    ctx,
-                    bucket_name,
-                    e,
-                    action="s3:GetReplicationConfiguration",
-                    expected_codes=("ReplicationConfigurationNotFoundError",),
-                )
-
-            try:
-                logging_response = bucket_s3_client.get_bucket_logging(Bucket=bucket_name)
-                if logging_response.get("LoggingEnabled"):
-                    checks["server_access_logs"].append(
-                        {
-                            "BucketName": bucket_name,
-                            "LoggingEnabled": True,
-                            "Recommendation": "Review if server access logs are still needed",
-                            "CheckCategory": "Logging Optimization",
-                            "EstimatedSavings": (
-                                "$0.00/month - depends on log-volume retention policy"
-                            ),
-                        }
-                    )
-            except Exception as e:
-                _route_bucket_error(ctx, bucket_name, e, action="s3:GetBucketLogging")
+            # Cross-region-replication and server-access-logging checks removed:
+            # both emitted a "review necessity / review if still needed" nudge with
+            # an explicit $0.00 saving — a best-practice/housekeeping recommendation
+            # with no concrete account-specific dollar, which is outside the scanner's
+            # strictly-cost scope. Dropping them also removes a get_bucket_replication
+            # + get_bucket_logging call per bucket. (Noncurrent-version growth — a
+            # real storage cost — is still surfaced via "Versioning Optimization".)
 
             try:
                 objects_response = bucket_s3_client.list_objects_v2(Bucket=bucket_name, MaxKeys=1)

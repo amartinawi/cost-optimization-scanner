@@ -55,7 +55,16 @@ class ApiGatewayModule(BaseServiceModule):
             if (rec.get("EstimatedMonthlySavings", 0.0) or 0.0) <= 0:
                 rec["Counted"] = False
 
-        savings = sum(rec.get("EstimatedMonthlySavings", 0.0) for rec in recs) * ctx.pricing_multiplier
+        # The per-rec EstimatedMonthlySavings already carries the REST→HTTP
+        # request-rate delta from the shim's us-east-1 constants ($3.50/M REST −
+        # $1.00/M HTTP). Do NOT re-scale by pricing_multiplier: API Gateway
+        # request pricing is regional but NOT proportional to the generic
+        # multiplier (eu-west-1 = $3.50/M same as us-east-1; eu-central-1 =
+        # $3.70/M ≈ +5.7%, not +12%), so multiplying overstated the saving AND
+        # broke counted==rendered (headline was scaled, the rendered cards were
+        # not). The us-east-1 constants stand as a conservative floor that never
+        # exceeds the real regional saving (api_gateway region fix).
+        savings = sum(rec.get("EstimatedMonthlySavings", 0.0) for rec in recs)
 
         return ServiceFindings(
             service_name="API Gateway",

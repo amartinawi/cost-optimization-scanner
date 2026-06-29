@@ -6,11 +6,16 @@ This module will later become MediastoreModule (T-321) implementing ServiceModul
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from botocore.exceptions import EndpointConnectionError  # type: ignore[import-untyped]
+
 from core.scan_context import ScanContext
 from services._aws_errors import record_aws_error
+
+logger = logging.getLogger(__name__)
 
 MEDIASTORE_OPTIMIZATION_DESCRIPTIONS: dict[str, dict[str, str]] = {
     "unused_containers": {
@@ -119,6 +124,12 @@ def get_enhanced_mediastore_checks(ctx: ScanContext) -> dict[str, Any]:
                     ctx.warn(f"Could not get MediaStore metrics for {container_name}: {e}", "mediastore")
                     continue
 
+    except EndpointConnectionError:
+        # LW-05: MediaStore is not offered in every region (e.g. ap-south-1) and
+        # is being deprecated by AWS. An unreachable regional endpoint is expected
+        # and non-actionable — log at debug and skip rather than emitting a scan
+        # warning on every run in an unsupported region.
+        logger.debug("MediaStore endpoint not available in %s - skipping", getattr(ctx, "region", "this region"))
     except Exception as e:
         ctx.warn(f"Could not analyze MediaStore resources: {e}", "mediastore")
 
