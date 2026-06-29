@@ -68,8 +68,13 @@ class S3Module(BaseServiceModule):
         enhanced_recs = enhanced_result.get("recommendations", [])
 
         opt_opps = s3_data.get("optimization_opportunities", [])
+        # F1 — tag each enhanced rec with the standard Counted flag (True only when
+        # its EstimatedSavings parses to a positive dollar) so the reporter and any
+        # count-hygiene consumer treat the $0 informational rows as advisory, not
+        # counted (matches the bucket_analysis source and every other adapter).
         other_recs = [
-            r for r in enhanced_recs
+            dict(r, Counted=(parse_dollar_savings(r.get("EstimatedSavings", "")) > 0))
+            for r in enhanced_recs
             if r.get("CheckCategory") not in _DEDICATED_CATEGORIES
         ]
 
