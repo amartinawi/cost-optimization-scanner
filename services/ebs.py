@@ -607,13 +607,37 @@ def compute_ebs_checks(
                 age_days = (datetime.now(snapshot["StartTime"].tzinfo) - snapshot["StartTime"]).days
                 if age_days <= old_snapshot_days:
                     continue
+                # Prefer ACTUAL stored bytes (FullSnapshotSizeInBytes) over the
+                # provisioned VolumeSize — snapshots are incremental and bill on
+                # stored blocks, so VolumeSize overstates ~2x (the same fix the AMI
+                # adapter already carries). Fall back to VolumeSize (an upper bound)
+                # only when the metadata is absent; never fabricate a size.
+                full_bytes = snapshot.get("FullSnapshotSizeInBytes")
+                if full_bytes:
+                    size_gb = float(full_bytes) / (1024**3)
+                    size_basis = "actual stored snapshot blocks (FullSnapshotSizeInBytes)"
+                    qualifier = ""
+                else:
+                    size_gb = float(snapshot.get("VolumeSize", 0) or 0)
+                    size_basis = "VolumeSize upper bound (FullSnapshotSizeInBytes unavailable)"
+                    qualifier = " (upper bound)"
+                if size_gb <= 0:
+                    continue
+                potential = round(size_gb * snapshot_rate, 2)
                 _snapshot_basis = {
-                    "metric": "snapshot data stored ($/GB-mo, max estimate)",
+                    "metric": f"snapshot data stored ($/GB-mo) — {size_basis}",
                     "rate_per_gb_month": round(snapshot_rate, 6),
                     "region": getattr(ctx, "region", ""),
-                    "basis": "VolumeSize × snapshot $/GB-mo; actual lower due to incremental storage",
+                    "basis": f"{size_gb:.1f}GB × ${snapshot_rate:.4f}/GB-mo = ${potential:.2f}/mo{qualifier}",
                 }
-                estimated = f"${snapshot['VolumeSize'] * snapshot_rate:.2f}/month (max estimate)"
+                # Advisory, NOT a counted saving: snapshot deletion is only realizable
+                # after the user confirms the snapshot is not needed (old snapshots are
+                # often deliberate backups). Render the recoverable figure but tag
+                # Counted=False so it is never summed into the headline — consistent
+                # with the EIP/OpenSearch advisory convention (EBS snapshot fidelity).
+                estimated = (
+                    f"$0.00/month — advisory: ${potential:.2f}/mo recoverable if deleted{qualifier}"
+                )
                 # A "Created by CreateImage" snapshot NOT backing a current AMI is
                 # from a deregistered AMI → orphaned. Everything else → old.
                 if snapshot.get("Description", "").startswith("Created by CreateImage"):
@@ -625,10 +649,14 @@ def compute_ebs_checks(
                             "Description": snapshot.get("Description", ""),
                             "Recommendation": (
                                 "Snapshot from a deregistered AMI — verify and delete"
-                                " (Note: Actual savings may be lower due to incremental storage)"
+                                " (advisory: snapshots bill incrementally; realizable"
+                                " only once confirmed unneeded)"
                             ),
                             "CheckCategory": "Orphaned Snapshots",
                             "EstimatedSavings": estimated,
+                            "EstimatedMonthlySavings": 0.0,
+                            "PotentialMonthlySavings": potential,
+                            "Counted": False,
                             "AuditBasis": _snapshot_basis,
                         }
                     )
@@ -641,9 +669,13 @@ def compute_ebs_checks(
                             "CheckCategory": "Old Snapshots",
                             "Recommendation": (
                                 f"Review {age_days}-day old snapshot for deletion"
-                                " (Note: Actual savings may be lower due to incremental storage)"
+                                " (advisory: snapshots bill incrementally; realizable"
+                                " only once confirmed unneeded)"
                             ),
                             "EstimatedSavings": estimated,
+                            "EstimatedMonthlySavings": 0.0,
+                            "PotentialMonthlySavings": potential,
+                            "Counted": False,
                             "AuditBasis": _snapshot_basis,
                         }
                     )

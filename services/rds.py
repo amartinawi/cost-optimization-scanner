@@ -723,7 +723,7 @@ def get_enhanced_rds_checks(
                         age_days = (datetime.now(create_time.tzinfo) - create_time).days
                         if age_days > old_snapshot_days:
                             snap_rate = _backup_rate(ctx, snap_engine, pricing_multiplier)
-                            snap_est, snap_formula, _snap_sv = _snapshot_savings_text(
+                            snap_est, snap_formula, snap_sv = _snapshot_savings_text(
                                 snap_allocated_storage, snap_rate
                             )
                             checks["old_snapshots"].append(
@@ -739,6 +739,11 @@ def get_enhanced_rds_checks(
                                         " allocated storage estimate)"
                                     ),
                                     "EstimatedSavings": snap_est,
+                                    # Numeric counterpart to the string so a JSON
+                                    # consumer summing EstimatedMonthlySavings gets
+                                    # the same figure the headline counts via
+                                    # parse_dollar_savings (counted == rendered).
+                                    "EstimatedMonthlySavings": snap_sv,
                                     "CheckCategory": "Old RDS Snapshots",
                                     "instanceFinding": (f"{age_days} days old ({snap_allocated_storage}GB)"),
                                     "AuditBasis": {
@@ -784,7 +789,7 @@ def get_enhanced_rds_checks(
                             age_days = (datetime.now(create_time.tzinfo) - create_time).days
                             if age_days > old_snapshot_days:
                                 snap_rate = _backup_rate(ctx, snap_engine, pricing_multiplier)
-                                snap_est, snap_formula, _snap_sv = _snapshot_savings_text(
+                                snap_est, snap_formula, snap_sv = _snapshot_savings_text(
                                     cluster_allocated_storage, snap_rate
                                 )
                                 checks["old_snapshots"].append(
@@ -803,6 +808,9 @@ def get_enhanced_rds_checks(
                                             " storage estimate)"
                                         ),
                                         "EstimatedSavings": snap_est,
+                                        # Numeric counterpart to the string (counted
+                                        # == rendered at the field level).
+                                        "EstimatedMonthlySavings": snap_sv,
                                         "CheckCategory": ("Old Aurora Cluster Snapshots"),
                                         "instanceFinding": (
                                             f"{age_days} days old Aurora"

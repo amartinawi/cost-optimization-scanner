@@ -168,6 +168,22 @@ def test_unused_ami_counted_with_audit_basis():
 
 
 # --------------------------------------------------------------------------- #
+# counted == rendered — the rendered string and the counted numeric agree to the
+# cent even when GB is fractional (the dollar is rounded once at the source).
+# --------------------------------------------------------------------------- #
+def test_snapshot_cost_string_matches_numeric_when_fractional():
+    # 49.975 GB x $0.05 = $2.49875 — without rounding the numeric ($2.49875) and
+    # the rendered string ("$2.50") diverge; the fix rounds once so they agree.
+    frac_bytes = int(49.975 * 1024**3)
+    ec2 = _FakeEc2(images=[_ami("ami-frac", 200)], snap_bytes={"snap-ami-frac": frac_bytes})
+    out = compute_ami_checks(_make_ctx(ec2))
+
+    rec = out["old_amis"][0]
+    assert rec["EstimatedMonthlySavings"] == round(rec["EstimatedMonthlySavings"], 2)
+    assert parse_dollar_savings(rec["EstimatedSavings"]) == rec["EstimatedMonthlySavings"]
+
+
+# --------------------------------------------------------------------------- #
 # LOW: when describe_snapshots fails, the size falls back to the AMI's
 # block-device-mapping VolumeSize (an upper bound) and the rec discloses the
 # estimate — the dollar is never presented as fully measured.

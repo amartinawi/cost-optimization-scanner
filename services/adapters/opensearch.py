@@ -349,6 +349,15 @@ class OpensearchModule(BaseServiceModule):
         # no-delta reason already set above.
         for rec in recs:
             if rec.get("Counted") is False:
+                # Zero the numeric so the advisory's field matches its $0 string
+                # (counted == rendered at the field level): a consumer summing
+                # EstimatedMonthlySavings must not pick up a demoted domain's
+                # pre-demotion value. Preserve it as PotentialMonthlySavings.
+                # Mirrors elasticache.py's advisory-zeroing.
+                emv = rec.get("EstimatedMonthlySavings", 0.0)
+                if emv:
+                    rec["PotentialMonthlySavings"] = emv
+                    rec["EstimatedMonthlySavings"] = 0.0
                 if not str(rec.get("EstimatedSavings", "")).startswith("$0.00"):
                     rec["EstimatedSavings"] = "$0.00/month — advisory (not counted toward total)"
             else:

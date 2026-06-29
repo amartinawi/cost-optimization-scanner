@@ -41,6 +41,31 @@ class ScanResultBuilder:
         return base
 
     @staticmethod
+    def _counted_recommendations(f: ServiceFindings) -> int:
+        """Count only COUNTED recs (``Counted`` is not False) across all sources.
+
+        The headline "N recommendations" must mean counted opportunities, not
+        rendered cards: a ``$0`` ``Counted=False`` advisory still renders but is
+        not a counted opportunity. Counting it inflates the figure and makes the
+        number adapter-dependent (some adapters included advisories, some did
+        not). Centralising the count here makes every service consistent
+        regardless of how its adapter populated ``total_recommendations``
+        (count-semantics fix). Mirrors the reporter's display count.
+
+        When a source carries a ``count`` placeholder with no materialised
+        recommendations, the per-rec ``Counted`` flag cannot be inspected, so the
+        declared count is trusted (matches html_report_generator._filter_recommendations).
+        """
+        total = 0
+        for sb in f.sources.values():
+            recs = sb.recommendations
+            if recs:
+                total += sum(1 for rec in recs if isinstance(rec, dict) and rec.get("Counted") is not False)
+            elif sb.count > 0:
+                total += sb.count
+        return total
+
+    @staticmethod
     def _serialize(f: ServiceFindings) -> dict[str, Any]:
         """Convert ServiceFindings to a dict, merging extras over base fields."""
         extras: dict[str, Any] = dict(f.extras) if f.extras else {}
@@ -51,6 +76,10 @@ class ScanResultBuilder:
             val = getattr(f, fld.name)
             if fld.name == "total_count" and val == 0:
                 continue
+            if fld.name == "total_recommendations":
+                # Override the adapter-supplied value with the counted-only count
+                # so the headline is consistent across every service.
+                val = ScanResultBuilder._counted_recommendations(f)
             if fld.name == "sources" and isinstance(val, dict):
                 val = {
                     k: ScanResultBuilder._serialize_source(v) if isinstance(v, SourceBlock) else v
@@ -68,6 +97,6 @@ class ScanResultBuilder:
         scanned = sum(1 for f in findings.values() if f.total_recommendations > 0 or f.total_count > 0)
         return {
             "total_services_scanned": scanned,
-            "total_recommendations": sum(f.total_recommendations for f in findings.values()),
+            "total_recommendations": sum(ScanResultBuilder._counted_recommendations(f) for f in findings.values()),
             "total_monthly_savings": sum(f.total_monthly_savings for f in findings.values()),
         }

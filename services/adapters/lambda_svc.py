@@ -137,6 +137,20 @@ class LambdaModule(BaseServiceModule):
                 deduped_enhanced.append(rec)
         enhanced_recs = deduped_enhanced
 
+        # Cost Hub recs arrive with only AWS's camelCase ``estimatedMonthlySavings``
+        # and no rendered string. The reporter's per-rec card reads PascalCase
+        # ``EstimatedSavings`` (and ``_group_counted_savings`` reads PascalCase
+        # ``EstimatedMonthlySavings``), so an un-normalized CoH rec renders the
+        # literal "Cost optimization" placeholder while its dollar is silently
+        # summed — counted != rendered. Normalize each CoH rec the way EBS/EC2 do
+        # so the counted $ also appears on the card. The camelCase key stays the
+        # source of truth for the sum below (no double count).
+        for rec in cost_hub_recs:
+            amt = float(rec.get("estimatedMonthlySavings", 0.0) or 0.0)
+            rec["EstimatedSavings"] = f"${amt:.2f}/month"
+            rec["EstimatedMonthlySavings"] = round(amt, 2)
+            rec.setdefault("Counted", True)
+
         hub_savings = sum(rec.get("estimatedMonthlySavings", 0) for rec in cost_hub_recs)
 
         formula_savings = 0.0

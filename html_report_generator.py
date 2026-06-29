@@ -2565,30 +2565,17 @@ class HTMLReportGenerator:
                         seen_snapshot_ids.add(snapshot_id)
                         snapshots.append(rec)
 
+        # Snapshot recs are advisory (Counted=False): deletion is realizable only
+        # once confirmed unneeded. They contribute $0 to the counted savings used
+        # for the savings-sorted tab order and the tab badge — the recoverable
+        # POTENTIAL is disclosed inside the panel via PotentialMonthlySavings, never
+        # presented as a counted saving (EBS snapshot fidelity). potential_savings
+        # is carried for any caller that wants the advisory figure explicitly.
         return {
             "count": len(snapshots),
             "recommendations": snapshots,
-            "total_savings": sum(
-                float(
-                    rec.get("EstimatedSavings", "0")
-                    .replace(",", "")
-                    .replace("$", "")
-                    .replace("/month", "")
-                    .split("(")[0]
-                    .strip()
-                )
-                for rec in snapshots
-                if "EstimatedSavings" in rec
-                and rec.get("EstimatedSavings", "0") != "0"
-                and rec.get("EstimatedSavings", "")
-                .replace(",", "")
-                .replace("$", "")
-                .replace("/month", "")
-                .split("(")[0]
-                .strip()
-                .replace(".", "")
-                .isdigit()
-            ),
+            "total_savings": 0.0,
+            "potential_savings": sum(float(rec.get("PotentialMonthlySavings", 0) or 0) for rec in snapshots),
         }
 
     def _extract_amis_data(self, services: Dict[str, Any]) -> Dict[str, Any]:
@@ -2622,7 +2609,12 @@ class HTMLReportGenerator:
         # Group snapshots by age range
         age_groups = {"90-180 days": [], "180-365 days": [], "1-2 years": [], "2+ years": []}
 
-        total_savings = 0
+        # Snapshot savings are ADVISORY (Counted=False): deletion is realizable
+        # only once the user confirms the snapshot is unneeded, so the figure is
+        # the recoverable potential, never part of the counted headline total. Use
+        # the numeric PotentialMonthlySavings (accurate stored-bytes basis), not a
+        # parse of the "$0.00 — advisory" string.
+        total_savings = 0.0
         for rec in snapshots_data["recommendations"]:
             # Filter out invalid entries
             snapshot_id = rec.get("SnapshotId", "N/A")
@@ -2641,34 +2633,23 @@ class HTMLReportGenerator:
             else:
                 age_groups["2+ years"].append(rec)
 
-            # Calculate savings
-            savings_str = rec.get("EstimatedSavings", "$0/month")
-            if "$" in savings_str and "/month" in savings_str:
-                try:
-                    # Remove currency, time unit, and any additional text like "(max estimate)"
-                    clean_str = (
-                        savings_str.replace(",", "").replace("$", "").replace("/month", "").split("(")[0].strip()
-                    )
-                    savings_val = float(clean_str)
-                    total_savings += savings_val
-                except (ValueError, AttributeError) as e:
-                    logger.warning("Could not parse snapshot savings '%s': %s", savings_str, e)
-                    # Continue without this savings amount
+            total_savings += float(rec.get("PotentialMonthlySavings", 0) or 0)
 
         # Use standard service header format
         content = '<div class="service-header">'
         content += '<h2 class="service-title">Snapshots Cost Optimization</h2>'
         content += '<div class="service-stats">'
         content += f'<div class="stat-card"><div class="stat-label">Old Snapshots</div><div class="value">{snapshots_data["count"]}</div></div>'
-        content += f'<div class="stat-card"><div class="stat-label">Potential Monthly Savings</div><div class="value savings">${total_savings:.2f}</div></div>'
+        content += f'<div class="stat-card"><div class="stat-label">Potential Savings (advisory)</div><div class="value savings">${total_savings:.2f}</div></div>'
         content += "</div></div>"
 
         # Use standard recommendations section format
         content += '<div class="recommendation-section">'
         content += '<h3 class="section-title"><svg class="icon icon-sm"><use href="#icon-lightbulb"/></svg> Optimization Recommendations</h3>'
-        content += f'<div class="rec-summary"><strong>Total Recommendations:</strong> {snapshots_data["count"]} | '
+        content += f'<div class="rec-summary"><strong>Advisory Recommendations:</strong> {snapshots_data["count"]} | '
         content += (
-            f'<strong>Estimated Monthly Savings:</strong> <span class="savings">${total_savings:.2f}</span></div>'
+            '<strong>Potential Monthly Savings (advisory — not in counted total):</strong>'
+            f' <span class="savings">${total_savings:.2f}</span></div>'
         )
 
         content += '<div class="recommendation-list">'
@@ -2677,19 +2658,10 @@ class HTMLReportGenerator:
             if not snapshots:
                 continue
 
-            group_savings = 0
+            group_savings = 0.0
             total_size = 0
             for snap in snapshots:
-                savings_str = snap.get("EstimatedSavings", "$0/month")
-                if "$" in savings_str and "/month" in savings_str:
-                    try:
-                        # Remove currency, time unit, and any additional text like "(max estimate)"
-                        clean_str = (
-                            savings_str.replace(",", "").replace("$", "").replace("/month", "").split("(")[0].strip()
-                        )
-                        group_savings += float(clean_str)
-                    except (ValueError, AttributeError) as e:
-                        logger.warning("Could not parse snapshot savings '%s': %s", savings_str, e)
+                group_savings += float(snap.get("PotentialMonthlySavings", 0) or 0)
                 total_size += snap.get("VolumeSize", 0)
 
             content += f'<div class="rec-item">'
@@ -2697,7 +2669,10 @@ class HTMLReportGenerator:
             content += (
                 f"<p><strong>Recommendation:</strong> Review and delete old snapshots that are no longer needed</p>"
             )
-            content += f'<p class="savings"><strong>Estimated Savings:</strong> ${group_savings:.2f}/month</p>'
+            content += (
+                '<p class="savings"><strong>Potential Savings (advisory):</strong>'
+                f' ${group_savings:.2f}/month</p>'
+            )
             content += "<p><strong>Snapshots:</strong></p><ul>"
 
             for snap in snapshots:
@@ -3007,20 +2982,26 @@ class HTMLReportGenerator:
                     filtered_data["sources"][source_name]["recommendations"] = filtered_recs
                     filtered_data["sources"][source_name]["count"] = len(filtered_recs)
 
-        # Recalculate total recommendations - only count sources with actual recommendations
+        # Recalculate total recommendations. The headline "N recommendations"
+        # counts only COUNTED opportunities — $0 advisory recs (Counted=False)
+        # still render as cards but are excluded from the count, so the number
+        # always means "counted opportunities" consistently across every service
+        # (the S3 convention, applied uniformly — count-semantics fix).
+        def _counted(recs: list) -> int:
+            return sum(1 for r in recs if not (isinstance(r, dict) and r.get("Counted") is False))
+
         total_recs = 0
         for source in filtered_data.get("sources", {}).values():
             if isinstance(source, dict):
-                # Only count if there are actual recommendations (not just a count placeholder)
                 recs = source.get("recommendations", [])
-                if recs and len(recs) > 0:
-                    total_recs += len(recs)
+                if recs:
+                    total_recs += _counted(recs)
                 elif source.get("count", 0) > 0:
-                    # Fallback to count if recommendations list is empty but count exists
+                    # Recommendations list is empty but a count exists — trust it
+                    # (no per-rec Counted flags available to filter on).
                     total_recs += source.get("count", 0)
             elif isinstance(source, list):
-                # New format: direct list of recommendations
-                total_recs += len(source)
+                total_recs += _counted(source)
         filtered_data["total_recommendations"] = total_recs
 
         # For services without direct savings (like Compute Optimizer), preserve calculated savings

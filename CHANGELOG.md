@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (second deep-audit remediation — eu-west-1 / level-Shoes-prod re-scan)
+A re-scan of the remediated account (019903302182, 90 → counted-only ~30 recs)
+was deep-audited again (43 agents, adversarially verified). The prior batch was
+confirmed active (pricing-fallback now surfaces in `scan_warnings`; ElastiCache
+`cache.m6g.medium` $0 fallback produces no counted dollar; pricing accurate to
+the cent on Aurora/EC2/RDS/OpenSearch/ElastiCache). Seventeen new findings
+collapsed to six distinct defects, all fixed under the same invariant — a
+rendered dollar must be **counted, account-specific, and defensible**, advisories
+are `$0` `Counted=False` (rendered, never summed), and `counted == rendered` at
+the per-rec field level.
+
+- **EBS snapshots — advisory + accurate sizing (fidelity).** The `ebs_snapshots`
+  cards rendered a non-zero `$/month (max estimate)` outside the headline total,
+  carried no `Counted` flag, and sized on the provisioned `VolumeSize` (~2×
+  overstatement). They are now explicit `$0` `Counted=False` advisories
+  (`EstimatedMonthlySavings=0.0`, recoverable figure in `PotentialMonthlySavings`),
+  sized on **`FullSnapshotSizeInBytes`** (the AMI fix, ported) with a `VolumeSize`
+  fallback and a no-fabrication guard. The synthetic Snapshots tab now shows the
+  potential as an explicit advisory (`not in counted total`) and no longer feeds a
+  dollar into the savings-sorted tab order.
+- **`total_recommendations` now means counted opportunities everywhere.** The
+  headline counted `$0` advisories for some adapters but not others ("90"
+  opportunities where only ~30 carried a counted dollar). `ScanResultBuilder` and
+  the reporter now count only `Counted != False` recs uniformly (the S3
+  convention, centralised) — advisories still render as cards but never inflate the
+  count. A `count` placeholder with no materialised recs is still trusted.
+- **Lambda Cost Hub card rendered a placeholder (counted != rendered).** The CoH
+  rec arrived with only AWS's camelCase `estimatedMonthlySavings`, so the card
+  showed the literal `"Cost optimization"` while `$7.51/mo` was silently summed.
+  Lambda now normalises CoH recs to a PascalCase `EstimatedSavings` string +
+  `Counted=True` (as EBS/EC2 already do); the camelCase key stays the source of
+  truth for the sum (no double count).
+- **OpenSearch advisory field consistency.** A demoted idle-domain advisory kept
+  its pre-demotion `EstimatedMonthlySavings` (e.g. `846.49`) while its string read
+  `$0.00 — advisory`. The advisory loop now zeroes the numeric and preserves the
+  figure as `PotentialMonthlySavings` (mirrors ElastiCache).
+- **RDS snapshot recs carry a numeric dollar.** The Old-RDS / Old-Aurora-Cluster
+  snapshot recs were counted via `parse_dollar_savings` on the string but exposed
+  no numeric `EstimatedMonthlySavings` (a JSON consumer summing the field got
+  `$0`). The numeric is now set alongside the string (the sum still flows through
+  the string, so no double count).
+- **AMI snapshot dollar rounded once.** The card showed `$2.50` while the counted
+  numeric was `$2.4987`; the monthly figure is now rounded to the cent before it
+  feeds both the string and the numeric (`counted == rendered`).
+
 ### Fixed (deep-audit remediation — eu-central-1 / Jarir-M2 + eu-west-1 / level-Shoes-prod)
 Two adversarially-verified deep audits of live multi-account scans (account
 071985014680 / 315 recs and 019903302182 / 92 recs) surfaced a fresh class of

@@ -255,8 +255,9 @@ def compute_ami_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> dic
 
             # AWS EBS snapshots are incremental — only changed blocks are billed.
             # VolumeSize is an UPPER BOUND; we emit the MAX with an explicit
-            # qualifier in the display string.
-            monthly_snapshot_cost = total_snapshot_size_gb * snapshot_rate
+            # qualifier in the display string. Round once so the rendered string
+            # and the counted numeric agree to the cent (counted == rendered).
+            monthly_snapshot_cost = round(total_snapshot_size_gb * snapshot_rate, 2)
             is_old = age_days > OLD_SNAPSHOT_DAYS
             rec = {
                 "ImageId": ami_id,
