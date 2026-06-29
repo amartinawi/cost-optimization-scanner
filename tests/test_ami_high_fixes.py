@@ -76,6 +76,7 @@ class _FakeEc2:
         shared_ids: set[str] | None = None,
         image_attr_exc: Exception | None = None,
         snap_bytes: dict[str, int] | None = None,
+        snap_exc: Exception | None = None,
     ) -> None:
         self._paginators = {
             "describe_images": _Pager([{"Images": images}]),
@@ -93,6 +94,7 @@ class _FakeEc2:
         self._shared_ids = shared_ids or set()
         self._image_attr_exc = image_attr_exc
         self._snap_bytes = snap_bytes or {}
+        self._snap_exc = snap_exc
 
     def get_paginator(self, name: str):
         return self._paginators[name]
@@ -109,6 +111,8 @@ class _FakeEc2:
         return {"ImageId": ImageId, "LaunchPermissions": []}
 
     def describe_snapshots(self, *, SnapshotIds: list[str]):  # noqa: N803
+        if self._snap_exc is not None:
+            raise self._snap_exc
         snap_id = SnapshotIds[0]
         full_bytes = self._snap_bytes.get(snap_id, 10 * 1024**3)
         return {"Snapshots": [{"FullSnapshotSizeInBytes": full_bytes, "VolumeSize": 100}]}
@@ -158,6 +162,50 @@ def test_unused_ami_counted_with_audit_basis():
     # AuditBasis defends the dollar (rate + metric + formula).
     assert "EBS:SnapshotUsage" in rec["AuditBasis"]
     assert "0.0500" in rec["AuditBasis"]
+    # A fully-measured AMI is not flagged as an estimate.
+    assert rec["SizeEstimated"] is False
+    assert "inferred from" not in rec["AuditBasis"]
+
+
+# --------------------------------------------------------------------------- #
+# LOW: when describe_snapshots fails, the size falls back to the AMI's
+# block-device-mapping VolumeSize (an upper bound) and the rec discloses the
+# estimate — the dollar is never presented as fully measured.
+# --------------------------------------------------------------------------- #
+def test_snapshot_describe_failure_falls_back_and_discloses_estimate():
+    ec2 = _FakeEc2(images=[_ami("ami-est", 200)], snap_exc=RuntimeError("throttled"))
+    out = compute_ami_checks(_make_ctx(ec2))
+
+    assert len(out["old_amis"]) == 1
+    rec = out["old_amis"][0]
+    # BDM VolumeSize=100 is the upper-bound fallback; 100 GB x $0.05 = $5.00.
+    assert rec["EstimatedMonthlySavings"] == 100.0 * SNAPSHOT_RATE
+    assert parse_dollar_savings(rec["EstimatedSavings"]) == rec["EstimatedMonthlySavings"]
+    # The estimate is disclosed, not silently presented as measured.
+    assert rec["SizeEstimated"] is True
+    assert "inferred from" in rec["AuditBasis"]
+
+
+# --------------------------------------------------------------------------- #
+# LOW (cardinal sin guard): describe_snapshots fails AND the block-device
+# mapping carries no VolumeSize — never fabricate an 8 GB dollar. With no
+# defensible size the AMI is skipped entirely (fail safe on missing data).
+# --------------------------------------------------------------------------- #
+def test_no_fabricated_size_when_describe_fails_and_no_volume_size():
+    created = (datetime.now(UTC) - timedelta(days=200)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    ami = {
+        "ImageId": "ami-nosize",
+        "Name": "ami-nosize",
+        "CreationDate": created,
+        # SnapshotId present but NO VolumeSize on the mapping.
+        "BlockDeviceMappings": [{"DeviceName": "/dev/sda1", "Ebs": {"SnapshotId": "snap-x"}}],
+    }
+    ec2 = _FakeEc2(images=[ami], snap_exc=RuntimeError("throttled"))
+    out = compute_ami_checks(_make_ctx(ec2))
+
+    # No fabricated 8 GB dollar — the unsizable AMI produces no recommendation.
+    assert out["recommendations"] == []
+    assert out["old_amis"] == [] and out["unused_amis"] == []
 
 
 # --------------------------------------------------------------------------- #

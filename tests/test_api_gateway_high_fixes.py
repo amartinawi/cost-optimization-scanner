@@ -190,7 +190,12 @@ def test_counted_dollar_from_measured_requests() -> None:
     assert basis["monthly_requests"] == 2_000_000.0
 
 
-def test_region_multiplier_applied_once() -> None:
+def test_region_multiplier_not_applied_us_constant_floor() -> None:
+    """API Gateway request pricing is regional but NOT proportional to the generic
+    pricing_multiplier (eu-west-1 = us-east-1 $3.50/M; eu-central-1 = $3.70/M ≈
+    +5.7%, not +12%). The savings keeps the us-east-1 constant floor and is NOT
+    scaled — so the headline equals the rendered per-rec dollar (counted==rendered)
+    and never overstates the real regional saving (api_gateway region fix)."""
     apigw = _FakeApiGateway(apis=[{"id": "a1", "name": "api-one"}], resource_counts={"a1": 5})
     cw = _FakeCloudWatch(monthly_requests=2_000_000.0)
     ctx = _recording_ctx(pricing_multiplier=1.5)
@@ -198,8 +203,14 @@ def test_region_multiplier_applied_once() -> None:
 
     findings = ApiGatewayModule().scan(ctx)
 
-    # 5.00 base × 1.5 region multiplier, applied exactly once.
-    assert findings.total_monthly_savings == pytest.approx(5.00 * 1.5)
+    # 2.0M requests × $2.50/M delta = $5.00, NOT re-scaled by the 1.5 multiplier.
+    assert findings.total_monthly_savings == pytest.approx(5.00)
+    # counted == rendered: headline equals the sum of the rendered per-rec dollars.
+    rendered = sum(
+        r.get("EstimatedMonthlySavings", 0.0)
+        for r in findings.sources["enhanced_checks"].recommendations
+    )
+    assert findings.total_monthly_savings == pytest.approx(rendered)
 
 
 # --------------------------------------------------------------------------- #

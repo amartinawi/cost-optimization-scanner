@@ -186,6 +186,7 @@ def test_opensearch_idle_domain_full_cost_beats_graviton(monkeypatch: pytest.Mon
             "InstanceType": "r6g.large.search",
             "InstanceCount": 3,
             "CheckCategory": "Idle Domain",
+            "IdleCorroborated": True,  # SearchRate + IndexingRate ~ 0 (truly idle)
         },
         {
             "DomainName": "idle-dom",
@@ -209,6 +210,32 @@ def test_opensearch_idle_domain_full_cost_beats_graviton(monkeypatch: pytest.Mon
     )
     assert idle.get("Counted") is True
     assert graviton.get("Counted") is False
+
+
+def test_opensearch_idle_domain_uncorroborated_is_advisory(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A domain at low CPU but WITHOUT request-level corroboration (the default,
+    e.g. it is still serving searches, or the metric was unavailable) is rendered
+    as a $0 advisory, never a counted DELETE — the irreversible-action safety gate."""
+    recs = [
+        {
+            "DomainName": "busy-but-low-cpu",
+            "InstanceType": "c5.2xlarge.search",
+            "InstanceCount": 2,
+            "EBSVolumeSize": 150,
+            "CheckCategory": "Idle Domain",
+            "IdleCorroborated": False,  # search/indexing activity present (or no metric)
+        },
+    ]
+    monkeypatch.setattr(
+        opensearch_adapter,
+        "get_enhanced_opensearch_checks",
+        lambda ctx: {"recommendations": [dict(r) for r in recs]},
+    )
+    findings = opensearch_adapter.OpensearchModule().scan(_ctx(pricing_engine=_FakePricing(es_monthly=400.0)))
+    # The DELETE is not counted (no corroboration); headline stays $0.
+    assert findings.total_monthly_savings == pytest.approx(0.0, abs=0.01)
+    idle = next(r for r in findings.sources["enhanced_checks"].recommendations if r["CheckCategory"] == "Idle Domain")
+    assert idle.get("Counted") is False  # rendered as advisory, not a counted delete
 
 
 # --------------------------------------------------------------------------- #

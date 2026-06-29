@@ -2307,8 +2307,49 @@ class HTMLReportGenerator:
                 "</p>"
             )
 
+        out += self._render_scan_diagnostics()
         out += "</section>"
         return out
+
+    def _render_scan_diagnostics(self) -> str:
+        """Render a collapsible disclosure of scan_warnings + permission_issues.
+
+        The scan records every dropped or degraded operation (stale Cost Hub
+        deletions, throttled metric reads, missing IAM permissions) in the JSON
+        as ``scan_warnings`` / ``permission_issues``. These were previously absent
+        from the HTML report, so a reader could not tell that e.g. 25 Cost Hub
+        delete recommendations had been suppressed. Renders nothing when both
+        lists are empty (the clean-scan case), so it never alters a clean report.
+        Inline-styled to stay fully self-contained (no global CSS change).
+        """
+        warnings = self.scan_results.get("scan_warnings", []) or []
+        perms = self.scan_results.get("permission_issues", []) or []
+        if not warnings and not perms:
+            return ""
+
+        def _msg(item: Any) -> str:
+            if isinstance(item, dict):
+                return str(item.get("message") or item.get("action") or item.get("reason") or item)
+            return str(item)
+
+        rows = "".join(
+            f'<li style="margin:0.2rem 0;color:#9a3412;"><strong>permission:</strong> {html.escape(_msg(p))}</li>'
+            for p in perms
+        ) + "".join(
+            f'<li style="margin:0.2rem 0;color:#92400e;">{html.escape(_msg(w))}</li>' for w in warnings
+        )
+
+        n = len(warnings) + len(perms)
+        label = f"{n} scan diagnostic{'s' if n != 1 else ''} — operations skipped or degraded during the scan"
+        if perms:
+            label += f" ({len(perms)} permission issue{'s' if len(perms) != 1 else ''})"
+        return (
+            '<details class="scan-diagnostics" style="margin-top:1rem;padding:0.5rem 0.75rem;'
+            'border:1px solid #fde68a;border-radius:6px;background:#fffbeb;font-size:0.85rem;">'
+            f'<summary style="cursor:pointer;color:#92400e;font-weight:600;">{html.escape(label)}</summary>'
+            f'<ul style="margin:0.5rem 0 0;padding-left:1.1rem;list-style:disc;">{rows}</ul>'
+            "</details>"
+        )
 
     def _count_priorities_by_severity(self) -> Dict[str, int]:
         """Aggregate HIGH/MEDIUM/LOW priority counts across all recommendations.

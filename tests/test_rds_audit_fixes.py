@@ -373,8 +373,9 @@ def test_adapter_dedups_multiremediation_and_excludes_ri(monkeypatch):
     enhanced_recs = findings.sources["enhanced_checks"].recommendations
     assert len(enhanced_recs) == 2
     assert findings.sources["compute_optimizer"].count == 0
-    # counted == rendered
-    assert findings.total_recommendations == len(enhanced_recs)
+    # The RI advisory renders but is Counted=False, so only the $53 concrete rec
+    # counts toward the opportunity count (advisory cards don't pad the count).
+    assert findings.total_recommendations == 1
 
 
 def test_adapter_co_beats_heuristic_same_db(monkeypatch):
@@ -725,7 +726,8 @@ def test_backup_retention_excluded_from_savings_but_rendered():
     _coh, _co, kept_enh, savings, count = resolve_rds_findings([], enhanced)
     assert savings == 0.0          # not summed into the headline
     assert len(kept_enh) == 1      # but still rendered
-    assert count == 1
+    assert kept_enh[0].get("Counted") is False  # Backup-Retention now carries the flag
+    assert count == 0              # advisory: excluded from the opportunity count
 
 
 # --------------------------------------------------------------------------- #

@@ -1139,9 +1139,11 @@ def _render_elasticache_enhanced_checks(recommendations: List[Rec], source_name:
         content += f"<h4>{category} ({len(clusters)} {label})</h4>"
         content += f"<p><strong>Recommendation:</strong> {clusters[0].get('Recommendation', 'Optimize cluster')}</p>"
 
-        savings_str = clusters[0].get("EstimatedSavings", "")
-        if savings_str:
-            content += f'<p class="savings"><strong>Estimated Savings:</strong> {savings_str}</p>'
+        # Sum the COUNTED savings across every cluster in the category — not just
+        # clusters[0] — so a category whose first cluster is advisory ($0) while
+        # others are counted still shows its true total (counted == rendered;
+        # mirrors the OpenSearch renderer; elasticache card-renderer fix).
+        content += _counted_savings_line(clusters)
 
         content += "<p><strong>Clusters:</strong></p><ul>"
         for cluster in clusters:

@@ -176,4 +176,29 @@ class ScanOrchestrator:
             )
         selected = resolve_cli_keys(self.modules, scan_only, skip)
         self._prefetch_advisor_data(selected)
-        return {m.key: safe_scan(m, self.ctx) for m in self.modules if m.key in selected}
+        findings = {m.key: safe_scan(m, self.ctx) for m in self.modules if m.key in selected}
+        # All pricing lookups are done — surface any fallback substitutions so the
+        # report discloses which rates were estimated vs fetched live.
+        self._drain_pricing_warnings()
+        return findings
+
+    def _drain_pricing_warnings(self) -> None:
+        """Promote PricingEngine fallback events into ``ctx`` scan warnings.
+
+        When a live Pricing-API lookup fails, ``PricingEngine`` substitutes a
+        region-scaled constant and records the event on its own ``warnings`` list
+        (and on each region sibling's). Those never reached ``ctx._warnings``, so
+        the report silently presented fallback rates as if live. Drain them here —
+        deduplicated with an occurrence count — so the scan diagnostics make the
+        estimate visible (cost-fidelity: a fallback constant is not an
+        account-specific live rate).
+        """
+        engine = self.ctx.pricing_engine
+        if engine is None:
+            return
+        for message, count in engine.drain_warnings().items():
+            suffix = f" (x{count})" if count > 1 else ""
+            self.ctx.warn(
+                f"Live pricing unavailable — used fallback rate: {message}{suffix}",
+                service="pricing",
+            )

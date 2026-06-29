@@ -95,6 +95,13 @@ FALLBACK_AURORA_BACKUP_GB_MONTH: float = 0.021
 # 0.025 was ~5x too low, inflating every io_tier_optimization saving. Used only
 # when the live API is unavailable; multiplied by the regional fallback multiplier.
 FALLBACK_AURORA_IO_STORAGE_PREMIUM_GB_MONTH: float = 0.125
+# Aurora Standard-tier per-request I/O rate, $/1M requests. Live (Pricing API
+# 2026-06, usagetype suffix Aurora:StorageIOUsage, unit "IOs"): $0.20/M us-east-1,
+# $0.22/M eu-central-1 / eu-west-1. The adapter previously scaled the $0.20
+# us-east-1 constant by the regional pricing_multiplier (1.12 → $0.224 in
+# Frankfurt) which over-states vs the live $0.22; used only when the live API
+# is unavailable, multiplied by the regional fallback multiplier.
+FALLBACK_AURORA_IO_RATE_PER_MILLION: float = 0.20
 # Single-AZ db.t3.medium MySQL us-east-1 on-demand monthly cost (730h × $0.068/h).
 # Used only when AWS Pricing API is unavailable; multiplied by the regional fallback multiplier.
 FALLBACK_RDS_INSTANCE_MONTHLY: float = 49.64
@@ -445,6 +452,24 @@ class PricingEngine:
         )
         for w in self.warnings:
             logger.warning("  pricing warning: %s", w)
+
+    def drain_warnings(self) -> dict[str, int]:
+        """Aggregate every fallback warning into a ``message -> count`` map.
+
+        Includes this engine plus all lazily-built region siblings (so a
+        cross-region fallback is not lost). Each ``_use_fallback`` call appends a
+        message, so the same rate can repeat once per priced resource; the count
+        captures how many resources were affected without flooding the report
+        with duplicates. The orchestrator uses this to surface pricing fallbacks
+        in the scan diagnostics — disclosing exactly which rates were estimated
+        rather than fetched live (a fallback constant is not an account-specific
+        live rate).
+        """
+        counts: dict[str, int] = {}
+        for engine in (self, *self._siblings.values()):
+            for message in engine.warnings:
+                counts[message] = counts.get(message, 0) + 1
+        return counts
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
@@ -1020,6 +1045,30 @@ class PricingEngine:
             )
         self._cache.set(key, premium)
         return premium
+
+    def get_aurora_io_rate_per_million(self) -> float:
+        """$/1M Aurora Standard-tier I/O requests in ``self._region``.
+
+        The per-request I/O charge a Standard cluster pays and that switching to
+        the I/O-Optimized tier eliminates. Sourced live from the Pricing API
+        (``productFamily="System Operation"``, usagetype suffix
+        ``Aurora:StorageIOUsage``, unit "IOs"): $0.20/M us-east-1, $0.22/M
+        eu-central-1 / eu-west-1. The exact suffix avoids the $0.00
+        ``Aurora:StorageIOUsage-LimitlessPreview`` decoy. Region-correct once via
+        the live API; on a miss returns
+        :data:`FALLBACK_AURORA_IO_RATE_PER_MILLION` × fallback_multiplier.
+        """
+        key = ("aurora_io_rate_per_million",)
+        if (cached := self._get_cached(key)) is not None:
+            return cached
+        rate = self._fetch_aurora_io_rate_per_million()
+        if rate is None:
+            rate = self._use_fallback(
+                FALLBACK_AURORA_IO_RATE_PER_MILLION * self._fallback_multiplier,
+                f"Pricing API unavailable for Aurora I/O rate in {self._region}; using fallback",
+            )
+        self._cache.set(key, rate)
+        return rate
 
     def get_aurora_io_instance_premium_monthly(
         self,
@@ -1821,6 +1870,24 @@ class PricingEngine:
             {"Type": "TERM_MATCH", "Field": "productFamily", "Value": "Database Storage"},
         ]
         return self._select_by_usagetype_suffix("AmazonRDS", filters, usagetype_suffix)
+
+    def _fetch_aurora_io_rate_per_million(self) -> float | None:
+        """$/1M Aurora Standard-tier I/O requests in ``self._region``; None on miss.
+
+        ``productFamily="System Operation"`` row on ``AmazonRDS`` (unit "IOs",
+        priced per request) whose usagetype is ``<region>-Aurora:StorageIOUsage``.
+        The Aurora I/O rate is engine-independent, so no databaseEngine pin is
+        needed. Region prefixes (USE1-, EUC1-, …) vary, so the suffix is matched;
+        the exact suffix ``Aurora:StorageIOUsage`` avoids the $0.00
+        ``…StorageIOUsage-LimitlessPreview`` decoy. The published rate is
+        per-request ($0.0000002/IO); ×1e6 to per-million.
+        """
+        filters = [
+            {"Type": "TERM_MATCH", "Field": "location", "Value": self._display_name},
+            {"Type": "TERM_MATCH", "Field": "productFamily", "Value": "System Operation"},
+        ]
+        per_io = self._select_by_usagetype_suffix("AmazonRDS", filters, "Aurora:StorageIOUsage")
+        return per_io * 1_000_000 if per_io is not None else None
 
     def _fetch_dms_instance_price(self, dms_class: str, *, multi_az: bool = False) -> float | None:
         """Fetch on-demand monthly DMS replication-instance price; None on miss.

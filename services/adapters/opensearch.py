@@ -284,6 +284,16 @@ class OpensearchModule(BaseServiceModule):
             # same saving is not counted twice.
             if rec.get("DomainName", "") in coh_keys:
                 rec["Counted"] = False
+            # Idle-domain DELETE is irreversible: only count it when request-level
+            # activity (SearchRate + IndexingRate ~ 0) corroborates the domain is
+            # truly unused. A CPU-only "idle" verdict renders the potential saving
+            # as a $0 advisory, never a counted delete (opensearch idle-domain
+            # safety gate — a 4.7% CPU prod search cluster is not safely deletable).
+            if category == "Idle Domain" and not rec.get("IdleCorroborated", False):
+                rec["Counted"] = False
+                rec["Recommendation"] = rec.get(
+                    "Recommendation", "Verify the domain is unused before deleting"
+                )
 
         # Dedupe instance-axis levers (Graviton vs downsize) per domain — they are
         # alternatives on the same nodes. Storage is a separate axis (kept). A rec
@@ -297,12 +307,28 @@ class OpensearchModule(BaseServiceModule):
             if cur is None or rec["EstimatedMonthlySavings"] > cur["EstimatedMonthlySavings"]:
                 best_instance[dom] = rec
 
+        # Domains being counted as an idle DELETE: their separate gp2→gp3 storage
+        # rec is mutually exclusive (you cannot migrate storage on a deleted
+        # domain) — and the idle saving already includes that storage at the gp3
+        # rate — so the storage rec must not also be counted (opensearch
+        # idle-vs-storage double-count). Built from non-demoted idle recs.
+        idle_deleted_domains = {
+            rec.get("DomainName", "")
+            for rec in recs
+            if rec.get("CheckCategory") == "Idle Domain"
+            and rec.get("Counted") is not False
+            and rec.get("EstimatedMonthlySavings", 0) > 0
+        }
+
         best_ids = {id(r) for r in best_instance.values()}
         savings = 0.0
         for rec in recs:
             if rec.get("Counted") is False:
                 continue
             is_storage = "storage" in rec.get("CheckCategory", "").lower()
+            if is_storage and rec.get("DomainName", "") in idle_deleted_domains:
+                rec["Counted"] = False  # superseded by the idle-domain delete
+                continue
             keep = (is_storage or id(rec) in best_ids) and rec["EstimatedMonthlySavings"] > 0
             if keep:
                 rec["Counted"] = True
@@ -311,6 +337,22 @@ class OpensearchModule(BaseServiceModule):
                 rec["Counted"] = False
 
         savings += coh_total
+
+        # counted == rendered: single-source the per-rec EstimatedSavings STRING
+        # from the finalized counted dollar so the card the reporter renders (it
+        # reads EstimatedSavings) matches the number summed into the headline.
+        # The qualitative upstream "30-50%" price-performance wording is dropped
+        # from the savings slot — it is not a $ figure. Mirrors elasticache.py;
+        # opensearch.py previously lacked this loop, leaving a counted domain
+        # rendering "30-50%" while $689.12 was credited (counted!=rendered fix).
+        # Advisory recs render an honest $0 line, preserving any specific
+        # no-delta reason already set above.
+        for rec in recs:
+            if rec.get("Counted") is False:
+                if not str(rec.get("EstimatedSavings", "")).startswith("$0.00"):
+                    rec["EstimatedSavings"] = "$0.00/month — advisory (not counted toward total)"
+            else:
+                rec["EstimatedSavings"] = f"${rec.get('EstimatedMonthlySavings', 0.0):.2f}/month"
 
         sources = {"enhanced_checks": SourceBlock(count=len(recs), recommendations=tuple(recs))}
         if coh_recs:

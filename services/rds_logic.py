@@ -106,7 +106,11 @@ def partition_enhanced(
     advisory: list[dict[str, Any]] = []
     for rec in recs:
         if is_advisory_rec(rec):
-            advisory.append(rec)
+            # Both RI and Backup-Retention advisory cards carry an explicit
+            # Counted=False so they render but are excluded from the savings
+            # total AND the recommendation count (previously only RI was flagged,
+            # so the 7 Backup-Retention cards padded the count — RDS count fix).
+            advisory.append(dict(rec, Counted=False))
         elif is_snapshot_rec(rec):
             snaps.append(rec)
         else:
@@ -265,9 +269,11 @@ def resolve_rds_findings(
 
     total_savings = coh_savings + cost_savings + snap_savings  # advisory excluded by design
     kept_enhanced = kept_concrete + snaps + advisory
-    # Count hygiene: Counted=False upper-bound snaps (F5) render but are excluded
-    # from the headline recommendation count.
-    uncounted_snaps = sum(1 for r in snaps if r.get("Counted") is False)
-    total_recs = len(coh_recs) + len(kept_co) + len(kept_enhanced) - uncounted_snaps
+    # Count hygiene: only recs that carry a real saving count toward the headline
+    # opportunity count. Every Counted=False rec — upper-bound snaps (F5), RI and
+    # Backup-Retention advisories — renders but is excluded (RDS count fix).
+    total_recs = sum(
+        1 for r in (list(coh_recs) + kept_co + kept_enhanced) if r.get("Counted") is not False
+    )
 
     return list(coh_recs), kept_co, kept_enhanced, total_savings, total_recs

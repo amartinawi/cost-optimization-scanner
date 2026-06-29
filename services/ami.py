@@ -20,17 +20,22 @@ OLD_SNAPSHOT_DAYS: int = 90
 UNUSED_MIN_DAYS: int = 30
 
 
-def _snapshot_storage_gb(ec2: Any, ami: dict[str, Any]) -> tuple[float, list[str]]:
+def _snapshot_storage_gb(ec2: Any, ami: dict[str, Any]) -> tuple[float, list[str], bool]:
     """Sum the backing EBS-snapshot storage (GB) for an AMI.
 
     Prefers actual stored bytes (``FullSnapshotSizeInBytes``) over the
     provisioned ``VolumeSize`` — snapshots bill on stored blocks, which are
     typically ~half the volume size, so VolumeSize overstates ~2x. Returns
-    ``(total_gb, snapshot_ids)``; instance-store AMIs (no EBS snapshots)
-    return ``(0.0, [])``.
+    ``(total_gb, snapshot_ids, estimated)`` where ``estimated`` is True when at
+    least one snapshot's size could not be read from snapshot metadata (the
+    ``describe_snapshots`` call failed) and was inferred from the AMI's
+    block-device mapping ``VolumeSize`` instead; the caller discloses this in the
+    rec so the dollar is never presented as fully measured. Instance-store AMIs
+    (no EBS snapshots) return ``(0.0, [], False)``.
     """
     total_gb = 0.0
     snapshot_ids: list[str] = []
+    estimated = False
     for block_device in ami.get("BlockDeviceMappings", []):
         ebs = block_device.get("Ebs") or {}
         snapshot_id = ebs.get("SnapshotId")
@@ -47,8 +52,16 @@ def _snapshot_storage_gb(ec2: Any, ami: dict[str, Any]) -> tuple[float, list[str
                     total_gb += snapshot.get("VolumeSize", 0)
         except Exception as e:
             logger.warning(f"⚠️ Error getting snapshot details for {snapshot_id}: {str(e)}")
-            total_gb += ebs.get("VolumeSize", 8)
-    return total_gb, snapshot_ids
+            # describe failed — fall back to the AMI block-device mapping's
+            # provisioned VolumeSize (an upper bound) and flag the estimate. Never
+            # fabricate a size: if the mapping carries no VolumeSize either,
+            # contribute 0 GB and let the AMI be skipped rather than emit a guessed
+            # dollar (no fabricated dollars; fail safe on missing data).
+            bdm_gb = ebs.get("VolumeSize") or 0
+            if bdm_gb:
+                total_gb += bdm_gb
+                estimated = True
+    return total_gb, snapshot_ids, estimated
 
 
 def compute_ami_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> dict[str, Any]:
@@ -215,7 +228,7 @@ def compute_ami_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> dic
             if ami_id in running_amis or age_days <= UNUSED_MIN_DAYS:
                 continue
 
-            total_snapshot_size_gb, snapshot_ids = _snapshot_storage_gb(ec2, ami)
+            total_snapshot_size_gb, snapshot_ids, size_estimated = _snapshot_storage_gb(ec2, ami)
             if total_snapshot_size_gb == 0:
                 # Instance-store / no resolvable EBS-snapshot storage — there is
                 # no storage cost to recover. Skip rather than emit $0 noise.
@@ -252,6 +265,7 @@ def compute_ami_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> dic
                 "CreationDate": ami["CreationDate"],
                 "SnapshotSizeGB": total_snapshot_size_gb,
                 "SnapshotIds": snapshot_ids,
+                "SizeEstimated": size_estimated,
                 "Recommendation": (
                     f"Unused AMI ({age_days} days old, not referenced by any"
                     " running/stopped instance, launch template, ASG, EC2 Fleet,"
@@ -272,6 +286,14 @@ def compute_ami_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> dic
                     " (AmazonEC2 EBS:SnapshotUsage, region-scaled) ="
                     f" ${monthly_snapshot_cost:.2f}/mo. Upper bound — snapshots"
                     " bill on changed blocks only."
+                    + (
+                        " Snapshot metadata was unavailable for one or more"
+                        " snapshots; that portion of the size was inferred from"
+                        " the AMI's provisioned block-device mapping (a further"
+                        " overstatement of the billed stored bytes)."
+                        if size_estimated
+                        else ""
+                    )
                 ),
                 "CheckCategory": "Old Unused AMIs" if is_old else "Unused AMIs",
             }
