@@ -760,6 +760,8 @@ def test_aurora_cluster_snapshot_uses_aurora_rate():
     rec = next(r for r in _recs(ctx) if r["CheckCategory"] == "Old Aurora Cluster Snapshots")
     # 3460 GB x $0.021 (Aurora) = $72.66, NOT x $0.095 ($328.70).
     assert "$72.66/month" in rec["EstimatedSavings"]
+    # counted == rendered at the field level: numeric matches the string.
+    assert rec["EstimatedMonthlySavings"] == pytest.approx(72.66)
     assert rec["AuditBasis"]["rate"] == pytest.approx(0.021)
     assert rec["AuditBasis"]["engine"] == "aurora-mysql"
 
@@ -776,6 +778,7 @@ def test_standard_db_snapshot_uses_standard_rate():
     rec = next(r for r in _recs(ctx) if r["CheckCategory"] == "Old RDS Snapshots")
     # 100 GB x $0.095 = $9.50.
     assert "$9.50/month" in rec["EstimatedSavings"]
+    assert rec["EstimatedMonthlySavings"] == pytest.approx(9.50)
     assert rec["AuditBasis"]["rate"] == pytest.approx(0.095)
 
 

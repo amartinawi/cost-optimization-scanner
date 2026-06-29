@@ -170,6 +170,27 @@ def test_qualified_coh_arn_dedupes_against_co(monkeypatch: pytest.MonkeyPatch) -
 
 
 # --------------------------------------------------------------------------- #
+# counted == rendered — CoH recs get a PascalCase EstimatedSavings string so the
+# reporter renders the dollar instead of the "Cost optimization" placeholder.
+# --------------------------------------------------------------------------- #
+def test_coh_rec_normalized_for_rendering(monkeypatch: pytest.MonkeyPatch) -> None:
+    cost_hub = [{"resourceArn": "arn:aws:lambda:eu-west-1:1:function:fwd", "estimatedMonthlySavings": 7.513}]
+    monkeypatch.setattr(adapter_mod, "get_lambda_compute_optimizer_recommendations", lambda c: [])
+    monkeypatch.setattr(adapter_mod, "get_enhanced_lambda_checks", lambda c: {"recommendations": []})
+
+    ctx = _recording_ctx(cost_hub_splits={"lambda": [dict(r) for r in cost_hub]})
+    findings = LambdaModule().scan(ctx)
+
+    rec = findings.sources["cost_optimization_hub"].recommendations[0]
+    # The card renders this string instead of the "Cost optimization" placeholder.
+    assert rec["EstimatedSavings"] == "$7.51/month"
+    assert rec["EstimatedMonthlySavings"] == 7.51
+    assert rec["Counted"] is True
+    # The counted dollar is unchanged (summed from the camelCase source key).
+    assert findings.total_monthly_savings == 7.513
+
+
+# --------------------------------------------------------------------------- #
 # C1 — opt-in placeholder → warning, dropped from counts
 # --------------------------------------------------------------------------- #
 def test_co_opt_in_placeholder_becomes_warning(monkeypatch: pytest.MonkeyPatch) -> None:

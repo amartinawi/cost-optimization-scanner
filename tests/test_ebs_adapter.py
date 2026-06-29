@@ -526,3 +526,44 @@ class TestSnapshotCrossTabDedup:
         assert "snap-ami-existing" not in old_ids and "snap-ami-existing" not in orphan_ids  # ceded to AMI tab
         assert orphan_ids == {"snap-ami-orphan"}
         assert old_ids == {"snap-standalone"}
+
+
+class TestSnapshotAdvisoryAndSizing:
+    """EBS snapshot recs are $0 Counted=False advisories sized on actual bytes."""
+
+    def _ctx(self, ec2):
+        return SimpleNamespace(
+            region="us-east-1", pricing_engine=None, pricing_multiplier=1.0, fast_mode=True,
+            old_snapshot_days=90,
+            client=lambda name, region=None: ec2 if name == "ec2" else None,
+            warn=lambda message, service="": None,
+        )
+
+    def test_snapshot_is_zero_dollar_advisory_with_potential(self):
+        from services.ebs import compute_ebs_checks
+
+        # No FullSnapshotSizeInBytes → VolumeSize=100 upper bound × $0.05 = $5.00.
+        ec2 = _FakeEc2Snapshots([], [_old_snap("snap-standalone", "nightly backup")])
+        result = compute_ebs_checks(self._ctx(ec2), 1.0, 90)
+        rec = result["old_snapshots"][0]
+        # Advisory: never summed into the headline.
+        assert rec["Counted"] is False
+        assert rec["EstimatedMonthlySavings"] == 0.0
+        # Recoverable potential disclosed, string leads with $0.00 advisory.
+        assert rec["PotentialMonthlySavings"] == 5.00
+        assert rec["EstimatedSavings"].startswith("$0.00")
+        assert "5.00" in rec["EstimatedSavings"]
+
+    def test_full_snapshot_size_preferred_over_volume_size(self):
+        from services.ebs import compute_ebs_checks
+
+        # Actual stored bytes = 20 GB; VolumeSize provisioned = 100 GB. The
+        # potential must use the ACTUAL bytes (20 × $0.05 = $1.00), not the
+        # 100 GB upper bound ($5.00) — the AMI FullSnapshotSizeInBytes fix ported.
+        snap = _old_snap("snap-incremental", "nightly backup")
+        snap["FullSnapshotSizeInBytes"] = 20 * 1024**3
+        ec2 = _FakeEc2Snapshots([], [snap])
+        result = compute_ebs_checks(self._ctx(ec2), 1.0, 90)
+        rec = result["old_snapshots"][0]
+        assert rec["PotentialMonthlySavings"] == 1.00  # 20 GB, not the 100 GB upper bound
+        assert rec["Counted"] is False

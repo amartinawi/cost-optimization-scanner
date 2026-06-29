@@ -48,6 +48,44 @@ class TestSummary:
         assert summary["total_recommendations"] == 8
         assert abs(summary["total_monthly_savings"] - 150.0) < 0.01
 
+    def test_total_recommendations_excludes_advisories(self) -> None:
+        """The headline counts only Counted!=False recs; $0 advisories don't inflate it."""
+        findings: dict[str, ServiceFindings] = {
+            "svc": ServiceFindings(
+                service_name="Svc",
+                total_recommendations=4,  # adapter's advisory-inclusive value (ignored)
+                total_monthly_savings=120.0,
+                sources={
+                    "enhanced_checks": SourceBlock(
+                        count=4,
+                        recommendations=(
+                            {"Counted": True, "EstimatedMonthlySavings": 100.0},
+                            {"EstimatedMonthlySavings": 20.0},  # Counted absent → counted
+                            {"Counted": False, "EstimatedMonthlySavings": 0.0},  # advisory
+                            {"Counted": False, "EstimatedMonthlySavings": 0.0},  # advisory
+                        ),
+                    )
+                },
+            ),
+        }
+        summary = ScanResultBuilder._summary(findings)
+        # 2 counted (True + absent), 2 advisories excluded.
+        assert summary["total_recommendations"] == 2
+        # The per-service serialized value is overridden to the counted-only count.
+        assert ScanResultBuilder._serialize(findings["svc"])["total_recommendations"] == 2
+        # A service that produced only advisories is still counted as scanned.
+        assert summary["total_services_scanned"] == 1
+
+    def test_count_placeholder_source_trusted_when_no_recs(self) -> None:
+        """A source with count>0 but empty recommendations trusts the declared count."""
+        f = ServiceFindings(
+            service_name="Svc",
+            total_recommendations=5,
+            total_monthly_savings=0.0,
+            sources={"placeholder": SourceBlock(count=5, recommendations=())},
+        )
+        assert ScanResultBuilder._counted_recommendations(f) == 5
+
 
 class TestSerialize:
     """Tests for ScanResultBuilder._serialize field filtering."""

@@ -236,6 +236,11 @@ def test_opensearch_idle_domain_uncorroborated_is_advisory(monkeypatch: pytest.M
     assert findings.total_monthly_savings == pytest.approx(0.0, abs=0.01)
     idle = next(r for r in findings.sources["enhanced_checks"].recommendations if r["CheckCategory"] == "Idle Domain")
     assert idle.get("Counted") is False  # rendered as advisory, not a counted delete
+    # counted == rendered at the field level: the numeric must match the $0 string,
+    # with the would-be saving preserved as PotentialMonthlySavings (mirrors elasticache).
+    assert idle.get("EstimatedMonthlySavings") == 0.0
+    assert idle.get("EstimatedSavings", "").startswith("$0.00")
+    assert idle.get("PotentialMonthlySavings", 0) > 0  # the demoted full-cost figure is retained
 
 
 # --------------------------------------------------------------------------- #
