@@ -13,6 +13,16 @@ a storage-class saving must be proven by request metrics before it is counted.
 
 ## PROMPT (copy from here)
 
+> **⚠ Latest live-audit findings (2026-06-30) — read these FIRST, then this prompt.**
+> Before auditing, also read and paste `docs/audits/prompts/_LIVE_AUDIT_LESSONS.md`
+> — the recurring cost-fidelity bug *classes* confirmed in live deep audits (with
+> real examples, ready-to-run JSON invariant sweeps, and the audit-method traps that
+> cause FALSE findings). Run those sweeps before manual tracing.
+>
+> Service-specific live-audit findings for `s3`:
+> - `_is_static_website_bucket` must forward `ctx` from BOTH call sites (the `get_enhanced_s3_checks` closure was missed on the first pass) to classify an AccessDenied on `GetBucketWebsite`; keep the `NoSuchWebsiteConfiguration` 'not a website' answer silent.
+> - S3 is evidence-gated (not advisory-only by design): accounts where no bucket proves cold produce all-advisory cards (138 `$0` observed in one account) — verify the tab still renders, since the tab gate keys off RENDERED cards (counted + advisory), not the counted-only headline count.
+
 You are auditing the **`s3`** adapter of this AWS cost-optimization scanner.
 Scope is strictly cost: every emitted recommendation must produce a concrete,
 account-specific dollar saving. Work read-only first (understand + validate),

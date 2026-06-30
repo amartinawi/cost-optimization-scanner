@@ -15,6 +15,17 @@ mostly a regression check that the established invariants still hold.
 
 ## PROMPT (copy from here)
 
+> **⚠ Latest live-audit findings (2026-06-30) — read these FIRST, then this prompt.**
+> Before auditing, also read and paste `docs/audits/prompts/_LIVE_AUDIT_LESSONS.md`
+> — the recurring cost-fidelity bug *classes* confirmed in live deep audits (with
+> real examples, ready-to-run JSON invariant sweeps, and the audit-method traps that
+> cause FALSE findings). Run those sweeps before manual tracing.
+>
+> Service-specific live-audit findings for `rds`:
+> - `reconcile_snapshot_savings` must cap the `EstimatedMonthlySavings` NUMERIC in lockstep with the capped `EstimatedSavings` string — a string-only cap left the numeric at the uncapped upper bound (+$719.60 stale field).
+> - The no-Cost-Explorer-actual demote branch must set `Counted=False` AND `EstimatedMonthlySavings=0.0` (upper bound → `PotentialMonthlySavings`) — a demoted advisory with a non-zero numeric is an advisory-leak.
+> - `rds` consumes both Cost Hub (`RdsDbInstance`+`RdsDbCluster` currentResourceTypes → `cost_hub_splits["rds"]`) and Compute Optimizer — check the scan log for a CoH "dropped type" warning (E2), and verify that the `normalize_rds_arn`-keyed authority chain (CoH > CO > heuristic) never counts the same DB id under two sources (A).
+
 You are auditing the **`rds`** adapter of this AWS cost-optimization scanner.
 Scope is strictly cost: every emitted recommendation must produce a concrete,
 account-specific dollar saving. Work read-only first (understand + validate),

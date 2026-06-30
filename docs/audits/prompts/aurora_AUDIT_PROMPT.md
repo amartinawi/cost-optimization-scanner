@@ -11,6 +11,16 @@ recommendation must produce a concrete, account-specific dollar saving.
 
 ## PROMPT (copy from here)
 
+> **⚠ Latest live-audit findings (2026-06-30) — read these FIRST, then this prompt.**
+> Before auditing, also read and paste `docs/audits/prompts/_LIVE_AUDIT_LESSONS.md`
+> — the recurring cost-fidelity bug *classes* confirmed in live deep audits (with
+> real examples, ready-to-run JSON invariant sweeps, and the audit-method traps that
+> cause FALSE findings). Run those sweeps before manual tracing.
+>
+> Service-specific live-audit findings for `aurora`:
+> - None beyond the cross-cutting lessons — run the invariant sweeps in `_LIVE_AUDIT_LESSONS.md` and the known-issue catalogue below (advisory-leak, string↔numeric agreement, flat-global rate scaling, dedup granularity, silent-failure classification).
+> - Class E (aurora-specific): `_get_cloudwatch_avg`, `_get_cloudwatch_sum`, and `_get_cloudwatch_avg_max` all use bare `except: pass` — a CloudWatch `AccessDenied` or throttle is silently treated as no datapoints, zeroing io-tier savings and serverless-v2 advisories without surfacing a permission error; unlike the enumeration helpers (`_describe_aurora_clusters`, `_describe_aurora_instances`) which correctly route failures through `record_aws_error`.
+
 You are auditing the **`aurora`** adapter of this AWS cost-optimization scanner.
 Scope is strictly cost: every emitted recommendation must produce a concrete,
 account-specific dollar saving. Work read-only first (understand + validate),

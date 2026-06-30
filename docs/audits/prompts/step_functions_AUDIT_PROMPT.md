@@ -11,6 +11,16 @@ recommendation must produce a concrete, account-specific dollar saving.
 
 ## PROMPT (copy from here)
 
+> **⚠ Latest live-audit findings (2026-06-30) — read these FIRST, then this prompt.**
+> Before auditing, also read and paste `docs/audits/prompts/_LIVE_AUDIT_LESSONS.md`
+> — the recurring cost-fidelity bug *classes* confirmed in live deep audits (with
+> real examples, ready-to-run JSON invariant sweeps, and the audit-method traps that
+> cause FALSE findings). Run those sweeps before manual tracing.
+>
+> Service-specific live-audit findings for `step_functions`:
+> - Classify the per-state-machine CloudWatch `ExecutionsStarted` read failure via `record_aws_error` (it was a bare `except: pass`) so an AccessDenied/throttle surfaces instead of silently skipping that machine's Express evaluation.
+> - All recs are advisory-only (`Counted=False`, `EstimatedMonthlySavings=0.0`); verify no shim branch pre-populates a non-zero numeric savings that survives the adapter's override loop, and confirm the $0 tab still renders correctly now that `_FLAT_SAVINGS_SERVICES` (SR-2) has been removed.
+
 You are auditing the **`step_functions`** adapter of this AWS cost-optimization
 scanner. Scope is strictly cost: every emitted recommendation must produce a
 concrete, account-specific dollar saving. Work read-only first (understand +

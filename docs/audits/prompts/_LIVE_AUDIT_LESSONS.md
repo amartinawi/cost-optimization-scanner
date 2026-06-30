@@ -55,13 +55,21 @@ will eventually both count it. This is the single most common real finding.
 
 ## B. Advisory hygiene & string ↔ numeric agreement
 
-- **B1 — Advisory-leak: `Counted=False` with a non-zero numeric.** A demoted/
-  advisory rec MUST carry `EstimatedMonthlySavings == 0.0`; the recoverable figure
-  goes in `PotentialMonthlySavings`. RDS snapshot reconciliation and the first NAT
-  demotion both left `Counted=False` recs with a non-zero `EstimatedMonthlySavings`
-  — invisible to the headline (which filters on `Counted`) but a trap for any
-  consumer that sums the numeric. **Detect:** sweep all recs for
-  `Counted is False and EstimatedMonthlySavings != 0`.
+- **B1 — Advisory-leak: a DEMOTED-resource `Counted=False` rec with a non-zero
+  numeric.** A rec demoted from counted to advisory MUST carry its numeric at
+  `0.0`; the recoverable figure goes in `PotentialMonthlySavings`. RDS snapshot
+  reconciliation and the first NAT demotion both left `Counted=False` recs with a
+  non-zero `EstimatedMonthlySavings` — invisible to the headline (which filters on
+  `Counted`) but a trap for any consumer that sums the numeric. **Two subtleties:**
+  (i) the numeric field name varies — `EstimatedMonthlySavings`,
+  `estimatedMonthlySavings` (CoH camelCase), or snake_case `monthly_savings`
+  (network_cost, commitment_analysis, sagemaker); a sweep that checks only one key
+  silently passes a leak in the others. (ii) a **PROJECTION / what-if advisory is
+  a legitimate exception** — an SP/RI purchase or coverage-gap rec in
+  `commitment_analysis` carries a non-zero `monthly_savings` ("you'd save $X *if
+  you buy*"), which is a projection, not a counted-resource saving the headline
+  dropped by accident; exclude those projection sources before asserting. **Detect:**
+  the sweep in the appendix (all numeric fields, projection sources excluded).
 - **B2 — The `EstimatedSavings` STRING and `EstimatedMonthlySavings` NUMERIC must
   agree to the cent in EVERY branch.** A reconciliation capped the string
   (`$4.84/month`) but left the numeric uncapped (`13.30`) — a +$719.60 field
@@ -184,21 +192,33 @@ import json, re
 d = json.load(open(SCAN_JSON)); svcs = d["services"]
 def parse(s):
     m = re.search(r"\$([0-9,]+\.?[0-9]*)", str(s)); return float(m.group(1).replace(",", "")) if m else 0.0
-def rec_dollar(r):  # every savings-bearing field (F1/F2)
+def rec_dollar(r):  # every savings-bearing field (F1/F2) — adapters are inconsistent
     return (float(r.get("EstimatedMonthlySavings") or 0)
-            or float(r.get("estimatedMonthlySavings") or 0)
-            or float(r.get("EstimatedMonthlyCost") or 0)
+            or float(r.get("estimatedMonthlySavings") or 0)   # CoH camelCase (F1)
+            or float(r.get("EstimatedMonthlyCost") or 0)      # unattached EBS (F2)
+            or float(r.get("monthly_savings") or 0)           # snake_case adapters (network_cost, commitment, sagemaker, …)
             or parse(r.get("EstimatedSavings", "")))
 
 # 1. Headline reconciles to the cent.
 tot = sum(v.get("total_monthly_savings", 0) for v in svcs.values())
 assert abs(tot - d["summary"]["total_monthly_savings"]) < 0.5, (tot, d["summary"])
 
-# 2. Advisory-leak: Counted=False MUST carry a 0 numeric (B1).
-leaks = [(k, r.get("EstimatedMonthlySavings")) for k, v in svcs.items()
-         for s in v.get("sources", {}).values() for r in s.get("recommendations", [])
-         if isinstance(r, dict) and r.get("Counted") is False
-         and abs(float(r.get("EstimatedMonthlySavings", 0) or 0)) > 1e-4]
+# 2. Advisory-leak: a DEMOTED-RESOURCE advisory (Counted=False) must carry a 0 numeric (B1).
+#    Two subtleties:
+#    (a) the numeric field name varies — EstimatedMonthlySavings, estimatedMonthlySavings (CoH),
+#        or snake_case monthly_savings (network_cost, commitment_analysis, …); check ALL.
+#    (b) EXCEPTION — a PROJECTION/what-if advisory legitimately carries a non-zero numeric: an
+#        SP/RI purchase or coverage-gap rec in commitment_analysis projects "you'd save $X IF you
+#        buy", it is NOT a counted resource saving the headline excludes by accident. Exclude those
+#        projection sources; everything else with a non-zero numeric is a real leak.
+def _num(r):
+    return (float(r.get("EstimatedMonthlySavings") or 0)
+            or float(r.get("estimatedMonthlySavings") or 0)
+            or float(r.get("monthly_savings") or 0))
+PROJECTION_SERVICES = {"commitment_analysis"}  # what-if buy/coverage projections, not resource savings
+leaks = [(k, sn, _num(r)) for k, v in svcs.items() if k not in PROJECTION_SERVICES
+         for sn, s in v.get("sources", {}).items() for r in s.get("recommendations", [])
+         if isinstance(r, dict) and r.get("Counted") is False and abs(_num(r)) > 1e-4]
 assert leaks == [], leaks
 
 # 3. Counted-but-$0 inflation — counts ALL savings fields so CoH/unattached are not false-flagged (F1/F2).

@@ -12,6 +12,16 @@ recommendation must produce a concrete, account-specific dollar saving.
 
 ## PROMPT (copy from here)
 
+> **⚠ Latest live-audit findings (2026-06-30) — read these FIRST, then this prompt.**
+> Before auditing, also read and paste `docs/audits/prompts/_LIVE_AUDIT_LESSONS.md`
+> — the recurring cost-fidelity bug *classes* confirmed in live deep audits (with
+> real examples, ready-to-run JSON invariant sweeps, and the audit-method traps that
+> cause FALSE findings). Run those sweeps before manual tracing.
+>
+> Service-specific live-audit findings for `transfer`:
+> - None beyond the cross-cutting lessons — run the invariant sweeps in `_LIVE_AUDIT_LESSONS.md` and the known-issue catalogue below (advisory-leak, string↔numeric agreement, flat-global rate scaling, dedup granularity, silent-failure classification).
+> - E1 — `transfer_svc.py` line 124 catches all `list_servers` failures with `ctx.warn()` not `record_aws_error`, so `AccessDenied` silently zeroes all transfer findings without a `permission_issue` entry; line 98 swallows `get_metric_statistics` errors with no classification either.
+
 You are auditing the **`transfer`** adapter of this AWS cost-optimization scanner
 (AWS Transfer Family — SFTP / FTPS / FTP / AS2 file-transfer servers). Scope is
 strictly cost: every emitted recommendation must produce a concrete,

@@ -11,6 +11,18 @@ recommendation must produce a concrete, account-specific dollar saving.
 
 ## PROMPT (copy from here)
 
+> **⚠ Latest live-audit findings (2026-06-30) — read these FIRST, then this prompt.**
+> Before auditing, also read and paste `docs/audits/prompts/_LIVE_AUDIT_LESSONS.md`
+> — the recurring cost-fidelity bug *classes* confirmed in live deep audits (with
+> real examples, ready-to-run JSON invariant sweeps, and the audit-method traps that
+> cause FALSE findings). Run those sweeps before manual tracing.
+>
+> Service-specific live-audit findings for `ami`:
+> - Cross-AMI shared-snapshot DOUBLE-COUNT (cardinal sin, fixed): a backing snapshot referenced by >1 unused AMI was counted under each. A snapshot is billed once and freed only when EVERY referencing AMI is deregistered — count it once via a `counted_snapshot_ids` set; the co-dependent AMI becomes a `Counted=False` advisory ('shared — counted under the other AMI').
+> - Dedup CLAIM-ORDER: claim a snapshot into the set only AFTER the AMI passes all skip checks (running/age/launchPermission) AND only once it sizes to >0 GB — else an unsizable snapshot steals the claim from a later AMI that can size it. Distinguish 'all-shared' (→ $0 advisory) from 'unsizable/no-data' (→ skip).
+> - Size on `FullSnapshotSizeInBytes` (actual stored bytes), VolumeSize fallback flagged; if unsizable, SKIP — never fabricate a size.
+> - `_snapshot_storage_gb` routes `describe_snapshots` failures through `logger.warning` (not `record_aws_error`), so an `AccessDenied` on that call is unclassified and silently falls back to the block-device-mapping `VolumeSize` overstatement — a permission gap that inflates the saving rather than surfacing the issue (E1).
+
 You are auditing the **`ami`** adapter of this AWS cost-optimization scanner.
 Scope is strictly cost: every emitted recommendation must produce a concrete,
 account-specific dollar saving. Work read-only first (understand + validate),

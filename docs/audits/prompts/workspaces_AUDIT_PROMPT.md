@@ -11,6 +11,16 @@ recommendation must produce a concrete, account-specific dollar saving.
 
 ## PROMPT (copy from here)
 
+> **⚠ Latest live-audit findings (2026-06-30) — read these FIRST, then this prompt.**
+> Before auditing, also read and paste `docs/audits/prompts/_LIVE_AUDIT_LESSONS.md`
+> — the recurring cost-fidelity bug *classes* confirmed in live deep audits (with
+> real examples, ready-to-run JSON invariant sweeps, and the audit-method traps that
+> cause FALSE findings). Run those sweeps before manual tracing.
+>
+> Service-specific live-audit findings for `workspaces`:
+> - **PROMPT-BODY DRIFT (correct before trusting it):** the adapter has changed since this prompt was generated — it now declares `requires_cloudwatch=True`, `reads_fast_mode=True`, and `required_clients()` returns `("workspaces", "cloudwatch")`, and the shim reads CloudWatch for the billing-mode lever (classify CW failures via `record_aws_error`, gate reads on `ctx.fast_mode`). Treat the body's "no usage telemetry / no cloudwatch / no requires_cloudwatch" statements as STALE.
+> - Otherwise run the invariant sweeps in `_LIVE_AUDIT_LESSONS.md` and the known-issue catalogue below (advisory-leak, string↔numeric agreement, flat-global rate scaling, silent-failure classification).
+
 You are auditing the **`workspaces`** adapter of this AWS cost-optimization
 scanner. Scope is strictly cost: every emitted recommendation must produce a
 concrete, account-specific dollar saving. Work read-only first (understand +

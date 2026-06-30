@@ -30,6 +30,17 @@ recommendation must produce a concrete, account-specific dollar saving.
 
 ## PROMPT (copy from here)
 
+> **⚠ Latest live-audit findings (2026-06-30) — read these FIRST, then this prompt.**
+> Before auditing, also read and paste `docs/audits/prompts/_LIVE_AUDIT_LESSONS.md`
+> — the recurring cost-fidelity bug *classes* confirmed in live deep audits (with
+> real examples, ready-to-run JSON invariant sweeps, and the audit-method traps that
+> cause FALSE findings). Run those sweeps before manual tracing.
+>
+> Service-specific live-audit findings for `network`:
+> - NAT Cost-Optimization-Hub consumption (fixed): wire `NatGateway` → `network` bucket and de-duplicate by NAT-id EXCLUSION (exclude CoH-owned NATs from the local topology math), NOT VPC-level demotion — demotion suppressed INDEPENDENT NATs' savings in the same VPC and left a stale numeric (advisory-leak).
+> - A $0 CoH NAT rec must NOT exclude its NAT (would zero a real local consolidation for no gain) — only `estimatedMonthlySavings > 0` CoH recs exclude.
+> - EIP / public-IPv4 is a FLAT $3.65/mo in every region — the `pricing_engine=None` fallback must NOT multiply by `pricing_multiplier`; counted EIP recs must carry a numeric `EstimatedMonthlySavings` matching the string.
+
 You are auditing the **`network`** adapter of this AWS cost-optimization scanner.
 Scope is strictly cost: every emitted recommendation must produce a concrete,
 account-specific dollar saving. Work read-only first (understand + validate),
