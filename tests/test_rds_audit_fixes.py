@@ -1010,6 +1010,46 @@ def test_reconcile_noop_when_actual_above_upper():
     assert not any(s.get("Reconciled") for s in out)
 
 
+def test_reconcile_caps_numeric_field_in_lockstep_with_string():
+    """The capped numeric EstimatedMonthlySavings must match the capped string.
+
+    The cap previously rewrote only the EstimatedSavings string, leaving the
+    numeric at the uncapped upper bound — so a numeric-summing consumer overstated
+    the saving (confirmed +$719.60 in the live field). Keep them in lockstep.
+    """
+    from services.rds_logic import enhanced_savings, reconcile_snapshot_savings
+
+    snaps = [
+        _snap("aurora-mysql", "$100.00/month (upper bound)"),
+        _snap("aurora-mysql", "$100.00/month (upper bound)"),
+    ]
+    # upper = 200, cap = 50 -> factor 0.25 -> each rec capped to 25.00
+    out = reconcile_snapshot_savings(snaps, {"aurora": 50.0, "standard": 0.0})
+    for s in out:
+        assert enhanced_savings(s) == pytest.approx(25.0)  # string
+        assert s["EstimatedMonthlySavings"] == pytest.approx(25.0)  # numeric agrees
+    assert sum(s["EstimatedMonthlySavings"] for s in out) == pytest.approx(50.0)
+
+
+def test_reconcile_advisory_demote_zeroes_numeric():
+    """No CE actual -> $0 advisory: numeric must be 0 (no advisory-leak).
+
+    The upper bound moves to PotentialMonthlySavings; a Counted=False rec that
+    retained a non-zero EstimatedMonthlySavings would let a numeric-summing
+    consumer count a demoted advisory.
+    """
+    from services.rds_logic import reconcile_snapshot_savings
+
+    # backup_actuals present but only for the standard pool -> aurora pool has no
+    # actual -> the aurora snap takes the F5 advisory-demote branch.
+    snaps = [_snap("aurora-mysql", "$80.00/month (upper bound)")]
+    out = reconcile_snapshot_savings(snaps, {"standard": 50.0})
+    rec = out[0]
+    assert rec["Counted"] is False
+    assert rec["EstimatedMonthlySavings"] == 0.0
+    assert rec["PotentialMonthlySavings"] == pytest.approx(80.0)
+
+
 def test_reconcile_noop_when_missing_or_zero():
     from services.rds_logic import enhanced_savings, reconcile_snapshot_savings
 

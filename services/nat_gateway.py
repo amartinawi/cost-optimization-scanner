@@ -19,14 +19,29 @@ logger = logging.getLogger(__name__)
 _DEV_TEST_ENVS = frozenset({"dev", "test", "development", "staging"})
 
 
-def get_nat_gateway_checks(ctx: ScanContext) -> dict[str, Any]:
+def get_nat_gateway_checks(
+    ctx: ScanContext,
+    exclude_nat_ids: set[str] | None = None,
+) -> dict[str, Any]:
     """Category 2: NAT Gateway & VPC Design optimization checks.
 
     Savings are attributed to each NAT at most once. Same-AZ duplicates are pure
     waste (no HA trade-off) and counted fully; cross-AZ consolidation only counts
     the *incremental* NATs beyond one-per-AZ (sacrificing HA), so a VPC's NATs are
     never double-counted across the same-AZ and per-VPC findings (audit H3).
+
+    Args:
+        ctx: ScanContext with EC2 client and NAT pricing.
+        exclude_nat_ids: NAT ids whose savings are owned elsewhere (an AWS Cost
+            Optimization Hub idle-NAT finding the network adapter counts). They are
+            removed from the consolidation / per-NAT math so the same NAT is never
+            counted twice, while *remaining* NATs in the same VPC are still
+            consolidated normally — dedup at NAT-id granularity, so an independent
+            NAT's saving is never silently suppressed (CoH > heuristic). The
+            returned ``nat_vpc_map`` still includes excluded NATs so the caller can
+            attribute each CoH finding to its VPC.
     """
+    exclude = exclude_nat_ids or set()
     nat_monthly = (
         ctx.pricing_engine.get_nat_gateway_monthly_price()
         if ctx.pricing_engine is not None
@@ -39,6 +54,12 @@ def get_nat_gateway_checks(ctx: ScanContext) -> dict[str, Any]:
         "multiple_nat_gateways": [],
     }
 
+    # Hoisted so they are always bound, even if enumeration fails before the
+    # first-pass loop populates them. `nat_vpc_map` is the FULL topology (every
+    # available NAT, including excluded ones) for CoH VPC attribution; `available`
+    # is the consolidation set with CoH-owned NATs removed.
+    available: list[dict[str, Any]] = []
+    nat_vpc_map: dict[str, str] = {}
     try:
         ec2 = ctx.client("ec2")
 
@@ -48,12 +69,18 @@ def get_nat_gateway_checks(ctx: ScanContext) -> dict[str, Any]:
             nat_gateways.extend(page.get("NatGateways", []))
 
         # First pass: resolve each available NAT's VPC, AZ, and environment.
-        available: list[dict[str, Any]] = []
         for nat in nat_gateways:
             if nat.get("State") != "available":
                 continue
             nat_id = nat.get("NatGatewayId", "N/A")
             vpc_id = nat.get("VpcId", "")
+            # Record the VPC for every available NAT first (cheap, no API call) so
+            # the caller can attribute an excluded CoH finding to its VPC.
+            nat_vpc_map[nat_id] = vpc_id
+            if nat_id in exclude:
+                # CoH owns this NAT's savings — drop it from the consolidation and
+                # per-NAT math entirely (no subnet lookup needed).
+                continue
             subnet_id = nat.get("SubnetId", "")
             try:
                 subnet_response = ec2.describe_subnets(SubnetIds=[subnet_id])
@@ -169,4 +196,8 @@ def get_nat_gateway_checks(ctx: ScanContext) -> dict[str, Any]:
     for _category, items in checks.items():
         recommendations.extend(items)
 
-    return {"recommendations": recommendations, **checks}
+    # Expose the resolved NAT->VPC topology (every available NAT) so the network
+    # adapter can attribute each Cost Optimization Hub per-NAT idle finding to its
+    # VPC for display; the consolidation math above already excluded CoH-owned
+    # NATs, so no further de-duplication is needed.
+    return {"recommendations": recommendations, "nat_vpc_map": nat_vpc_map, **checks}

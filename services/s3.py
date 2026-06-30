@@ -19,6 +19,7 @@ from botocore.exceptions import (  # type: ignore[import-untyped]
 )
 
 from core.scan_context import ScanContext
+from services._aws_errors import record_aws_error
 
 logger = logging.getLogger(__name__)
 
@@ -637,7 +638,7 @@ def _calculate_s3_storage_cost(
         return round(size_gb * S3_STORAGE_COSTS["STANDARD"], 2)
 
 
-def _is_static_website_bucket(bucket_name: str, s3_client: Any) -> bool:
+def _is_static_website_bucket(bucket_name: str, s3_client: Any, ctx: ScanContext | None = None) -> bool:
     """Return True if ``bucket_name`` is configured for static-website hosting.
 
     Result is intended to be cached on ``bucket_info`` by the caller so it is
@@ -647,8 +648,17 @@ def _is_static_website_bucket(bucket_name: str, s3_client: Any) -> bool:
         s3_client.get_bucket_website(Bucket=bucket_name)
         return True
     except Exception as e:
+        # NoSuchWebsiteConfiguration is the normal "not a website" answer — not an
+        # error. Anything else (AccessDenied / throttle) was previously only
+        # debug-logged, so a permission gap silently classified the bucket as
+        # non-website; classify it so it surfaces in the report instead.
         if "NoSuchWebsiteConfiguration" not in str(e):
-            logger.debug("S3 GetBucketWebsite error on %s: %s", bucket_name, e)
+            if ctx is not None:
+                record_aws_error(
+                    ctx, e, service="s3", context=f"GetBucketWebsite on {bucket_name} failed"
+                )
+            else:
+                logger.debug("S3 GetBucketWebsite error on %s: %s", bucket_name, e)
         return False
 
 
@@ -908,7 +918,7 @@ def get_s3_bucket_analysis(
             # result on bucket_info; downstream code paths and the enhanced
             # checks no longer need to re-query (audit L2-S3-007).
             bucket_info["IsStaticWebsite"] = _is_static_website_bucket(
-                bucket_name, bucket_s3_client
+                bucket_name, bucket_s3_client, ctx
             )
 
             if fast_mode:
@@ -1198,7 +1208,10 @@ def get_enhanced_s3_checks(
 
     def _static(name: str, client: Any) -> bool:
         if name not in static_cache:
-            static_cache[name] = _is_static_website_bucket(name, client)
+            # Forward ctx so an AccessDenied/throttle on GetBucketWebsite is
+            # classified here too, not silently debug-logged (the enhanced-checks
+            # path was missed in the first pass of this fix).
+            static_cache[name] = _is_static_website_bucket(name, client, ctx)
         return static_cache[name]
 
     try:

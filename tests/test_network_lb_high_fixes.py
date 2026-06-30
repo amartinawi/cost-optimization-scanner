@@ -215,7 +215,9 @@ def test_shared_alb_opportunity_is_advisory_zero() -> None:
 def test_scan_does_not_double_count_standalone_albs(monkeypatch: pytest.MonkeyPatch) -> None:
     # Isolate the LB sub-shim; the other four contribute nothing.
     monkeypatch.setattr(network_mod, "get_elastic_ip_checks", lambda c: {"recommendations": []})
-    monkeypatch.setattr(network_mod, "get_nat_gateway_checks", lambda c: {"recommendations": []})
+    monkeypatch.setattr(
+        network_mod, "get_nat_gateway_checks", lambda c, **kw: {"recommendations": [], "nat_vpc_map": {}}
+    )
     monkeypatch.setattr(network_mod, "get_vpc_endpoints_checks", lambda c: {"recommendations": []})
     monkeypatch.setattr(network_mod, "get_auto_scaling_checks", lambda c: {"recommendations": []})
 

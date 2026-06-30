@@ -299,3 +299,55 @@ def test_scan_diagnostics_silent_when_clean(scan_results: dict) -> None:
     is byte-for-byte unchanged from before this disclosure was added."""
     clean = {**scan_results, "scan_warnings": [], "permission_issues": []}
     assert HTMLReportGenerator(clean)._render_scan_diagnostics() == ""
+
+
+def test_advisory_only_service_renders_a_tab(scan_results: dict, tmp_path: Path) -> None:
+    """A service with only $0 advisory recs (counted total = 0) must still render
+    a tab — restoring the regression that hid S3's 138 advisory cards. A service
+    that renders nothing at all must NOT get a tab.
+    """
+    import copy
+
+    enriched = copy.deepcopy(scan_results)
+    enriched["services"]["advtest"] = {
+        "service_name": "AdvOnly",
+        "total_recommendations": 0,  # counted-only headline is 0
+        "total_monthly_savings": 0.0,
+        "sources": {
+            "checks": {
+                "count": 2,
+                "recommendations": [
+                    {
+                        "Counted": False,
+                        "EstimatedMonthlySavings": 0.0,
+                        "EstimatedSavings": "$0.00/month — advisory: one",
+                        "Recommendation": "advisory one",
+                        "CheckCategory": "Advisory",
+                        "ResourceName": "res-a",
+                    },
+                    {
+                        "Counted": False,
+                        "EstimatedMonthlySavings": 0.0,
+                        "EstimatedSavings": "$0.00/month — advisory: two",
+                        "Recommendation": "advisory two",
+                        "CheckCategory": "Advisory",
+                        "ResourceName": "res-b",
+                    },
+                ],
+            }
+        },
+    }
+    enriched["services"]["emptytest"] = {
+        "service_name": "EmptyOnly",
+        "total_recommendations": 0,
+        "total_monthly_savings": 0.0,
+        "sources": {},
+    }
+    out_file = tmp_path / "advisory_tab_report.html"
+    HTMLReportGenerator(enriched).generate_html_report(str(out_file))
+    html = out_file.read_text()
+    # Advisory-only service -> tab + panel present.
+    assert 'id="panel-advtest"' in html
+    assert 'id="tab-advtest"' in html
+    # Truly empty service -> no tab (nothing renders).
+    assert 'id="panel-emptytest"' not in html

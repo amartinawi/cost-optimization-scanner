@@ -70,6 +70,15 @@ class AthenaModule(BaseServiceModule):
                     # 70-91% compression for columnar formats (Parquet/ORC).
                     rec_savings = monthly_tb * ATHENA_PRICE_PER_TB * ctx.pricing_multiplier * 0.75
                     rec["EstimatedMonthlySavings"] = round(rec_savings, 2)
+                    # Replace the generic "Up to 75%" placeholder with the measured
+                    # per-workgroup dollar so the string and the numeric agree. The
+                    # base-scan-cost figure is region-scaled too (× pricing_multiplier)
+                    # so it matches the savings basis in non-US regions.
+                    scanned_cost = monthly_tb * ATHENA_PRICE_PER_TB * ctx.pricing_multiplier
+                    rec["EstimatedSavings"] = (
+                        f"${round(rec_savings, 2):.2f}/month — partition/compress to "
+                        f"Parquet/ORC (~75% of ${scanned_cost:.2f}/mo scanned)"
+                    )
                     savings += rec_savings
                 else:
                     # CW returned no data; emit a $0 advisory (Counted=False) so
@@ -77,12 +86,20 @@ class AthenaModule(BaseServiceModule):
                     # savings" and is not summed/counted (live-audit H5).
                     rec["EstimatedMonthlySavings"] = 0.0
                     rec["Counted"] = False
+                    rec["EstimatedSavings"] = (
+                        "$0.00/month — advisory: up to 75% scan-cost reduction once "
+                        "CW ProcessedBytes is measured"
+                    )
                     rec["PricingWarning"] = "CW ProcessedBytes metric returned no data"
             else:
                 # fast_mode: skip CW lookup. Emit a $0 advisory so a full scan
                 # re-runs the metric query (live-audit H5).
                 rec["EstimatedMonthlySavings"] = 0.0
                 rec["Counted"] = False
+                rec["EstimatedSavings"] = (
+                    "$0.00/month — advisory: up to 75% scan-cost reduction "
+                    "(fast mode skipped CW; re-run without --fast)"
+                )
                 rec["PricingWarning"] = "fast mode skipped CW; re-run without --fast"
 
         sources = {"enhanced_checks": SourceBlock(count=len(recs), recommendations=tuple(recs))}

@@ -8,6 +8,7 @@ from typing import Any, Callable
 from core.contracts import ServiceFindings, SourceBlock
 from services._aws_errors import record_aws_error
 from services._base import BaseServiceModule
+from services._coh_dedup import coh_key, coh_savings, is_renderable_coh_rec
 from services._savings import mark_zero_savings_advisory, parse_dollar_savings
 from services.ec2 import get_auto_scaling_checks
 from services.elastic_ip import get_elastic_ip_checks
@@ -84,6 +85,75 @@ def _sum_savings(recs: list[dict[str, Any]]) -> float:
     return sum(parse_dollar_savings(rec.get("EstimatedSavings", "")) for rec in recs)
 
 
+def _coh_nat_recs(ctx: Any) -> list[dict[str, Any]]:
+    """Renderable Cost Optimization Hub NAT-gateway findings worth counting.
+
+    Only NatGateway recs with a POSITIVE ``estimatedMonthlySavings`` are returned:
+    a ``$0`` CoH rec carries no dollar, so it must NOT cause its NAT to be excluded
+    from the local topology math (which would silently zero that VPC's savings for
+    no gain). RI/SP purchase recs and ``N/A`` resources are filtered by
+    ``is_renderable_coh_rec``.
+    """
+    coh_raw = (getattr(ctx, "cost_hub_splits", {}) or {}).get("network", [])
+    return [
+        r
+        for r in coh_raw
+        if r.get("currentResourceType") == "NatGateway"
+        and is_renderable_coh_rec(r)
+        and coh_savings(r) > 0
+    ]
+
+
+def _collect_nat_with_topology(
+    ctx: Any,
+    exclude_nat_ids: set[str],
+) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    """Run the NAT shim once, excluding CoH-owned NATs, returning ``(recs, map)``.
+
+    ``exclude_nat_ids`` are the NATs a Cost Optimization Hub finding already counts,
+    so the shim drops them from its consolidation / per-NAT math — the remaining
+    NATs in the same VPC are still consolidated normally (NAT-id granularity, no
+    over-suppression of independent NATs). ``_safe_collect`` would discard the
+    topology map, so the shim is called directly with the same error-classification
+    contract.
+    """
+    try:
+        result = get_nat_gateway_checks(ctx, exclude_nat_ids=exclude_nat_ids)
+        return list(result.get("recommendations", [])), dict(result.get("nat_vpc_map", {}))
+    except Exception as e:
+        record_aws_error(ctx, e, service="network", context="nat_gateway sub-check failed")
+        return [], {}
+
+
+def _normalize_coh_nat(
+    coh_raw: list[dict[str, Any]],
+    nat_vpc_map: dict[str, str],
+) -> list[dict[str, Any]]:
+    """Convert raw CoH NAT findings into counted recs for the NAT source block.
+
+    Each finding's NAT was excluded from the local topology math, so counting the
+    AWS-computed dollar here can never double-count. The VPC is taken from the
+    full topology map for display only.
+    """
+    out: list[dict[str, Any]] = []
+    for r in coh_raw:
+        nat_id = coh_key(r)
+        amt = coh_savings(r)
+        out.append(
+            {
+                "NatGatewayId": nat_id or "N/A",
+                "VpcId": nat_vpc_map.get(nat_id, "N/A"),
+                "Recommendation": "AWS Cost Optimization Hub: idle/underused NAT gateway — review for removal",
+                "EstimatedSavings": f"${amt:.2f}/month (AWS Cost Optimization Hub)",
+                "EstimatedMonthlySavings": round(amt, 2),
+                "Counted": True,
+                "Source": "CostOptimizationHub",
+                "CheckCategory": "NAT Gateway (Cost Optimization Hub)",
+            }
+        )
+    return out
+
+
 class NetworkModule(BaseServiceModule):
     """ServiceModule adapter for EIP, NAT, VPC, ELB, and ASG. Composite savings strategy."""
 
@@ -113,7 +183,18 @@ class NetworkModule(BaseServiceModule):
         """
 
         eip_recs = _annotate_severity(_safe_collect("elastic_ip", get_elastic_ip_checks, ctx))
-        nat_recs = _annotate_severity(_safe_collect("nat_gateway", get_nat_gateway_checks, ctx))
+        # NAT: take AWS Cost Optimization Hub per-NAT idle findings first, EXCLUDE
+        # those NATs from the local topology math (NAT-id granularity), then render
+        # CoH counted + the local consolidation on the *remaining* NATs. Excluding
+        # rather than VPC-demoting means an independent NAT's saving in the same
+        # VPC is never suppressed, and a demoted rec can never leak a numeric
+        # (CoH > heuristic, no double-count).
+        coh_nat_raw = _coh_nat_recs(ctx)
+        coh_nat_ids = {coh_key(r) for r in coh_nat_raw}
+        local_nat_recs, nat_vpc_map = _collect_nat_with_topology(ctx, coh_nat_ids)
+        nat_recs = _annotate_severity(local_nat_recs) + _annotate_severity(
+            _normalize_coh_nat(coh_nat_raw, nat_vpc_map)
+        )
         vpc_recs = _annotate_severity(_safe_collect("vpc_endpoints", get_vpc_endpoints_checks, ctx))
         lb_recs = _annotate_severity(_safe_collect("load_balancer", get_load_balancer_checks, ctx))
         # ASG rightsizing is owned by the EC2 tab (Compute Optimizer + member dedup);

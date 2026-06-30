@@ -164,9 +164,16 @@ def reconcile_snapshot_savings(
             if cap is not None and cap > 0:
                 basis["actual_billed_backup_pool"] = round(cap, 2)
             if apply_cap:
+                capped_sv = round(sv * factor, 2)
                 new_rec["EstimatedSavings"] = (
-                    f"${sv * factor:.2f}/month (reconciled to actual billed backup via Cost Explorer)"
+                    f"${capped_sv:.2f}/month (reconciled to actual billed backup via Cost Explorer)"
                 )
+                # Cap the NUMERIC field too — the headline sums the EstimatedSavings
+                # string (capped) but the per-rec EstimatedMonthlySavings was left at
+                # the uncapped upper bound, so any consumer that sums the numeric
+                # overstated the saving (confirmed +$719.60 in the field). Keep the
+                # numeric and the string in lockstep (cardinal-sin: no overstated $).
+                new_rec["EstimatedMonthlySavings"] = capped_sv
                 basis["reconciled_to_actual_billed"] = round(cap, 2)  # type: ignore[arg-type]
                 basis["reconciliation_factor"] = round(factor, 4)
                 basis["upper_bound_before_reconciliation"] = round(sv, 2)
@@ -183,6 +190,13 @@ def reconcile_snapshot_savings(
                     "no Cost Explorer actual available — upper bound retained as advisory (not counted)"
                 )
                 new_rec["Counted"] = False
+                # A Counted=False advisory must carry a 0 numeric — leaving the
+                # uncapped upper bound here would let any numeric-summing consumer
+                # count a demoted advisory (advisory-leak). Surface the upper bound
+                # via PotentialMonthlySavings instead, mirroring the EBS-snapshot
+                # advisory convention.
+                new_rec["EstimatedMonthlySavings"] = 0.0
+                new_rec["PotentialMonthlySavings"] = round(sv, 2)
                 new_rec["EstimatedSavings"] = (
                     f"up to ${sv:.2f}/month — advisory (provisioned-size upper bound; "
                     "grant ce:GetCostAndUsage backup actuals to quantify)"

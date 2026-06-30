@@ -76,6 +76,42 @@ class TestSummary:
         # A service that produced only advisories is still counted as scanned.
         assert summary["total_services_scanned"] == 1
 
+    def test_advisory_only_service_counts_as_scanned(self) -> None:
+        """A service with only $0 advisories renders a tab, so it is scanned.
+
+        Its counted total_recommendations is 0, but it produces visible advisory
+        cards — total_services_scanned must include it so the header count matches
+        the rendered service tabs (the scanned-vs-tabs fix).
+        """
+        findings: dict[str, ServiceFindings] = {
+            "s3": ServiceFindings(
+                service_name="S3",
+                total_recommendations=0,  # counted-only headline is 0
+                total_monthly_savings=0.0,
+                sources={
+                    "s3_bucket_analysis": SourceBlock(
+                        count=3,
+                        recommendations=(
+                            {"Counted": False, "EstimatedMonthlySavings": 0.0},
+                            {"Counted": False, "EstimatedMonthlySavings": 0.0},
+                            {"Counted": False, "EstimatedMonthlySavings": 0.0},
+                        ),
+                    )
+                },
+            ),
+            "empty": ServiceFindings(
+                service_name="Empty",
+                total_recommendations=0,
+                total_monthly_savings=0.0,
+                sources={},
+            ),
+        }
+        summary = ScanResultBuilder._summary(findings)
+        # s3 renders 3 advisory cards -> scanned; empty produces nothing -> not.
+        assert summary["total_services_scanned"] == 1
+        # Advisories are still excluded from the counted headline.
+        assert summary["total_recommendations"] == 0
+
     def test_count_placeholder_source_trusted_when_no_recs(self) -> None:
         """A source with count>0 but empty recommendations trusts the declared count."""
         f = ServiceFindings(

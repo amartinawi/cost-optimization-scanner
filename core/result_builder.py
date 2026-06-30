@@ -66,6 +66,27 @@ class ScanResultBuilder:
         return total
 
     @staticmethod
+    def _rendered_recommendations(f: ServiceFindings) -> int:
+        """Count recs that RENDER as cards: counted opportunities + ``$0`` advisories.
+
+        Excludes only ``OPTIMIZED`` findings (which carry no card). Mirrors
+        ``html_report_generator._filter_recommendations``'s ``total_rendered`` so
+        ``total_services_scanned`` equals the number of service tabs the report
+        actually shows — an advisory-only service (counted=0, advisories>0) renders
+        a tab and is therefore scanned, fixing the scanned-vs-tabs mismatch.
+        """
+        total = 0
+        for sb in f.sources.values():
+            recs = sb.recommendations
+            if recs:
+                total += sum(
+                    1 for rec in recs if isinstance(rec, dict) and rec.get("finding") != "OPTIMIZED"
+                )
+            elif sb.count > 0:
+                total += sb.count
+        return total
+
+    @staticmethod
     def _serialize(f: ServiceFindings) -> dict[str, Any]:
         """Convert ServiceFindings to a dict, merging extras over base fields."""
         extras: dict[str, Any] = dict(f.extras) if f.extras else {}
@@ -94,7 +115,11 @@ class ScanResultBuilder:
     @staticmethod
     def _summary(findings: dict[str, ServiceFindings]) -> dict[str, Any]:
         """Compute aggregate totals across all service findings."""
-        scanned = sum(1 for f in findings.values() if f.total_recommendations > 0 or f.total_count > 0)
+        scanned = sum(
+            1
+            for f in findings.values()
+            if ScanResultBuilder._rendered_recommendations(f) > 0 or f.total_count > 0
+        )
         return {
             "total_services_scanned": scanned,
             "total_recommendations": sum(ScanResultBuilder._counted_recommendations(f) for f in findings.values()),

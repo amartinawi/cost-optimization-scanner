@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from core.contracts import GroupingSpec, ServiceFindings, SourceBlock, StatCardSpec
+from services._aws_errors import record_aws_error
 from services._base import BaseServiceModule
 from services._savings import mark_zero_savings_advisory
 
@@ -80,7 +81,7 @@ def _get_cloudwatch_invocations_sum(cw: Any, endpoint_name: str, days: int = IDL
     return None
 
 
-def _list_endpoints(sm: Any) -> list[dict[str, Any]]:
+def _list_endpoints(sm: Any, ctx: Any = None) -> list[dict[str, Any]]:
     endpoints: list[dict[str, Any]] = []
     try:
         paginator = sm.get_paginator("list_endpoints")
@@ -101,8 +102,12 @@ def _list_endpoints(sm: Any) -> list[dict[str, Any]]:
                 if not token:
                     break
                 params["NextToken"] = token
-        except Exception:
-            pass
+        except Exception as e:
+            # Both paths failed — a real enumeration failure (AccessDenied /
+            # throttle), not "no endpoints". Classify so the permission gap
+            # surfaces instead of hiding the idle-endpoint counted savings.
+            if ctx is not None:
+                record_aws_error(ctx, e, service="sagemaker", context="list_endpoints failed")
     return endpoints
 
 
@@ -130,7 +135,7 @@ def _check_idle_endpoints(
     fast_mode: bool,
 ) -> tuple[list[dict[str, Any]], int]:
     recs: list[dict[str, Any]] = []
-    endpoints = _list_endpoints(sm)
+    endpoints = _list_endpoints(sm, ctx)
     active_count = 0
 
     for ep in endpoints:
@@ -217,7 +222,10 @@ def _check_idle_notebooks(
             if not next_token:
                 break
             params["NextToken"] = next_token
-    except Exception:
+    except Exception as e:
+        # list_notebook_instances failed (AccessDenied / throttle) — classify so
+        # the gap surfaces rather than reporting "0 notebooks" silently.
+        record_aws_error(ctx, e, service="sagemaker", context="list_notebook_instances failed")
         return recs, 0
 
     _ = pricing_multiplier  # PricingEngine values are already region-correct.
@@ -283,7 +291,10 @@ def _check_spot_training(
             if not next_token:
                 break
             params["NextToken"] = next_token
-    except Exception:
+    except Exception as e:
+        # list_training_jobs failed (AccessDenied / throttle) — classify so the
+        # gap surfaces rather than silently skipping spot-training analysis.
+        record_aws_error(ctx, e, service="sagemaker", context="list_training_jobs failed")
         return recs
 
     pricing_multiplier = ctx.pricing_multiplier
@@ -377,7 +388,7 @@ def _check_multi_model_consolidation(
     idle_endpoint_names: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     recs: list[dict[str, Any]] = []
-    endpoints = _list_endpoints(sm)
+    endpoints = _list_endpoints(sm, ctx)
     # sagemaker H2 — an idle endpoint is already counted at full cost for
     # deletion; excluding it from the consolidation grouping population
     # prevents the same compute being counted a second time as a

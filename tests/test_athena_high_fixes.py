@@ -76,3 +76,33 @@ def test_athena_list_work_groups_transient_failure_warns() -> None:
     # Non-permission failure still falls back to ctx.warn, never silently swallowed.
     assert ctx.permission_issues == []
     assert any(svc == "athena" for svc, _ in ctx.warnings)
+
+
+def test_athena_advisory_string_is_dollar_zero_prefixed(monkeypatch: Any) -> None:
+    """A $0 advisory athena rec leads with '$0.00/month — advisory:'.
+
+    The adapter set Counted=False + EMV=0 but left the bare 'Up to 75% scan-cost
+    reduction' string, so the card showed a percentage with no $0 marker. The
+    string must now agree with the advisory state (Fix H).
+    """
+    from types import SimpleNamespace
+
+    import services.adapters.athena as athena_adapter
+
+    rec = {
+        "WorkGroup": "primary",
+        "CheckCategory": "Athena Optimization",
+        "EstimatedSavings": "Up to 75% scan-cost reduction (priced from CW ProcessedBytes)",
+    }
+    monkeypatch.setattr(
+        athena_adapter, "get_enhanced_athena_checks", lambda _ctx: {"recommendations": [rec]}
+    )
+    # fast_mode forces the $0 advisory branch without a live CloudWatch call.
+    ctx = SimpleNamespace(
+        fast_mode=True, pricing_multiplier=1.0, region="us-east-1", client=lambda *a, **k: None
+    )
+    findings = athena_adapter.AthenaModule().scan(ctx)
+    out = findings.sources["enhanced_checks"].recommendations[0]
+    assert out["Counted"] is False
+    assert out["EstimatedMonthlySavings"] == 0.0
+    assert out["EstimatedSavings"].startswith("$0.00/month — advisory")
