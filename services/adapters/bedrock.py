@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from core.contracts import GroupingSpec, ServiceFindings, SourceBlock, StatCardSpec
+from services._aws_errors import record_aws_error
 from services._base import BaseServiceModule
 
 PT_HOURLY_PRICE: dict[str, float] = {
@@ -40,7 +41,7 @@ def _empty_findings() -> ServiceFindings:
     )
 
 
-def _list_provisioned_throughputs(bedrock: Any) -> list[dict[str, Any]]:
+def _list_provisioned_throughputs(bedrock: Any, ctx: Any = None) -> list[dict[str, Any]]:
     pts: list[dict[str, Any]] = []
     try:
         paginator = bedrock.get_paginator("list_provisioned_model_throughputs")
@@ -51,8 +52,15 @@ def _list_provisioned_throughputs(bedrock: Any) -> list[dict[str, Any]]:
         try:
             resp = bedrock.list_provisioned_model_throughputs()
             pts = resp.get("provisionedModelSummaries", [])
-        except Exception:
-            pass
+        except Exception as e:
+            # Both the paginator and the direct call failed — this is a real
+            # enumeration failure (AccessDenied / throttle), not a "no PTs"
+            # result. Classify it so a permission gap surfaces in the report
+            # instead of masquerading as zero idle Provisioned Throughputs.
+            if ctx is not None:
+                record_aws_error(
+                    ctx, e, service="bedrock", context="list_provisioned_model_throughputs failed"
+                )
     return pts
 
 
@@ -359,7 +367,8 @@ def _check_idle_knowledge_bases(ctx: Any, pricing_multiplier: float) -> list[dic
         try:
             resp = agent_client.list_knowledge_bases()
             kbs = resp.get("knowledgeBaseSummaries", [])
-        except Exception:
+        except Exception as e:
+            record_aws_error(ctx, e, service="bedrock", context="list_knowledge_bases failed")
             return recs
 
     for kb in kbs:
@@ -404,7 +413,8 @@ def _check_idle_agents(ctx: Any, pricing_multiplier: float) -> list[dict[str, An
         try:
             resp = agent_client.list_agents()
             agents = resp.get("agentSummaries", [])
-        except Exception:
+        except Exception as e:
+            record_aws_error(ctx, e, service="bedrock", context="list_agents failed")
             return recs
 
     # Bedrock Agent idle finding removed: agents themselves accrue no AWS charge
@@ -456,7 +466,7 @@ class BedrockModule(BaseServiceModule):
         multiplier = ctx.pricing_multiplier
         fast_mode = getattr(ctx, "fast_mode", False)
 
-        pts = _list_provisioned_throughputs(bedrock)
+        pts = _list_provisioned_throughputs(bedrock, ctx)
 
         idle_pt_recs: list[dict[str, Any]] = []
         breakeven_recs: list[dict[str, Any]] = []

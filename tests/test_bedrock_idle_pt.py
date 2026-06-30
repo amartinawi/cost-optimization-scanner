@@ -165,3 +165,43 @@ def test_fast_mode_skips_pt_check() -> None:
     cw = _FakeCloudWatch(datapoints=[{"Sum": 0.0}])
     recs = bedrock._check_idle_pt(_pt(_HAIKU_ARN), cw, pricing_multiplier=1.0, fast_mode=True)
     assert recs == []
+
+
+# --------------------------------------------------------------------------- #
+# Silent-swallow fix: a real PT-enumeration failure is classified, not hidden.
+# --------------------------------------------------------------------------- #
+class _BoomBedrock:
+    def __init__(self, exc: BaseException):
+        self._exc = exc
+
+    def get_paginator(self, _name: str):
+        raise self._exc
+
+    def list_provisioned_model_throughputs(self, **_kw: Any):
+        raise self._exc
+
+
+def test_list_pt_enumeration_failure_is_classified() -> None:
+    """Paginator AND direct call failing is a real enumeration failure — it must
+    surface (AccessDenied -> permission_issue), not masquerade as 'no PTs'."""
+    from types import SimpleNamespace
+
+    from botocore.exceptions import ClientError  # type: ignore[import-untyped]
+
+    err = ClientError(
+        {"Error": {"Code": "AccessDenied", "Message": "denied"}},
+        "ListProvisionedModelThroughputs",
+    )
+    perms: list[tuple] = []
+    ctx = SimpleNamespace(region="us-east-1", account_id="123")
+    ctx.permission_issue = lambda msg, service=None, action=None, **k: perms.append((service, action, msg))
+    ctx.warn = lambda msg, service=None, **k: None
+
+    out = bedrock._list_provisioned_throughputs(_BoomBedrock(err), ctx)
+    assert out == []
+    assert any(svc == "bedrock" for svc, *_ in perms)
+
+
+def test_list_pt_without_ctx_is_backward_compatible() -> None:
+    """Called without ctx (legacy), a failure still returns [] without crashing."""
+    assert bedrock._list_provisioned_throughputs(_BoomBedrock(RuntimeError("boom"))) == []

@@ -10,6 +10,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from core.scan_context import ScanContext
+from services._aws_errors import record_aws_error
 
 STEP_FUNCTIONS_OPTIMIZATION_DESCRIPTIONS: dict[str, dict[str, str]] = {
     "standard_vs_express": {
@@ -72,8 +73,16 @@ def get_enhanced_step_functions_checks(ctx: ScanContext) -> dict[str, Any]:
                                     "CheckCategory": "Step Functions Type Optimization",
                                 }
                             )
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        # Per-machine CloudWatch read failed (AccessDenied /
+                        # throttle) — classify so the gap surfaces instead of
+                        # silently skipping this machine's Express evaluation.
+                        record_aws_error(
+                            ctx,
+                            e,
+                            service="stepfunctions",
+                            context=f"CloudWatch ExecutionsStarted for {sm_name} failed",
+                        )
 
                 # Non-prod 24/7 finding removed: emitted "65-75%" percentage range without
                 # concrete per-state-machine cost baseline.

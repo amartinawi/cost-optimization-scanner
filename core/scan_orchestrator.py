@@ -70,6 +70,13 @@ class ScanOrchestrator:
             # never satisfied and EksCluster recs are silently dropped.
             "eks_cost",
             "dynamodb",
+            # NAT Gateway idle/underuse recs that AWS Cost Optimization Hub
+            # computes. The network adapter consumes cost_hub_splits["network"]
+            # and de-duplicates them against its local topology-based NAT
+            # consolidation levers (CoH > heuristic). Without this bucket the
+            # NatGateway type fell through to unbucketed_types and AWS-computed
+            # NAT savings were silently dropped (the NatGateway CoH-drop bug).
+            "network",
             # Catch ECS / EKS service-level recs and any cross-service CoH
             # findings that previously lived in the dedicated CoH tab.
             "containers",
@@ -105,6 +112,7 @@ class ScanOrchestrator:
             "RedshiftCluster": "redshift",
             "EksCluster": "eks_cost",
             "DynamoDBTable": "dynamodb",
+            "NatGateway": "network",
             # ECS / container-level
             "EcsService": "containers",
             "EcsTask": "containers",

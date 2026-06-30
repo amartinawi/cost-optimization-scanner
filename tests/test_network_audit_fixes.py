@@ -256,6 +256,127 @@ def test_net06_no_missing_endpoint_advisory_from_nat_shim() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# NAT Gateway Cost Optimization Hub consumption + VPC-scoped dedup (CoH > heuristic)
+# --------------------------------------------------------------------------- #
+def _coh_nat_rec(nat_id: str, savings: float, action: str = "Delete") -> dict[str, Any]:
+    return {
+        "currentResourceType": "NatGateway",
+        "actionType": action,
+        "resourceId": nat_id,
+        "resourceArn": f"arn:aws:ec2:ap-southeast-1:123456789012:natgateway/{nat_id}",
+        "estimatedMonthlySavings": savings,
+    }
+
+
+def test_nat_shim_exposes_nat_vpc_map() -> None:
+    nat_pages = [{"NatGateways": [_nat("nat-1", "vpc-a", "sub-1"), _nat("nat-2", "vpc-b", "sub-2")]}]
+    ec2 = _FakeEc2(nat_pages=nat_pages, subnet_az={"sub-1": "az-a", "sub-2": "az-b"})
+    out = get_nat_gateway_checks(_ctx(ec2, pricing_engine=_nat_engine()))
+    assert out["nat_vpc_map"] == {"nat-1": "vpc-a", "nat-2": "vpc-b"}
+
+
+def test_coh_nat_recs_filters_zero_savings_and_nonrenderable() -> None:
+    ctx = _ctx()
+    ctx.cost_hub_splits = {
+        "network": [
+            _coh_nat_rec("nat-1", 40.0),  # kept
+            _coh_nat_rec("nat-2", 0.0),  # dropped — $0 carries no dollar
+            {**_coh_nat_rec("nat-3", 99.0), "actionType": "PurchaseSavingsPlans"},  # dropped — RI/SP
+            {**_coh_nat_rec("nat-4", 99.0), "currentResourceType": "Ec2Instance"},  # dropped — wrong type
+        ]
+    }
+    kept = network_mod._coh_nat_recs(ctx)
+    assert [network_mod.coh_key(r) for r in kept] == ["nat-1"]
+
+
+def test_nat_shim_excludes_coh_owned_nats_but_keeps_them_in_map() -> None:
+    # vpc-a has 2 same-AZ NATs. Excluding nat-1 (CoH-owned) leaves only nat-2, so
+    # the same-AZ consolidation no longer fires — but nat-1 stays in nat_vpc_map.
+    nat_pages = [{"NatGateways": [_nat("nat-1", "vpc-a", "sub-1"), _nat("nat-2", "vpc-a", "sub-2")]}]
+    ec2 = _FakeEc2(nat_pages=nat_pages, subnet_az={"sub-1": "az-a", "sub-2": "az-a"})
+    out = get_nat_gateway_checks(_ctx(ec2, pricing_engine=_nat_engine()), exclude_nat_ids={"nat-1"})
+    assert out["nat_vpc_map"] == {"nat-1": "vpc-a", "nat-2": "vpc-a"}  # full topology
+    assert out["multiple_nat_gateways"] == []  # only nat-2 remains -> no duplicate
+
+
+def test_normalize_coh_nat_counts_with_vpc_from_map() -> None:
+    recs = network_mod._normalize_coh_nat([_coh_nat_rec("nat-1", 40.0)], {"nat-1": "vpc-a"})
+    assert len(recs) == 1
+    assert recs[0]["Counted"] is True
+    assert recs[0]["EstimatedMonthlySavings"] == 40.0
+    assert recs[0]["VpcId"] == "vpc-a"
+    assert recs[0]["Source"] == "CostOptimizationHub"
+
+
+def _nat_counted(findings: Any) -> float:
+    return sum(
+        r.get("EstimatedMonthlySavings", 0.0)
+        for r in findings.sources["nat_gateways"].recommendations
+        if r.get("Counted", True) is not False
+    )
+
+
+def test_network_scan_nat_coh_no_double_count() -> None:
+    # vpc-a has 2 same-AZ NATs; CoH flags nat-1 at $40. Excluding nat-1 leaves nat-2
+    # sole-in-VPC -> no local consolidation -> counted = $40 (CoH only). No double-count.
+    nat_pages = [{"NatGateways": [_nat("nat-1", "vpc-a", "sub-1"), _nat("nat-2", "vpc-a", "sub-2")]}]
+    ec2 = _FakeEc2(nat_pages=nat_pages, subnet_az={"sub-1": "az-a", "sub-2": "az-a"})
+    ctx = _ctx(ec2, pricing_engine=_nat_engine(32.85))
+    ctx.cost_hub_splits = {"network": [_coh_nat_rec("nat-1", 40.0)]}
+    findings = NetworkModule().scan(ctx)
+    nat_block = findings.sources["nat_gateways"].recommendations
+    assert _nat_counted(findings) == pytest.approx(40.0)
+    assert any(r.get("Source") == "CostOptimizationHub" for r in nat_block)
+    # No demoted local rec carrying a stale non-zero numeric (advisory-leak guard).
+    assert all(
+        r.get("EstimatedMonthlySavings", 0.0) == 0.0
+        for r in nat_block
+        if r.get("Counted") is False
+    )
+
+
+def test_network_scan_nat_coh_preserves_independent_savings() -> None:
+    # REGRESSION GUARD (the over-demotion HIGH defect): vpc-a has 3 NATs across 3
+    # AZs. CoH flags only nat-1 ($45). Excluding nat-1 leaves nat-2/nat-3 across 2
+    # AZs -> the cross-AZ consolidation of those INDEPENDENT NATs ($32.85) must
+    # still be counted. Total = $45 + $32.85 = $77.85 (not $45).
+    nat_pages = [{"NatGateways": [
+        _nat("nat-1", "vpc-a", "sub-1"),
+        _nat("nat-2", "vpc-a", "sub-2"),
+        _nat("nat-3", "vpc-a", "sub-3"),
+    ]}]
+    ec2 = _FakeEc2(nat_pages=nat_pages, subnet_az={"sub-1": "az-a", "sub-2": "az-b", "sub-3": "az-c"})
+    ctx = _ctx(ec2, pricing_engine=_nat_engine(32.85))
+    ctx.cost_hub_splits = {"network": [_coh_nat_rec("nat-1", 45.0)]}
+    findings = NetworkModule().scan(ctx)
+    assert _nat_counted(findings) == pytest.approx(45.0 + 32.85)
+    # Both the CoH rec AND the independent local consolidation are counted.
+    recs = findings.sources["nat_gateways"].recommendations
+    assert any(r.get("Source") == "CostOptimizationHub" for r in recs)
+    assert any(
+        r.get("CheckCategory") == "Unnecessary NAT per AZ" and r.get("Counted", True) is not False
+        for r in recs
+    )
+
+
+def test_network_scan_zero_coh_does_not_suppress_local() -> None:
+    # MEDIUM GUARD: a $0 CoH NAT rec must NOT exclude its NAT (which would zero the
+    # VPC's real consolidation saving for no gain). vpc-a has 2 same-AZ NATs; CoH
+    # returns nat-1 at $0 -> filtered out -> local same-AZ consolidation ($32.85)
+    # is still counted.
+    nat_pages = [{"NatGateways": [_nat("nat-1", "vpc-a", "sub-1"), _nat("nat-2", "vpc-a", "sub-2")]}]
+    ec2 = _FakeEc2(nat_pages=nat_pages, subnet_az={"sub-1": "az-a", "sub-2": "az-a"})
+    ctx = _ctx(ec2, pricing_engine=_nat_engine(32.85))
+    ctx.cost_hub_splits = {"network": [_coh_nat_rec("nat-1", 0.0)]}
+    findings = NetworkModule().scan(ctx)
+    assert _nat_counted(findings) == pytest.approx(32.85)
+    assert not any(
+        r.get("Source") == "CostOptimizationHub"
+        for r in findings.sources["nat_gateways"].recommendations
+    )
+
+
+# --------------------------------------------------------------------------- #
 # M4 — interface endpoints priced per-AZ, gateway endpoints excluded
 # --------------------------------------------------------------------------- #
 def test_interface_endpoint_priced_per_az() -> None:
@@ -299,16 +420,23 @@ def test_net05_dead_check_categories_removed() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# L1 — fallback region scaling when pricing_engine is None
+# EIP fallback is a FLAT global rate — NOT region-scaled. Public IPv4 / EIP is
+# billed at $0.005/hr ($3.65/mo) in every commercial region, so multiplying the
+# fallback by pricing_multiplier would fabricate a region-specific rate for a
+# globally flat charge (Route53-class fix).
 # --------------------------------------------------------------------------- #
-def test_eip_fallback_region_scaled() -> None:
+def test_eip_fallback_is_flat_not_region_scaled() -> None:
     from core.pricing_engine import FALLBACK_EIP_MONTH
 
     addresses = [{"AllocationId": "eipalloc-1", "PublicIp": "1.2.3.4"}]  # unassociated
     ec2 = _FakeEc2(addresses=addresses)
+    # Even with a 2x regional multiplier, the EIP fallback must stay flat.
     out = get_elastic_ip_checks(_ctx(ec2, pricing_engine=None, pricing_multiplier=2.0))
     rec = out["unassociated_eips"][0]
-    assert parse_dollar_savings(rec["EstimatedSavings"]) == pytest.approx(FALLBACK_EIP_MONTH * 2.0)
+    assert parse_dollar_savings(rec["EstimatedSavings"]) == pytest.approx(FALLBACK_EIP_MONTH)
+    # The counted rec also carries a numeric EstimatedMonthlySavings (Fix G) that
+    # agrees with the string.
+    assert rec["EstimatedMonthlySavings"] == pytest.approx(FALLBACK_EIP_MONTH)
 
 
 def _eng_eip(rate: float = 3.65) -> SimpleNamespace:
@@ -404,7 +532,9 @@ def test_network_scan_asg_is_advisory_and_excluded_from_total(monkeypatch: pytes
     monkeypatch.setattr(network_mod, "get_elastic_ip_checks", lambda c: {"recommendations": [
         {"EstimatedSavings": "$3.65/month per EIP", "CheckCategory": "Unassociated EIPs"}
     ]})
-    monkeypatch.setattr(network_mod, "get_nat_gateway_checks", lambda c: {"recommendations": []})
+    monkeypatch.setattr(
+        network_mod, "get_nat_gateway_checks", lambda c, **kw: {"recommendations": [], "nat_vpc_map": {}}
+    )
     monkeypatch.setattr(network_mod, "get_vpc_endpoints_checks", lambda c: {"recommendations": []})
     monkeypatch.setattr(network_mod, "get_load_balancer_checks", lambda c: {"recommendations": []})
     monkeypatch.setattr(network_mod, "get_auto_scaling_checks", lambda c: {"recommendations": [

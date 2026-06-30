@@ -148,7 +148,10 @@ def test_network_rate_string_recs_marked_advisory(monkeypatch):
     # empty network sub-shims into the rest of the session (broke the later
     # NetworkModule scan tests in tests/test_network_lb_high_fixes.py).
     monkeypatch.setattr(net, "get_elastic_ip_checks", lambda c: {"recommendations": eip})
-    monkeypatch.setattr(net, "get_nat_gateway_checks", lambda c: {"recommendations": []})
+    # NAT shim now takes exclude_nat_ids (CoH-owned NATs) — accept it in the stub.
+    monkeypatch.setattr(
+        net, "get_nat_gateway_checks", lambda c, **kw: {"recommendations": [], "nat_vpc_map": {}}
+    )
     monkeypatch.setattr(net, "get_vpc_endpoints_checks", lambda c: {"recommendations": vpc})
     monkeypatch.setattr(net, "get_load_balancer_checks", lambda c: {"recommendations": []})
     monkeypatch.setattr(net, "get_auto_scaling_checks", lambda c: {"recommendations": []})

@@ -906,9 +906,13 @@ class PricingEngine:
             return cached
         price = self._fetch_eip_price()
         if price is None:
+            # Public IPv4 / EIP is billed at a FLAT $0.005/hr ($3.65/mo) in every
+            # commercial region — it does NOT vary by region, so the fallback must
+            # NOT be region-scaled by `_fallback_multiplier` (doing so fabricated a
+            # region-specific rate for a globally flat charge). Route53-class fix.
             price = self._use_fallback(
-                FALLBACK_EIP_MONTH * self._fallback_multiplier,
-                f"Pricing API unavailable for EIP in {self._region}; using fallback",
+                FALLBACK_EIP_MONTH,
+                f"Pricing API unavailable for EIP in {self._region}; using flat fallback",
             )
         self._cache.set(key, price)
         return price

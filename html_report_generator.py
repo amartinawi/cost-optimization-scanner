@@ -2409,7 +2409,11 @@ class HTMLReportGenerator:
 
         for service_key, service_data in services.items():
             filtered = self._filter_recommendations(service_data)
-            rec_count = filtered.get("total_recommendations", 0)
+            # Gate on RENDERED cards (counted + $0 advisories), not the counted-only
+            # headline: an advisory-only service still has cards to show and must get
+            # a tab. rec_count drives the sort tiebreak below, so use the rendered
+            # figure there too (a 138-advisory-card service should not sort as 0).
+            rec_count = filtered.get("total_rendered", filtered.get("total_recommendations", 0))
             if rec_count == 0:
                 continue
             savings = float(filtered.get("total_monthly_savings", 0) or 0)
@@ -2450,7 +2454,13 @@ class HTMLReportGenerator:
             )
 
         # Synthetic AMIs tab only if there's no underlying AMI service section.
-        ami_already_present = any(s.get("total_recommendations", 0) > 0 for k, s in services.items() if k == "ami")
+        # Mirror the tab gate's RENDERED-card test: if the ami service tab renders
+        # (counted OR advisory cards), the synthetic AMIs tab would duplicate it.
+        ami_already_present = any(
+            self._filter_recommendations(s).get("total_rendered", 0) > 0
+            for k, s in services.items()
+            if k == "ami"
+        )
         if amis_data["count"] > 0 and not ami_already_present:
             ami_savings = sum(
                 float(r.get("EstimatedMonthlySavings", 0) or 0) for r in amis_data.get("recommendations", [])
@@ -2990,19 +3000,33 @@ class HTMLReportGenerator:
         def _counted(recs: list) -> int:
             return sum(1 for r in recs if not (isinstance(r, dict) and r.get("Counted") is False))
 
+        # total_rendered counts every card that RENDERS — counted opportunities
+        # PLUS $0 advisories (Counted=False) — because both produce visible cards.
+        # The tab gate keys off this, not total_recommendations: an advisory-only
+        # service (e.g. S3 with 138 $0 cards, commitment_analysis RI/SP advisories)
+        # has total_recommendations=0 but must still get a tab, else its cards
+        # vanish entirely (the count-semantics regression this restores).
+        def _rendered(recs: list) -> int:
+            return sum(1 for r in recs if isinstance(r, dict))
+
         total_recs = 0
+        total_rendered = 0
         for source in filtered_data.get("sources", {}).values():
             if isinstance(source, dict):
                 recs = source.get("recommendations", [])
                 if recs:
                     total_recs += _counted(recs)
+                    total_rendered += _rendered(recs)
                 elif source.get("count", 0) > 0:
                     # Recommendations list is empty but a count exists — trust it
                     # (no per-rec Counted flags available to filter on).
                     total_recs += source.get("count", 0)
+                    total_rendered += source.get("count", 0)
             elif isinstance(source, list):
                 total_recs += _counted(source)
+                total_rendered += _rendered(source)
         filtered_data["total_recommendations"] = total_recs
+        filtered_data["total_rendered"] = total_rendered
 
         # For services without direct savings (like Compute Optimizer), preserve calculated savings
         if service_data.get("service_name") == "EC2" and all(

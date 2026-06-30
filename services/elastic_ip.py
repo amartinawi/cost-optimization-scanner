@@ -17,10 +17,14 @@ logger = logging.getLogger(__name__)
 
 def get_elastic_ip_checks(ctx: ScanContext) -> dict[str, Any]:
     """Category 1: Elastic IPs & Public Addressing optimization checks."""
+    # Public IPv4 / EIP is a FLAT $3.65/mo charge in every commercial region —
+    # not region-scaled — so the pricing_engine=None fallback uses the flat
+    # constant directly (multiplying by pricing_multiplier would fabricate a
+    # region-specific rate for a globally flat charge).
     eip_monthly = (
         ctx.pricing_engine.get_eip_monthly_price()
         if ctx.pricing_engine is not None
-        else FALLBACK_EIP_MONTH * ctx.pricing_multiplier
+        else FALLBACK_EIP_MONTH
     )
     checks: dict[str, list[dict[str, Any]]] = {
         "unassociated_eips": [],
@@ -58,6 +62,7 @@ def get_elastic_ip_checks(ctx: ScanContext) -> dict[str, Any]:
                         "ResourceName": eip_name,
                         "Recommendation": "Release unassociated Elastic IP to avoid charges",
                         "EstimatedSavings": f"${eip_monthly:.2f}/month per EIP",
+                        "EstimatedMonthlySavings": round(eip_monthly, 2),
                         "CheckCategory": "Unassociated EIPs",
                     }
                 )
@@ -77,6 +82,7 @@ def get_elastic_ip_checks(ctx: ScanContext) -> dict[str, Any]:
                             "InstanceState": "stopped",
                             "Recommendation": "Release EIP from stopped instance or start instance",
                             "EstimatedSavings": f"${eip_monthly:.2f}/month per EIP",
+                            "EstimatedMonthlySavings": round(eip_monthly, 2),
                             "CheckCategory": "EIPs on Stopped Instances",
                         }
                     )
@@ -97,6 +103,7 @@ def get_elastic_ip_checks(ctx: ScanContext) -> dict[str, Any]:
                         "InstanceType": instance.get("InstanceType", "N/A"),
                         "Recommendation": f"Instance has {eip_count} EIPs - review if all are necessary",
                         "EstimatedSavings": f"${(eip_count - 1) * eip_monthly:.2f}/month if reduced to 1 EIP",
+                        "EstimatedMonthlySavings": round((eip_count - 1) * eip_monthly, 2),
                         "CheckCategory": "Multiple EIPs per Instance",
                     }
                 )

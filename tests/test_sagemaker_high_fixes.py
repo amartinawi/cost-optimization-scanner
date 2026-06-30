@@ -422,3 +422,43 @@ def test_fast_mode_skips_idle_cloudwatch() -> None:
     # Idle check is CloudWatch-gated; fast mode emits no idle recs.
     assert findings.sources["idle_endpoints"].count == 0
     assert findings.extras["active_endpoint_count"] == 1
+
+
+# --------------------------------------------------------------------------- #
+# Silent-swallow fix: a real endpoint-enumeration failure is classified.
+# --------------------------------------------------------------------------- #
+def test_list_endpoints_enumeration_failure_is_classified() -> None:
+    """Both the paginator and the manual NextToken loop failing is a real
+    enumeration failure — it must surface (AccessDenied -> permission_issue),
+    not hide the idle-endpoint counted savings as 'no endpoints'."""
+    from botocore.exceptions import ClientError  # type: ignore[import-untyped]
+
+    from services.adapters.sagemaker import _list_endpoints
+
+    err = ClientError({"Error": {"Code": "AccessDenied", "Message": "denied"}}, "ListEndpoints")
+
+    class _BoomSageMaker:
+        def get_paginator(self, _name: str):
+            raise err
+
+        def list_endpoints(self, **_kw: Any):
+            raise err
+
+    ctx = _ctx(_BoomSageMaker(), None)
+    result = _list_endpoints(_BoomSageMaker(), ctx)
+    assert result == []
+    assert any(svc == "sagemaker" for svc, *_ in ctx.permissions)
+
+
+def test_list_endpoints_without_ctx_is_backward_compatible() -> None:
+    """Called without ctx (legacy), a failure still returns [] without crashing."""
+    from services.adapters.sagemaker import _list_endpoints
+
+    class _BoomSageMaker:
+        def get_paginator(self, _name: str):
+            raise RuntimeError("boom")
+
+        def list_endpoints(self, **_kw: Any):
+            raise RuntimeError("boom")
+
+    assert _list_endpoints(_BoomSageMaker()) == []

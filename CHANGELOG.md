@@ -7,6 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (third deep-audit remediation — ap-south-1 + ap-southeast-1, account bnc)
+Two regions of a new account (784852663902) were deep-audited (adversarially
+verified): ap-south-1 (15 confirmed) and ap-southeast-1 (5 confirmed). Every
+headline reconciled and all big-ticket rates were live-verified to the cent; the
+defects were in error visibility, a self-introduced regression, and missed
+savings. Nine fixes under the same invariant (counted dollars are
+account-specific and defensible; advisories are `$0` `Counted=False`, rendered
+but never summed; double-counting is the cardinal sin).
+
+- **Advisory-only services lost their HTML tab (regression).** The prior
+  count-semantics change made the reporter tab gate key off the counted-only
+  `total_recommendations`, so a service whose cards are all `$0` advisories
+  (S3's 138 bucket cards, `commitment_analysis` RI/SP advisories, redshift,
+  athena, network_cost) rendered **no tab at all**. The gate now keys off a new
+  `total_rendered` (counted + advisory cards); the headline count stays
+  counted-only. `total_services_scanned` was realigned to the same
+  rendered-aware count so it matches the rendered tabs.
+- **NAT Gateway Cost Optimization Hub savings were silently dropped.** CoH
+  computed per-NAT idle savings, but a 3-layer gap (`network` absent from
+  `_HUB_SERVICES`, no `NatGateway` entry in the orchestrator `type_map`, and the
+  network adapter consumed no CoH) discarded them — self-reported as a
+  "dropped type" warning. The network adapter now consumes
+  `cost_hub_splits["network"]` and de-duplicates the local VPC-scoped
+  consolidation levers CoH supersedes (CoH > heuristic, demotion by VPC via the
+  NAT→VPC topology the shim now exposes); when CoH covers only some of a VPC's
+  NATs this under-counts rather than overstates (the safe direction).
+- **RDS snapshot reconciliation capped the string but not the numeric.**
+  `reconcile_snapshot_savings` rewrote the `EstimatedSavings` string to the
+  Cost-Explorer-capped value but left `EstimatedMonthlySavings` at the uncapped
+  upper bound (confirmed +$719.60 overstatement in the field). The numeric is
+  now capped in lockstep; the no-CE-data advisory-demote branch also zeroes the
+  numeric (`EstimatedMonthlySavings=0.0`, upper bound moved to
+  `PotentialMonthlySavings`) so a demoted advisory cannot leak into a numeric sum.
+- **EIP fallback region-scaled a globally flat rate.** Public IPv4 / EIP is a
+  flat $3.65/mo in every commercial region, but the `pricing_engine=None`
+  fallback multiplied it by `pricing_multiplier` (in both `core/pricing_engine`
+  and `services/elastic_ip`). The flat constant is now used directly. The counted
+  EIP recs (unassociated / on-stopped-instance / multiple-per-instance) also gained
+  the numeric `EstimatedMonthlySavings` field they were missing.
+- **Athena advisory string not `$0`-formatted.** A metric-gapped athena rec was
+  demoted to `Counted=False`/`EMV=0` but kept the bare "Up to 75% scan-cost
+  reduction" string. All three branches (measured / no-data / fast-mode) now set
+  a string that agrees with the rec's counted state.
+- **Silent error-swallowing classified (observability).** Eight previously-bare
+  `except: pass` / `return` sites that masked an `AccessDenied`/throttle as
+  "no resources" now route through `record_aws_error`: bedrock (PT / knowledge-base
+  / agent enumeration), sagemaker (endpoint / notebook / training-job enumeration),
+  step_functions (per-machine CloudWatch read), and s3 (`GetBucketWebsite`). The
+  normal fallback paths (paginator-unavailable, `NoSuchWebsiteConfiguration`,
+  no-datapoints) stay silent.
+
 ### Fixed (second deep-audit remediation — eu-west-1 / level-Shoes-prod re-scan)
 A re-scan of the remediated account (019903302182, 90 → counted-only ~30 recs)
 was deep-audited again (43 agents, adversarially verified). The prior batch was
