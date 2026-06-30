@@ -11,6 +11,16 @@ recommendation must produce a concrete, account-specific dollar saving.
 
 ## PROMPT (copy from here)
 
+> **⚠ Latest live-audit findings (2026-06-30) — read these FIRST, then this prompt.**
+> Before auditing, also read and paste `docs/audits/prompts/_LIVE_AUDIT_LESSONS.md`
+> — the recurring cost-fidelity bug *classes* confirmed in live deep audits (with
+> real examples, ready-to-run JSON invariant sweeps, and the audit-method traps that
+> cause FALSE findings). Run those sweeps before manual tracing.
+>
+> Service-specific live-audit findings for `quicksight`:
+> - This service emits `$0` advisory recs ALONGSIDE counted ones (it is a counted/advisory split, not advisory-only) — verify the tab still renders even when ALL recs happen to be advisory (D2; the tab gate keys off RENDERED cards, counted + advisory, not the counted-only headline count), and confirm no `Counted=False` rec carries a non-zero numeric (advisory-leak, B1).
+> - The outer `except` in `services/quicksight.py` (around `describe_account_subscription` and `list_namespaces`) calls `ctx.warn()` for all non-ResourceNotFoundException failures; an `AccessDenied` or `Unauthorized` on either call is treated as a generic warning rather than a classified `permission_issue` via `record_aws_error` — the per-namespace `ListUsers` and `DescribeSpiceCapacity` inner excepts are correctly classified, but the outer gate is not (E1).
+
 You are auditing the **`quicksight`** adapter of this AWS cost-optimization
 scanner. Scope is strictly cost: every emitted recommendation must produce a
 concrete, account-specific dollar saving. Work read-only first (understand +

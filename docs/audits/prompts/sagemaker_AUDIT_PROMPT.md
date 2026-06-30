@@ -11,6 +11,16 @@ recommendation must produce a concrete, account-specific dollar saving.
 
 ## PROMPT (copy from here)
 
+> **⚠ Latest live-audit findings (2026-06-30) — read these FIRST, then this prompt.**
+> Before auditing, also read and paste `docs/audits/prompts/_LIVE_AUDIT_LESSONS.md`
+> — the recurring cost-fidelity bug *classes* confirmed in live deep audits (with
+> real examples, ready-to-run JSON invariant sweeps, and the audit-method traps that
+> cause FALSE findings). Run those sweeps before manual tracing.
+>
+> Service-specific live-audit findings for `sagemaker`:
+> - Thread `ctx` + `record_aws_error` into the endpoint / notebook / training-job ENUMERATION paths — a bare `except: pass` turned an AccessDenied/throttle into a false 'no resources', hiding the idle-endpoint counted savings AND the permission gap. Keep the normal paginator-unavailable fallback silent.
+> - `_get_cloudwatch_invocations_sum` still has a bare `except: pass` (returns `None`); `invocations is None` triggers `continue` in `_check_idle_endpoints`, so a single CW AccessDenied/throttle silently skips every endpoint from idle classification and suppresses all idle-endpoint counted savings — call `record_aws_error(ctx, e, service="sagemaker", context="get_metric_statistics invocations")` before returning `None` (Class E, metric-fetch path).
+
 You are auditing the **`sagemaker`** adapter (`SageMakerModule`,
 `services/adapters/sagemaker.py`) of this AWS cost-optimization scanner. Scope is
 strictly cost: every emitted recommendation must produce a concrete,

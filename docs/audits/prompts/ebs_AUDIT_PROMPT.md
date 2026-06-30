@@ -11,6 +11,18 @@ recommendation must produce a concrete, account-specific dollar saving.
 
 ## PROMPT (copy from here)
 
+> **⚠ Latest live-audit findings (2026-06-30) — read these FIRST, then this prompt.**
+> Before auditing, also read and paste `docs/audits/prompts/_LIVE_AUDIT_LESSONS.md`
+> — the recurring cost-fidelity bug *classes* confirmed in live deep audits (with
+> real examples, ready-to-run JSON invariant sweeps, and the audit-method traps that
+> cause FALSE findings). Run those sweeps before manual tracing.
+>
+> Service-specific live-audit findings for `ebs`:
+> - A snapshot recoverable that rounds to $0.00 (a few stored MB) must be suppressed — gate on the rounded `potential`, not just `size_gb > 0`, or a '$0.00/mo recoverable' noise card renders.
+> - EBS snapshot recs are `$0` `Counted=False` advisories; AMI-backed snapshots are owned by the AMI tab — keep them out of the EBS snapshot source (cross-adapter dedup).
+> - AUDIT-METHOD: unattached-volume savings live in `EstimatedMonthlyCost` (not `EstimatedSavings`/`EstimatedMonthlySavings`), and CoH recs in camelCase `estimatedMonthlySavings` — a naive '$0 string' sweep false-flags them.
+> - EBS consumes both CoH (`ctx.cost_hub_splits['ebs']`) and CO; verify the scan JSON shows no 'dropped type' warnings for `EbsVolume` — a 3-layer wire-up gap silently discards AWS-computed savings (E2 orphan-bucket check).
+
 You are auditing the **`ebs`** adapter of this AWS cost-optimization scanner.
 Scope is strictly cost: every emitted recommendation must produce a concrete,
 account-specific dollar saving. Work read-only first (understand + validate),

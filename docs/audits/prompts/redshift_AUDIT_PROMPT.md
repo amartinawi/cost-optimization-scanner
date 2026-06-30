@@ -11,6 +11,16 @@ recommendation must produce a concrete, account-specific dollar saving.
 
 ## PROMPT (copy from here)
 
+> **⚠ Latest live-audit findings (2026-06-30) — read these FIRST, then this prompt.**
+> Before auditing, also read and paste `docs/audits/prompts/_LIVE_AUDIT_LESSONS.md`
+> — the recurring cost-fidelity bug *classes* confirmed in live deep audits (with
+> real examples, ready-to-run JSON invariant sweeps, and the audit-method traps that
+> cause FALSE findings). Run those sweeps before manual tracing.
+>
+> Service-specific live-audit findings for `redshift`:
+> - CoH consumer + largely advisory — verify the bucket is consumed (CoH > heuristic) and that the tab still renders despite `$0` counted; no `Counted=False` rec with a non-zero numeric (advisory-leak).
+> - E1 silent failure: the shim swallows all `redshift-serverless` errors with a bare `except Exception: pass` (line 122 of `services/redshift.py`) and routes `describe_clusters` failures to `ctx.warn` instead of `record_aws_error`; classify AccessDenied/throttle as `permission_issue`, else `warn`.
+
 You are auditing the **`redshift`** adapter of this AWS cost-optimization
 scanner. Scope is strictly cost: every emitted recommendation must produce a
 concrete, account-specific dollar saving. Work read-only first (understand +

@@ -11,6 +11,15 @@ recommendation must produce a concrete, account-specific dollar saving.
 
 ## PROMPT (copy from here)
 
+> **⚠ Latest live-audit findings (2026-06-30) — read these FIRST, then this prompt.**
+> Before auditing, also read and paste `docs/audits/prompts/_LIVE_AUDIT_LESSONS.md`
+> — the recurring cost-fidelity bug *classes* confirmed in live deep audits (with
+> real examples, ready-to-run JSON invariant sweeps, and the audit-method traps that
+> cause FALSE findings). Run those sweeps before manual tracing.
+>
+> Service-specific live-audit findings for `glue`:
+> - Dev endpoints are **counted** (`Counted=True`, real DPU footprint × $0.44/hr × 730 h × pricing_multiplier); job-rightsizing and crawler levers are `$0` `Counted=False` advisory — confirm no advisory rec carries a non-zero `EstimatedMonthlySavings` (advisory-leak, B1), and in accounts with no READY dev endpoints verify the tab still renders despite zero counted savings (D2, tab gate keys off rendered cards not counted-only headline).
+
 You are auditing the **`glue`** adapter of this AWS cost-optimization scanner.
 Scope is strictly cost: every emitted recommendation must produce a concrete,
 account-specific dollar saving. Work read-only first (understand + validate),

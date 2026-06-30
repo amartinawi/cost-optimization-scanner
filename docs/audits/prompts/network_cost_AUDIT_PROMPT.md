@@ -11,6 +11,15 @@ emitted recommendation must produce a concrete, account-specific dollar saving.
 
 ## PROMPT (copy from here)
 
+> **⚠ Latest live-audit findings (2026-06-30) — read these FIRST, then this prompt.**
+> Before auditing, also read and paste `docs/audits/prompts/_LIVE_AUDIT_LESSONS.md`
+> — the recurring cost-fidelity bug *classes* confirmed in live deep audits (with
+> real examples, ready-to-run JSON invariant sweeps, and the audit-method traps that
+> cause FALSE findings). Run those sweeps before manual tracing.
+>
+> Service-specific live-audit findings for `network_cost`:
+> - This service is (largely) ADVISORY-ONLY — verify it still renders a TAB despite `$0` counted savings (the tab gate keys off RENDERED cards, counted + advisory, not the counted-only headline count), and confirm no `Counted=False` rec carries a non-zero `monthly_savings` (advisory-leak; this adapter uses snake_case `monthly_savings`, not `EstimatedMonthlySavings` — the standard invariant sweep targets the wrong key for this adapter).
+
 You are auditing the **`network_cost`** adapter of this AWS cost-optimization
 scanner. Scope is strictly cost: every emitted recommendation must produce a
 concrete, account-specific dollar saving. Work read-only first (understand +

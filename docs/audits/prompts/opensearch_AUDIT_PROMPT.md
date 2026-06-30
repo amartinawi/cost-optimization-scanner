@@ -11,6 +11,16 @@ recommendation must produce a concrete, account-specific dollar saving.
 
 ## PROMPT (copy from here)
 
+> **⚠ Latest live-audit findings (2026-06-30) — read these FIRST, then this prompt.**
+> Before auditing, also read and paste `docs/audits/prompts/_LIVE_AUDIT_LESSONS.md`
+> — the recurring cost-fidelity bug *classes* confirmed in live deep audits (with
+> real examples, ready-to-run JSON invariant sweeps, and the audit-method traps that
+> cause FALSE findings). Run those sweeps before manual tracing.
+>
+> Service-specific live-audit findings for `opensearch`:
+> - CoH consumer — verify the bucket is consumed and dedup is CoH > heuristic by normalized id; non-priceable levers (e.g. the r5.medium.search $0 pricing fallback) must be `$0` `Counted=False` advisories (they are flagged via the rec's `EstimatedSavings` string, NOT via `scan_warnings`).
+> - B1 advisory-leak: the adapter has four distinct demotion paths (CoH supersession, best-lever per-domain dedup, idle-vs-storage exclusion, non-priceable fallback); verify every `Counted=False` rec carries `EstimatedMonthlySavings == 0.0` after the advisory-zeroing loop before the SourceBlock is built.
+
 You are auditing the **`opensearch`** adapter of this AWS cost-optimization
 scanner. Scope is strictly cost: every emitted recommendation must produce a
 concrete, account-specific dollar saving. Work read-only first (understand +

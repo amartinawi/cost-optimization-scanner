@@ -15,6 +15,16 @@ rightsizing levers they overlap.**
 
 ## PROMPT (copy from here)
 
+> **⚠ Latest live-audit findings (2026-06-30) — read these FIRST, then this prompt.**
+> Before auditing, also read and paste `docs/audits/prompts/_LIVE_AUDIT_LESSONS.md`
+> — the recurring cost-fidelity bug *classes* confirmed in live deep audits (with
+> real examples, ready-to-run JSON invariant sweeps, and the audit-method traps that
+> cause FALSE findings). Run those sweeps before manual tracing.
+>
+> Service-specific live-audit findings for `commitment_analysis`:
+> - Skip an SP coverage-gap whose service is `"Unknown"`: when the account holds no active Savings Plans, Cost Explorer aggregates ALL on-demand spend under 'Unknown', producing a flat-30%-of-everything estimate that can EXCEED the whole counted headline — non-actionable; the concrete buy scenarios come from `purchase_recommendations`.
+> - Every SP/RI coverage-gap & purchase rec is `Counted=False` (no fabricated commitment dollar reaches the headline).
+
 You are auditing the **`commitment_analysis`** adapter of this AWS
 cost-optimization scanner (Savings Plans + Reserved Instance utilization,
 coverage, expiry, and purchase recommendations, plus a Fargate-isolated Compute

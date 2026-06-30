@@ -11,6 +11,17 @@ recommendation must produce a concrete, account-specific dollar saving.
 
 ## PROMPT (copy from here)
 
+> **⚠ Latest live-audit findings (2026-06-30) — read these FIRST, then this prompt.**
+> Before auditing, also read and paste `docs/audits/prompts/_LIVE_AUDIT_LESSONS.md`
+> — the recurring cost-fidelity bug *classes* confirmed in live deep audits (with
+> real examples, ready-to-run JSON invariant sweeps, and the audit-method traps that
+> cause FALSE findings). Run those sweeps before manual tracing.
+>
+> Service-specific live-audit findings for `athena`:
+> - The metric-gap advisory string must lead with `$0.00/month — advisory:` agreeing with `Counted=False`/`EMV=0` in ALL THREE branches (measured / no-CW-data / fast-mode) — a bare 'Up to 75%' string on a $0 advisory rec is a string↔state mismatch.
+> - Region-scale the base-cost figure shown in the string (`× pricing_multiplier`) so it matches the savings basis in non-US regions.
+> - The `get_metric_statistics` exception in the adapter's CW pricing loop is caught with `logger.warning` + `monthly_tb = 0` only — an `AccessDenied`/throttle silently becomes a `$0` advisory; classify it via `record_aws_error` the way the `list_work_groups` path already does (class E1).
+
 You are auditing the **`athena`** adapter of this AWS cost-optimization scanner.
 Scope is strictly cost: every emitted recommendation must produce a concrete,
 account-specific dollar saving. Work read-only first (understand + validate),

@@ -14,6 +14,16 @@ retired media-object store with no dedicated PricingEngine method.
 
 ## PROMPT (copy from here)
 
+> **⚠ Latest live-audit findings (2026-06-30) — read these FIRST, then this prompt.**
+> Before auditing, also read and paste `docs/audits/prompts/_LIVE_AUDIT_LESSONS.md`
+> — the recurring cost-fidelity bug *classes* confirmed in live deep audits (with
+> real examples, ready-to-run JSON invariant sweeps, and the audit-method traps that
+> cause FALSE findings). Run those sweeps before manual tracing.
+>
+> Service-specific live-audit findings for `mediastore`:
+> - This service emits `$0` advisory recs ALONGSIDE counted ones (it is a counted/advisory split, not advisory-only) — verify the tab still renders even when ALL recs happen to be advisory (D2; the tab gate keys off RENDERED cards, counted + advisory, not the counted-only headline count), and confirm no `Counted=False` rec carries a non-zero numeric (advisory-leak, B1).
+> - (B2) On the counted path the adapter overwrites `EstimatedMonthlySavings` with the PricingEngine-derived rate (no multiplier) but does NOT update `rec["EstimatedSavings"]`, leaving the shim's string (computed at `0.023 × ctx.pricing_multiplier`) stale — verify string and numeric agree to the cent in every branch.
+
 You are auditing the **`mediastore`** adapter of this AWS cost-optimization
 scanner. Scope is strictly cost: every emitted recommendation must produce a
 concrete, account-specific dollar saving. Work read-only first (understand +

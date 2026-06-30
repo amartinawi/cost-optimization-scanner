@@ -11,6 +11,16 @@ recommendation must produce a concrete, account-specific dollar saving.
 
 ## PROMPT (copy from here)
 
+> **⚠ Latest live-audit findings (2026-06-30) — read these FIRST, then this prompt.**
+> Before auditing, also read and paste `docs/audits/prompts/_LIVE_AUDIT_LESSONS.md`
+> — the recurring cost-fidelity bug *classes* confirmed in live deep audits (with
+> real examples, ready-to-run JSON invariant sweeps, and the audit-method traps that
+> cause FALSE findings). Run those sweeps before manual tracing.
+>
+> Service-specific live-audit findings for `eks_cost`:
+> - None beyond the cross-cutting lessons — run the invariant sweeps in `_LIVE_AUDIT_LESSONS.md` and the known-issue catalogue below (advisory-leak, string↔numeric agreement, flat-global rate scaling, dedup granularity, silent-failure classification).
+> - `eks_cost` consumes Cost Hub via `ctx.cost_hub_splits["eks_cost"]`; confirm the 3-layer wire-up (`_HUB_SERVICES`, `type_map["EksCluster"]="eks_cost"`, adapter reads the bucket) and that the dedup key converges — CoH `resourceArn` final segment vs heuristic cluster-name `resource_id` — and no CoH bucket is orphaned; a regression to key `"eks"` silently drops all EKS CoH recs (class E2).
+
 You are auditing the **`eks_cost`** adapter (`EksCostModule`) of this AWS
 cost-optimization scanner. Scope is strictly cost: every emitted recommendation
 must produce a concrete, account-specific dollar saving. Work read-only first

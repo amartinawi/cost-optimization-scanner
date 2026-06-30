@@ -11,6 +11,16 @@ recommendation must produce a concrete, account-specific dollar saving.
 
 ## PROMPT (copy from here)
 
+> **⚠ Latest live-audit findings (2026-06-30) — read these FIRST, then this prompt.**
+> Before auditing, also read and paste `docs/audits/prompts/_LIVE_AUDIT_LESSONS.md`
+> — the recurring cost-fidelity bug *classes* confirmed in live deep audits (with
+> real examples, ready-to-run JSON invariant sweeps, and the audit-method traps that
+> cause FALSE findings). Run those sweeps before manual tracing.
+>
+> Service-specific live-audit findings for `bedrock`:
+> - Thread `ctx` + `record_aws_error` into the Provisioned-Throughput / knowledge-base / agent ENUMERATION paths (bare `except: pass` hid AccessDenied as 'no resources'); record only the genuine double-failure, not the paginator-unavailable fallback.
+> - `_check_idle_knowledge_bases` emits `monthly_savings: 0.0` recs without `Counted: False`; unlike the idle-PT advisory path these inflate `total_recommendations` and evade the B1 advisory-hygiene sweep — confirm each KB rec carries `Counted: False` so D4 holds (advisory recs must not inflate the count).
+
 You are auditing the **`bedrock`** adapter of this AWS cost-optimization scanner.
 Scope is strictly cost: every emitted recommendation must produce a concrete,
 account-specific dollar saving. Work read-only first (understand + validate),

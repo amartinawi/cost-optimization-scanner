@@ -11,6 +11,17 @@ recommendation must produce a concrete, account-specific dollar saving.
 
 ## PROMPT (copy from here)
 
+> **⚠ Latest live-audit findings (2026-06-30) — read these FIRST, then this prompt.**
+> Before auditing, also read and paste `docs/audits/prompts/_LIVE_AUDIT_LESSONS.md`
+> — the recurring cost-fidelity bug *classes* confirmed in live deep audits (with
+> real examples, ready-to-run JSON invariant sweeps, and the audit-method traps that
+> cause FALSE findings). Run those sweeps before manual tracing.
+>
+> Service-specific live-audit findings for `lightsail`:
+> - Two adapter-specific gaps apply (see below); also run the invariant sweeps in `_LIVE_AUDIT_LESSONS.md` and the known-issue catalogue (advisory-leak, string↔numeric agreement, flat-global rate scaling, dedup granularity, silent-failure classification).
+> - E1 (silent failure): `get_enhanced_lightsail_checks` wraps all Lightsail API calls in a single `except Exception: ctx.warn()`, routing `AccessDenied`/throttle to a warning instead of `record_aws_error`; permission gaps appear as false "no resources" results.
+> - C1 (flat-global rate): `LIGHTSAIL_UNUSED_STATIC_IP_HOURLY` ($0.005/hr, sourced from `USE1-UnusedStaticIP`) is multiplied by `pricing_multiplier`; verify whether Lightsail static-IP pricing is flat-global (the shim comment notes "Matches the AWS public-IPv4 charge" — same rate as EIP) — if so, the multiplier fabricates a region-specific rate for a flat charge.
+
 You are auditing the **`lightsail`** adapter of this AWS cost-optimization
 scanner. Scope is strictly cost: every emitted recommendation must produce a
 concrete, account-specific dollar saving. Work read-only first (understand +

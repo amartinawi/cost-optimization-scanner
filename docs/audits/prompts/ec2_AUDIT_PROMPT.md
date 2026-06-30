@@ -11,6 +11,17 @@ recommendation must produce a concrete, account-specific dollar saving.
 
 ## PROMPT (copy from here)
 
+> **⚠ Latest live-audit findings (2026-06-30) — read these FIRST, then this prompt.**
+> Before auditing, also read and paste `docs/audits/prompts/_LIVE_AUDIT_LESSONS.md`
+> — the recurring cost-fidelity bug *classes* confirmed in live deep audits (with
+> real examples, ready-to-run JSON invariant sweeps, and the audit-method traps that
+> cause FALSE findings). Run those sweeps before manual tracing.
+>
+> Service-specific live-audit findings for `ec2`:
+> - AUDIT-METHOD: EC2 CoH recs render as a few action-GROUPED cards ('MigrateToGraviton (5 resources)') with every instance listed inside — a low card count vs many recs is NOT a render desync; their savings are in camelCase `estimatedMonthlySavings` (empty PascalCase string).
+> - Consider attaching a structured `AuditBasis` to CoH recs so the largest chunk of the headline is defensible from the report alone.
+> - DEDUP/COH: EC2 consumes both CoH (`ctx.cost_hub_splits["ec2"]`) and CO inline; audit the CoH > CO > heuristic dedup at normalized instance-id granularity (A1/A2) and confirm no additional EC2-related CoH `currentResourceType` (e.g. `Ec2AutoScalingGroup`) is orphaned without a consuming bucket (E2).
+
 You are auditing the **`ec2`** adapter of this AWS cost-optimization scanner.
 Scope is strictly cost: every emitted recommendation must produce a concrete,
 account-specific dollar saving. Work read-only first (understand + validate),
