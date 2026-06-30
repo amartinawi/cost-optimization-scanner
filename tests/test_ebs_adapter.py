@@ -567,3 +567,15 @@ class TestSnapshotAdvisoryAndSizing:
         rec = result["old_snapshots"][0]
         assert rec["PotentialMonthlySavings"] == 1.00  # 20 GB, not the 100 GB upper bound
         assert rec["Counted"] is False
+
+    def test_tiny_snapshot_rounding_to_zero_is_suppressed(self):
+        from services.ebs import compute_ebs_checks
+
+        # 0.1 GB stored × $0.05 = $0.005 → rounds to $0.00. The potential<=0 guard
+        # must suppress the rec so no "$0.00/mo recoverable" noise card is emitted
+        # (the size>0 guard alone passes such a tiny snapshot).
+        snap = _old_snap("snap-tiny", "nightly backup")
+        snap["FullSnapshotSizeInBytes"] = int(0.1 * 1024**3)
+        ec2 = _FakeEc2Snapshots([], [snap])
+        result = compute_ebs_checks(self._ctx(ec2), 1.0, 90)
+        assert result["old_snapshots"] == []

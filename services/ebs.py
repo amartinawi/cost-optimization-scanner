@@ -624,6 +624,12 @@ def compute_ebs_checks(
                 if size_gb <= 0:
                     continue
                 potential = round(size_gb * snapshot_rate, 2)
+                # A snapshot whose recoverable rounds to $0.00 (a few stored MB) is
+                # not actionable — a "$0.00/mo recoverable" advisory card is noise.
+                # The size>0 guard above still passes such tiny snapshots (e.g.
+                # 0.1GB), so gate on the rounded potential too.
+                if potential <= 0:
+                    continue
                 _snapshot_basis = {
                     "metric": f"snapshot data stored ($/GB-mo) — {size_basis}",
                     "rate_per_gb_month": round(snapshot_rate, 6),

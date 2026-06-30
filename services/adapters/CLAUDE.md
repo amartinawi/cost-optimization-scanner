@@ -70,7 +70,7 @@ rate lookup in the adapter itself).
 
 | Adapter | Method |
 |---------|--------|
-| `ami.py` | Sums float `EstimatedMonthlySavings` per rec (EBS snapshot GB × the live snapshot rate from `PricingEngine.get_ebs_snapshot_price_per_gb()`; fallback `0.05 × pricing_multiplier`) — does **not** call `parse_dollar_savings()`. Unused-AMI age bucketed (30-90 / 90-180 / 180-365 / 1-2y / 2y+). |
+| `ami.py` | Sums float `EstimatedMonthlySavings` per rec (EBS snapshot GB × the live snapshot rate from `PricingEngine.get_ebs_snapshot_price_per_gb()`; fallback `0.05 × pricing_multiplier`) — does **not** call `parse_dollar_savings()`. Sizes on **actual stored bytes** (`FullSnapshotSizeInBytes`), VolumeSize fallback flagged. **Cross-AMI snapshot dedup**: `_snapshot_storage_gb` takes a `counted_snapshot_ids` set so a snapshot shared by N AMIs is counted **once** (the first AMI); an all-shared AMI becomes a `Counted=False` advisory ("shared — counted under the other AMI"), partial-overlap counts only unique GB (a shared snapshot is billed once and freed only when every referencing AMI is deregistered — counting it per-AMI double-counts). Launch-permission check runs **before** snapshot attribution so a skipped AMI never claims a snapshot id. Unused-AMI age bucketed (30-90 / 90-180 / 180-365 / 1-2y / 2y+). |
 | `monitoring.py` | 4-domain composite (CloudWatch custom metrics + CloudTrail + Backup + Route53). Savings use the numeric `EstimatedMonthlySavings` the shim emits (CW custom-metric cost via a 4-tier per-namespace ladder — monitoring L2); best-practice nudges that resolve to `$0` → `Counted=False` advisory. |
 
 ### Advisory-only — every rec `$0` `Counted=False` (5 adapters)
