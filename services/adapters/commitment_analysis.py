@@ -297,6 +297,16 @@ class CommitmentAnalysisModule(BaseServiceModule):
                     rate = self._parse_pct(cov.get("CoveragePercentage", "0"))
                     if rate < self.COVERAGE_GAP_THRESHOLD:
                         svc = entry.get("Attributes", {}).get("service", "Unknown")
+                        # An unattributable coverage gap (CE returned no service —
+                        # typical when the account holds NO active Savings Plans, so
+                        # all on-demand spend aggregates under "Unknown") is not
+                        # account-specific or actionable: the concrete buy scenarios
+                        # already come from purchase_recommendations. Emitting a
+                        # flat-30%-of-everything "$X potential" tied to "Unknown" is
+                        # misleading noise (it can exceed the whole counted headline),
+                        # so skip it. The spend still fed overall_rate above.
+                        if not svc or svc == "Unknown":
+                            continue
                         potential = od * (1.0 - rate) * self.AVG_SP_DISCOUNT_RATE
                         recs.append(
                             {

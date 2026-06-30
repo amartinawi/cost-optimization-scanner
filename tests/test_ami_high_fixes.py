@@ -365,3 +365,119 @@ def test_scan_counts_only_genuine_unused_ami():
     assert rec["ImageId"] == "ami-free"
     # counted dollar == rendered dollar on the card.
     assert parse_dollar_savings(rec["EstimatedSavings"]) == findings.total_monthly_savings
+
+
+# --------------------------------------------------------------------------- #
+# AMI-001 — a snapshot shared across AMIs is counted ONCE (cardinal-sin double-
+# count fix). An EBS snapshot is billed once and cannot be freed until every AMI
+# referencing it is deregistered, so attributing its storage to each AMI overstates.
+# --------------------------------------------------------------------------- #
+def _ami_with_snaps(image_id: str, age_days: int, snap_ids: list[str]) -> dict:
+    created = (datetime.now(UTC) - timedelta(days=age_days)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    bdm = [
+        {"DeviceName": f"/dev/sd{chr(98 + i)}", "Ebs": {"SnapshotId": s, "VolumeSize": 100}}
+        for i, s in enumerate(snap_ids)
+    ]
+    return {"ImageId": image_id, "Name": image_id, "CreationDate": created, "BlockDeviceMappings": bdm}
+
+
+def test_shared_snapshot_counted_once_second_ami_is_advisory():
+    # ami-a and ami-b both reference ONLY snap-shared (200 GB -> $10). It must be
+    # counted once ($10), not twice ($20); the second AMI becomes a $0 advisory.
+    ec2 = _FakeEc2(
+        images=[_ami_with_snaps("ami-a", 200, ["snap-shared"]), _ami_with_snaps("ami-b", 200, ["snap-shared"])],
+        snap_bytes={"snap-shared": 200 * 1024**3},
+    )
+    out = compute_ami_checks(_make_ctx(ec2))
+    recs = out["old_amis"]
+    assert len(recs) == 2
+    counted = [r for r in recs if r.get("Counted") is not False]
+    advisory = [r for r in recs if r.get("Counted") is False]
+    assert len(counted) == 1 and len(advisory) == 1
+    # The shared snapshot's $10 is counted exactly once.
+    assert counted[0]["EstimatedMonthlySavings"] == 200.0 * SNAPSHOT_RATE
+    assert advisory[0]["EstimatedMonthlySavings"] == 0.0
+    assert "snap-shared" in advisory[0]["SharedSnapshotIds"]
+    assert advisory[0]["EstimatedSavings"].startswith("$0.00/month")
+    # Headline = $10 (NOT $20) — the double-count is gone.
+    assert sum(r["EstimatedMonthlySavings"] for r in recs) == 200.0 * SNAPSHOT_RATE
+
+
+def test_partial_shared_snapshot_counts_only_unique_gb():
+    # ami-a -> snap-shared (200 GB). ami-b -> snap-shared + snap-uniqueB (100 GB).
+    # ami-a counts snap-shared ($10); ami-b counts only its unique snap ($5).
+    ec2 = _FakeEc2(
+        images=[
+            _ami_with_snaps("ami-a", 200, ["snap-shared"]),
+            _ami_with_snaps("ami-b", 200, ["snap-shared", "snap-uniqueB"]),
+        ],
+        snap_bytes={"snap-shared": 200 * 1024**3, "snap-uniqueB": 100 * 1024**3},
+    )
+    out = compute_ami_checks(_make_ctx(ec2))
+    recs = out["old_amis"]
+    a = next(r for r in recs if r["ImageId"] == "ami-a")
+    b = next(r for r in recs if r["ImageId"] == "ami-b")
+    assert a["EstimatedMonthlySavings"] == 200.0 * SNAPSHOT_RATE  # $10 (snap-shared)
+    assert b["EstimatedMonthlySavings"] == 100.0 * SNAPSHOT_RATE  # $5 (only snap-uniqueB)
+    assert b.get("Counted") is not False  # still a counted candidate
+    assert "shared" in b["AuditBasis"].lower()  # discloses the shared portion
+    # snap-shared counted once -> total $15, not $25.
+    assert sum(r["EstimatedMonthlySavings"] for r in recs) == 300.0 * SNAPSHOT_RATE
+
+
+def test_unsizable_snapshot_is_skipped_not_treated_as_shared():
+    # describe_snapshots fails AND the BDM carries no VolumeSize -> the AMI cannot
+    # be sized. It must be SKIPPED (no fabricated dollar), not emitted as a "shared"
+    # advisory (incremental_gb==0 with empty shared_ids).
+    created = (datetime.now(UTC) - timedelta(days=200)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    ami = {
+        "ImageId": "ami-nosize",
+        "Name": "ami-nosize",
+        "CreationDate": created,
+        "BlockDeviceMappings": [{"DeviceName": "/dev/sda1", "Ebs": {"SnapshotId": "snap-x"}}],
+    }
+    ec2 = _FakeEc2(images=[ami], snap_exc=RuntimeError("throttled"))
+    out = compute_ami_checks(_make_ctx(ec2))
+    assert out["recommendations"] == []
+
+
+def test_unsizable_snapshot_not_claimed_so_later_ami_can_count_it():
+    # Claim-order safety (adversarial-review defect): an UNSIZABLE snapshot
+    # (describe fails, no VolumeSize) must NOT be claimed into the dedup set, or a
+    # later AMI that CAN size the same snapshot would be wrongly zeroed as "shared".
+    from services.ami import _snapshot_storage_gb
+
+    counted: set[str] = set()
+    # AMI-x: snap-z, describe throws, no VolumeSize -> unsizable -> must NOT claim.
+    ami_x = {"BlockDeviceMappings": [{"Ebs": {"SnapshotId": "snap-z"}}]}
+    gb_x, _all_x, shared_x, _est_x = _snapshot_storage_gb(
+        _FakeEc2(images=[], snap_exc=RuntimeError("throttled")), ami_x, counted
+    )
+    assert gb_x == 0.0 and shared_x == [] and "snap-z" not in counted  # left unclaimed
+
+    # AMI-y: same snap-z, describe SUCCEEDS (200 GB) -> counted, NOT "shared".
+    ami_y = {"BlockDeviceMappings": [{"Ebs": {"SnapshotId": "snap-z", "VolumeSize": 100}}]}
+    gb_y, _all_y, shared_y, _est_y = _snapshot_storage_gb(
+        _FakeEc2(images=[], snap_bytes={"snap-z": 200 * 1024**3}), ami_y, counted
+    )
+    assert gb_y == 200.0 and shared_y == []  # genuinely counted
+    assert "snap-z" in counted
+
+
+def test_self_duplicate_snapshot_counted_once_not_reported_shared():
+    # A snapshot mapped twice within ONE AMI's block devices is counted once and is
+    # NOT mislabeled "shared with another AMI".
+    from services.ami import _snapshot_storage_gb
+
+    ami = {
+        "BlockDeviceMappings": [
+            {"DeviceName": "/dev/sda1", "Ebs": {"SnapshotId": "snap-dup", "VolumeSize": 100}},
+            {"DeviceName": "/dev/sdb", "Ebs": {"SnapshotId": "snap-dup", "VolumeSize": 100}},
+        ]
+    }
+    gb, all_ids, shared, _est = _snapshot_storage_gb(
+        _FakeEc2(images=[], snap_bytes={"snap-dup": 100 * 1024**3}), ami, set()
+    )
+    assert gb == 100.0  # counted once, not 200
+    assert shared == []  # self-duplicate is not "shared"
+    assert all_ids == ["snap-dup", "snap-dup"]

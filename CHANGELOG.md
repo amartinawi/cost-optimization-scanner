@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (fourth deep-audit remediation — eu-west-1, account tadweer-prod)
+A deep audit (12 agents across 4 dimensions, every finding adversarially
+verified) of account 625908733617 found one genuine cardinal-sin double-count
+plus two cosmetic items. The headline ($2,356.06) reconciled to the cent and EC2
+($1,579.51, all Cost Optimization Hub) rendered correctly (grouped action cards,
+all 22 instances visible, ARM caveat disclosed).
+
+- **AMI snapshots shared across AMIs were counted twice (cardinal sin).** Five
+  EBS snapshots were each referenced by two unused AMIs, and `services/ami.py`
+  attributed each snapshot's full storage to *both* — overstating the AMI total
+  by ~$43–46/mo. A snapshot is billed once and can't be freed until every AMI
+  referencing it is deregistered, so the second attribution is not recoverable.
+  `_snapshot_storage_gb` now takes a `counted_snapshot_ids` set and counts each
+  snapshot's GB exactly once (the first AMI to reference it); an AMI whose backing
+  snapshots are *all* already counted becomes a `Counted=False` advisory
+  ("backing snapshots shared with another AMI — counted there; deregister both to
+  realize") so it stays visible without double-counting, and partial-overlap AMIs
+  count only their unique GB with disclosure. The launch-permission check was
+  moved ahead of snapshot attribution so a skipped AMI never claims a snapshot id.
+- **EBS snapshot advisory rounding to $0.00 (noise).** A 0.1 GB snapshot whose
+  recoverable rounds to $0.00 still emitted a "$0.00/mo recoverable if deleted"
+  advisory card — the `size_gb <= 0` guard passes such tiny snapshots. Added a
+  `potential <= 0` guard so they are suppressed (no dollar impact; UX noise).
+- **Savings Plans coverage gap for an unattributable service (noise).** When an
+  account holds no active Savings Plans, Cost Explorer aggregates all on-demand
+  spend under service `"Unknown"`, producing a flat-30%-of-everything advisory
+  (e.g. $2,873.68 — larger than the whole counted headline) that is non-actionable.
+  It is now skipped (the concrete buy scenarios already come from
+  `purchase_recommendations`); the spend still feeds the coverage-rate stat card.
+
 ### Fixed (third deep-audit remediation — ap-south-1 + ap-southeast-1, account bnc)
 Two regions of a new account (784852663902) were deep-audited (adversarially
 verified): ap-south-1 (15 confirmed) and ap-southeast-1 (5 confirmed). Every

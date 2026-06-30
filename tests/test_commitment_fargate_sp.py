@@ -293,3 +293,47 @@ def test_render_fargate_sp_matrix():
     assert "$1,615.04/mo" in html and "$1,315.04/mo" in html
     assert "45.0%" in html and "$515.00/mo" in html and "$727.37/mo" in html
     assert "Rightsize first" in html
+
+
+# --------------------------------------------------------------------------- #
+# COMMIT-01 — an unattributable SP coverage gap (service "Unknown", the whole-
+# account on-demand spend when no Savings Plans are active) is non-actionable
+# noise and must NOT emit a flat-30%-of-everything advisory. Known services still
+# emit. The purchase_recommendations source owns the concrete buy path.
+# --------------------------------------------------------------------------- #
+def _cov_ctx():
+    return SimpleNamespace(
+        region="eu-west-1",
+        warn=lambda *a, **k: None,
+        permission_issue=lambda *a, **k: None,
+    )
+
+
+def _cov_ce(service_attr: dict):
+    return SimpleNamespace(
+        get_savings_plans_coverage=lambda **kw: {
+            "SavingsPlansCoverages": [
+                {
+                    "Attributes": service_attr,
+                    "Coverage": {"OnDemandCost": "9578.93", "CoveredCost": "0", "CoveragePercentage": "0"},
+                }
+            ]
+        }
+    )
+
+
+def test_sp_coverage_gap_skips_unknown_service():
+    mod = CommitmentAnalysisModule()
+    tp = {"Start": "2026-06-01", "End": "2026-06-30"}
+    recs, rate = mod._check_sp_coverage(_cov_ctx(), _cov_ce({}), tp)  # no 'service' attr -> "Unknown"
+    assert recs == []  # the unattributable gap is suppressed
+    assert rate == 0.0  # 0% coverage still computed for the stat card
+
+
+def test_sp_coverage_gap_emits_for_known_service():
+    mod = CommitmentAnalysisModule()
+    tp = {"Start": "2026-06-01", "End": "2026-06-30"}
+    recs, rate = mod._check_sp_coverage(_cov_ctx(), _cov_ce({"service": "Amazon EC2"}), tp)
+    assert len(recs) == 1
+    assert recs[0]["resource_id"] == "Amazon EC2"
+    assert recs[0]["monthly_savings"] > 0  # 9578.93 × (1-0) × 0.30
