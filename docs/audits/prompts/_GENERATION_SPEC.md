@@ -8,7 +8,11 @@ one per assigned service, at `docs/audits/prompts/<service_key>_AUDIT_PROMPT.md`
 
 ## Grounding (do this BEFORE writing each prompt)
 1. Read `docs/NETWORK_AUDIT_PROMPT.md` (gold-standard exemplar — match its structure
-   and depth EXACTLY) and `docs/SERVICE_AUDIT_PROMPT.md` (generic template).
+   and depth EXACTLY), `docs/SERVICE_AUDIT_PROMPT.md` (generic template), and
+   `docs/audits/prompts/_LIVE_AUDIT_LESSONS.md` (recurring bug classes CONFIRMED in
+   live audits, with real examples, detection sweeps, and the audit-method traps
+   that cause false findings — every generated prompt must tell the auditor to
+   paste it alongside).
 2. Read the adapter `services/adapters/<file>.py` in full.
 3. Read its helpers: `services/<key>.py` and `services/<key>_logic.py` if they exist;
    any sub-shims it imports; the `PricingEngine` methods it calls in
@@ -66,8 +70,10 @@ one per assigned service, at `docs/audits/prompts/<service_key>_AUDIT_PROMPT.md`
   `tests/test_rds_audit_fixes.py`; regression gate
   `pytest tests/test_regression_snapshot.py tests/test_reporter_snapshots.py`;
   AuditBasis; update the `services/adapters/CLAUDE.md` row; stage only changed files).
-- Known-issue catalogue: the UNIVERSAL list below verbatim, THEN 4-8 service-specific
-  items you discovered from the code.
+- Known-issue catalogue: the UNIVERSAL list below verbatim (including the live-audit
+  additions), a one-line instruction to ALSO paste `docs/audits/prompts/_LIVE_AUDIT_LESSONS.md`
+  (recurring bug classes + ready-to-run invariant sweeps + audit-method traps), THEN 4-8
+  service-specific items you discovered from the code.
 
 ## UNIVERSAL known-issue catalogue (embed verbatim in every prompt)
 - Usage savings computed from a config dimension alone (memory/size/capacity/RCU-WCU/DPU)
@@ -114,6 +120,42 @@ one per assigned service, at `docs/audits/prompts/<service_key>_AUDIT_PROMPT.md`
   rightsize first.
 - Each counted finding must carry a structured AuditBasis (rate/region/metric-window/
   formula) so the number is defensible from the report alone; counted == rendered.
+
+### Live-audit additions (2026-06-30 — see `_LIVE_AUDIT_LESSONS.md` for examples + sweeps)
+- Advisory-leak: a `Counted=False` rec carrying a non-zero `EstimatedMonthlySavings`
+  numeric (must be `0.0`; recoverable figure goes in `PotentialMonthlySavings`).
+- String ↔ numeric divergence: `EstimatedSavings` string and `EstimatedMonthlySavings`
+  numeric (and AuditBasis) must agree to the cent in EVERY branch — capping/reconciling
+  the string but not the numeric, or vice-versa, is a silent field overstatement.
+- A globally-FLAT rate (public IPv4 / EIP $3.65; Route53 $0.50/zone) region-scaled by
+  `pricing_multiplier` in the fallback path (flat charges must NOT be scaled — the mirror
+  of the region item above).
+- Dedup at too-coarse a scope (demoting every lever in a VPC/cluster because CoH covered
+  ONE resource) — suppresses independent resources; dedup at the resource-id granularity
+  and prefer EXCLUSION (drop the covered resource from the heuristic's input) over blanket
+  demotion. A dedup fix's failure mode is UNDER-count + advisory-leak + claim-order.
+- Dedup claim-order: claim a resource into the "seen" set only AFTER all skip checks AND
+  only once it actually contributes a counted dollar; distinguish "all-shared" (→ $0
+  advisory) from "unsizable/no-data" (→ skip) when both yield `incremental == 0`.
+- Same physical snapshot counted under >1 AMI (shared backing snapshots) — a snapshot is
+  billed once and freed only when every referencing AMI is deregistered; count it once,
+  emit the co-dependent AMI as a `Counted=False` advisory.
+- Advisory-only service rendered with NO tab — the tab gate must key off RENDERED cards
+  (counted + advisory), while the headline COUNT keys off counted-only; `total_services_scanned`
+  must match rendered service tabs (synthetic Snapshots/AMIs tabs are intentionally extra).
+- A de-minimis saving that rounds to `$0.00` still emitting a card — gate on the rounded
+  potential, not just raw size.
+- A flat-%-of-spend estimate with no per-resource signal (e.g. an "Unknown"-service SP
+  coverage gap = the whole account's on-demand spend × a flat discount) — non-actionable,
+  suppress or $0-advisory; never let it near the headline.
+- Silent-failure fix completeness: thread `ctx` into EVERY call site of a helper (the s3
+  `GetBucketWebsite` second call site was missed first pass), and record only genuine
+  enumeration/metric failures — keep the normal fallback paths (paginator-unavailable,
+  `NoSuchWebsiteConfiguration`, empty-datapoints) silent.
+- Audit-method traps (avoid FALSE findings): CoH recs carry savings in camelCase
+  `estimatedMonthlySavings` (empty PascalCase string); unattached EBS in
+  `EstimatedMonthlyCost`; EC2/EBS CoH render as a few action-GROUPED cards (not one per
+  rec); a CoH `estimatedSavingsPercentage` ~1pp off is AWS rounding, not our bug.
 
 ## Rules
 - Read-only on source; the ONLY file you create per service is its prompt `.md`.

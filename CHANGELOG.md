@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (consolidated live-audit lessons → enriched audit prompts)
+The recurring cost-fidelity bug *classes* surfaced across four live deep-audit
+cycles (eu-central-1, eu-west-1, ap-south-1, ap-southeast-1; accounts
+level-Shoes-prod, bnc, tadweer-prod) are consolidated into a new
+`docs/audits/prompts/_LIVE_AUDIT_LESSONS.md` — each pattern with a real example,
+a detection technique, and the fix pattern, grouped as: double-counting &
+de-duplication (granularity, exclusion-vs-demotion, cross-adapter shared
+resources, claim-order), advisory hygiene & string↔numeric agreement,
+pricing-rate traps (flat-global rates, actual-vs-provisioned sizing, flat-%
+fabrication, de-minimis rounding), render/tab/count semantics, silent-failure
+classification & Cost-Hub plumbing, and **audit-method traps** that cause false
+findings (CoH camelCase savings, unattached `EstimatedMonthlyCost`, grouped
+rendering, AWS-supplied annotations). Includes ready-to-run JSON invariant sweeps
+(headline reconcile, advisory-leak, all-fields counted-$0, shared-snapshot
+double-count) and a "how to verify a dedup fix" checklist. The
+`_GENERATION_SPEC.md` UNIVERSAL known-issue catalogue is extended with the new
+classes and every future per-service prompt now references the lessons file.
+
 ### Fixed (fourth deep-audit remediation — eu-west-1, account tadweer-prod)
 A deep audit (12 agents across 4 dimensions, every finding adversarially
 verified) of account 625908733617 found one genuine cardinal-sin double-count
