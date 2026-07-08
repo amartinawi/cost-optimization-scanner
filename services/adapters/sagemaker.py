@@ -16,6 +16,7 @@ from core.contracts import GroupingSpec, ServiceFindings, SourceBlock, StatCardS
 from services._aws_errors import record_aws_error
 from services._base import BaseServiceModule
 from services._savings import mark_zero_savings_advisory
+from services.commitment_coverage import demote_recs_in_place
 
 SPOT_SAVINGS_RATE: float = 0.70
 HOURS_PER_MONTH: int = 730
@@ -519,6 +520,16 @@ class SageMakerModule(BaseServiceModule):
         # placeholders are excluded from BOTH the dollar total and the counted
         # rec count. counted == rendered: total sums only Counted!=False recs.
         mark_zero_savings_advisory(all_recs, lambda r: r.get("EstimatedMonthlySavings", 0.0))
+
+        # Active-commitment demotion: a SageMaker Savings Plan is fixed pre-paid
+        # spend that continues after an idle endpoint is removed or a notebook
+        # rightsized, so the on-demand figure is not realizable. Demote every
+        # counted SageMaker rec to advisory. (A Compute SP does NOT cover
+        # SageMaker.) No SageMaker SP -> no change.
+        coverage = getattr(ctx, "commitment_coverage", None)
+        if coverage is not None and coverage.covers_sagemaker():
+            demote_recs_in_place(all_recs, lambda g: coverage.plan_note("SageMaker Savings Plan", g))
+
         total_savings = sum(
             r.get("EstimatedMonthlySavings", 0.0) for r in all_recs if r.get("Counted") is not False
         )

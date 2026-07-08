@@ -24,8 +24,11 @@ from services.commitment_coverage import (
     CommitmentCoverage,
     coh_resource_type,
     demote_coh_by_commitment,
+    demote_recs_in_place,
     fetch_commitment_coverage,
     instance_family,
+    normalize_type,
+    rec_gross,
     split_by_commitment,
 )
 
@@ -85,14 +88,18 @@ def test_ri_predicates_by_family() -> None:
         region="eu-central-1",
         rds_ri_families=frozenset({"r5"}),
         elasticache_ri_families=frozenset({"r6g"}),
-        redshift_ri_families=frozenset({"ra3"}),
-        opensearch_ri_families=frozenset({"r6g"}),
+        redshift_ri_types=frozenset({"ra3.xlplus"}),  # exact — not size-flexible
+        opensearch_ri_types=frozenset({"r6g.large"}),  # exact — not size-flexible
     )
-    assert cov.covers_rds("db.r5.4xlarge") is True
+    assert cov.covers_rds("db.r5.4xlarge") is True  # size-flexible within family
     assert cov.covers_rds("db.m6g.large") is False
     assert cov.covers_elasticache("cache.r6g.large") is True
+    # Redshift/OpenSearch are EXACT-type: the reserved type matches, a different
+    # size in the same family does NOT.
     assert cov.covers_redshift("ra3.xlplus") is True
+    assert cov.covers_redshift("ra3.4xlarge") is False
     assert cov.covers_opensearch("r6g.large.search") is True
+    assert cov.covers_opensearch("r6g.xlarge.search") is False
     assert cov.covers("rds", "db.r5.large") is True
     assert cov.covers("unknown", "x") is False
 
@@ -374,7 +381,7 @@ def test_redshift_adapter_demotes_ri_covered_cluster(monkeypatch) -> None:
 
     ctx = SimpleNamespace(
         cost_hub_splits={"redshift": coh},
-        commitment_coverage=CommitmentCoverage(region="eu-central-1", redshift_ri_families=frozenset({"ra3"})),
+        commitment_coverage=CommitmentCoverage(region="eu-central-1", redshift_ri_types=frozenset({"ra3.xlplus"})),
         region="eu-central-1",
         pricing_multiplier=1.0,
         fast_mode=False,
@@ -387,3 +394,179 @@ def test_redshift_adapter_demotes_ri_covered_cluster(monkeypatch) -> None:
     recs = findings.sources["cost_optimization_hub"].recommendations
     assert all(r.get("Counted") is False for r in recs)
     assert recs[0]["AdvisoryEstimate"] == pytest.approx(500.0)
+
+
+# --------------------------------------------------------------------------- #
+# normalize_type / exact-type matching
+# --------------------------------------------------------------------------- #
+def test_normalize_type() -> None:
+    assert normalize_type("db.r5.large") == "r5.large"
+    assert normalize_type("cache.r6g.large") == "r6g.large"
+    assert normalize_type("r6g.large.search") == "r6g.large"
+    assert normalize_type("ra3.xlplus") == "ra3.xlplus"
+
+
+# --------------------------------------------------------------------------- #
+# EC2 classic Reserved Instances (regional family + zonal exact type)
+# --------------------------------------------------------------------------- #
+def test_covers_ec2_classic_ri() -> None:
+    cov = CommitmentCoverage(
+        region="eu-central-1",
+        ec2_ri_families=frozenset({"c5"}),       # regional RI -> family
+        ec2_ri_types=frozenset({"m5.xlarge"}),   # zonal RI -> exact type
+    )
+    assert cov.covers_ec2("c5.9xlarge") is True   # family-flex
+    assert cov.covers_ec2("m5.xlarge") is True     # exact zonal
+    assert cov.covers_ec2("m5.2xlarge") is False   # different size, zonal is exact
+    assert cov.covers_ec2("t3.large") is False
+
+
+# --------------------------------------------------------------------------- #
+# SageMaker SP / DynamoDB reserved / Compute-SP-for-containers predicates
+# --------------------------------------------------------------------------- #
+def test_sagemaker_and_dynamodb_and_containers_predicates() -> None:
+    sm = CommitmentCoverage(region="x", has_sagemaker_sp=True)
+    assert sm.covers_sagemaker() is True
+    assert sm.covers_containers() is False   # SageMaker SP != Compute SP
+    compute = CommitmentCoverage(region="x", has_compute_sp=True)
+    assert compute.covers_containers() is True
+    assert compute.covers_lambda() is True
+    assert compute.covers_sagemaker() is False   # Compute SP does NOT cover SageMaker
+    ddb = CommitmentCoverage(region="x", dynamodb_reserved=True)
+    assert ddb.covers_dynamodb() is True
+    assert ddb.has_any_commitment is True
+
+
+# --------------------------------------------------------------------------- #
+# CE headroom cap — realizable savings survive up to uncovered on-demand
+# --------------------------------------------------------------------------- #
+def test_headroom_cap_counts_up_to_uncovered_then_demotes() -> None:
+    # Family r5 has $100/mo uncovered on-demand; three r5 recs total $160.
+    recs = [{"g": 80, "fam": "r5"}, {"g": 50, "fam": "r5"}, {"g": 30, "fam": "r5"}]
+    counted, advisory = split_by_commitment(
+        recs,
+        is_covered=lambda r: True,
+        gross_of=lambda r: r["g"],
+        note_of=lambda r, g: "x",
+        ceiling_of=lambda r: 100.0,
+        key_of=lambda r: r["fam"],
+    )
+    # Greedy highest-first: 80 fits (budget->20), 50 & 30 exceed remaining -> demoted.
+    assert sum(r["g"] for r in counted) <= 100.0
+    assert {r["g"] for r in counted} == {80}
+    assert len(advisory) == 2
+
+
+def test_headroom_cap_independent_budgets_per_family() -> None:
+    # Two families each with an equal $100 ceiling must NOT share a budget.
+    recs = [{"g": 90, "fam": "r5"}, {"g": 90, "fam": "m5"}]
+    counted, advisory = split_by_commitment(
+        recs,
+        is_covered=lambda r: True,
+        gross_of=lambda r: r["g"],
+        note_of=lambda r, g: "x",
+        ceiling_of=lambda r: 100.0,
+        key_of=lambda r: r["fam"],
+    )
+    assert len(counted) == 2 and not advisory  # each family's 90 fits its own 100
+
+
+def test_headroom_cap_zero_ceiling_demotes_all() -> None:
+    recs = [{"g": 10, "fam": "r5"}]
+    counted, advisory = split_by_commitment(
+        recs, is_covered=lambda r: True, gross_of=lambda r: r["g"],
+        note_of=lambda r, g: "x", ceiling_of=lambda r: 0.0, key_of=lambda r: r["fam"],
+    )
+    assert not counted and len(advisory) == 1
+
+
+# --------------------------------------------------------------------------- #
+# rec_gross + demote_recs_in_place (whole-service gate)
+# --------------------------------------------------------------------------- #
+def test_rec_gross_variants() -> None:
+    assert rec_gross({"EstimatedMonthlySavings": 12.5}) == 12.5
+    assert rec_gross({"estimatedMonthlySavings": 8.0}) == 8.0
+    assert rec_gross({"EstimatedSavings": "$3.40/month"}) == pytest.approx(3.40)
+    assert rec_gross({}) == 0.0
+
+
+def test_demote_recs_in_place_respects_only_filter() -> None:
+    recs = [
+        {"EstimatedMonthlySavings": 100.0, "LaunchType": "FARGATE", "Counted": True},
+        {"EstimatedMonthlySavings": 40.0, "CheckCategory": "ECR Storage", "Counted": True},
+    ]
+    removed = demote_recs_in_place(
+        recs, lambda g: "compute-covered", only=lambda r: str(r.get("LaunchType", "")).upper() == "FARGATE"
+    )
+    assert removed == pytest.approx(100.0)
+    assert recs[0]["Counted"] is False and recs[0]["AdvisoryEstimate"] == 100.0
+    assert recs[1]["Counted"] is True  # ECR storage NOT demoted (not Compute-SP-covered)
+
+
+# --------------------------------------------------------------------------- #
+# Fetch: SageMaker SP, EC2 classic RI, exact-type OS/Redshift, uncovered cap
+# --------------------------------------------------------------------------- #
+def test_fetch_sagemaker_sp_and_ec2_ri(monkeypatch) -> None:
+    sp = MagicMock()
+    sp.describe_savings_plans.return_value = {
+        "savingsPlans": [{"savingsPlanType": "SageMaker", "region": None}]
+    }
+    ec2 = MagicMock()
+    ec2.describe_reserved_instances.return_value = {
+        "ReservedInstances": [
+            {"InstanceType": "c5.9xlarge", "Scope": "Region", "State": "active"},
+            {"InstanceType": "m5.large", "Scope": "Availability Zone", "State": "active"},
+        ]
+    }
+    ce = MagicMock()
+    ce.get_savings_plans_utilization.return_value = {"Total": {"Utilization": {}}}
+    ce.get_savings_plans_coverage.return_value = {"SavingsPlansCoverages": []}
+    ce.get_reservation_coverage.return_value = {"CoveragesByTime": [{"Groups": []}]}
+    clients = {"savingsplans": sp, "ec2": ec2, "ce": ce}
+    ctx = SimpleNamespace(
+        region="eu-central-1", client=lambda n, region=None: clients.get(n, MagicMock()),
+        warn=MagicMock(), permission_issue=MagicMock(),
+    )
+    cov = fetch_commitment_coverage(ctx, {"ec2", "sagemaker"})
+    assert cov.has_sagemaker_sp is True
+    assert cov.ec2_ri_families == frozenset({"c5"})
+    assert cov.ec2_ri_types == frozenset({"m5.large"})
+
+
+def test_fetch_reservation_coverage_ceiling(monkeypatch) -> None:
+    rds = MagicMock()
+    rds.get_paginator.return_value.paginate.return_value = [
+        {"ReservedDBInstances": [{"State": "active", "DBInstanceClass": "db.r5.large"}]}
+    ]
+    ce = MagicMock()
+    ce.get_reservation_coverage.return_value = {
+        "CoveragesByTime": [
+            {"Groups": [{"Attributes": {"instanceTypeFamily": "r5"},
+                         "Coverage": {"CoverageCost": {"OnDemandCost": "123.45"}}}]}
+        ]
+    }
+    clients = {"rds": rds, "ce": ce}
+    ctx = SimpleNamespace(
+        region="ap-south-1", client=lambda n, region=None: clients.get(n, MagicMock()),
+        warn=MagicMock(), permission_issue=MagicMock(),
+    )
+    cov = fetch_commitment_coverage(ctx, {"rds"})
+    assert cov.rds_ri_families == frozenset({"r5"})
+    assert cov.realizable_ceiling("rds", "db.r5.large") == pytest.approx(123.45)
+
+
+# --------------------------------------------------------------------------- #
+# Adapter integration: DynamoDB reserved capacity demotes counted recs
+# --------------------------------------------------------------------------- #
+def test_dynamodb_reserved_gate_demotes_counted_recs() -> None:
+    # Mirrors the dynamodb adapter's whole-service gate: under reserved capacity,
+    # every counted table/CoH saving is demoted (the reservation bills regardless).
+    cov = CommitmentCoverage(region="x", dynamodb_reserved=True)
+    opt = [{"TableName": "t1", "EstimatedMonthlySavings": 50.0, "Counted": True}]
+    coh = [{"TableName": "t2", "estimatedMonthlySavings": 30.0, "Counted": True}]
+    removed = 0.0
+    if cov.covers_dynamodb():
+        removed = demote_recs_in_place(opt + coh, lambda g: cov.plan_note("DynamoDB reserved capacity", g))
+    assert removed == pytest.approx(80.0)
+    assert all(r["Counted"] is False for r in opt + coh)
+    assert "DynamoDB reserved capacity" in opt[0]["CommitmentCoverageNote"]
