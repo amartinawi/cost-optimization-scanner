@@ -94,6 +94,7 @@ serialized output.
 - `fast_mode` -- skip CloudWatch-heavy scans for faster results
 - `old_snapshot_days` -- threshold for old EBS snapshot checks (default 90)
 - `cost_hub_splits` -- pre-fetched Cost Optimization Hub recommendations partitioned by service key
+- `commitment_coverage` -- pre-fetched active Savings Plan / Reserved Instance coverage (`CommitmentCoverage`); adapters demote commitment-covered rightsizing recs to advisory
 - `warn()` / `permission_issue()` -- structured warning collection
 
 Adapters call `ctx.client("ec2")` to get a boto3 client. The ClientRegistry
@@ -117,9 +118,18 @@ to `us-east-1` automatically.
    `SageMakerSavingsPlans`) -> `"commitment_analysis"`. Anything unrecognised
    is recorded via `ctx.warn` so the map can be extended deliberately rather
    than silently dropped.
-3. Iterates `self.modules`, calling `safe_scan(module, ctx)` for each
+3. Calls `_prefetch_commitment_coverage()` -- when a commitment-sensitive
+   service is selected, resolves the account's active Savings Plans / Reserved
+   Instances once into `ctx.commitment_coverage`
+   (`services/commitment_coverage.py`): EC2-Instance / Compute / SageMaker SPs,
+   classic EC2 RIs, RDS / ElastiCache / Redshift / OpenSearch RIs, and DynamoDB
+   reserved capacity, plus per-family uncovered-on-demand from Cost Explorer.
+   Adapters use it to demote commitment-covered rightsizing recs to advisory
+   (`Counted=False`), counting only realizable on-demand overflow up to the CE
+   headroom ceiling. See `docs/audits/prompts/_LIVE_AUDIT_LESSONS.md` (C6).
+4. Iterates `self.modules`, calling `safe_scan(module, ctx)` for each
    selected module
-4. `safe_scan()` catches any exception, logs a warning, and returns an
+5. `safe_scan()` catches any exception, logs a warning, and returns an
    empty `ServiceFindings` so one broken module never crashes the scan
 
 The dedicated `CostOptimizationHubModule` was retired from `ALL_MODULES` on
