@@ -8,8 +8,8 @@ Shared infrastructure for the AWS Cost Optimization Scanner. Adapters depend on 
 |------|-------|---------|
 | `contracts.py` | 188 | `ServiceModule` Protocol, `ServiceFindings`, `SourceBlock`, `StatCardSpec`, `GroupingSpec`, `Group`, `WarningRecord`, `PermissionIssueRecord` |
 | `pricing_engine.py` | ~1800 | AWS Pricing API client with `PricingCache` (6-hour TTL) + `for_region()` region-scoped sibling engines. 30+ public pricing methods (the table below is a representative subset — see the source for the full list incl. EFS/FSx/Fargate/EKS/Aurora/SageMaker/MSK/ECR) |
-| `scan_context.py` | 72 | `ScanContext` — region, account, clients, `pricing_engine`, `fast_mode`, `pricing_multiplier` |
-| `scan_orchestrator.py` | 143 | `ScanOrchestrator`, `safe_scan` — iterates modules, pre-fetches AWS Cost Optimization Hub recommendations and buckets them into `ctx.cost_hub_splits` for per-service adapters to consume (replaces the retired aggregate CoH tab) |
+| `scan_context.py` | 77 | `ScanContext` — region, account, clients, `pricing_engine`, `fast_mode`, `pricing_multiplier`, `cost_hub_splits`, `commitment_coverage` |
+| `scan_orchestrator.py` | 241 | `ScanOrchestrator`, `safe_scan` — iterates modules; `_prefetch_advisor_data` buckets AWS Cost Optimization Hub recs into `ctx.cost_hub_splits`; `_prefetch_commitment_coverage` resolves active SP/RI coverage into `ctx.commitment_coverage` so adapters demote commitment-covered rightsizing recs to advisory (see `services/commitment_coverage.py`) |
 | `result_builder.py` | 70 | `ScanResultBuilder` — serializes `ServiceFindings` to JSON dict |
 | `client_registry.py` | 62 | `ClientRegistry` — caching boto3 client factory with global-service routing |
 | `session.py` | 50 | `AwsSessionFactory` — boto3 session with adaptive retry (10 attempts) |

@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (active-commitment coverage — SP/RI-covered rightsizing demoted to advisory)
+CoH / Compute-Optimizer rightsizing & Graviton recommendations carry
+`estimatedMonthlySavings` on an **on-demand ("before discounts") basis**
+(`estimatedMonthlyCost` == on-demand monthly). When the account already holds a
+Savings Plan or Reserved Instance covering the resource, that figure is not the
+realizable saving — a family-locked EC2-Instance SP **strands** on a cross-family
+Graviton migration (m4→r6g), and freed same-family commitment only saves if
+reabsorbed. New `services/commitment_coverage.py` resolves the account's active
+commitments once per scan into `ctx.commitment_coverage`
+(`ScanOrchestrator._prefetch_commitment_coverage`) across **every matrix**:
+EC2-Instance / Compute / SageMaker Savings Plans, classic EC2 Reserved Instances
+(regional→family / zonal→exact-type), RDS / ElastiCache RIs (family), Redshift /
+OpenSearch RIs (exact type), and DynamoDB reserved capacity. Two aggregate-safe
+layers — **membership demotion** (`Counted=False`; never overstates) and a **CE
+headroom cap** (`ce:GetReservationCoverage` / `GetSavingsPlansCoverage` give
+uncovered on-demand $ per `(service, family)`; candidate recs are counted greedily
+up to that ceiling so realizable on-demand overflow survives while a family's
+total counted never exceeds its real uncovered on-demand; CE-read failure →
+demote-all). Wired into ec2, rds, elasticache, redshift, opensearch, lambda,
+containers (Fargate compute; ECR storage stays counted), sagemaker, and dynamodb.
+*Real: alyasra, eu-central-1 — 8 EC2-Instance SPs {m4,m5,r5}, 92% util / 90%
+coverage collapsed reported EC2 savings **$1,057.12 → $13.87/mo** (membership
+layer); the flagship m4.2xlarge→r6g.large "$324.70 saving" is actually ~−$26/mo
+during the SP term.* Recurring class **C6** in
+`docs/audits/prompts/_LIVE_AUDIT_LESSONS.md`.
+
 ### Added (consolidated live-audit lessons → enriched audit prompts)
 The recurring cost-fidelity bug *classes* surfaced across four live deep-audit
 cycles (eu-central-1, eu-west-1, ap-south-1, ap-southeast-1; accounts
