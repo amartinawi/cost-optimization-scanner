@@ -13,6 +13,7 @@ from services.advisor import (
     get_asg_compute_optimizer_recommendations,
     get_ec2_compute_optimizer_recommendations,
 )
+from services.commitment_coverage import split_by_commitment
 from services.ec2 import get_advanced_ec2_checks, get_ec2_instance_count, get_enhanced_ec2_checks
 
 logger = logging.getLogger(__name__)
@@ -51,6 +52,18 @@ def _coh_is_renderable(rec: dict[str, Any]) -> bool:
 def _coh_instance_id(rec: dict[str, Any]) -> str:
     """Instance id for a Cost Optimization Hub EC2 recommendation."""
     return str(rec.get("resourceId", "") or "")
+
+
+def _coh_instance_type(rec: dict[str, Any]) -> str:
+    """Current instance type of a Cost Optimization Hub EC2 recommendation."""
+    return str(
+        (rec.get("currentResourceDetails") or {})
+        .get("ec2Instance", {})
+        .get("configuration", {})
+        .get("instance", {})
+        .get("type", "")
+        or ""
+    )
 
 
 def _co_instance_id(rec: dict[str, Any]) -> str:
@@ -258,24 +271,68 @@ class EC2Module(BaseServiceModule):
         # (CoH/CO/ASG). They carry "$0.00" EstimatedSavings, so the savings sum below
         # leaves them at $0 — rendered, never counted.
         advisory_final = [r for r in advisory_advanced if str(r.get("InstanceId", "") or "") not in covered]
-        advanced_final = advanced_counted_final + advisory_final
 
-        # --- Savings (each instance counted once) ------------------------------
+        # --- Active-commitment demotion ----------------------------------------
+        # Rightsizing / Graviton-migration / idle recs are computed on an
+        # on-demand basis. When an active Savings Plan or Reserved Instance
+        # already covers the instance's family, that figure is NOT the realizable
+        # saving: family-locked EC2-Instance SPs strand on cross-family migration
+        # (e.g. m5 -> r6g), and freed same-family commitment only saves if
+        # reabsorbed. Demote covered recs to advisory (Counted=False) so they
+        # still render with their indicative on-demand figure but never inflate
+        # the counted headline. Empty/absent coverage → no demotion (counts as
+        # before), so accounts with no commitments are unaffected.
+        coverage = getattr(ctx, "commitment_coverage", None)
+        demote = coverage is not None and coverage.has_any_commitment
+
+        def _coh_gross(r: dict[str, Any]) -> float:
+            return float(r.get("estimatedMonthlySavings", 0.0) or 0.0)
+
+        def _heur_gross(r: dict[str, Any]) -> float:
+            return parse_dollar_savings(r.get("EstimatedSavings", ""))
+
+        def _split(recs: list[dict[str, Any]], family_of, gross_of):
+            if not demote or coverage is None:
+                return list(recs), []
+            cov = coverage  # non-optional local so the closures type-narrow
+            return split_by_commitment(
+                recs,
+                is_covered=lambda r: cov.covers_ec2(family_of(r)),
+                gross_of=gross_of,
+                note_of=lambda r, g: cov.ec2_note(family_of(r), g),
+            )
+
+        def _co_type(r: dict[str, Any]) -> str:
+            return str(r.get("currentInstanceType", "") or "")
+
+        def _heur_type(r: dict[str, Any]) -> str:
+            return str(r.get("InstanceType", "") or "")
+
+        coh_counted, coh_adv = _split(cost_hub_recs, _coh_instance_type, _coh_gross)
+        co_counted, co_adv = _split(co_recs, _co_type, compute_optimizer_savings)
+        asg_counted, asg_adv = _split(asg_co_recs, _co_type, _coh_gross)
+        enh_counted, enh_adv = _split(enhanced_final, _heur_type, _heur_gross)
+        adv_counted, adv_cov_adv = _split(advanced_counted_final, _heur_type, _heur_gross)
+
+        # --- Savings (counted recs only; each instance counted once) -----------
         savings = 0.0
-        savings += sum(float(rec.get("estimatedMonthlySavings", 0.0) or 0.0) for rec in cost_hub_recs)
-        savings += sum(compute_optimizer_savings(rec) for rec in co_recs)
-        savings += sum(float(rec.get("estimatedMonthlySavings", 0.0) or 0.0) for rec in asg_co_recs)
-        savings += sum(parse_dollar_savings(rec.get("EstimatedSavings", "")) for rec in enhanced_final)
-        savings += sum(parse_dollar_savings(rec.get("EstimatedSavings", "")) for rec in advanced_final)
+        savings += sum(_coh_gross(rec) for rec in coh_counted)
+        savings += sum(compute_optimizer_savings(rec) for rec in co_counted)
+        savings += sum(_coh_gross(rec) for rec in asg_counted)
+        savings += sum(_heur_gross(rec) for rec in enh_counted)
+        savings += sum(_heur_gross(rec) for rec in adv_counted)
 
-        enhanced_recs = enhanced_final
-        advanced_recs = advanced_final
+        # Source blocks carry counted + advisory (advisory = Counted=False):
+        # rendered as cards, split out in the tab header, excluded from the
+        # counted total (result_builder) and from ``savings`` above.
+        cost_hub_out = coh_counted + coh_adv
+        co_out = co_counted + co_adv
+        asg_out = asg_counted + asg_adv
+        enhanced_out = enh_counted + enh_adv
+        advanced_out = adv_counted + adv_cov_adv + advisory_final
+
         total_recs = (
-            len(cost_hub_recs)
-            + len(co_recs)
-            + len(asg_co_recs)
-            + len(enhanced_recs)
-            + len(advanced_recs)
+            len(coh_counted) + len(co_counted) + len(asg_counted) + len(enh_counted) + len(adv_counted)
         )
 
         return ServiceFindings(
@@ -283,11 +340,11 @@ class EC2Module(BaseServiceModule):
             total_recommendations=total_recs,
             total_monthly_savings=savings,
             sources={
-                "cost_optimization_hub": SourceBlock(count=len(cost_hub_recs), recommendations=tuple(cost_hub_recs)),
-                "compute_optimizer": SourceBlock(count=len(co_recs), recommendations=tuple(co_recs)),
-                "asg_compute_optimizer": SourceBlock(count=len(asg_co_recs), recommendations=tuple(asg_co_recs)),
-                "enhanced_checks": SourceBlock(count=len(enhanced_recs), recommendations=tuple(enhanced_recs)),
-                "advanced_ec2_checks": SourceBlock(count=len(advanced_recs), recommendations=tuple(advanced_recs)),
+                "cost_optimization_hub": SourceBlock(count=len(cost_hub_out), recommendations=tuple(cost_hub_out)),
+                "compute_optimizer": SourceBlock(count=len(co_out), recommendations=tuple(co_out)),
+                "asg_compute_optimizer": SourceBlock(count=len(asg_out), recommendations=tuple(asg_out)),
+                "enhanced_checks": SourceBlock(count=len(enhanced_out), recommendations=tuple(enhanced_out)),
+                "advanced_ec2_checks": SourceBlock(count=len(advanced_out), recommendations=tuple(advanced_out)),
             },
             extras={"instance_count": get_ec2_instance_count(ctx)},
         )

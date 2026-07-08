@@ -14,6 +14,7 @@ from services.rds import (
     get_rds_compute_optimizer_recommendations,
     get_rds_instance_count,
 )
+from services.commitment_coverage import demote_coh_by_commitment
 from services.rds_logic import normalize_rds_arn, resolve_rds_findings
 
 logger = logging.getLogger(__name__)
@@ -125,6 +126,23 @@ class RdsModule(BaseServiceModule):
         coh_kept, co_kept, enhanced_kept, savings, total_recs = resolve_rds_findings(
             co_recs, enhanced_recs, coh_recs=coh_recs, backup_actuals=backup_actuals
         )
+
+        # Active-commitment demotion: a DB instance already covered by an RDS
+        # Reserved DB Instance bills the reservation regardless of rightsizing,
+        # so its on-demand CoH figure is not realizable. Demote covered CoH recs
+        # to advisory (Counted=False) and remove their gross from the headline.
+        # resolve_rds_findings already suppressed the CO/heuristic recs for these
+        # DBs (via coh_keys over ALL coh_recs), so none re-enters counted here.
+        # Empty coverage → all counted (no change for un-reserved accounts).
+        coverage = getattr(ctx, "commitment_coverage", None)
+
+        def _coh_gross(r: dict[str, Any]) -> float:
+            return float(r.get("estimatedMonthlySavings", 0.0) or 0.0)
+
+        coh_counted, coh_demoted = demote_coh_by_commitment(coh_kept, coverage, "rds", _coh_gross)
+        savings -= sum(_coh_gross(r) for r in coh_demoted)
+        total_recs -= len(coh_demoted)
+        coh_kept = coh_counted + coh_demoted
 
         # Cross-adapter dedup (rds H1 / aurora H3). Publish the normalized ids of
         # the DB instances this tab actually counts (Cost Optimization Hub +

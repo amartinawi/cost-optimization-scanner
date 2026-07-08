@@ -10,6 +10,10 @@ from core.contracts import ServiceFindings, ServiceModule
 from core.filtering import resolve_cli_keys, unrecognized_tokens
 from core.scan_context import ScanContext
 from services.advisor import get_detailed_cost_hub_recommendations
+from services.commitment_coverage import (
+    COMMITMENT_SENSITIVE_SERVICES,
+    fetch_commitment_coverage,
+)
 
 
 def safe_scan(module: ServiceModule, ctx: ScanContext) -> ServiceFindings:
@@ -161,6 +165,30 @@ class ScanOrchestrator:
 
         self.ctx.cost_hub_splits = splits
 
+    def _prefetch_commitment_coverage(self, selected: set[str]) -> None:
+        """Resolve active Savings Plan / Reserved Instance coverage once per scan.
+
+        Rightsizing / Graviton-migration / idle recommendations are computed on
+        an on-demand basis; when a Savings Plan or Reserved Instance already
+        covers the resource, that figure is not the realizable saving (the
+        commitment is fixed spend, and family-locked EC2-Instance SPs strand on
+        cross-family migration). Adapters consult ``ctx.commitment_coverage`` to
+        demote such recs to advisory rather than count phantom dollars.
+
+        Skipped entirely when no commitment-sensitive service is selected, so a
+        focused scan of, say, only S3 pays nothing for it.
+        """
+        if not (selected & COMMITMENT_SENSITIVE_SERVICES):
+            return
+        try:
+            self.ctx.commitment_coverage = fetch_commitment_coverage(self.ctx, selected)
+        except Exception as exc:  # noqa: BLE001 — never let coverage break a scan
+            self.ctx.warn(
+                f"Commitment-coverage prefetch failed; rightsizing recs not "
+                f"SP/RI-adjusted: {exc}",
+                service="commitment_coverage",
+            )
+
     def run(
         self,
         scan_only: set[str] | None = None,
@@ -184,6 +212,7 @@ class ScanOrchestrator:
             )
         selected = resolve_cli_keys(self.modules, scan_only, skip)
         self._prefetch_advisor_data(selected)
+        self._prefetch_commitment_coverage(selected)
         findings = {m.key: safe_scan(m, self.ctx) for m in self.modules if m.key in selected}
         # All pricing lookups are done — surface any fallback substitutions so the
         # report discloses which rates were estimated vs fetched live.

@@ -122,6 +122,18 @@ and the test style I expect (`tests/test_ec2_audit_fixes.py`,
      emits nothing). Validate two `_PREVIOUS_GEN_TARGETS` mappings against the
      API (e.g. `m4.→m6i.`, `c4.→c6i.`) — confirm the target is current-gen,
      same-arch (x86→x86, not x86→Graviton), and actually cheaper.
+   - **Active-commitment coverage (SP/RI) — C6**: CoH/CO `estimatedMonthlySavings`
+     is on-demand ("before discounts") basis (`estimatedMonthlyCost` == on-demand
+     monthly). If the account holds Savings Plans / Reserved Instances, a
+     rightsizing/Graviton rec on a covered instance is NOT realizable: an
+     **EC2-Instance SP is family-locked**, so a Graviton migration (m4→r6g)
+     strands the family commitment to its end date (net zero or cost-NEGATIVE).
+     Confirm `ScanContext.commitment_coverage` is prefetched and that
+     `covers_ec2(family)` instances are demoted to advisory (`Counted=False`).
+     Validate live: `aws savingsplans describe-savings-plans --states active`
+     (families + region), `aws ce get-savings-plans-utilization` (headroom). A
+     counted rec whose current family has an active EC2-Instance SP, or whose
+     target leaves that family, is a finding. *Real: alyasra — $1,057→$13.87/mo.*
    - **Factor checks** (idle 1.0, dedicated 0.30, cron 0.85, batch 0.75,
      instance-store 0.15, nonprod 0.64): these are reduction factors, not exact
      deltas. Confirm each factor is defensible and labelled; the cron/batch/

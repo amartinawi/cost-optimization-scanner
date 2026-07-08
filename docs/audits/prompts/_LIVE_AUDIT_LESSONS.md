@@ -113,6 +113,26 @@ will eventually both count it. This is the single most common real finding.
   `$0.00` yet a `size_gb > 0` guard still emits a "$0.00/mo recoverable" card.
   Gate on the **rounded potential** (`if potential <= 0: continue`), not just raw
   size. *Real: EBS snapshot, tadweer-prod.*
+- **C6 — Rightsizing under an existing Savings Plan / RI is on-demand-basis, not
+  realizable.** CoH/Compute-Optimizer `estimatedMonthlySavings` is computed
+  "before discounts" (`estimatedMonthlyCost` == on-demand monthly). When the
+  account already holds a commitment covering the resource, that figure is a
+  phantom: an **EC2-Instance SP is family-locked**, so a Graviton migration
+  (m4→r6g) moves the instance OUT of coverage — the new instance bills full
+  on-demand while the family-locked commitment **strands to its end date**
+  (net effect zero or **cost-NEGATIVE**); a same-family downsize only saves if
+  the freed commitment is reabsorbed. The scanner now prefetches
+  `ctx.commitment_coverage` (`services/commitment_coverage.py`, via
+  `savingsplans:DescribeSavingsPlans` + `ce:GetSavingsPlansUtilization` +
+  `describe-reserved-*`) and **demotes commitment-covered rightsizing recs to
+  advisory** (`Counted=False`) in ec2/rds/elasticache/redshift/opensearch/lambda.
+  *Real: alyasra, eu-central-1 — 8 EC2-Instance SPs {m4,m5,r5}, 92% util, 90%
+  coverage collapsed a reported **$1,057→$13.87/mo** counted; the flagship
+  m4.2xlarge→r6g.large "$324.70 saving" is actually ~**−$26/mo** during the SP
+  term (m4 SP $248/mo strands to 2028).* **Sweep:** any account with active SPs/
+  RIs — assert no counted rightsizing/Graviton rec targets a family that leaves
+  its SP/RI family, and that same-family recs are advisory unless SP utilization
+  headroom or on-demand overflow proves reabsorption.
 
 ## D. Render / tab / count semantics (`counted == rendered`, both directions)
 

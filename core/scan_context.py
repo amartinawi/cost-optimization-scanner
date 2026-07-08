@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from core.pricing_engine import PricingEngine
+    from services.commitment_coverage import CommitmentCoverage
 
 from core.client_registry import ClientRegistry
 from core.contracts import PermissionIssueRecord, WarningRecord
@@ -30,6 +31,9 @@ class ScanContext:
         pricing_multiplier: Regional pricing multiplier.
         old_snapshot_days: Age threshold for old snapshot checks.
         cost_hub_splits: Pre-fetched Cost Optimization Hub data keyed by service.
+        commitment_coverage: Pre-fetched active Savings Plan / Reserved Instance
+            coverage; adapters demote commitment-covered rightsizing recs to
+            advisory (``None`` until the orchestrator prefetch resolves it).
         _warnings: Accumulated non-fatal warnings.
         _permission_issues: Accumulated IAM permission gaps.
     """
@@ -43,6 +47,7 @@ class ScanContext:
     pricing_engine: "PricingEngine | None" = field(default=None)
     old_snapshot_days: int = 90
     cost_hub_splits: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    commitment_coverage: "CommitmentCoverage | None" = field(default=None)
     _warnings: list[WarningRecord] = field(default_factory=list)
     _permission_issues: list[PermissionIssueRecord] = field(default_factory=list)
 

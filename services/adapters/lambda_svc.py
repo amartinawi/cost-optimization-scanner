@@ -231,6 +231,24 @@ class LambdaModule(BaseServiceModule):
 
         savings = hub_savings + formula_savings + co_savings
 
+        # Active-commitment demotion: a Compute Savings Plan covers Lambda
+        # duration cost (EC2-Instance SPs do not). Under an active Compute SP the
+        # commitment bills regardless of memory-rightsizing, so the on-demand
+        # CoH/Compute-Optimizer figures are not realizable — demote them to
+        # advisory and drop their gross from the headline. No Compute SP → no
+        # change.
+        coverage = getattr(ctx, "commitment_coverage", None)
+        if coverage is not None and coverage.covers_lambda():
+            for rec in list(cost_hub_recs) + list(co_recs):
+                gross = float(rec.get("estimatedMonthlySavings", 0.0) or 0.0)
+                rec["Counted"] = False
+                rec["AdvisoryEstimate"] = gross
+                rec["CommitmentCoverageNote"] = (
+                    "Covered by an active Compute Savings Plan; the on-demand "
+                    f"${gross:,.2f}/mo is not realizable while the commitment bills — not counted."
+                )
+            savings = formula_savings
+
         total_recs = len(cost_hub_recs) + len(co_recs) + len(enhanced_recs)
 
         return ServiceFindings(

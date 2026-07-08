@@ -7,6 +7,7 @@ from typing import Any
 from core.contracts import ServiceFindings, SourceBlock
 from services._base import BaseServiceModule
 from services._coh_dedup import coh_key, coh_savings, is_renderable_coh_rec
+from services.commitment_coverage import demote_coh_by_commitment
 from services.redshift import REDSHIFT_OPTIMIZATION_DESCRIPTIONS, get_enhanced_redshift_checks
 
 # Enhanced-check categories rendered for context but whose dollar value is NOT
@@ -66,8 +67,17 @@ class RedshiftModule(BaseServiceModule):
         # is authoritative: a cluster it covers suppresses that cluster's
         # heuristic levers (SR-3 / Redshift C1).
         coh_recs = [r for r in getattr(ctx, "cost_hub_splits", {}).get("redshift", []) if is_renderable_coh_rec(r)]
+        # Suppression keys span ALL CoH recs (covered or not) so a Reserved-Node
+        # demotion below never re-enables the heuristic lever for that cluster.
         coh_keys = {coh_key(r) for r in coh_recs} - {""}
-        coh_total = sum(coh_savings(r) for r in coh_recs)
+        # Active-commitment demotion: a cluster already covered by a Redshift
+        # Reserved Node bills the reservation regardless of rightsizing, so its
+        # on-demand CoH figure is not realizable — demote to advisory (Counted=
+        # False). Empty coverage → all counted (no change for un-reserved accounts).
+        coverage = getattr(ctx, "commitment_coverage", None)
+        coh_counted, coh_advisory = demote_coh_by_commitment(coh_recs, coverage, "redshift", coh_savings)
+        coh_out = coh_counted + coh_advisory
+        coh_total = sum(coh_savings(r) for r in coh_counted)
 
         # CoH is the only counted Redshift source. Every heuristic lever the shim
         # emits is either a commitment advisory (RI / Serverless Reservation) or an
@@ -117,12 +127,12 @@ class RedshiftModule(BaseServiceModule):
             )
 
         sources = {"enhanced_checks": SourceBlock(count=len(recs), recommendations=tuple(recs))}
-        if coh_recs:
-            sources["cost_optimization_hub"] = SourceBlock(count=len(coh_recs), recommendations=tuple(coh_recs))
+        if coh_out:
+            sources["cost_optimization_hub"] = SourceBlock(count=len(coh_out), recommendations=tuple(coh_out))
 
         return ServiceFindings(
             service_name="Redshift",
-            total_recommendations=len(recs) + len(coh_recs),
+            total_recommendations=len(recs) + len(coh_counted),
             total_monthly_savings=savings,
             sources=sources,
             optimization_descriptions=REDSHIFT_OPTIMIZATION_DESCRIPTIONS,
