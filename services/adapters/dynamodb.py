@@ -6,6 +6,7 @@ from typing import Any
 
 from core.contracts import ServiceFindings, SourceBlock
 from services._base import BaseServiceModule
+from services.commitment_coverage import demote_recs_in_place
 from services.dynamodb import (
     DYNAMODB_ADVISORY_CATEGORIES,
     get_dynamodb_optimization_descriptions,
@@ -189,12 +190,24 @@ class DynamoDbModule(BaseServiceModule):
             coh_kept.append(rec)
             savings += float(rec.get("estimatedMonthlySavings", 0.0) or 0.0)
 
+        # Active-commitment demotion: DynamoDB reserved capacity is fixed pre-paid
+        # RCU/WCU spend that bills regardless of a provisioned-capacity reduction,
+        # so an over-provisioning saving is not realizable while the reservation is
+        # held. Demote every counted DynamoDB rec to advisory. No reserved capacity
+        # -> no change.
+        coverage = getattr(ctx, "commitment_coverage", None)
+        if coverage is not None and coverage.covers_dynamodb():
+            savings -= demote_recs_in_place(
+                list(opt_opps) + list(enhanced_recs) + coh_kept,
+                lambda g: coverage.plan_note("DynamoDB reserved capacity", g),
+            )
+
         # Count hygiene: $0 advisory recs are shown in their source block but excluded
         # from the headline rec count (mirrors services/_savings.mark_zero_savings_advisory).
         total_recs = (
             sum(1 for r in opt_opps if r.get("Counted") is not False)
             + sum(1 for r in enhanced_recs if r.get("Counted") is not False)
-            + len(coh_kept)
+            + sum(1 for r in coh_kept if r.get("Counted") is not False)
         )
 
         return ServiceFindings(

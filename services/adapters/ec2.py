@@ -295,11 +295,14 @@ class EC2Module(BaseServiceModule):
             if not demote or coverage is None:
                 return list(recs), []
             cov = coverage  # non-optional local so the closures type-narrow
+            has_ceiling = bool(cov.uncovered_on_demand)
             return split_by_commitment(
                 recs,
                 is_covered=lambda r: cov.covers_ec2(family_of(r)),
                 gross_of=gross_of,
                 note_of=lambda r, g: cov.ec2_note(family_of(r), g),
+                ceiling_of=(lambda r: cov.realizable_ceiling("ec2", family_of(r))) if has_ceiling else None,
+                key_of=family_of,
             )
 
         def _co_type(r: dict[str, Any]) -> str:

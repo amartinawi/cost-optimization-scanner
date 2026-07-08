@@ -6,20 +6,36 @@
 
 `ScanOrchestrator._prefetch_commitment_coverage` resolves the account's active
 commitments once per scan into `ctx.commitment_coverage`
-(`services/commitment_coverage.py`): region-locked EC2-Instance SP families +
-any Compute SP (`savingsplans:DescribeSavingsPlans` + `ce:GetSavingsPlansUtilization`)
-and Reserved-Instance families for RDS / ElastiCache / Redshift / OpenSearch
-(`describe-reserved-*`). CoH / Compute-Optimizer rightsizing dollars are
+(`services/commitment_coverage.py`), across **every commitment matrix**:
+EC2-Instance / Compute / SageMaker Savings Plans (`savingsplans:DescribeSavingsPlans`),
+classic EC2 Reserved Instances (`ec2:describe-reserved-instances` — regional RIs
+match a family, zonal RIs match the exact type), RDS / ElastiCache Reserved
+Instances (family, size-flexible), Redshift / OpenSearch Reserved Instances
+(**exact node/instance type** — not size-flexible), and DynamoDB reserved
+capacity (via Cost Explorer). CoH / Compute-Optimizer rightsizing dollars are
 **on-demand ("before discounts") basis** (`estimatedMonthlyCost` == on-demand
 monthly), so when a commitment already covers the resource that figure is not
-realizable — a family-locked EC2-Instance SP **strands** on a cross-family
-Graviton migration (m4→r6g), and freed same-family commitment only saves if
-reabsorbed. The ec2 / rds / elasticache / redshift / opensearch / lambda
-adapters therefore **demote commitment-covered rightsizing recs to advisory**
-(`Counted=False`, gross preserved in `AdvisoryEstimate` + a `CommitmentCoverageNote`)
-via `split_by_commitment` / `demote_coh_by_commitment`. Absent/empty coverage →
-counted as before (no change for accounts without commitments); fetch failures
-are fail-safe (warn/permission_issue, nothing demoted). See lesson **C6** in
+realizable. Two aggregate-safe layers:
+
+1. **Membership demotion** — a rec whose resource family/type carries an active
+   commitment is demoted to advisory (`Counted=False`, gross in
+   `AdvisoryEstimate` + a `CommitmentCoverageNote`). Never overstates.
+2. **CE headroom cap** — `ce:GetReservationCoverage` / `GetSavingsPlansCoverage`
+   give the *uncovered on-demand $* per `(service, family)`; candidate recs are
+   counted greedily up to that ceiling (`split_by_commitment` with `ceiling_of` /
+   `key_of`) so a realizable on-demand-overflow saving survives while a family's
+   total counted never exceeds its real uncovered on-demand. CE-read failure →
+   layer-1 demote-all (safe).
+
+Wiring: ec2 / rds / elasticache / redshift / opensearch use `split_by_commitment`
+/ `demote_coh_by_commitment` (per-family, headroom-capped); lambda / containers
+(Fargate — **Compute SP covers Fargate/ECS compute but NOT ECR storage**) /
+sagemaker (SageMaker SP) / dynamodb (reserved capacity) use the whole-service
+`demote_recs_in_place` gate. Coverage matrix reminders: **Compute SP covers
+EC2 + Lambda + Fargate, NOT RDS/ElastiCache/Redshift/OpenSearch/SageMaker**;
+**SageMaker SP covers only SageMaker**. Absent/empty coverage → counted as before
+(accounts without commitments unaffected); fetch failures are fail-safe
+(warn/permission_issue). See lesson **C6** in
 `docs/audits/prompts/_LIVE_AUDIT_LESSONS.md`.
 
 ## Pricing Models

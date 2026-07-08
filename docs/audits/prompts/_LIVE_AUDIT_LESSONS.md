@@ -121,18 +121,30 @@ will eventually both count it. This is the single most common real finding.
   (m4→r6g) moves the instance OUT of coverage — the new instance bills full
   on-demand while the family-locked commitment **strands to its end date**
   (net effect zero or **cost-NEGATIVE**); a same-family downsize only saves if
-  the freed commitment is reabsorbed. The scanner now prefetches
-  `ctx.commitment_coverage` (`services/commitment_coverage.py`, via
-  `savingsplans:DescribeSavingsPlans` + `ce:GetSavingsPlansUtilization` +
-  `describe-reserved-*`) and **demotes commitment-covered rightsizing recs to
-  advisory** (`Counted=False`) in ec2/rds/elasticache/redshift/opensearch/lambda.
+  the freed commitment is reabsorbed. The scanner prefetches
+  `ctx.commitment_coverage` (`services/commitment_coverage.py`) covering **every
+  commitment matrix**: EC2-Instance / Compute / SageMaker SPs
+  (`savingsplans:DescribeSavingsPlans`), classic EC2 RIs
+  (`ec2:describe-reserved-instances`, regional-family vs zonal-exact), RDS /
+  ElastiCache RIs (family, size-flexible), Redshift / OpenSearch RIs (**exact
+  type** — not size-flexible), DynamoDB reserved capacity (CE). It **demotes
+  commitment-covered rightsizing recs to advisory** (`Counted=False`) in
+  ec2/rds/elasticache/redshift/opensearch/lambda/**sagemaker/dynamodb/
+  containers(Fargate; ECR storage stays counted)**. Two aggregate-safe layers:
+  (1) membership demotion (never overstates); (2) a **CE headroom cap** —
+  `GetReservationCoverage`/`GetSavingsPlansCoverage` give *uncovered on-demand $*
+  per `(service, family)`, and candidates are counted greedily up to that
+  ceiling so the realizable on-demand overflow (incl. the engine/size a
+  family-level RI misses) survives while total counted never exceeds real
+  uncovered on-demand; CE-read failure falls back to demote-all (safe).
   *Real: alyasra, eu-central-1 — 8 EC2-Instance SPs {m4,m5,r5}, 92% util, 90%
-  coverage collapsed a reported **$1,057→$13.87/mo** counted; the flagship
-  m4.2xlarge→r6g.large "$324.70 saving" is actually ~**−$26/mo** during the SP
-  term (m4 SP $248/mo strands to 2028).* **Sweep:** any account with active SPs/
-  RIs — assert no counted rightsizing/Graviton rec targets a family that leaves
-  its SP/RI family, and that same-family recs are advisory unless SP utilization
-  headroom or on-demand overflow proves reabsorption.
+  coverage collapsed a reported **$1,057→$13.87/mo** counted (membership layer);
+  the flagship m4.2xlarge→r6g.large "$324.70 saving" is actually ~**−$26/mo**
+  during the SP term.* **Sweep:** any account with active SPs/RIs — assert (a) no
+  counted rightsizing rec targets a family/type that leaves its SP/RI coverage,
+  and (b) per service, counted rightsizing savings ≤ CE uncovered-on-demand for
+  that family. **Note:** Compute SP covers EC2/Lambda/Fargate but NOT
+  RDS/ElastiCache/…/SageMaker; SageMaker SP covers only SageMaker.
 
 ## D. Render / tab / count semantics (`counted == rendered`, both directions)
 

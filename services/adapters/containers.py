@@ -7,6 +7,7 @@ from typing import Any
 from core.contracts import ServiceFindings, SourceBlock
 from services._base import BaseServiceModule
 from services.advisor import get_ecs_compute_optimizer_recommendations
+from services.commitment_coverage import demote_recs_in_place
 from services.containers import get_container_services_analysis, get_enhanced_container_checks
 from services.containers_logic import (
     dedupe_by_authority,
@@ -167,6 +168,24 @@ class ContainersModule(BaseServiceModule):
 
         savings += sum(float(r.get("estimatedMonthlySavings", 0) or 0) for r in cost_hub_recs)
         savings += sum(float(r.get("estimatedMonthlySavings", 0.0) or 0.0) for r in co_recs)
+
+        # Active-commitment demotion: a Compute Savings Plan covers Fargate
+        # (ECS/EKS) and ECS task compute — but NOT ECR storage. Under an active
+        # Compute SP the commitment bills regardless of task rightsizing, so those
+        # on-demand figures are not realizable. Demote the CoH/CO rightsizing recs
+        # and Fargate-compute heuristics; leave ECR-storage reclaim counted. No
+        # Compute SP -> no change.
+        coverage = getattr(ctx, "commitment_coverage", None)
+        if coverage is not None and coverage.covers_containers():
+            note = lambda g: coverage.plan_note("Compute Savings Plan", g)  # noqa: E731
+            savings -= demote_recs_in_place(list(cost_hub_recs) + list(co_recs), note)
+            savings -= demote_recs_in_place(
+                enhanced_recs,
+                note,
+                only=lambda r: str(r.get("LaunchType", "")).upper() == "FARGATE"
+                or "rightsizing" in str(r.get("CheckCategory", "")).lower(),
+            )
+            savings = round(savings, 2)
 
         total_recs = len(enhanced_recs) + len(cost_hub_recs) + len(co_recs)
 
