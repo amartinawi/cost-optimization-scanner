@@ -7,6 +7,7 @@ from typing import Any
 from core.contracts import ServiceFindings, SourceBlock
 from services._base import BaseServiceModule
 from services._coh_dedup import coh_key, coh_savings, is_renderable_coh_rec
+from services.commitment_coverage import demote_coh_by_commitment
 from services.opensearch import (
     LOW_CPU_THRESHOLD,
     OPENSEARCH_OPTIMIZATION_DESCRIPTIONS,
@@ -187,8 +188,16 @@ class OpensearchModule(BaseServiceModule):
         # is authoritative: a domain it covers suppresses that domain's heuristic
         # levers (SR-3 / OpenSearch C1).
         coh_recs = [r for r in getattr(ctx, "cost_hub_splits", {}).get("opensearch", []) if is_renderable_coh_rec(r)]
+        # Suppression keys span ALL CoH recs so an RI demotion below never
+        # re-enables the heuristic lever for that domain.
         coh_keys = {coh_key(r) for r in coh_recs} - {""}
-        coh_total = sum(coh_savings(r) for r in coh_recs)
+        # Active-commitment demotion: a domain covered by an OpenSearch Reserved
+        # Instance bills the reservation regardless of rightsizing, so its
+        # on-demand CoH figure is not realizable — demote to advisory.
+        coverage = getattr(ctx, "commitment_coverage", None)
+        coh_counted, coh_advisory = demote_coh_by_commitment(coh_recs, coverage, "opensearch", coh_savings)
+        coh_out = coh_counted + coh_advisory
+        coh_total = sum(coh_savings(r) for r in coh_counted)
 
         # Price every rec and attach the per-rec dollar figure (the report
         # previously showed only "30-50%", with no per-domain $). Each counted
@@ -364,12 +373,12 @@ class OpensearchModule(BaseServiceModule):
                 rec["EstimatedSavings"] = f"${rec.get('EstimatedMonthlySavings', 0.0):.2f}/month"
 
         sources = {"enhanced_checks": SourceBlock(count=len(recs), recommendations=tuple(recs))}
-        if coh_recs:
-            sources["cost_optimization_hub"] = SourceBlock(count=len(coh_recs), recommendations=tuple(coh_recs))
+        if coh_out:
+            sources["cost_optimization_hub"] = SourceBlock(count=len(coh_out), recommendations=tuple(coh_out))
 
         return ServiceFindings(
             service_name="OpenSearch",
-            total_recommendations=len(recs) + len(coh_recs),
+            total_recommendations=len(recs) + len(coh_counted),
             total_monthly_savings=round(savings, 2),
             sources=sources,
             optimization_descriptions=OPENSEARCH_OPTIMIZATION_DESCRIPTIONS,

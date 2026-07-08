@@ -33,6 +33,10 @@ class ClientRegistry:
             "budgets",
             "cost-optimization-hub",
             "organizations",
+            # Savings Plans is a global (partition-wide) service; route to
+            # us-east-1 so commitment-coverage detection resolves the whole
+            # account regardless of the scan region.
+            "savingsplans",
             # QuickSight user/namespace (identity) operations must hit the account's
             # QuickSight identity region — us-east-1 for the common case. Calling
             # them from the scan region raises AccessDenied ("use the us-east-1

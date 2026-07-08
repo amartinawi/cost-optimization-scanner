@@ -2,6 +2,26 @@
 
 34 ServiceModule adapter files in `services/adapters/`. Each implements `scan(ctx) -> ServiceFindings`. Two former adapters were retired from `ALL_MODULES` on 2026-05-14 and their findings now flow per-service: AWS Cost Optimization Hub recommendations are fetched once by `ScanOrchestrator._prefetch_advisor_data` and consumed via `ctx.cost_hub_splits[<service_key>]`; AWS Compute Optimizer recommendations are pulled inline by EC2 / EBS / RDS / Lambda / Containers adapters via the `services.advisor.get_<resource>_compute_optimizer_recommendations` helpers.
 
+## Active-commitment coverage (Savings Plan / Reserved Instance demotion)
+
+`ScanOrchestrator._prefetch_commitment_coverage` resolves the account's active
+commitments once per scan into `ctx.commitment_coverage`
+(`services/commitment_coverage.py`): region-locked EC2-Instance SP families +
+any Compute SP (`savingsplans:DescribeSavingsPlans` + `ce:GetSavingsPlansUtilization`)
+and Reserved-Instance families for RDS / ElastiCache / Redshift / OpenSearch
+(`describe-reserved-*`). CoH / Compute-Optimizer rightsizing dollars are
+**on-demand ("before discounts") basis** (`estimatedMonthlyCost` == on-demand
+monthly), so when a commitment already covers the resource that figure is not
+realizable — a family-locked EC2-Instance SP **strands** on a cross-family
+Graviton migration (m4→r6g), and freed same-family commitment only saves if
+reabsorbed. The ec2 / rds / elasticache / redshift / opensearch / lambda
+adapters therefore **demote commitment-covered rightsizing recs to advisory**
+(`Counted=False`, gross preserved in `AdvisoryEstimate` + a `CommitmentCoverageNote`)
+via `split_by_commitment` / `demote_coh_by_commitment`. Absent/empty coverage →
+counted as before (no change for accounts without commitments); fetch failures
+are fail-safe (warn/permission_issue, nothing demoted). See lesson **C6** in
+`docs/audits/prompts/_LIVE_AUDIT_LESSONS.md`.
+
 ## Pricing Models
 
 The 34 adapters fall into six pricing strategies. Counts below sum to 34.
