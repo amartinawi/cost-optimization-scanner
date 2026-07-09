@@ -25,6 +25,70 @@ from core.scan_context import ScanContext
 logger = logging.getLogger(__name__)
 
 
+def get_ebs_snapshot_actuals(ctx: ScanContext) -> float | None:
+    """Actual billed EBS snapshot storage ($/month) for the scan region.
+
+    AMI/EBS snapshot savings are computed from a snapshot's **full** size, but AWS
+    bills only the *unique changed blocks* across a snapshot chain — so the figure
+    is an upper bound. Cost Explorer's ``EBS:SnapshotUsage`` usage type is the real
+    billed total and is a valid (tighter) ceiling for the whole region's snapshot
+    savings.
+
+    Returns:
+        Billed $/month for the last complete calendar month, or ``None`` when the
+        data is unavailable (no CE client, permission gap, error). ``None`` means
+        "unsubstantiated" — the caller must demote its upper bounds to advisories
+        rather than count them (lesson C8: never fail open on a missing ceiling).
+        ``0.0`` means CE answered and the region bills no snapshot storage.
+    """
+    ce = ctx.client("ce")
+    if ce is None:
+        ctx.warn("Cost Explorer client unavailable; snapshot savings cannot be corroborated", service="ami")
+        return None
+
+    today = datetime.now(UTC).date()
+    first_of_this_month = today.replace(day=1)
+    start = (first_of_this_month - timedelta(days=1)).replace(day=1)
+    end = first_of_this_month
+
+    try:
+        resp = ce.get_cost_and_usage(
+            TimePeriod={"Start": start.isoformat(), "End": end.isoformat()},
+            Granularity="MONTHLY",
+            Metrics=["UnblendedCost"],
+            GroupBy=[{"Type": "DIMENSION", "Key": "USAGE_TYPE"}],
+            Filter={
+                "And": [
+                    {"Dimensions": {"Key": "SERVICE", "Values": ["Amazon Elastic Compute Cloud - Compute"]}},
+                    {"Dimensions": {"Key": "REGION", "Values": [ctx.region]}},
+                ]
+            },
+        )
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code in ("AccessDenied", "AccessDeniedException", "UnauthorizedOperation"):
+            ctx.permission_issue(
+                f"Cost Explorer snapshot actuals unavailable ({code}); AMI snapshot savings demoted to advisory",
+                service="ami",
+                action="ce:GetCostAndUsage",
+            )
+        else:
+            ctx.warn(f"Cost Explorer snapshot actuals unavailable ({code or 'error'})", service="ami")
+        return None
+    except Exception as exc:  # noqa: BLE001
+        ctx.warn(f"Cost Explorer snapshot actuals unavailable ({type(exc).__name__})", service="ami")
+        return None
+
+    billed = 0.0
+    for period in resp.get("ResultsByTime", []):
+        for group in period.get("Groups", []):
+            key = (group.get("Keys") or [""])[0]
+            if "SnapshotUsage" not in key:
+                continue
+            billed += float(group.get("Metrics", {}).get("UnblendedCost", {}).get("Amount", 0) or 0.0)
+    return billed
+
+
 def get_rds_backup_actuals(ctx: ScanContext) -> dict[str, float]:
     """Actual billed RDS/Aurora backup spend ($/month) for the scan region.
 

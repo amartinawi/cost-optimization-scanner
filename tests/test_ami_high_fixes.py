@@ -28,6 +28,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from services._savings import parse_dollar_savings
@@ -134,15 +136,37 @@ def _ami(image_id: str, age_days: int, with_snapshot: bool = True) -> dict:
     return {"ImageId": image_id, "Name": image_id, "CreationDate": created, "BlockDeviceMappings": bdm}
 
 
-def _make_ctx(ec2: _FakeEc2) -> SimpleNamespace:
+class _FakeCe:
+    """CE stub reporting an ample billed EBS:SnapshotUsage pool.
+
+    AMI savings are a snapshot-size UPPER BOUND and are only counted up to the
+    billed pool (lesson C8). Tests below exercise AMI selection logic, not
+    capping, so they supply a pool large enough to leave the bound intact.
+    A ``billed`` of None simulates ce:GetCostAndUsage being unavailable.
+    """
+
+    def __init__(self, billed: float | None = 10_000.0) -> None:
+        self._billed = billed
+
+    def get_cost_and_usage(self, **_kw):
+        if self._billed is None:
+            raise RuntimeError("AccessDeniedException")
+        return {"ResultsByTime": [{"Groups": [
+            {"Keys": ["APS1-EBS:SnapshotUsage"],
+             "Metrics": {"UnblendedCost": {"Amount": str(self._billed)}}}
+        ]}]}
+
+
+def _make_ctx(ec2: _FakeEc2, billed_snapshot_pool: float | None = 10_000.0) -> SimpleNamespace:
     autoscaling = _FakeAutoscaling()
+    ce = _FakeCe(billed_snapshot_pool)
     pe = SimpleNamespace(get_ebs_snapshot_price_per_gb=lambda: SNAPSHOT_RATE)
-    ctx = SimpleNamespace(pricing_engine=pe, pricing_multiplier=1.0)
+    ctx = SimpleNamespace(pricing_engine=pe, pricing_multiplier=1.0, region="ap-southeast-1")
     ctx.warnings = []
     ctx.permission_issues = []
     ctx.warn = lambda msg, **kw: ctx.warnings.append((msg, kw))
     ctx.permission_issue = lambda msg, **kw: ctx.permission_issues.append((msg, kw))
-    ctx.client = lambda n: ec2 if n == "ec2" else autoscaling
+    ctx.client = lambda n: {"ec2": ec2, "autoscaling": autoscaling, "ce": ce}.get(n, autoscaling)
     return ctx
 
 
@@ -481,3 +505,27 @@ def test_self_duplicate_snapshot_counted_once_not_reported_shared():
     assert gb == 100.0  # counted once, not 200
     assert shared == []  # self-duplicate is not "shared"
     assert all_ids == ["snap-dup", "snap-dup"]
+
+
+# --------------------------------------------------------------------------- #
+# C8: AMI upper bounds are corroborated against billed EBS:SnapshotUsage
+# --------------------------------------------------------------------------- #
+def test_ami_savings_demoted_when_cost_explorer_unavailable():
+    """Removing evidence must never raise counted savings (bnc: ce:* SCP-denied)."""
+    ec2 = _FakeEc2(images=[_ami("ami-free", 200)], snap_bytes={"snap-ami-free": 100 * 1024**3})
+    findings = AmiModule().scan(_make_ctx(ec2, billed_snapshot_pool=None))
+    assert findings.total_monthly_savings == 0.0
+    rec = list(findings.sources["old_amis"].recommendations)[0]
+    assert rec["Counted"] is False
+    assert rec["PotentialMonthlySavings"] == 100.0 * SNAPSHOT_RATE
+    assert "no Cost Explorer actual" in rec["ReconciliationBasis"]
+
+
+def test_ami_savings_capped_at_billed_snapshot_pool():
+    ec2 = _FakeEc2(images=[_ami("ami-free", 200)], snap_bytes={"snap-ami-free": 100 * 1024**3})
+    findings = AmiModule().scan(_make_ctx(ec2, billed_snapshot_pool=1.50))
+    # Upper bound is 100GB x rate; billed pool is only $1.50 -> capped to it.
+    assert findings.total_monthly_savings == pytest.approx(1.50, abs=0.02)
+    rec = list(findings.sources["old_amis"].recommendations)[0]
+    assert rec["Reconciled"] is True
+    assert rec["UpperBoundBeforeReconciliation"] == pytest.approx(100.0 * SNAPSHOT_RATE)
