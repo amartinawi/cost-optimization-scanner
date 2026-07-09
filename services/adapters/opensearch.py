@@ -21,6 +21,10 @@ from services.opensearch import (
 GP3_PRICE_PER_GB_MONTH: float = 0.122
 GP2_PRICE_PER_GB_MONTH: float = 0.135
 
+# Trailing window used to measure the billed Extended Support surcharge, matching
+# the commitment-coverage headroom read (reflects the CURRENT engine versions).
+_SURCHARGE_WINDOW_DAYS: int = 7
+
 # x86/Intel OpenSearch (AmazonES) instance family -> its same-size Graviton
 # (ARM) equivalent. The realizable Graviton saving is the exact per-node price
 # delta, NOT a flat 20-40% / 0.25 price-performance figure (that is a
@@ -126,6 +130,74 @@ def _graviton_equivalent(instance_type: str | None) -> str | None:
         return None
     parts[0] = graviton_family
     return ".".join(parts)
+
+
+def _domain_engine_versions(ctx: Any) -> list[tuple[str, str]]:
+    """(domain, engine version) pairs, for naming who carries the surcharge.
+
+    Context only — the surcharge dollar comes from billing, never from this list.
+    Returns ``[]`` on any failure (the rec then omits the version detail).
+    """
+    try:
+        client = ctx.client("opensearch")
+        names = [d.get("DomainName", "") for d in client.list_domain_names().get("DomainNames", [])]
+        names = [n for n in names if n]
+        if not names:
+            return []
+        resp = client.describe_domains(DomainNames=names)
+        return [
+            (str(d.get("DomainName", "?")), str(d.get("EngineVersion", "?")))
+            for d in resp.get("DomainStatusList", [])
+        ]
+    except Exception:  # noqa: BLE001 — cosmetic detail only
+        return []
+
+
+def _extended_support_monthly(ctx: Any) -> float:
+    """Monthly OpenSearch Extended Support surcharge the account is ACTUALLY billed.
+
+    Measured, not inferred: AWS bills the surcharge as its own Cost-Explorer usage
+    type (``<region>-OpenSearchExtendedSupport``), so the trailing-7-day spend on
+    that usage type — scaled to a 30-day run rate — is the exact realizable saving
+    from upgrading the offending domain's engine version.
+
+    Deriving it from engine-version numbers instead would repeat the EKS
+    Extended-Support bug: a version-based guess counted a surcharge AWS was not
+    charging. Returns ``0.0`` when the read fails or no such usage type is billed
+    (fail closed — never assert a charge we cannot substantiate).
+    """
+    try:
+        ce = ctx.client("ce")
+    except Exception:  # noqa: BLE001
+        return 0.0
+    from datetime import UTC, datetime, timedelta
+
+    end = datetime.now(UTC).date()
+    start = end - timedelta(days=_SURCHARGE_WINDOW_DAYS)
+    try:
+        resp = ce.get_cost_and_usage(
+            TimePeriod={"Start": start.isoformat(), "End": end.isoformat()},
+            Granularity="MONTHLY",
+            Metrics=["UnblendedCost"],
+            GroupBy=[{"Type": "DIMENSION", "Key": "USAGE_TYPE"}],
+            Filter={"Dimensions": {"Key": "SERVICE", "Values": ["Amazon OpenSearch Service"]}},
+        )
+    except Exception as e:  # noqa: BLE001 — fail closed
+        ctx.warn(f"Could not read OpenSearch Extended Support spend: {e}", "opensearch")
+        return 0.0
+
+    total = 0.0
+    for bucket in resp.get("ResultsByTime", []) or []:
+        for grp in bucket.get("Groups", []) or []:
+            usage_type = str((grp.get("Keys") or [""])[0])
+            if "extendedsupport" not in usage_type.replace("-", "").replace("_", "").lower():
+                continue
+            amount = grp.get("Metrics", {}).get("UnblendedCost", {}).get("Amount")
+            try:
+                total += float(amount or 0)
+            except (TypeError, ValueError):
+                continue
+    return total / _SURCHARGE_WINDOW_DAYS * 30.0 if total > 0 else 0.0
 
 
 def _graviton_node_delta(ctx: Any, instance_type: str | None) -> tuple[float, str | None]:
@@ -379,13 +451,49 @@ class OpensearchModule(BaseServiceModule):
             else:
                 rec["EstimatedSavings"] = f"${rec.get('EstimatedMonthlySavings', 0.0):.2f}/month"
 
+        # Extended Support surcharge — a real, separately-billed recurring charge
+        # (CE usage type `*-OpenSearchExtendedSupport`) that no other lever covers.
+        # Kept OUT of `recs` so the per-domain "best lever" dedup cannot suppress
+        # it: it is additive to any downsize/Graviton saving on the same domain,
+        # not an alternative remediation.
+        surcharge_recs: list[dict[str, Any]] = []
+        surcharge = _extended_support_monthly(ctx)
+        if surcharge > 0:
+            domain_engines = _domain_engine_versions(ctx)
+            engines = ", ".join(f"{n}={v}" for n, v in domain_engines) or "unknown"
+            surcharge_recs.append(
+                {
+                    "DomainName": ", ".join(n for n, _ in domain_engines) or "(all domains)",
+                    "CheckCategory": "OpenSearch Extended Support",
+                    "Recommendation": "Upgrade the domain engine version off Extended Support",
+                    "EstimatedMonthlySavings": round(surcharge, 2),
+                    "EstimatedSavings": f"${surcharge:.2f}/month",
+                    "Counted": True,
+                    "Severity": "HIGH",
+                    "AuditBasis": {
+                        "metric": f"Cost Explorer usage type *-OpenSearchExtendedSupport, trailing {_SURCHARGE_WINDOW_DAYS}d",
+                        "formula": f"billed surcharge / {_SURCHARGE_WINDOW_DAYS}d x 30",
+                        "engine_versions": engines,
+                        "evidence": "measured from actual billing, not inferred from version numbers",
+                    },
+                    "Reason": (
+                        f"AWS is billing an OpenSearch Extended Support surcharge of "
+                        f"~${surcharge:.2f}/mo. Upgrading the domain(s) off the end-of-standard-support "
+                        f"engine version removes it. Current engine versions: {engines}."
+                    ),
+                }
+            )
+            savings += surcharge
+
         sources = {"enhanced_checks": SourceBlock(count=len(recs), recommendations=tuple(recs))}
         if coh_out:
             sources["cost_optimization_hub"] = SourceBlock(count=len(coh_out), recommendations=tuple(coh_out))
+        if surcharge_recs:
+            sources["extended_support"] = SourceBlock(count=len(surcharge_recs), recommendations=tuple(surcharge_recs))
 
         return ServiceFindings(
             service_name="OpenSearch",
-            total_recommendations=len(recs) + len(coh_counted),
+            total_recommendations=len(recs) + len(coh_counted) + len(surcharge_recs),
             total_monthly_savings=round(savings, 2),
             sources=sources,
             optimization_descriptions=OPENSEARCH_OPTIMIZATION_DESCRIPTIONS,

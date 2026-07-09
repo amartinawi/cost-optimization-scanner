@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (extended-support surcharges — verify against billing, not config; live bnc audit)
+Deep audit of `bnc` / `ap-southeast-1` (headline **$2,326.87/mo**) found **$730/mo of
+phantom savings (31% of the headline)** and one **$264.75/mo real saving that was never
+reported**. Corrected headline: **$1,861.62/mo**.
+
+- **EKS Extended Support counted a surcharge AWS was not billing ($730/mo phantom).**
+  `services/adapters/eks.py` counted `$0.50/hr` (~$365/mo) per cluster whenever
+  `cluster.upgradePolicy.supportType == "EXTENDED"`. That field is a **policy** — "when
+  standard support ends, enter extended support rather than auto-upgrade" — not a billing
+  state. Two clusters on Kubernetes 1.33 were flagged while Cost Explorer showed only
+  `APS1-AmazonEKS-Hours:perCluster` at `$0.098/cluster-hour` (the standard `$0.10` rate).
+  The surcharge is now gated on `eks:DescribeClusterVersions[<version>].versionStatus ==
+  "EXTENDED_SUPPORT"`, which reports 1.33 as `STANDARD_SUPPORT` until 2026-07-29. A cluster
+  configured for extended support but still on a standard-support version now emits a **$0
+  advisory naming the date** (`extended_support_pending`). An unreadable version lookup
+  **fails closed** — never invent a charge that cannot be substantiated.
+- **OpenSearch Extended Support was billed but never reported ($264.75/mo missed).**
+  `production-bnc` runs `OpenSearch_2.9` and AWS bills `APS1-OpenSearchExtendedSupport`.
+  A new check **measures** the surcharge from the Cost-Explorer usage type (trailing 7 days
+  scaled x30/7) rather than inferring it from engine-version numbers — the same mistake the
+  EKS check made. Emitted as its own `extended_support` source block so the per-domain
+  "best lever" dedup cannot suppress it (it is additive to a downsize/Graviton saving, not
+  an alternative). Fails closed to $0 when unreadable or not billed.
+- **RDS `enhanced_checks` recs now pass through the commitment gate.**
+  `demote_coh_by_commitment` only sees Cost-Hub recs, so a locally-derived instance
+  rightsizing check against an RI-covered DB would have been counted at full on-demand
+  basis. Gated via `demote_covered_in_place`, matching on **(family, engine)** since the
+  enhanced recs carry the engine. Snapshot/storage recs carry no instance class and pass
+  through untouched (backup storage is not reservation-covered). The Cost-Hub path stays
+  engine-agnostic — a CoH rec carries only `dbInstanceClass` — which can over-demote but
+  never produces a phantom; this is now documented at the call site.
+
+Recurring class **C7** in `docs/audits/prompts/_LIVE_AUDIT_LESSONS.md`.
+
 ### Fixed (commitment coverage — phantom savings on reserved resources; live Jarir-M2 audit)
 A deep audit of `Jarir-M2` / `eu-central-1` (headline **$4,057.57/mo**, 34 services,
 holding EC2-Instance SPs, RDS/Aurora + ElastiCache + OpenSearch RIs) found

@@ -47,6 +47,23 @@ class _FakeEks:
     def describe_cluster(self, name):
         return {"cluster": self._clusters[name]["cluster"]}
 
+    def describe_cluster_versions(self, **_kw):
+        """Authoritative support status per version (eks:DescribeClusterVersions).
+
+        Only 1.27 is genuinely past end-of-standard-support and therefore
+        surcharged; 1.31/1.33 remain in standard support.
+        """
+        return {
+            "clusterVersions": [
+                {"clusterVersion": "1.27", "versionStatus": "EXTENDED_SUPPORT",
+                 "endOfStandardSupportDate": "2024-07-24T00:00:00Z"},
+                {"clusterVersion": "1.31", "versionStatus": "STANDARD_SUPPORT",
+                 "endOfStandardSupportDate": "2026-11-26T00:00:00Z"},
+                {"clusterVersion": "1.33", "versionStatus": "STANDARD_SUPPORT",
+                 "endOfStandardSupportDate": "2026-07-29T00:00:00Z"},
+            ]
+        }
+
     def describe_nodegroup(self, clusterName, nodegroupName):
         return {"nodegroup": self._clusters[clusterName]["nodegroups"][nodegroupName]}
 
@@ -260,3 +277,59 @@ def test_pricing_lookup_failure_warns_and_zeroes():
     findings = EksCostModule().scan(ctx)
     ctx.warn.assert_called()
     assert findings.total_monthly_savings == 0.0
+
+
+# --------------------------------------------------------------------------- #
+# bnc live regression (2026-07-09): supportType is a POLICY, not a billing state
+# --------------------------------------------------------------------------- #
+def test_policy_extended_on_standard_version_is_advisory_not_counted():
+    # bnc: two clusters on Kubernetes 1.33 (STANDARD_SUPPORT until 2026-07-29)
+    # carried upgradePolicy.supportType == EXTENDED. The old check counted
+    # $365/mo each ($730 phantom) while AWS billed only the $0.10/hr base rate.
+    eks = _FakeEks({
+        "c1": {"cluster": {"status": "ACTIVE", "version": "1.33",
+                           "upgradePolicy": {"supportType": "EXTENDED"}},
+               "nodegroups": {}, "fargate": []},
+    })
+    findings = EksCostModule().scan(_ctx(eks))
+    recs = _recs(findings, "cluster_costs")
+    counted = [r for r in recs if r["check_type"] == "extended_support"]
+    pending = [r for r in recs if r["check_type"] == "extended_support_pending"]
+    assert counted == [], "must not count a surcharge AWS is not billing"
+    assert len(pending) == 1
+    assert pending[0]["monthly_savings"] == 0.0
+    assert pending[0]["Counted"] is False
+    assert pending[0]["AdvisoryEstimate"] == 365.0
+    assert "2026-07-29" in pending[0]["current_value"]
+    # The $0 advisory must not reach the headline.
+    assert all(r["check_type"] != "extended_support" for r in recs)
+
+
+def test_extended_support_counted_when_version_actually_extended():
+    eks = _FakeEks({
+        "c1": {"cluster": {"status": "ACTIVE", "version": "1.27",
+                           "upgradePolicy": {"supportType": "EXTENDED"}},
+               "nodegroups": {}, "fargate": []},
+    })
+    recs = _recs(EksCostModule().scan(_ctx(eks)), "cluster_costs")
+    ext = [r for r in recs if r["check_type"] == "extended_support"]
+    assert len(ext) == 1 and ext[0]["monthly_savings"] == 365.0
+    assert "versionStatus == EXTENDED_SUPPORT" in ext[0]["audit_basis"]["evidence"]
+
+
+def test_version_support_lookup_failure_counts_nothing():
+    # Fail closed: if DescribeClusterVersions is denied we cannot substantiate a
+    # surcharge, so none is counted (never invent a charge).
+    class _NoVersions(_FakeEks):
+        def describe_cluster_versions(self, **_kw):
+            raise RuntimeError("AccessDeniedException")
+
+    eks = _NoVersions({
+        "c1": {"cluster": {"status": "ACTIVE", "version": "1.27",
+                           "upgradePolicy": {"supportType": "EXTENDED"}},
+               "nodegroups": {}, "fargate": []},
+    })
+    ctx = _ctx(eks)
+    recs = _recs(EksCostModule().scan(ctx), "cluster_costs")
+    assert [r for r in recs if r["check_type"] == "extended_support"] == []
+    assert ctx.warn.called

@@ -26,6 +26,8 @@ fake boto3 clients directly rather than paginators.
 
 from __future__ import annotations
 
+import pytest
+
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -390,3 +392,51 @@ def test_shim_to_adapter_end_to_end_prices_every_lever(monkeypatch: pytest.Monke
     assert cats["Storage Optimization"]["Counted"] is True
     # Total = downsize 800 + storage 13 = 813.00.
     assert findings.total_monthly_savings == pytest.approx(813.0)
+
+
+# --------------------------------------------------------------------------- #
+# bnc live regression (2026-07-09): Extended Support surcharge is MEASURED
+# --------------------------------------------------------------------------- #
+def _ce_with(usage_types):
+    from unittest.mock import MagicMock
+    ce = MagicMock()
+    ce.get_cost_and_usage.return_value = {
+        "ResultsByTime": [{"Groups": [
+            {"Keys": [k], "Metrics": {"UnblendedCost": {"Amount": str(v)}}} for k, v in usage_types
+        ]}]
+    }
+    return ce
+
+
+def test_extended_support_measured_from_billing_and_scaled():
+    from types import SimpleNamespace
+    from services.adapters.opensearch import _extended_support_monthly
+
+    ce = _ce_with([("APS1-ESInstance:m5.xlarge", 350.46),
+                   ("APS1-OpenSearchExtendedSupport", 61.78),
+                   ("APS1-ES:GP3-Storage", 19.48)])
+    ctx = SimpleNamespace(client=lambda _n: ce, warn=lambda *a, **k: None)
+    got = _extended_support_monthly(ctx)
+    assert got == pytest.approx(61.78 / 7 * 30, rel=1e-6)   # ~$264.77/mo (bnc)
+
+
+def test_extended_support_zero_when_not_billed():
+    from types import SimpleNamespace
+    from services.adapters.opensearch import _extended_support_monthly
+
+    ce = _ce_with([("APS1-ESInstance:m5.xlarge", 350.46)])
+    ctx = SimpleNamespace(client=lambda _n: ce, warn=lambda *a, **k: None)
+    assert _extended_support_monthly(ctx) == 0.0
+
+
+def test_extended_support_fails_closed_on_ce_error():
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    from services.adapters.opensearch import _extended_support_monthly
+
+    ce = MagicMock()
+    ce.get_cost_and_usage.side_effect = RuntimeError("AccessDenied")
+    warns = []
+    ctx = SimpleNamespace(client=lambda _n: ce, warn=lambda m, s=None: warns.append(m))
+    assert _extended_support_monthly(ctx) == 0.0   # never invent a charge
+    assert warns
