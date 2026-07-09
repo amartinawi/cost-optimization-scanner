@@ -58,45 +58,99 @@ def _coh_is_renderable(rec: dict[str, Any]) -> bool:
     return str(rec.get("finding", "")).lower() != "optimized"
 
 
+# DescribeVolumes filter values per request. The API caps filter values, so long
+# delete-rec lists are verified in chunks rather than one unbounded request.
+_VOLUME_FILTER_CHUNK = 200
+
+
+def _is_delete_rec(rec: dict[str, Any]) -> bool:
+    """True for a Cost-Hub recommendation whose action deletes the resource."""
+    return "delete" in str(rec.get("actionType", "")).lower()
+
+
+def _volume_id(rec: dict[str, Any]) -> str:
+    """The ``vol-`` resource id of a rec, or "" when it does not target a volume."""
+    vid = str(rec.get("resourceId", "") or "")
+    return vid if vid.startswith("vol-") else ""
+
+
+def _live_volume_states(ctx: Any, vol_ids: list[str]) -> dict[str, str]:
+    """Map volume id -> live state, omitting volumes that no longer exist.
+
+    Filters on ``volume-id`` rather than passing ``VolumeIds``: DescribeVolumes
+    raises ``InvalidVolume.NotFound`` for the **whole request** if any listed id
+    has been deleted, and a volume deleted since Cost Hub's snapshot is exactly
+    the staleness this guard exists to catch. A filter silently omits unknown
+    ids, so one deleted volume can no longer blind the check for every other one.
+
+    Raises:
+        Any boto3 error — the caller fails closed rather than trusting stale data.
+    """
+    states: dict[str, str] = {}
+    paginator = ctx.client("ec2").get_paginator("describe_volumes")
+    for start in range(0, len(vol_ids), _VOLUME_FILTER_CHUNK):
+        chunk = vol_ids[start : start + _VOLUME_FILTER_CHUNK]
+        for page in paginator.paginate(Filters=[{"Name": "volume-id", "Values": chunk}]):
+            for vol in page.get("Volumes", []):
+                vid = str(vol.get("VolumeId", "") or "")
+                if vid:
+                    states[vid] = str(vol.get("State", "") or "")
+    return states
+
+
 def _drop_stale_delete_recs(ctx: Any, coh_recs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Drop Cost-Hub 'delete' recs whose volume is no longer unattached.
 
     Cost Optimization Hub data lags live state, so it can recommend deleting a
-    volume that has since been re-attached. Acting on that would destroy a live
-    instance's storage. For deletion actions we re-check the live volume state
-    and keep only volumes that are actually ``available`` (unattached). Non-delete
-    actions (e.g. rightsizing an attached volume) are left untouched. On any
-    error (e.g. ec2 permission) the recs pass through unchanged.
+    volume that has since been re-attached — acting on that would destroy a live
+    instance's storage. Deletion actions are re-checked against the live volume
+    state and only volumes that are genuinely ``available`` (unattached) survive.
+    A volume that no longer exists is dropped too: there is nothing left to save.
+    Non-delete actions (e.g. rightsizing an attached volume) pass through
+    untouched.
+
+    **Fails closed.** If the live state cannot be read at all (IAM denial,
+    throttling), every unverified delete rec is dropped rather than surfaced —
+    advising deletion of a volume we could not prove is unattached risks data
+    loss, which is strictly worse than under-reporting a saving.
     """
-    delete_recs = [r for r in coh_recs if "delete" in str(r.get("actionType", "")).lower()]
+    delete_recs = [r for r in coh_recs if _is_delete_rec(r) and _volume_id(r)]
     if not delete_recs:
         return coh_recs
-    vol_ids = [str(r.get("resourceId", "")) for r in delete_recs if str(r.get("resourceId", "")).startswith("vol-")]
-    if not vol_ids:
-        return coh_recs
+    vol_ids = sorted({_volume_id(r) for r in delete_recs})
+
     try:
-        ec2 = ctx.client("ec2")
-        available: set[str] = set()
-        paginator = ec2.get_paginator("describe_volumes")
-        for page in paginator.paginate(VolumeIds=vol_ids):
-            for v in page.get("Volumes", []):
-                if v.get("State") == "available":
-                    available.add(v.get("VolumeId", ""))
-    except Exception as e:
-        ctx.warn(f"could not verify EBS volume state for CoH delete recs: {e}", "ebs")
-        return coh_recs
+        states = _live_volume_states(ctx, vol_ids)
+    except Exception as e:  # noqa: BLE001 — fail closed on a destructive action
+        ctx.warn(
+            f"could not verify EBS volume state for {len(delete_recs)} Cost Hub delete "
+            f"recommendation(s) ({e}) — dropping them rather than risk advising deletion "
+            "of an in-use volume.",
+            "ebs",
+        )
+        return [r for r in coh_recs if not (_is_delete_rec(r) and _volume_id(r))]
 
     kept: list[dict[str, Any]] = []
-    for r in coh_recs:
-        vid = str(r.get("resourceId", ""))
-        if "delete" in str(r.get("actionType", "")).lower() and vid.startswith("vol-") and vid not in available:
+    for rec in coh_recs:
+        vid = _volume_id(rec)
+        if not (_is_delete_rec(rec) and vid):
+            kept.append(rec)
+            continue
+        state = states.get(vid)
+        if state == "available":
+            kept.append(rec)  # genuinely unattached — a real, actionable saving
+        elif state is None:
             ctx.warn(
-                f"Cost Hub recommends deleting {vid} but it is currently attached/in-use — "
+                f"Cost Hub recommends deleting {vid} but it no longer exists — "
                 "dropping the stale recommendation.",
                 "ebs",
             )
-            continue
-        kept.append(r)
+        else:
+            ctx.warn(
+                f"Cost Hub recommends deleting {vid} but it is currently '{state}', not unattached — "
+                "dropping the stale recommendation.",
+                "ebs",
+            )
     return kept
 
 
