@@ -6,6 +6,8 @@ from typing import Any
 
 from core.contracts import ServiceFindings, SourceBlock
 from services._base import BaseServiceModule
+from services._reconcile import reconcile_against_billed
+from services.advisor import get_ebs_snapshot_actuals
 from services.ami import compute_ami_checks
 
 
@@ -39,11 +41,21 @@ class AmiModule(BaseServiceModule):
         old_recs = result.get("old_amis", [])
         unused_recs = result.get("unused_amis", [])
 
-        # Both sources are quantified deletion candidates; every rec carries a
-        # concrete EstimatedMonthlySavings from its backing-snapshot storage.
-        savings = 0.0
-        for rec in old_recs + unused_recs:
-            savings += float(rec.get("EstimatedMonthlySavings", 0) or 0)
+        # An AMI's saving is priced from its backing snapshot's FULL size, but EBS
+        # snapshots bill only the unique changed blocks across a chain — so it is an
+        # UPPER BOUND. Corroborate the whole region's AMI snapshot savings against
+        # the billed EBS:SnapshotUsage pool and cap them at it. When Cost Explorer
+        # cannot be read the bound is unsubstantiated and every rec is demoted to a
+        # $0 advisory: removing evidence must never raise counted savings (C8).
+        n_old = len(old_recs)
+        billed = get_ebs_snapshot_actuals(ctx)
+        reconciled, savings = reconcile_against_billed(
+            old_recs + unused_recs,
+            billed,
+            pool_label="EBS snapshot storage",
+            grant_hint="grant ce:GetCostAndUsage to corroborate against billed EBS:SnapshotUsage",
+        )
+        old_recs, unused_recs = reconciled[:n_old], reconciled[n_old:]
 
         total_recs = len(old_recs) + len(unused_recs)
 

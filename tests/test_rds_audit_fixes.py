@@ -887,7 +887,11 @@ def test_zero_size_snapshot_counted_but_adds_zero_to_total():
          "EstimatedSavings": "$23.00/month (upper bound — provisioned size; actual backup bytes are typically lower)"},
     ]
     from services.rds_logic import resolve_rds_findings
-    _coh, _co, kept_enh, savings, count = resolve_rds_findings([], enhanced)
+    # Ample billed backup corroborates the $23 upper bound; the size-unknown
+    # snapshot is advisory and contributes 0 either way.
+    _coh, _co, kept_enh, savings, count = resolve_rds_findings(
+        [], enhanced, backup_actuals={"aurora": 10_000.0}
+    )
     assert savings == pytest.approx(23.0)   # advisory snapshot adds 0
     assert count == 2                        # both rendered/counted
 
@@ -1050,13 +1054,37 @@ def test_reconcile_advisory_demote_zeroes_numeric():
     assert rec["PotentialMonthlySavings"] == pytest.approx(80.0)
 
 
-def test_reconcile_noop_when_missing_or_zero():
+def test_reconcile_demotes_when_actual_missing_or_zero():
+    """An unsubstantiated provisioned-size upper bound is NEVER counted.
+
+    Regression: `if not backup_actuals: return snaps` returned the UNCAPPED upper
+    bound whenever Cost Explorer was unavailable (bnc: ce:GetCostAndUsage denied by
+    an SCP), counting $1,131.45 where billed backup supported only $411.87 — a
+    $719.58/mo silent overstatement. A missing/zero actual now demotes to a $0
+    advisory that preserves the bound as PotentialMonthlySavings.
+    """
     from services.rds_logic import enhanced_savings, reconcile_snapshot_savings
 
-    snaps = [_snap("aurora-mysql", "$100.00/month (upper bound)")]
-    assert reconcile_snapshot_savings(snaps, {}) == snaps          # no data
-    out = reconcile_snapshot_savings(snaps, {"aurora": 0.0})       # 0 == no data (CE gap guard)
+    for actuals in ({}, None, {"aurora": 0.0}):
+        out = reconcile_snapshot_savings([_snap("aurora-mysql", "$100.00/month (upper bound)")], actuals)
+        # Mirrors resolve_rds_findings: only Counted recs reach the headline.
+        counted = sum(enhanced_savings(s) for s in out if s.get("Counted") is not False)
+        assert counted == pytest.approx(0.0), actuals
+        assert out[0]["Counted"] is False
+        assert out[0]["EstimatedMonthlySavings"] == 0.0
+        assert out[0]["PotentialMonthlySavings"] == pytest.approx(100.0)
+        assert "no Cost Explorer actual" in out[0]["AuditBasis"]["reconciliation"]
+        assert out[0]["EstimatedSavings"].startswith("up to $100.00/month — advisory")
+
+
+def test_reconcile_counts_when_actual_corroborates():
+    from services.rds_logic import enhanced_savings, reconcile_snapshot_savings
+
+    out = reconcile_snapshot_savings(
+        [_snap("aurora-mysql", "$100.00/month (upper bound)")], {"aurora": 250.0}
+    )
     assert sum(enhanced_savings(s) for s in out) == pytest.approx(100.0)
+    assert out[0].get("Counted") is not False
 
 
 def test_reconcile_per_engine_independent():

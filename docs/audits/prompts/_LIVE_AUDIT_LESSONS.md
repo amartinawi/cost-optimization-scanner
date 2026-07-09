@@ -169,6 +169,47 @@ will eventually both count it. This is the single most common real finding.
   that family. **Note:** Compute SP covers EC2/Lambda/Fargate but NOT
   RDS/ElastiCache/…/SageMaker; SageMaker SP covers only SageMaker.
 
+- **C7 — A recurring surcharge is only real if AWS is billing it. Verify against a
+  Cost-Explorer usage type, never against a config field.** `eks.py` counted a
+  `$365/mo` Extended-Support surcharge per cluster whenever
+  `cluster.upgradePolicy.supportType == "EXTENDED"` — with the comment
+  *"evidence-based … not guessing from the version number"*. But that field is a
+  **policy** ("when standard support ends, enter extended support rather than
+  auto-upgrade"), **not a billing state**. *Real: bnc, ap-southeast-1 — two
+  clusters on Kubernetes 1.33 produced **$730/mo phantom** (31% of the headline)
+  while CE showed exactly one usage type, `APS1-AmazonEKS-Hours:perCluster` at
+  `$0.098/cluster-hour` — the standard `$0.10` rate, no surcharge line at all.
+  `eks:DescribeClusterVersions` confirmed 1.33 = `STANDARD_SUPPORT` until
+  2026-07-29.* Authoritative signal: `DescribeClusterVersions[v].versionStatus ==
+  "EXTENDED_SUPPORT"` (fail closed — an unreadable lookup counts nothing). A
+  cluster with `supportType=EXTENDED` on a still-standard version is a **$0
+  advisory naming the date**, not a counted saving. **Converse, same account:** the
+  scanner had *no* OpenSearch extended-support check while `APS1-OpenSearchExtendedSupport`
+  billed **$264.75/mo** — it invented a surcharge that did not exist and missed one
+  that did. Measure surcharges from the billed usage type (trailing 7d x 30/7).
+  **Sweep:** for every counted rec whose saving is "remove a surcharge", grep CE
+  usage types for a matching line; absent it, the rec is phantom. Note EKS bills
+  under CE service `"Amazon Elastic Container Service for Kubernetes"`, not
+  `"Amazon Elastic Kubernetes Service"`.
+
+- **C8 — When the evidence read fails, fail CLOSED. An early `return` that skips a
+  cap is a silent overstatement.** `reconcile_snapshot_savings` opened with
+  `if not backup_actuals: return snaps`, documented as *"a CE gap never silently
+  zeroes real savings"* — optimising for the wrong direction. Snapshot savings are a
+  **provisioned-size upper bound** (`AllocatedStorage x rate`); actual backup bytes
+  sit well below it, so the bound is only counted when Cost Explorer corroborates
+  it. The function's own per-group branch already demoted an uncorroborated bound
+  (F5) — the early return jumped over it. *Real: bnc, ap-southeast-1 — `ce:GetCostAndUsage`
+  is denied by an org SCP for some roles; under such a role the RDS snapshot tab
+  counts **$1,131.45** (11,910 GB x $0.095) where billed backup supports only
+  **$411.87** — a **$719.58/mo silent overstatement** that appears only when a
+  permission is missing.* **Sweep:** for every `except`/empty-result path feeding a
+  counted number, ask *"does this skip a ceiling?"* Compare the same account scanned
+  with and without `ce:GetCostAndUsage`; the counted total must never rise when
+  evidence is removed. Same class as the EBS delete guard that failed open on
+  `InvalidVolume.NotFound` (C-series) and the EKS surcharge counted from a config
+  field (**C7**).
+
 ## D. Render / tab / count semantics (`counted == rendered`, both directions)
 
 - **D1 — Counted-but-invisible (render desync).** Savings summed into the headline

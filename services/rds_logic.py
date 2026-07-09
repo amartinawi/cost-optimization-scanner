@@ -128,16 +128,24 @@ def reconcile_snapshot_savings(
     reports the *actual* billed backup for the region (``services.advisor.
     get_rds_backup_actuals``), cap each engine group's snapshot savings at it:
     manual snapshots are a subset of total backup spend, so the actual is a valid
-    (tighter) ceiling. Capping is applied **only** when the actual is a POSITIVE
-    number below the group's summed upper bound — a 0/missing actual is treated as
-    "no data" and leaves the upper bound untouched, so a CE gap never silently
-    zeroes real savings. Advisory/size-unknown snaps (no ``$``) pass through.
+    (tighter) ceiling. Capping is applied when the actual is a POSITIVE number
+    below the group's summed upper bound. A 0/missing/unreadable actual means the
+    upper bound cannot be substantiated against billing, so those recs are demoted
+    to $0 advisories (the bound survives as ``PotentialMonthlySavings``) — never
+    counted. Failing this check open would overstate, since actual backup bytes sit
+    well below provisioned size. Advisory/size-unknown snaps (no ``$``) pass through.
 
     Returns a new list; capped recs are copies with an updated EstimatedSavings
     and AuditBasis (``reconciled_to_actual_billed`` / ``reconciliation_factor``).
     """
-    if not backup_actuals:
-        return snaps
+    # An absent/empty Cost-Explorer read is NOT "no cap needed" — it means the
+    # provisioned-size upper bound is unsubstantiated. Fall through to the
+    # per-group branch below, which demotes an uncorroborated bound to a $0
+    # advisory (F5). Returning early here counted the UNCAPPED upper bound
+    # whenever ce:GetCostAndUsage was denied or throttled: on bnc that is
+    # $1,131.45 instead of $411.87 — a $719.58/mo silent overstatement, in the
+    # one direction this scanner must never fail.
+    backup_actuals = backup_actuals or {}
 
     def _is_aurora(s: dict[str, Any]) -> bool:
         return str(s.get("engine") or "").lower().startswith("aurora") or "Aurora" in str(

@@ -14,7 +14,7 @@ from services.rds import (
     get_rds_compute_optimizer_recommendations,
     get_rds_instance_count,
 )
-from services.commitment_coverage import demote_coh_by_commitment
+from services.commitment_coverage import demote_coh_by_commitment, demote_covered_in_place
 from services.rds_logic import normalize_rds_arn, resolve_rds_findings
 
 logger = logging.getLogger(__name__)
@@ -139,10 +139,30 @@ class RdsModule(BaseServiceModule):
         def _coh_gross(r: dict[str, Any]) -> float:
             return float(r.get("estimatedMonthlySavings", 0.0) or 0.0)
 
+        # NOTE: a CoH rec carries only `dbInstanceClass` — no engine — so this
+        # match is engine-agnostic (family-only). RDS RIs ARE engine-scoped, so
+        # this can over-demote (e.g. an aurora-postgresql RI flagging a sqlserver
+        # instance of the same family). That errs toward under-reporting, never
+        # toward a phantom saving. The enhanced_checks gate below, which does see
+        # the engine, matches on (family, engine).
         coh_counted, coh_demoted = demote_coh_by_commitment(coh_kept, coverage, "rds", _coh_gross)
         savings -= sum(_coh_gross(r) for r in coh_demoted)
         total_recs -= len(coh_demoted)
         coh_kept = coh_counted + coh_demoted
+
+        # Same gate for the locally-derived levers: demote_coh_by_commitment only
+        # sees CoH recs, so an instance-rightsizing enhanced check against an
+        # RI-covered DB would otherwise be counted at full on-demand basis.
+        # Snapshot/storage recs carry no instance class and pass through untouched
+        # (backup storage is not reservation-covered).
+        enhanced_removed = demote_covered_in_place(
+            enhanced_kept,
+            coverage,
+            "rds",
+            lambda r: str(r.get("DBInstanceClass") or r.get("InstanceClass") or ""),
+            engine_of=lambda r: str(r.get("Engine") or ""),
+        )
+        savings -= enhanced_removed
 
         # Cross-adapter dedup (rds H1 / aurora H3). Publish the normalized ids of
         # the DB instances this tab actually counts (Cost Optimization Hub +

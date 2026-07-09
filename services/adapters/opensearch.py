@@ -21,6 +21,10 @@ from services.opensearch import (
 GP3_PRICE_PER_GB_MONTH: float = 0.122
 GP2_PRICE_PER_GB_MONTH: float = 0.135
 
+# Trailing window used to measure the billed Extended Support surcharge, matching
+# the commitment-coverage headroom read (reflects the CURRENT engine versions).
+_SURCHARGE_WINDOW_DAYS: int = 7
+
 # x86/Intel OpenSearch (AmazonES) instance family -> its same-size Graviton
 # (ARM) equivalent. The realizable Graviton saving is the exact per-node price
 # delta, NOT a flat 20-40% / 0.25 price-performance figure (that is a
@@ -126,6 +130,133 @@ def _graviton_equivalent(instance_type: str | None) -> str | None:
         return None
     parts[0] = graviton_family
     return ".".join(parts)
+
+
+def _domain_engine_versions(ctx: Any) -> list[tuple[str, str]]:
+    """(domain, engine version) pairs, for naming who carries the surcharge.
+
+    Context only — the surcharge dollar comes from billing, never from this list.
+    Returns ``[]`` on any failure (the rec then omits the version detail).
+    """
+    try:
+        client = ctx.client("opensearch")
+        names = [d.get("DomainName", "") for d in client.list_domain_names().get("DomainNames", [])]
+        names = [n for n in names if n]
+        if not names:
+            return []
+        resp = client.describe_domains(DomainNames=names)
+        return [
+            (str(d.get("DomainName", "?")), str(d.get("EngineVersion", "?")))
+            for d in resp.get("DomainStatusList", [])
+        ]
+    except Exception:  # noqa: BLE001 — cosmetic detail only
+        return []
+
+
+_CE_OPENSEARCH_SERVICE = "Amazon OpenSearch Service"
+
+
+def _is_extended_support_usage_type(usage_type: str) -> bool:
+    """True for the ``<region>-OpenSearchExtendedSupport`` billing line."""
+    return "extendedsupport" in usage_type.replace("-", "").replace("_", "").lower()
+
+
+def _domain_from_arn(resource_id: str) -> str:
+    """``arn:aws:es:...:domain/production-bnc`` -> ``production-bnc``."""
+    rid = str(resource_id or "")
+    return rid.rsplit("/", 1)[-1] if "/" in rid else rid
+
+
+def _extended_support_breakdown(ctx: Any) -> tuple[float, dict[str, float]]:
+    """The billed OpenSearch Extended Support surcharge, and who pays it.
+
+    Measured, never inferred: AWS bills the surcharge as its own Cost-Explorer
+    usage type (``<region>-OpenSearchExtendedSupport``), so trailing-7-day spend
+    on that usage type — scaled to a 30-day run rate — is the exact realizable
+    saving from upgrading the offending domain's engine version. Guessing from
+    engine-version numbers instead would repeat the EKS Extended-Support bug: a
+    version-based guess counted a surcharge AWS was not charging.
+
+    Attribution uses ``GetCostAndUsageWithResources``, which resolves the charge
+    to a domain ARN. It requires the account to have Cost Explorer resource-level
+    granularity enabled, so an empty per-domain map means "billed, but we cannot
+    prove which domain" — the caller must then name no domain rather than blame
+    one. Never attribute by engine version: the newest domain would be implicated
+    just as readily as the oldest.
+
+    Returns:
+        ``(monthly_total, {domain: monthly_amount})``. ``(0.0, {})`` when the read
+        fails or no surcharge is billed (fail closed).
+    """
+    try:
+        ce = ctx.client("ce")
+    except Exception:  # noqa: BLE001
+        return 0.0, {}
+    from datetime import UTC, datetime, timedelta
+
+    end = datetime.now(UTC).date()
+    start = end - timedelta(days=_SURCHARGE_WINDOW_DAYS)
+    period = {"Start": start.isoformat(), "End": end.isoformat()}
+    scale = 30.0 / _SURCHARGE_WINDOW_DAYS
+
+    try:
+        resp = ce.get_cost_and_usage(
+            TimePeriod=period,
+            Granularity="MONTHLY",
+            Metrics=["UnblendedCost"],
+            GroupBy=[{"Type": "DIMENSION", "Key": "USAGE_TYPE"}],
+            Filter={"Dimensions": {"Key": "SERVICE", "Values": [_CE_OPENSEARCH_SERVICE]}},
+        )
+    except Exception as e:  # noqa: BLE001 — fail closed
+        ctx.warn(f"Could not read OpenSearch Extended Support spend: {e}", "opensearch")
+        return 0.0, {}
+
+    total = 0.0
+    usage_types: list[str] = []
+    for bucket in resp.get("ResultsByTime", []) or []:
+        for grp in bucket.get("Groups", []) or []:
+            usage_type = str((grp.get("Keys") or [""])[0])
+            if not _is_extended_support_usage_type(usage_type):
+                continue
+            amount = grp.get("Metrics", {}).get("UnblendedCost", {}).get("Amount")
+            try:
+                total += float(amount or 0)
+            except (TypeError, ValueError):
+                continue
+            if usage_type not in usage_types:
+                usage_types.append(usage_type)
+
+    if total <= 0 or not usage_types:
+        return 0.0, {}
+
+    per_domain: dict[str, float] = {}
+    try:
+        detail = ce.get_cost_and_usage_with_resources(
+            TimePeriod=period,
+            Granularity="MONTHLY",
+            Metrics=["UnblendedCost"],
+            GroupBy=[{"Type": "DIMENSION", "Key": "RESOURCE_ID"}],
+            Filter={
+                "And": [
+                    {"Dimensions": {"Key": "SERVICE", "Values": [_CE_OPENSEARCH_SERVICE]}},
+                    {"Dimensions": {"Key": "USAGE_TYPE", "Values": usage_types}},
+                ]
+            },
+        )
+        for bucket in detail.get("ResultsByTime", []) or []:
+            for grp in bucket.get("Groups", []) or []:
+                domain = _domain_from_arn((grp.get("Keys") or [""])[0])
+                amount = grp.get("Metrics", {}).get("UnblendedCost", {}).get("Amount")
+                try:
+                    value = float(amount or 0)
+                except (TypeError, ValueError):
+                    continue
+                if domain and domain.lower() != "noresourceid" and value > 0:
+                    per_domain[domain] = per_domain.get(domain, 0.0) + value
+    except Exception:  # noqa: BLE001 — resource granularity may be disabled
+        per_domain = {}
+
+    return total * scale, {d: v * scale for d, v in per_domain.items()}
 
 
 def _graviton_node_delta(ctx: Any, instance_type: str | None) -> tuple[float, str | None]:
@@ -379,13 +510,79 @@ class OpensearchModule(BaseServiceModule):
             else:
                 rec["EstimatedSavings"] = f"${rec.get('EstimatedMonthlySavings', 0.0):.2f}/month"
 
+        # Extended Support surcharge — a real, separately-billed recurring charge
+        # (CE usage type `*-OpenSearchExtendedSupport`) that no other lever covers.
+        # Kept OUT of `recs` so the per-domain "best lever" dedup cannot suppress
+        # it: it is additive to any downsize/Graviton saving on the same domain,
+        # not an alternative remediation.
+        surcharge_recs: list[dict[str, Any]] = []
+        surcharge, per_domain = _extended_support_breakdown(ctx)
+        if surcharge > 0:
+            engine_of = dict(_domain_engine_versions(ctx))
+            basis = {
+                "metric": f"Cost Explorer usage type *-OpenSearchExtendedSupport, trailing {_SURCHARGE_WINDOW_DAYS}d",
+                "formula": f"billed surcharge / {_SURCHARGE_WINDOW_DAYS}d x 30",
+                "evidence": "measured from actual billing, not inferred from engine-version numbers",
+            }
+            if per_domain:
+                # Attributed: charge exactly the domain(s) AWS bills. Never implicate
+                # a domain whose engine version merely looks old.
+                for domain, amount in sorted(per_domain.items(), key=lambda kv: -kv[1]):
+                    version = engine_of.get(domain, "?")
+                    surcharge_recs.append(
+                        {
+                            "DomainName": domain,
+                            "EngineVersion": version,
+                            "CheckCategory": "OpenSearch Extended Support",
+                            "Recommendation": f"Upgrade {domain} off Extended Support (currently {version})",
+                            "EstimatedMonthlySavings": round(amount, 2),
+                            "EstimatedSavings": f"${amount:.2f}/month",
+                            "Counted": True,
+                            "Severity": "HIGH",
+                            "AuditBasis": {**basis, "attribution": "CE resource-level (GetCostAndUsageWithResources)"},
+                            "Reason": (
+                                f"AWS bills ~${amount:.2f}/mo of OpenSearch Extended Support against domain "
+                                f"'{domain}' (engine {version}). Upgrading it to a standard-support engine "
+                                f"version removes the surcharge."
+                            ),
+                        }
+                    )
+            else:
+                # Billed, but resource-level granularity is off, so we cannot prove
+                # which domain pays. Name none — list the versions as context only.
+                engines = ", ".join(f"{n}={v}" for n, v in sorted(engine_of.items())) or "unknown"
+                surcharge_recs.append(
+                    {
+                        "DomainName": "(unattributed — enable Cost Explorer resource-level granularity)",
+                        "CheckCategory": "OpenSearch Extended Support",
+                        "Recommendation": "Upgrade the domain running an end-of-standard-support engine version",
+                        "EstimatedMonthlySavings": round(surcharge, 2),
+                        "EstimatedSavings": f"${surcharge:.2f}/month",
+                        "Counted": True,
+                        "Severity": "HIGH",
+                        "AuditBasis": {
+                            **basis,
+                            "attribution": "unavailable — CE resource-level granularity disabled",
+                            "engine_versions": engines,
+                        },
+                        "Reason": (
+                            f"AWS is billing an OpenSearch Extended Support surcharge of ~${surcharge:.2f}/mo. "
+                            f"Billing does not attribute it to a domain at this granularity, so no single domain "
+                            f"is named here. Engine versions in this region: {engines}."
+                        ),
+                    }
+                )
+            savings += surcharge
+
         sources = {"enhanced_checks": SourceBlock(count=len(recs), recommendations=tuple(recs))}
         if coh_out:
             sources["cost_optimization_hub"] = SourceBlock(count=len(coh_out), recommendations=tuple(coh_out))
+        if surcharge_recs:
+            sources["extended_support"] = SourceBlock(count=len(surcharge_recs), recommendations=tuple(surcharge_recs))
 
         return ServiceFindings(
             service_name="OpenSearch",
-            total_recommendations=len(recs) + len(coh_counted),
+            total_recommendations=len(recs) + len(coh_counted) + len(surcharge_recs),
             total_monthly_savings=round(savings, 2),
             sources=sources,
             optimization_descriptions=OPENSEARCH_OPTIMIZATION_DESCRIPTIONS,

@@ -88,6 +88,24 @@ class _FakeEks:
     def describe_cluster(self, name: str) -> dict[str, Any]:
         return {"cluster": self._clusters[name]["cluster"]}
 
+    def describe_cluster_versions(self, **_kw: Any) -> dict[str, Any]:
+        """Authoritative per-version support status (mirrors eks:DescribeClusterVersions).
+
+        1.27 is genuinely past end-of-standard-support (surcharged); newer
+        versions are still in standard support, so a cluster on one of those is
+        NOT billed the surcharge even if upgradePolicy.supportType == EXTENDED.
+        """
+        return {
+            "clusterVersions": [
+                {"clusterVersion": "1.27", "versionStatus": "EXTENDED_SUPPORT",
+                 "endOfStandardSupportDate": "2024-07-24T00:00:00Z"},
+                {"clusterVersion": "1.31", "versionStatus": "STANDARD_SUPPORT",
+                 "endOfStandardSupportDate": "2026-11-26T00:00:00Z"},
+                {"clusterVersion": "1.33", "versionStatus": "STANDARD_SUPPORT",
+                 "endOfStandardSupportDate": "2026-07-29T00:00:00Z"},
+            ]
+        }
+
     def describe_nodegroup(self, clusterName: str, nodegroupName: str) -> dict[str, Any]:  # noqa: N803
         return {"nodegroup": self._clusters[clusterName]["nodegroups"][nodegroupName]}
 
