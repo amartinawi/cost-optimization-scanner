@@ -192,6 +192,24 @@ will eventually both count it. This is the single most common real finding.
   under CE service `"Amazon Elastic Container Service for Kubernetes"`, not
   `"Amazon Elastic Kubernetes Service"`.
 
+- **C8 — When the evidence read fails, fail CLOSED. An early `return` that skips a
+  cap is a silent overstatement.** `reconcile_snapshot_savings` opened with
+  `if not backup_actuals: return snaps`, documented as *"a CE gap never silently
+  zeroes real savings"* — optimising for the wrong direction. Snapshot savings are a
+  **provisioned-size upper bound** (`AllocatedStorage x rate`); actual backup bytes
+  sit well below it, so the bound is only counted when Cost Explorer corroborates
+  it. The function's own per-group branch already demoted an uncorroborated bound
+  (F5) — the early return jumped over it. *Real: bnc, ap-southeast-1 — `ce:GetCostAndUsage`
+  is denied by an org SCP for some roles; under such a role the RDS snapshot tab
+  counts **$1,131.45** (11,910 GB x $0.095) where billed backup supports only
+  **$411.87** — a **$719.58/mo silent overstatement** that appears only when a
+  permission is missing.* **Sweep:** for every `except`/empty-result path feeding a
+  counted number, ask *"does this skip a ceiling?"* Compare the same account scanned
+  with and without `ce:GetCostAndUsage`; the counted total must never rise when
+  evidence is removed. Same class as the EBS delete guard that failed open on
+  `InvalidVolume.NotFound` (C-series) and the EKS surcharge counted from a config
+  field (**C7**).
+
 ## D. Render / tab / count semantics (`counted == rendered`, both directions)
 
 - **D1 — Counted-but-invisible (render desync).** Savings summed into the headline

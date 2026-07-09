@@ -33,9 +33,17 @@ def _enhanced_rec(arn: str, savings_str: str, category: str = "Multi-AZ Optimiza
     return {"resourceArn": arn, "EstimatedSavings": savings_str, "CheckCategory": category}
 
 
-def _savings(co, enhanced) -> float:
+# Snapshot upper bounds are only counted when corroborated by billed backup spend
+# (reconcile_snapshot_savings). Tests that are not about capping supply an ample
+# actual so snapshots stay counted; a missing actual demotes them to $0 advisories.
+_AMPLE_BACKUP = {"aurora": 10_000.0, "standard": 10_000.0}
+
+
+def _savings(co, enhanced, backup_actuals=_AMPLE_BACKUP) -> float:
     """Convenience: return just the total savings from the resolver."""
-    _coh, _co, _enh, total_savings, _count = resolve_rds_findings(co, enhanced)
+    _coh, _co, _enh, total_savings, _count = resolve_rds_findings(
+        co, enhanced, backup_actuals=backup_actuals
+    )
     return total_savings
 
 
@@ -117,6 +125,8 @@ class TestResolveRdsSavings:
             _enhanced_rec("arn:aws:rds:us-east-1:1:db:b", "$25.00/month"),  # kept
             _enhanced_rec("arn:aws:rds:us-east-1:1:snapshot:s", "$5.00/month", "Old RDS Snapshots"),
         ]
-        _coh, kept_co, kept_enh, savings, count = resolve_rds_findings(co, enhanced)
+        _coh, kept_co, kept_enh, savings, count = resolve_rds_findings(
+            co, enhanced, backup_actuals=_AMPLE_BACKUP
+        )
         assert count == len(kept_co) + len(kept_enh)
         assert savings == pytest.approx(30.0 + 25.0 + 5.0)

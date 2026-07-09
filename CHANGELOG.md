@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (RDS snapshot savings failed OPEN when Cost Explorer was unavailable)
+`reconcile_snapshot_savings` opened with `if not backup_actuals: return snaps`, so an
+unreadable Cost-Explorer backup read skipped the cap entirely and counted the raw
+**provisioned-size upper bound** (`AllocatedStorage x rate`). Actual backup bytes sit
+well below provisioned size, and the function's own per-group branch already demoted an
+uncorroborated bound to a $0 advisory — the early return jumped over it. *Real: bnc /
+ap-southeast-1 — `ce:GetCostAndUsage` is denied by an organization SCP for some roles;
+under such a role the RDS snapshot tab counts **$1,131.45** where billed backup supports
+only **$411.87**, a **$719.58/mo silent overstatement triggered by a missing permission**.*
+A missing, zero, or unreadable actual now demotes the snapshot recs to $0 advisories
+(the bound survives as `PotentialMonthlySavings`). Recurring class **C8**.
+
+Also: the OpenSearch Extended Support rec now attributes the surcharge to the domain AWS
+actually bills, via `ce:GetCostAndUsageWithResources` grouped by `RESOURCE_ID`. It
+previously named every domain in the region, implicating a domain on a current engine
+version alongside the real payer. Resource-level granularity is an account opt-in (and is
+SCP-denied on bnc), so when it is unavailable the rec names **no** domain rather than
+guessing by engine version — the same inference that produced the EKS phantom.
+
 ### Fixed (extended-support surcharges — verify against billing, not config; live bnc audit)
 Deep audit of `bnc` / `ap-southeast-1` (headline **$2,326.87/mo**) found **$730/mo of
 phantom savings (31% of the headline)** and one **$264.75/mo real saving that was never
