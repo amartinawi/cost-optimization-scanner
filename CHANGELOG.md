@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (commitment coverage — phantom savings on reserved resources; live Jarir-M2 audit)
+A deep audit of `Jarir-M2` / `eu-central-1` (headline **$4,057.57/mo**, 34 services,
+holding EC2-Instance SPs, RDS/Aurora + ElastiCache + OpenSearch RIs) found
+**$1,741.78/mo of the headline was phantom** and EC2 was **understated by $979.43/mo**.
+Corrected headline: **$3,295.22/mo**. Four defects, each verified against the live account:
+
+- **`enhanced_checks` recs bypassed the commitment gate** ($1,254.14/mo phantom).
+  Adapters only routed Cost-Optimization-Hub recs through `demote_coh_by_commitment`,
+  so locally-derived levers were never gated — ElastiCache ($565.02, a 3-node
+  `cache.r5.xlarge` group against a 3-node RI at 100% coverage) and OpenSearch
+  ($689.12, `r8g.xlarge.search` x4 against an RI x4), both with **zero** instance
+  on-demand spend. New `demote_covered_in_place` applies the same two-layer
+  treatment to those recs (wired into elasticache, opensearch, aurora).
+- **Aurora was commitment-blind** ($487.64/mo phantom). Nine `db.r7i.* -> db.r6g.*`
+  Graviton migrations were counted against a 22x `db.r7i.large` aurora-mysql Reserved
+  DB Instance pool. `aurora` is now in `COMMITMENT_SENSITIVE_SERVICES` and shares the
+  RDS RI pool. Only `prod-commerce` (the sole r7i instance with real on-demand spend)
+  remains counted.
+- **The CE headroom cap never ran.** `GetSavingsPlansCoverage` was called with an
+  invalid `INSTANCE_FAMILY` groupBy (correct: `INSTANCE_TYPE_FAMILY`) and no
+  SERVICE/REGION filter; `GetReservationCoverage` was called with an
+  `INSTANCE_TYPE_FAMILY` groupBy it rejects — and even when corrected, its
+  `Coverage.CoverageCost.OnDemandCost` is `null` for RDS/ElastiCache/OpenSearch.
+  Both are replaced by a single `GetCostAndUsage` read
+  (`PURCHASE_TYPE="On Demand Instances"`, `GroupBy=[INSTANCE_TYPE]`, `DAILY` over a
+  trailing 7 days scaled to a 30-day run rate, skipping `NoInstanceType`). The
+  ceiling is now keyed by **exact instance type** (overflow concentrates in one size,
+  so a family ceiling let recs on fully-covered sibling sizes spend it) over a
+  **7-day** window (a 30-day window spanning a mid-window RI purchase reports
+  on-demand the now-active reservation already absorbs). EC2 counted
+  $344.91 -> $1,324.34, every dollar backed by real uncovered on-demand spend.
+- **RDS RI matching was engine-blind.** An `aurora-mysql` reservation would demote a
+  `mysql` instance. Now engine-scoped via `rds_ri_engine_families` + `normalize_engine`
+  (reconciles `postgres`/`postgresql`, legacy `aurora`, and `(byol)` licence suffixes).
+
+Also: the CE page loop now breaks on a non-string or repeated `NextPageToken` (a
+stubbed client made it spin), and Aurora's headline sums only `Counted` recs.
+
 ### Added (active-commitment coverage — SP/RI-covered rightsizing demoted to advisory)
 CoH / Compute-Optimizer rightsizing & Graviton recommendations carry
 `estimatedMonthlySavings` on an **on-demand ("before discounts") basis**

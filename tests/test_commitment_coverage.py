@@ -20,9 +20,16 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from dataclasses import replace
+
 from services.commitment_coverage import (
+    COMMITMENT_SENSITIVE_SERVICES,
+    EMPTY_COVERAGE,
     CommitmentCoverage,
+    _fetch_uncovered_on_demand,
     coh_resource_type,
+    demote_covered_in_place,
+    normalize_engine,
     demote_coh_by_commitment,
     demote_recs_in_place,
     fetch_commitment_coverage,
@@ -533,26 +540,165 @@ def test_fetch_sagemaker_sp_and_ec2_ri(monkeypatch) -> None:
     assert cov.ec2_ri_types == frozenset({"m5.large"})
 
 
-def test_fetch_reservation_coverage_ceiling(monkeypatch) -> None:
+def _cost_and_usage_ctx(groups, service="rds", region="ap-south-1"):
+    """ctx whose CE returns one DAILY bucket of GetCostAndUsage groups."""
     rds = MagicMock()
     rds.get_paginator.return_value.paginate.return_value = [
-        {"ReservedDBInstances": [{"State": "active", "DBInstanceClass": "db.r5.large"}]}
+        {"ReservedDBInstances": [
+            {"State": "active", "DBInstanceClass": "db.r5.large", "ProductDescription": "postgresql"}
+        ]}
     ]
     ce = MagicMock()
-    ce.get_reservation_coverage.return_value = {
-        "CoveragesByTime": [
-            {"Groups": [{"Attributes": {"instanceTypeFamily": "r5"},
-                         "Coverage": {"CoverageCost": {"OnDemandCost": "123.45"}}}]}
-        ]
-    }
+    ce.get_cost_and_usage.return_value = {"ResultsByTime": [{"Groups": groups}], "NextPageToken": None}
     clients = {"rds": rds, "ce": ce}
-    ctx = SimpleNamespace(
-        region="ap-south-1", client=lambda n, region=None: clients.get(n, MagicMock()),
+    return SimpleNamespace(
+        region=region, client=lambda n, region=None: clients.get(n, MagicMock()),
         warn=MagicMock(), permission_issue=MagicMock(),
-    )
+    ), ce
+
+
+def _group(itype, amount):
+    return {"Keys": [itype], "Metrics": {"UnblendedCost": {"Amount": str(amount)}}}
+
+
+def test_headroom_from_cost_and_usage_scales_7d_to_30d() -> None:
+    # Live-verified source: GetCostAndUsage, PURCHASE_TYPE="On Demand Instances",
+    # grouped by INSTANCE_TYPE. GetReservationCoverage cannot be used — its
+    # Coverage.CoverageCost.OnDemandCost is null for RDS/ElastiCache/OpenSearch.
+    ctx, ce = _cost_and_usage_ctx([_group("db.r5.large", 70.0)])
     cov = fetch_commitment_coverage(ctx, {"rds"})
     assert cov.rds_ri_families == frozenset({"r5"})
-    assert cov.realizable_ceiling("rds", "db.r5.large") == pytest.approx(123.45)
+    assert cov.realizable_ceiling("rds", "db.r5.large") == pytest.approx(70.0 * 30 / 7)
+
+    kwargs = ce.get_cost_and_usage.call_args.kwargs
+    assert kwargs["Granularity"] == "DAILY"
+    dims = [d["Dimensions"] for d in kwargs["Filter"]["And"]]
+    assert {"Key": "PURCHASE_TYPE", "Values": ["On Demand Instances"]} in dims
+    assert {"Key": "REGION", "Values": ["ap-south-1"]} in dims
+    assert kwargs["GroupBy"] == [{"Type": "DIMENSION", "Key": "INSTANCE_TYPE"}]
+
+
+def test_headroom_skips_noinstancetype_and_zero_cost() -> None:
+    # "NoInstanceType" is storage/IO/data-transfer spend, not instance on-demand.
+    ctx, _ = _cost_and_usage_ctx([
+        _group("NoInstanceType", 5000.0), _group("db.r5.large", 70.0), _group("db.r5.xlarge", 0.0)
+    ])
+    cov = fetch_commitment_coverage(ctx, {"rds"})
+    assert not any("noinstancetype" in k for k in cov.uncovered_on_demand)
+    # A fully-covered sibling size carries no headroom -> its recs demote.
+    assert cov.realizable_ceiling("rds", "db.r5.xlarge") is None
+
+
+def test_ceiling_is_keyed_by_exact_type_not_family() -> None:
+    # Jarir-M2: on-demand overflow sat only on db.r7i.4xlarge. A family-keyed
+    # ceiling would let recs against the fully-covered r7i.xlarge/2xlarge spend
+    # the 4xlarge's headroom and slip phantom savings through.
+    cov = CommitmentCoverage(
+        region="eu-central-1",
+        rds_ri_families=frozenset({"r7i"}),
+        uncovered_on_demand={"aurora:r7i.4xlarge": 1564.20},
+    )
+    assert cov.realizable_ceiling("aurora", "db.r7i.4xlarge") == pytest.approx(1564.20)
+    assert cov.realizable_ceiling("aurora", "db.r7i.xlarge") is None
+    assert cov.realizable_ceiling("aurora", "db.r7i.large") is None
+
+
+def test_ce_page_loop_terminates_on_repeated_or_nonstring_token() -> None:
+    # A MagicMock client (or a service echoing its token) must never spin.
+    ce = MagicMock()  # every .get() yields a truthy MagicMock
+    ctx = SimpleNamespace(
+        region="eu-central-1", client=lambda n, region=None: ce,
+        warn=MagicMock(), permission_issue=MagicMock(),
+    )
+    assert _fetch_uncovered_on_demand(ctx, {"ec2"}) == {}
+
+
+# --------------------------------------------------------------------------- #
+# Jarir-M2 live-audit regressions (2026-07-09)
+# --------------------------------------------------------------------------- #
+def test_aurora_is_commitment_gated() -> None:
+    # Aurora was commitment-blind: 9 db.r7i.*->db.r6g.* migrations were counted
+    # against a 22x db.r7i.large aurora-mysql RI pool.
+    assert "aurora" in COMMITMENT_SENSITIVE_SERVICES
+
+
+def test_rds_ri_is_engine_scoped() -> None:
+    # An aurora-mysql reservation must NOT cover a plain mysql instance.
+    cov = CommitmentCoverage(
+        region="eu-central-1",
+        rds_ri_families=frozenset({"t3"}),
+        rds_ri_engine_families=frozenset({("t3", "aurora-mysql")}),
+    )
+    assert cov.covers("rds", "db.t3.medium", "aurora-mysql") is True
+    assert cov.covers("rds", "db.t3.medium", "mysql") is False
+    assert cov.covers("aurora", "db.t3.medium", "aurora-mysql") is True
+    # postgres/postgresql and bare aurora are the same engine under two spellings.
+    assert normalize_engine("postgres") == "postgresql"
+    assert normalize_engine("aurora") == "aurora-mysql"
+    assert normalize_engine("oracle-se2(byol)") == "oracle-se2"
+    # No engine on the rec -> engine-agnostic family fallback (never crashes).
+    assert cov.covers("rds", "db.t3.medium") is True
+
+
+def test_enhanced_checks_gate_demotes_fully_covered_and_keeps_overflow() -> None:
+    # The gate previously only wrapped CoH recs, so locally-derived enhanced_checks
+    # levers (elasticache $565.02, opensearch $689.12) bypassed it entirely.
+    cov = CommitmentCoverage(
+        region="eu-central-1",
+        elasticache_ri_families=frozenset({"r5"}),
+        uncovered_on_demand={},  # no on-demand overflow -> nothing realizable
+    )
+    recs = [
+        {"ClusterId": f"n-{i}", "NodeType": "cache.r5.xlarge",
+         "EstimatedMonthlySavings": 188.34, "Counted": True}
+        for i in range(3)
+    ]
+    removed = demote_covered_in_place(recs, cov, "elasticache", lambda r: r["NodeType"])
+    assert removed == pytest.approx(565.02)
+    assert all(r["Counted"] is False for r in recs)
+    assert all(r["AdvisoryEstimate"] == pytest.approx(188.34) for r in recs)
+
+    # With real overflow on that exact type, the realizable part stays counted.
+    cov2 = replace(cov, uncovered_on_demand={"elasticache:r5.xlarge": 200.0})
+    recs2 = [
+        {"ClusterId": "a", "NodeType": "cache.r5.xlarge", "EstimatedMonthlySavings": 188.34, "Counted": True},
+        {"ClusterId": "b", "NodeType": "cache.r5.xlarge", "EstimatedMonthlySavings": 188.34, "Counted": True},
+    ]
+    removed2 = demote_covered_in_place(recs2, cov2, "elasticache", lambda r: r["NodeType"])
+    assert removed2 == pytest.approx(188.34)  # one fits the $200 ceiling, one does not
+    assert [r["Counted"] for r in recs2] == [True, False]
+
+
+def test_enhanced_checks_gate_zero_keys_and_uncovered_passthrough() -> None:
+    cov = CommitmentCoverage(region="eu-central-1", rds_ri_families=frozenset({"r7i"}),
+                             rds_ri_engine_families=frozenset({("r7i", "aurora-mysql")}))
+    recs = [
+        # Covered, no headroom -> demoted, numeric mirrors zeroed (aurora sums these).
+        {"CurrentSize": "db.r7i.xlarge", "engine": "aurora-mysql",
+         "monthly_savings": 69.35, "EstimatedMonthlySavings": 69.35, "Counted": True},
+        # Uncovered family -> untouched.
+        {"CurrentSize": "db.r6g.large", "engine": "aurora-mysql",
+         "monthly_savings": 10.0, "EstimatedMonthlySavings": 10.0, "Counted": True},
+        # No instance type (io-tier / serverless rec) -> untouched.
+        {"monthly_savings": 44.57, "EstimatedMonthlySavings": 44.57, "Counted": True},
+    ]
+    removed = demote_covered_in_place(
+        recs, cov, "aurora", lambda r: r.get("CurrentSize") or "",
+        engine_of=lambda r: r.get("engine") or "", zero_keys=("monthly_savings", "EstimatedMonthlySavings"),
+    )
+    assert removed == pytest.approx(69.35)
+    assert recs[0]["Counted"] is False and recs[0]["monthly_savings"] == 0.0
+    assert recs[0]["AdvisoryEstimate"] == pytest.approx(69.35)
+    assert recs[1]["Counted"] is True and recs[2]["Counted"] is True
+    # Headline sums only counted recs -> the phantom never reaches the total.
+    assert sum(r["monthly_savings"] for r in recs if r.get("Counted") is not False) == pytest.approx(54.57)
+
+
+def test_enhanced_checks_gate_noop_without_commitment() -> None:
+    recs = [{"NodeType": "cache.r5.xlarge", "EstimatedMonthlySavings": 188.34, "Counted": True}]
+    assert demote_covered_in_place(recs, None, "elasticache", lambda r: r["NodeType"]) == 0.0
+    assert demote_covered_in_place(recs, EMPTY_COVERAGE, "elasticache", lambda r: r["NodeType"]) == 0.0
+    assert recs[0]["Counted"] is True
 
 
 # --------------------------------------------------------------------------- #

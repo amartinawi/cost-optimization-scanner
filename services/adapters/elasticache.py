@@ -7,7 +7,7 @@ from typing import Any
 from core.contracts import ServiceFindings, SourceBlock
 from services._base import BaseServiceModule
 from services._coh_dedup import coh_key, coh_savings, is_renderable_coh_rec
-from services.commitment_coverage import demote_coh_by_commitment
+from services.commitment_coverage import demote_coh_by_commitment, demote_covered_in_place
 from services.elasticache import get_enhanced_elasticache_checks
 
 # x86/Intel ElastiCache node family -> its same-size Graviton (ARM) equivalent.
@@ -299,6 +299,12 @@ class ElasticacheModule(BaseServiceModule):
                 savings += rec["EstimatedMonthlySavings"]
             else:
                 rec["Counted"] = False  # superseded by a better lever on the same cluster
+
+        # Active-commitment gate for the locally-derived levers. demote_coh_by_commitment
+        # above only sees CoH recs; a downsize/Graviton lever on a node covered by a
+        # Reserved Cache Node is equally unrealizable (the reservation bills regardless),
+        # so it is demoted unless that exact node type shows uncovered on-demand spend.
+        savings -= demote_covered_in_place(recs, coverage, "elasticache", lambda r: r.get("NodeType") or "")
 
         savings += coh_total
 

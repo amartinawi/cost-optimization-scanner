@@ -14,6 +14,7 @@ from typing import Any
 from core.contracts import GroupingSpec, ServiceFindings, SourceBlock, StatCardSpec
 from services._aws_errors import record_aws_error
 from services._base import BaseServiceModule
+from services.commitment_coverage import demote_covered_in_place
 from services.rds_logic import normalize_rds_arn
 
 logger = logging.getLogger(__name__)
@@ -715,7 +716,24 @@ class AuroraModule(BaseServiceModule):
         )
 
         all_recs = serverless_recs + io_recs + instance_recs
-        total_savings = sum(r.get("monthly_savings", 0.0) for r in all_recs)
+
+        # Active-commitment gate. Aurora instances draw on the same Reserved DB
+        # Instance pool as RDS (engine-scoped, size-flexible within a family), so a
+        # rightsizing or Graviton migration off a covered family strands that
+        # reservation while the new instance bills full on-demand — net zero or
+        # cost-negative. Realizable only up to the exact instance type's uncovered
+        # on-demand spend. Serverless/IO-tier recs carry no CurrentSize and pass
+        # through untouched. See lesson C6.
+        demote_covered_in_place(
+            all_recs,
+            getattr(ctx, "commitment_coverage", None),
+            "aurora",
+            lambda r: r.get("CurrentSize") or "",
+            engine_of=lambda r: r.get("engine") or "",
+            zero_keys=("monthly_savings", "EstimatedMonthlySavings"),
+        )
+        # Counted==rendered: a demoted rec must not survive in the headline sum.
+        total_savings = sum(r.get("monthly_savings", 0.0) for r in all_recs if r.get("Counted") is not False)
 
         return ServiceFindings(
             service_name="Aurora",

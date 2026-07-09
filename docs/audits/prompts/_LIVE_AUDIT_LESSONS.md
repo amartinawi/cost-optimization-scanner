@@ -129,14 +129,37 @@ will eventually both count it. This is the single most common real finding.
   ElastiCache RIs (family, size-flexible), Redshift / OpenSearch RIs (**exact
   type** — not size-flexible), DynamoDB reserved capacity (CE). It **demotes
   commitment-covered rightsizing recs to advisory** (`Counted=False`) in
-  ec2/rds/elasticache/redshift/opensearch/lambda/**sagemaker/dynamodb/
+  ec2/**aurora**/rds/elasticache/redshift/opensearch/lambda/**sagemaker/dynamodb/
   containers(Fargate; ECR storage stays counted)**. Two aggregate-safe layers:
-  (1) membership demotion (never overstates); (2) a **CE headroom cap** —
-  `GetReservationCoverage`/`GetSavingsPlansCoverage` give *uncovered on-demand $*
-  per `(service, family)`, and candidates are counted greedily up to that
-  ceiling so the realizable on-demand overflow (incl. the engine/size a
-  family-level RI misses) survives while total counted never exceeds real
-  uncovered on-demand; CE-read failure falls back to demote-all (safe).
+  (1) membership demotion (never overstates); (2) a **CE headroom cap** — the
+  *uncovered on-demand $* per `(service, exact instance type)`, with candidates
+  counted greedily up to that ceiling so realizable on-demand overflow survives
+  while total counted never exceeds real uncovered on-demand; CE-read failure
+  falls back to demote-all (safe). Four traps, each cost real money on Jarir-M2:
+  * **The gate must cover locally-derived recs, not just CoH.** Adapters that only
+    called `demote_coh_by_commitment(coh_recs, …)` let their `enhanced_checks`
+    levers through ungated — elasticache **$565.02** + opensearch **$689.12** of
+    pure phantom on nodes at 100% RI coverage. Use `demote_covered_in_place`.
+  * **Key the ceiling by EXACT instance type, never family.** Overflow concentrates
+    in one size; a family ceiling lets a rec on a fully-covered sibling size spend
+    it. (Only `db.r7i.4xlarge` carried on-demand; the other 8 r7i were covered.)
+  * **Read on-demand over a trailing 7 days, not 30.** A 30d window spanning a
+    mid-window RI purchase reports on-demand the now-active RI already absorbs.
+    (OpenSearch: $288/mo over 30d, **$0** over the last 7d.)
+  * **Source it from `GetCostAndUsage`** (`PURCHASE_TYPE="On Demand Instances"`,
+    `GroupBy=INSTANCE_TYPE`, skip the `NoInstanceType` group).
+    `GetReservationCoverage` **cannot** serve: it rejects an `INSTANCE_TYPE_FAMILY`
+    groupBy, rejects `Granularity` alongside `GroupBy`, and its
+    `Coverage.CoverageCost.OnDemandCost` is **`null`** for RDS/ElastiCache/OpenSearch.
+    `GetSavingsPlansCoverage` needs `INSTANCE_TYPE_FAMILY` (not `INSTANCE_FAMILY`)
+    plus SERVICE+REGION filters, else it sweeps in other regions and a
+    `NoInstanceTypeFamily` (Lambda/Fargate) bucket.
+
+  RDS/Aurora RIs are **engine-scoped** (an `aurora-mysql` reservation never covers
+  a `mysql` instance) and Aurora draws on the *same* Reserved DB Instance pool as
+  RDS — gate both. **Do not infer coverage from normalized-unit arithmetic:** a
+  "22 x db.r7i.large = 88 NU == 88 NU fleet, so all covered" inference was flatly
+  contradicted by CE's per-instance-type on-demand spend. Actual on-demand $ wins.
   *Real: alyasra, eu-central-1 — 8 EC2-Instance SPs {m4,m5,r5}, 92% util, 90%
   coverage collapsed a reported **$1,057→$13.87/mo** counted (membership layer);
   the flagship m4.2xlarge→r6g.large "$324.70 saving" is actually ~**−$26/mo**

@@ -7,7 +7,7 @@ from typing import Any
 from core.contracts import ServiceFindings, SourceBlock
 from services._base import BaseServiceModule
 from services._coh_dedup import coh_key, coh_savings, is_renderable_coh_rec
-from services.commitment_coverage import demote_coh_by_commitment
+from services.commitment_coverage import demote_coh_by_commitment, demote_covered_in_place
 from services.opensearch import (
     LOW_CPU_THRESHOLD,
     OPENSEARCH_OPTIMIZATION_DESCRIPTIONS,
@@ -344,6 +344,13 @@ class OpensearchModule(BaseServiceModule):
                 savings += rec["EstimatedMonthlySavings"]
             else:
                 rec["Counted"] = False
+
+        # Active-commitment gate for the locally-derived levers (demote_coh_by_commitment
+        # above only sees CoH recs). Downsizing a domain whose exact instance type carries
+        # an OpenSearch Reserved Instance strands that reservation, so the on-demand figure
+        # is realizable only up to that type's uncovered on-demand spend. Storage-tier recs
+        # carry no InstanceType and are never RI-covered, so they pass through untouched.
+        savings -= demote_covered_in_place(recs, coverage, "opensearch", lambda r: r.get("InstanceType") or "")
 
         savings += coh_total
 
