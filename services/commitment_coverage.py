@@ -49,8 +49,11 @@ from botocore.exceptions import ClientError  # type: ignore[import-untyped]
 # Services whose rightsizing recs this module can demote. Used by the
 # orchestrator to decide whether a coverage prefetch is worth its API calls.
 COMMITMENT_SENSITIVE_SERVICES: frozenset[str] = frozenset(
-    {"ec2", "lambda", "rds", "elasticache", "redshift", "opensearch", "sagemaker", "dynamodb", "containers"}
+    {"ec2", "lambda", "rds", "aurora", "elasticache", "redshift", "opensearch", "sagemaker", "dynamodb", "containers"}
 )
+
+# Aurora instances draw on the same Reserved DB Instance pool as RDS.
+_RDS_RI_SERVICES: frozenset[str] = frozenset({"rds", "aurora"})
 
 # Services whose Reserved Instances/Nodes are matched at EXACT type granularity
 # (their reservations are NOT size-flexible): a Redshift Reserved Node / OpenSearch
@@ -89,6 +92,22 @@ def normalize_type(instance_type: str) -> str:
     return t
 
 
+def normalize_engine(engine: str) -> str:
+    """Normalize an RDS engine / RI ProductDescription for coverage matching.
+
+    A Reserved DB Instance covers only its own engine, so ``aurora-mysql`` never
+    covers ``mysql``. Strips licence suffixes (``oracle-se2(byol)`` ->
+    ``oracle-se2``) and reconciles the two spellings AWS uses for the same
+    engine: instances report ``postgres`` where RIs report ``postgresql``, and
+    bare ``aurora`` is the legacy name for ``aurora-mysql``.
+    """
+    e = (engine or "").strip().lower()
+    if not e:
+        return ""
+    e = e.split("(")[0].strip()
+    return {"postgres": "postgresql", "aurora": "aurora-mysql"}.get(e, e)
+
+
 def _match_key(service: str, resource_type: str) -> str:
     """The membership key for a service: exact type for OS/Redshift, else family."""
     if service in _EXACT_TYPE_SERVICES:
@@ -114,7 +133,11 @@ class CommitmentCoverage:
     has_compute_sp: bool = False
     has_sagemaker_sp: bool = False
     # Data-store / cache Reserved Instances (family-flexible unless noted).
+    # RDS/Aurora share one pool; RIs are engine-scoped, so the (family, engine)
+    # pairs are authoritative and ``rds_ri_families`` is the engine-agnostic
+    # fallback used when a rec does not carry its engine.
     rds_ri_families: frozenset[str] = field(default_factory=frozenset)
+    rds_ri_engine_families: frozenset[tuple[str, str]] = field(default_factory=frozenset)
     elasticache_ri_families: frozenset[str] = field(default_factory=frozenset)
     # Non-size-flexible: exact node/instance types.
     redshift_ri_types: frozenset[str] = field(default_factory=frozenset)
@@ -153,9 +176,22 @@ class CommitmentCoverage:
         """True if the account holds DynamoDB reserved capacity."""
         return self.dynamodb_reserved
 
-    def covers_rds(self, instance_class: str) -> bool:
-        """True if an RDS Reserved DB Instance covers this instance's family."""
-        return instance_family(instance_class) in self.rds_ri_families
+    def covers_rds(self, instance_class: str, engine: str = "") -> bool:
+        """True if a Reserved DB Instance covers this instance's family + engine.
+
+        RDS/Aurora RIs are size-flexible within a family but **engine-scoped** —
+        an ``aurora-mysql`` reservation does not cover a ``mysql`` instance. When
+        ``engine`` is given and engine-tagged RIs were resolved, both must match;
+        otherwise falls back to the engine-agnostic family check.
+        """
+        fam = instance_family(instance_class)
+        if engine and self.rds_ri_engine_families:
+            return (fam, normalize_engine(engine)) in self.rds_ri_engine_families
+        return fam in self.rds_ri_families
+
+    def covers_aurora(self, instance_class: str, engine: str = "") -> bool:
+        """True if a Reserved DB Instance covers this Aurora instance (same pool)."""
+        return self.covers_rds(instance_class, engine)
 
     def covers_elasticache(self, node_type: str) -> bool:
         """True if a Reserved Cache Node covers this node's family."""
@@ -169,25 +205,30 @@ class CommitmentCoverage:
         """True if a Reserved Instance covers this EXACT type (not size-flexible)."""
         return normalize_type(instance_type) in self.opensearch_ri_types
 
-    def covers(self, service: str, resource_type: str) -> bool:
+    def covers(self, service: str, resource_type: str, engine: str = "") -> bool:
         """Dispatch coverage check by service key (for the data-store adapters)."""
+        if service in _RDS_RI_SERVICES:
+            return self.covers_rds(resource_type, engine)
         return {
             "ec2": self.covers_ec2,
-            "rds": self.covers_rds,
             "elasticache": self.covers_elasticache,
             "redshift": self.covers_redshift,
             "opensearch": self.covers_opensearch,
         }.get(service, lambda _t: False)(resource_type)
 
     def realizable_ceiling(self, service: str, resource_type: str) -> float | None:
-        """Uncovered on-demand $/mo for this rec's family — the CE headroom cap.
+        """Uncovered on-demand $/mo for this rec's EXACT instance type — the cap.
 
-        ``None`` when Cost Explorer coverage could not be resolved (the caller
-        then falls back to demoting every candidate — the safe default).
+        Keyed by exact type, not family: on-demand overflow concentrates in
+        individual sizes, so a family-aggregate ceiling would let a rec against a
+        fully-covered size spend a sibling size's headroom.
+
+        ``None`` when Cost Explorer coverage could not be resolved, or when the
+        type carries no on-demand spend — both demote the candidate (safe).
         """
         if not self.uncovered_on_demand:
             return None
-        return self.uncovered_on_demand.get(f"{service}:{_match_key(service, resource_type)}")
+        return self.uncovered_on_demand.get(f"{service}:{normalize_type(resource_type)}")
 
     @property
     def has_any_commitment(self) -> bool:
@@ -210,6 +251,7 @@ class CommitmentCoverage:
         key = _match_key(service, resource_type)
         label = {
             "rds": "RDS Reserved DB Instance",
+            "aurora": "RDS Reserved DB Instance",
             "elasticache": "ElastiCache Reserved Cache Node",
             "redshift": "Redshift Reserved Node",
             "opensearch": "OpenSearch Reserved Instance",
@@ -376,6 +418,65 @@ def demote_recs_in_place(
     return removed
 
 
+def demote_covered_in_place(
+    recs: list[dict[str, Any]],
+    coverage: "CommitmentCoverage | None",
+    service: str,
+    type_of: Callable[[dict[str, Any]], str],
+    *,
+    engine_of: Callable[[dict[str, Any]], str] | None = None,
+    zero_keys: tuple[str, ...] = (),
+) -> float:
+    """Demote commitment-covered *locally-derived* recs, capped by CE headroom.
+
+    The CoH/Compute-Optimizer path (``demote_coh_by_commitment``) does not see an
+    adapter's own ``enhanced_checks`` levers, yet a downsizing rec against an
+    RI-covered node is exactly as unrealizable: the reservation bills regardless.
+    This applies the same two-layer treatment to those recs, in place (matching
+    those adapters' mutation convention).
+
+    Candidates on one **exact instance type** are counted greedily (highest gross
+    first) up to that type's uncovered on-demand ceiling — genuine overflow
+    survives — and the remainder demote. A type with no headroom demotes wholly.
+    No coverage / no commitment / no gross -> no-op.
+
+    ``zero_keys`` names numeric savings fields to zero on a demoted rec, for
+    adapters that total their headline straight off a rec field (the gross is
+    preserved in ``AdvisoryEstimate``), keeping counted == rendered.
+
+    Returns the total gross removed from the counted headline.
+    """
+    if coverage is None or not coverage.has_any_commitment:
+        return 0.0
+    candidates = [
+        rec
+        for rec in recs
+        if rec.get("Counted") is not False
+        and rec_gross(rec) > 0
+        and coverage.covers(service, type_of(rec), engine_of(rec) if engine_of else "")
+    ]
+    budgets: dict[str, float] = {}
+    removed = 0.0
+    for rec in sorted(candidates, key=rec_gross, reverse=True):
+        rtype = type_of(rec)
+        gross = rec_gross(rec)
+        key = normalize_type(rtype)
+        if key not in budgets:
+            ceiling = coverage.realizable_ceiling(service, rtype)
+            budgets[key] = ceiling if ceiling and ceiling > 0 else 0.0
+        if gross <= budgets[key]:
+            budgets[key] -= gross  # realizable on-demand overflow — stays counted
+            continue
+        rec["Counted"] = False
+        rec["AdvisoryEstimate"] = gross
+        rec["CommitmentCoverageNote"] = coverage.ri_note(service, rtype, gross)
+        for zkey in zero_keys:
+            if zkey in rec:
+                rec[zkey] = 0.0
+        removed += gross
+    return removed
+
+
 def demote_coh_by_commitment(
     coh_recs: list[dict[str, Any]],
     coverage: "CommitmentCoverage | None",
@@ -397,7 +498,9 @@ def demote_coh_by_commitment(
         gross_of=gross_of,
         note_of=lambda r, g: coverage.ri_note(service, coh_resource_type(r), g),
         ceiling_of=(lambda r: coverage.realizable_ceiling(service, coh_resource_type(r))) if has_ceiling else None,
-        key_of=lambda r: _match_key(service, coh_resource_type(r)),
+        # Budget key must match the ceiling key (exact type), so sibling sizes
+        # never share a headroom budget.
+        key_of=lambda r: normalize_type(coh_resource_type(r)),
     )
 
 
@@ -478,18 +581,38 @@ def _fetch_ec2_reserved(ctx: Any) -> tuple[frozenset[str], frozenset[str]]:
     return frozenset(families), frozenset(types)
 
 
+def _fetch_rds_reserved(ctx: Any) -> tuple[frozenset[str], frozenset[tuple[str, str]]]:
+    """Active Reserved DB Instances as (families, (family, engine) pairs).
+
+    RDS/Aurora RIs are size-flexible within a family but engine-scoped, so the
+    engine-tagged pairs are what coverage matching should use.
+    """
+    families: set[str] = set()
+    engine_families: set[tuple[str, str]] = set()
+    try:
+        for page in ctx.client("rds").get_paginator("describe_reserved_db_instances").paginate():
+            for ri in page.get("ReservedDBInstances", []):
+                if ri.get("State") != "active":
+                    continue
+                fam = instance_family(ri.get("DBInstanceClass", ""))
+                if not fam:
+                    continue
+                families.add(fam)
+                engine = normalize_engine(ri.get("ProductDescription", ""))
+                if engine:
+                    engine_families.add((fam, engine))
+    except Exception as exc:  # noqa: BLE001 — fail-safe
+        _report(ctx, exc, "Could not read rds Reserved Instances (recs not RI-adjusted)", "rds:DescribeReserved")
+    return frozenset(families), frozenset(engine_families)
+
+
 def _fetch_ri_families(ctx: Any, service: str) -> frozenset[str]:
-    """Active Reserved-Instance families (rds/elasticache) or exact types (redshift/opensearch)."""
+    """Active Reserved-Instance families (elasticache) or exact types (redshift/opensearch)."""
     keys: set[str] = set()
     exact = service in _EXACT_TYPE_SERVICES
     add = normalize_type if exact else instance_family
     try:
-        if service == "rds":
-            for page in ctx.client("rds").get_paginator("describe_reserved_db_instances").paginate():
-                for ri in page.get("ReservedDBInstances", []):
-                    if ri.get("State") == "active":
-                        keys.add(add(ri.get("DBInstanceClass", "")))
-        elif service == "elasticache":
+        if service == "elasticache":
             for page in ctx.client("elasticache").get_paginator("describe_reserved_cache_nodes").paginate():
                 for ri in page.get("ReservedCacheNodes", []):
                     if ri.get("State") == "active":
@@ -541,69 +664,114 @@ def _fetch_dynamodb_reserved(ctx: Any) -> bool:
         return False
 
 
-def _fetch_uncovered_on_demand(ctx: Any, selected: set[str], has_sp: bool) -> dict[str, float]:
-    """Per-(service, family) uncovered on-demand $/mo — the CE headroom ceiling.
+# Cost Explorer ``SERVICE`` dimension values for the on-demand headroom read.
+# Aurora bills under the RDS service dimension.
+_CE_SERVICE_DIM: dict[str, str] = {
+    "ec2": "Amazon Elastic Compute Cloud - Compute",
+    "rds": "Amazon Relational Database Service",
+    "aurora": "Amazon Relational Database Service",
+    "elasticache": "Amazon ElastiCache",
+    "redshift": "Amazon Redshift",
+    "opensearch": "Amazon OpenSearch Service",
+}
 
-    EC2 from ``GetSavingsPlansCoverage`` (family groupBy); RDS/ElastiCache/
-    Redshift/OpenSearch from ``GetReservationCoverage`` (family groupBy + SERVICE
-    filter). Missing/failed reads simply omit that service, so the caller falls
-    back to layer-1 demote-all for it (safe).
+# Trailing window for the headroom read. Deliberately short: it must reflect the
+# CURRENT commitment posture. A 30-day window spanning a mid-window RI purchase
+# reports on-demand spend that the now-active reservation already absorbs, which
+# would inflate the ceiling and let a phantom saving through.
+_HEADROOM_DAYS = 7
+
+# Hard page cap for the headroom read (7 days x a handful of instance types fits
+# in one page; the cap only exists so a pathological token can never spin).
+_MAX_CE_PAGES = 20
+
+
+def _fetch_uncovered_on_demand(ctx: Any, selected: set[str]) -> dict[str, float]:
+    """Per-(service, exact instance type) uncovered on-demand $/mo — the ceiling.
+
+    Read from ``GetCostAndUsage`` filtered to ``PURCHASE_TYPE="On Demand
+    Instances"`` (SP- and RI-covered usage bills under other purchase types) and
+    grouped by ``INSTANCE_TYPE``, over the trailing ``_HEADROOM_DAYS`` scaled to
+    a 30-day run rate.
+
+    Keyed by **exact instance type**, never family: on-demand overflow
+    concentrates in individual sizes (a family-level ceiling would let a rec
+    against a fully-covered size spend a sibling size's headroom). Types absent
+    from the result carry no headroom, so their recs demote.
+
+    ``GetReservationCoverage`` is deliberately not used: its
+    ``Coverage.CoverageCost.OnDemandCost`` is ``null`` for RDS/ElastiCache/
+    OpenSearch, and it rejects an ``INSTANCE_TYPE_FAMILY`` groupBy. A failed read
+    omits that service, so the caller falls back to demote-all for it (safe).
     """
     out: dict[str, float] = {}
-    ce = None
     try:
         ce = ctx.client("ce")
     except Exception:  # noqa: BLE001
         return out
-    start, end = _last_30d(ctx)
-    tp = {"Start": start, "End": end}
+    start, end = _trailing_window(ctx, _HEADROOM_DAYS)
 
-    if has_sp and (selected & {"ec2", "lambda"}):
+    for svc in sorted(selected & set(_CE_SERVICE_DIM)):
+        totals: dict[str, float] = {}
         try:
-            resp = ce.get_savings_plans_coverage(
-                TimePeriod=tp, Granularity="MONTHLY",
-                GroupBy=[{"Type": "DIMENSION", "Key": "INSTANCE_FAMILY"}],
-            )
-            for grp in resp.get("SavingsPlansCoverages", []):
-                fam = "".join(grp.get("Attributes", {}).get("INSTANCE_FAMILY", "")).lower()
-                od = grp.get("Coverage", {}).get("OnDemandCost")
-                if fam and od is not None:
-                    out[f"ec2:{fam}"] = out.get(f"ec2:{fam}", 0.0) + float(od)
-        except Exception as exc:  # noqa: BLE001
-            _report(ctx, exc, "Could not read SP coverage (EC2 headroom cap unavailable)", "ce:GetSavingsPlansCoverage")
-
-    _SERVICE_DIM = {
-        "rds": "Amazon Relational Database Service",
-        "elasticache": "Amazon ElastiCache",
-        "redshift": "Amazon Redshift",
-        "opensearch": "Amazon OpenSearch Service",
-    }
-    for svc, dim in _SERVICE_DIM.items():
-        if svc not in selected:
+            token: str | None = None
+            # Bounded: a page cap plus a strict string-token check means a service
+            # that echoes the same token (or a stubbed client) can never spin here.
+            for _page in range(_MAX_CE_PAGES):
+                kwargs: dict[str, Any] = {
+                    "TimePeriod": {"Start": start, "End": end},
+                    "Granularity": "DAILY",
+                    "Metrics": ["UnblendedCost"],
+                    "GroupBy": [{"Type": "DIMENSION", "Key": "INSTANCE_TYPE"}],
+                    "Filter": {
+                        "And": [
+                            {"Dimensions": {"Key": "SERVICE", "Values": [_CE_SERVICE_DIM[svc]]}},
+                            {"Dimensions": {"Key": "REGION", "Values": [ctx.region]}},
+                            {"Dimensions": {"Key": "PURCHASE_TYPE", "Values": ["On Demand Instances"]}},
+                        ]
+                    },
+                }
+                if token:
+                    kwargs["NextPageToken"] = token
+                resp = ce.get_cost_and_usage(**kwargs)
+                for day in resp.get("ResultsByTime", []):
+                    for grp in day.get("Groups", []):
+                        raw = (grp.get("Keys") or [""])[0]
+                        # Non-instance RDS/EC2 spend (storage, IO, data transfer).
+                        if not raw or raw.lower().startswith("noinstancetype"):
+                            continue
+                        key = normalize_type(raw)
+                        amount = grp.get("Metrics", {}).get("UnblendedCost", {}).get("Amount")
+                        try:
+                            totals[key] = totals.get(key, 0.0) + float(amount or 0)
+                        except (TypeError, ValueError):
+                            continue
+                next_token = resp.get("NextPageToken")
+                if not isinstance(next_token, str) or not next_token or next_token == token:
+                    break
+                token = next_token
+        except Exception as exc:  # noqa: BLE001 — fail-safe per service
+            _report(ctx, exc, f"Could not read {svc} on-demand spend (headroom cap unavailable)", "ce:GetCostAndUsage")
             continue
-        try:
-            resp = ce.get_reservation_coverage(
-                TimePeriod=tp,
-                GroupBy=[{"Type": "DIMENSION", "Key": "INSTANCE_TYPE_FAMILY"}],
-                Filter={"Dimensions": {"Key": "SERVICE", "Values": [dim]}},
-            )
-            for grp in resp.get("CoveragesByTime", [{}])[0].get("Groups", []) if resp.get("CoveragesByTime") else []:
-                fam = "".join(grp.get("Attributes", {}).get("instanceTypeFamily", "")).lower()
-                od = grp.get("Coverage", {}).get("CoverageCost", {}).get("OnDemandCost")
-                key = _match_key(svc, fam)
-                if key and od is not None:
-                    out[f"{svc}:{key}"] = out.get(f"{svc}:{key}", 0.0) + float(od)
-        except Exception as exc:  # noqa: BLE001
-            _report(ctx, exc, f"Could not read {svc} RI coverage (headroom cap unavailable)", "ce:GetReservationCoverage")
+
+        scale = 30.0 / _HEADROOM_DAYS
+        for key, amount in totals.items():
+            if key and amount > 0:
+                out[f"{svc}:{key}"] = out.get(f"{svc}:{key}", 0.0) + amount * scale
     return out
+
+
+def _trailing_window(ctx: Any, days: int) -> tuple[str, str]:
+    """(start, end) ISO dates for the trailing ``days``-day window."""
+    from datetime import UTC, datetime, timedelta
+
+    end = datetime.now(UTC).date()
+    return (end - timedelta(days=days)).isoformat(), end.isoformat()
 
 
 def _last_30d(ctx: Any) -> tuple[str, str]:
     """(start, end) ISO dates for the trailing 30-day window."""
-    from datetime import UTC, datetime, timedelta
-
-    end = datetime.now(UTC).date()
-    return (end - timedelta(days=30)).isoformat(), end.isoformat()
+    return _trailing_window(ctx, 30)
 
 
 def fetch_commitment_coverage(ctx: Any, selected: set[str]) -> CommitmentCoverage:
@@ -630,6 +798,12 @@ def fetch_commitment_coverage(ctx: Any, selected: set[str]) -> CommitmentCoverag
     if has_sp:
         util_pct, unused = _fetch_sp_utilization(ctx)
 
+    # Aurora and RDS share one Reserved DB Instance pool — one read serves both.
+    rds_fams: frozenset[str] = frozenset()
+    rds_engine_fams: frozenset[tuple[str, str]] = frozenset()
+    if selected & _RDS_RI_SERVICES:
+        rds_fams, rds_engine_fams = _fetch_rds_reserved(ctx)
+
     coverage = CommitmentCoverage(
         region=ctx.region,
         ec2_sp_families=ec2_fams,
@@ -637,7 +811,8 @@ def fetch_commitment_coverage(ctx: Any, selected: set[str]) -> CommitmentCoverag
         ec2_ri_types=ec2_ri_types,
         has_compute_sp=has_compute,
         has_sagemaker_sp=has_sagemaker,
-        rds_ri_families=_fetch_ri_families(ctx, "rds") if "rds" in selected else frozenset(),
+        rds_ri_families=rds_fams,
+        rds_ri_engine_families=rds_engine_fams,
         elasticache_ri_families=_fetch_ri_families(ctx, "elasticache") if "elasticache" in selected else frozenset(),
         redshift_ri_types=_fetch_ri_families(ctx, "redshift") if "redshift" in selected else frozenset(),
         opensearch_ri_types=_fetch_ri_families(ctx, "opensearch") if "opensearch" in selected else frozenset(),
@@ -647,5 +822,5 @@ def fetch_commitment_coverage(ctx: Any, selected: set[str]) -> CommitmentCoverag
     )
     # CE headroom cap — only worth the calls when something is actually reserved.
     if coverage.has_any_commitment:
-        coverage = replace(coverage, uncovered_on_demand=_fetch_uncovered_on_demand(ctx, selected, has_sp))
+        coverage = replace(coverage, uncovered_on_demand=_fetch_uncovered_on_demand(ctx, selected))
     return coverage

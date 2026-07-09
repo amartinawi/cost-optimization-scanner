@@ -20,23 +20,45 @@ realizable. Two aggregate-safe layers:
 1. **Membership demotion** — a rec whose resource family/type carries an active
    commitment is demoted to advisory (`Counted=False`, gross in
    `AdvisoryEstimate` + a `CommitmentCoverageNote`). Never overstates.
-2. **CE headroom cap** — `ce:GetReservationCoverage` / `GetSavingsPlansCoverage`
-   give the *uncovered on-demand $* per `(service, family)`; candidate recs are
-   counted greedily up to that ceiling (`split_by_commitment` with `ceiling_of` /
-   `key_of`) so a realizable on-demand-overflow saving survives while a family's
-   total counted never exceeds its real uncovered on-demand. CE-read failure →
-   layer-1 demote-all (safe).
+2. **CE headroom cap** — the *uncovered on-demand $* per `(service, exact
+   instance type)`; candidate recs are counted greedily up to that ceiling so a
+   realizable on-demand-overflow saving survives while a type's total counted
+   never exceeds its real uncovered on-demand. CE-read failure → layer-1
+   demote-all (safe).
 
-Wiring: ec2 / rds / elasticache / redshift / opensearch use `split_by_commitment`
-/ `demote_coh_by_commitment` (per-family, headroom-capped); lambda / containers
-(Fargate — **Compute SP covers Fargate/ECS compute but NOT ECR storage**) /
-sagemaker (SageMaker SP) / dynamodb (reserved capacity) use the whole-service
-`demote_recs_in_place` gate. Coverage matrix reminders: **Compute SP covers
-EC2 + Lambda + Fargate, NOT RDS/ElastiCache/Redshift/OpenSearch/SageMaker**;
-**SageMaker SP covers only SageMaker**. Absent/empty coverage → counted as before
-(accounts without commitments unaffected); fetch failures are fail-safe
-(warn/permission_issue). See lesson **C6** in
-`docs/audits/prompts/_LIVE_AUDIT_LESSONS.md`.
+The ceiling comes from **one** call — `ce:GetCostAndUsage` with
+`PURCHASE_TYPE="On Demand Instances"`, `GroupBy=[INSTANCE_TYPE]`, `DAILY` over a
+**trailing 7 days** scaled to a 30-day run rate, skipping the `NoInstanceType`
+group. Three non-obvious constraints, each verified live:
+
+- **Exact type, never family.** Overflow concentrates in one size; a family-level
+  ceiling lets a rec on a fully-covered sibling size spend it.
+- **7 days, not 30.** A 30-day window spanning a mid-window RI purchase reports
+  on-demand spend the now-active reservation already absorbs → inflated ceiling.
+- **Not `GetReservationCoverage`.** It rejects an `INSTANCE_TYPE_FAMILY` groupBy,
+  rejects `Granularity` alongside `GroupBy`, and its
+  `Coverage.CoverageCost.OnDemandCost` is `null` for RDS/ElastiCache/OpenSearch.
+
+Wiring — **both** rec sources must be gated:
+
+- **CoH / Compute-Optimizer recs** → `demote_coh_by_commitment` /
+  `split_by_commitment` (ec2, rds, elasticache, redshift, opensearch).
+- **Locally-derived `enhanced_checks` recs** → `demote_covered_in_place`
+  (elasticache, opensearch, aurora). Gating only the CoH list silently leaks
+  phantom savings whenever CoH returns nothing for that service.
+- **Whole-service gates** → `demote_recs_in_place` for lambda / containers
+  (Fargate — **Compute SP covers Fargate/ECS compute but NOT ECR storage**) /
+  sagemaker (SageMaker SP) / dynamodb (reserved capacity).
+
+Coverage matrix reminders: **Compute SP covers EC2 + Lambda + Fargate, NOT
+RDS/ElastiCache/Redshift/OpenSearch/SageMaker**; **SageMaker SP covers only
+SageMaker**; **Aurora draws on the same Reserved DB Instance pool as RDS**, and
+RDS/Aurora RIs are **engine-scoped** (an `aurora-mysql` reservation never covers
+a `mysql` instance — see `normalize_engine`). Adapters that total their headline
+straight off a rec field must pass `zero_keys` so a demoted rec cannot survive in
+the sum. Absent/empty coverage → counted as before (accounts without commitments
+unaffected); fetch failures are fail-safe (warn/permission_issue). See lesson
+**C6** in `docs/audits/prompts/_LIVE_AUDIT_LESSONS.md`.
 
 ## Pricing Models
 
