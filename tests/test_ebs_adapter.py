@@ -579,3 +579,86 @@ class TestSnapshotAdvisoryAndSizing:
         ec2 = _FakeEc2Snapshots([], [snap])
         result = compute_ebs_checks(self._ctx(ec2), 1.0, 90)
         assert result["old_snapshots"] == []
+
+
+# --------------------------------------------------------------------------- #
+# _drop_stale_delete_recs — destructive-rec guard (must fail CLOSED)
+# --------------------------------------------------------------------------- #
+def _guard_ctx(volumes=None, error=None):
+    """ctx whose describe_volumes paginator yields ``volumes`` or raises ``error``."""
+    calls = {"filters": []}
+
+    class Paginator:
+        def paginate(self, **kw):
+            if error is not None:
+                raise error
+            calls["filters"].append(kw.get("Filters"))
+            vals = kw["Filters"][0]["Values"]
+            return [{"Volumes": [v for v in (volumes or []) if v["VolumeId"] in vals]}]
+
+    warns: list[str] = []
+    ctx = SimpleNamespace(
+        client=lambda _n: SimpleNamespace(get_paginator=lambda _o: Paginator()),
+        warn=lambda m, s=None: warns.append(m),
+    )
+    return ctx, warns, calls
+
+
+def _del(vid):
+    return {"actionType": "Delete", "resourceId": vid}
+
+
+def test_guard_keeps_only_available_volumes():
+    ctx, warns, _ = _guard_ctx([
+        {"VolumeId": "vol-free", "State": "available"},
+        {"VolumeId": "vol-attached", "State": "in-use"},
+    ])
+    kept = ebs_adapter._drop_stale_delete_recs(ctx, [_del("vol-free"), _del("vol-attached")])
+    assert [r["resourceId"] for r in kept] == ["vol-free"]
+    assert "in-use" in warns[0] and "vol-attached" in warns[0]
+
+
+def test_guard_drops_delete_rec_for_vanished_volume():
+    # A volume deleted since CoH's snapshot: the filter simply omits it. Nothing
+    # left to save -> drop, and say so accurately (not "attached/in-use").
+    ctx, warns, _ = _guard_ctx([{"VolumeId": "vol-free", "State": "available"}])
+    kept = ebs_adapter._drop_stale_delete_recs(ctx, [_del("vol-free"), _del("vol-gone")])
+    assert [r["resourceId"] for r in kept] == ["vol-free"]
+    assert "no longer exists" in warns[0]
+
+
+def test_guard_uses_filter_not_volumeids():
+    # VolumeIds raises InvalidVolume.NotFound for the WHOLE request when any id is
+    # gone; a volume-id Filter omits unknown ids instead.
+    ctx, _, calls = _guard_ctx([{"VolumeId": "vol-free", "State": "available"}])
+    ebs_adapter._drop_stale_delete_recs(ctx, [_del("vol-free")])
+    assert calls["filters"] == [[{"Name": "volume-id", "Values": ["vol-free"]}]]
+
+
+def test_guard_fails_closed_when_state_unreadable():
+    # Regression: the guard used to `return coh_recs` here, surfacing a
+    # delete-this-volume rec for a live, attached volume. Data loss > lost saving.
+    ctx, warns, _ = _guard_ctx(error=RuntimeError("InvalidVolume.NotFound"))
+    recs = [_del("vol-attached-live"), {"actionType": "Rightsize", "resourceId": "vol-keep"}]
+    kept = ebs_adapter._drop_stale_delete_recs(ctx, recs)
+    assert [r["resourceId"] for r in kept] == ["vol-keep"]  # delete rec dropped
+    assert "rather than risk advising deletion" in warns[0]
+
+
+def test_guard_leaves_non_delete_and_non_volume_recs_untouched():
+    ctx, _, _ = _guard_ctx([{"VolumeId": "vol-free", "State": "available"}])
+    recs = [
+        {"actionType": "Rightsize", "resourceId": "vol-attached"},
+        {"actionType": "Delete", "resourceId": "i-not-a-volume"},
+        _del("vol-free"),
+    ]
+    kept = ebs_adapter._drop_stale_delete_recs(ctx, recs)
+    assert len(kept) == 3
+
+
+def test_guard_chunks_large_volume_lists():
+    vols = [{"VolumeId": f"vol-{i:04d}", "State": "available"} for i in range(450)]
+    ctx, _, calls = _guard_ctx(vols)
+    kept = ebs_adapter._drop_stale_delete_recs(ctx, [_del(v["VolumeId"]) for v in vols])
+    assert len(kept) == 450
+    assert [len(f[0]["Values"]) for f in calls["filters"]] == [200, 200, 50]

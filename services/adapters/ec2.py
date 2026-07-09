@@ -13,7 +13,7 @@ from services.advisor import (
     get_asg_compute_optimizer_recommendations,
     get_ec2_compute_optimizer_recommendations,
 )
-from services.commitment_coverage import split_by_commitment
+from services.commitment_coverage import coh_resource_type, split_by_commitment
 from services.ec2 import get_advanced_ec2_checks, get_ec2_instance_count, get_enhanced_ec2_checks
 
 logger = logging.getLogger(__name__)
@@ -55,15 +55,16 @@ def _coh_instance_id(rec: dict[str, Any]) -> str:
 
 
 def _coh_instance_type(rec: dict[str, Any]) -> str:
-    """Current instance type of a Cost Optimization Hub EC2 recommendation."""
-    return str(
-        (rec.get("currentResourceDetails") or {})
-        .get("ec2Instance", {})
-        .get("configuration", {})
-        .get("instance", {})
-        .get("type", "")
-        or ""
-    )
+    """Current instance type of a Cost Optimization Hub EC2 recommendation.
+
+    Must stay wrapper-agnostic: CoH nests EC2 recs under ``ec2Instance`` *or*
+    ``ec2AutoScalingGroup`` (and Compute-Optimizer ASG recs under the latter).
+    Reading only ``ec2Instance`` returned "" for every ASG rec, whose empty
+    family then read as "not commitment-covered" — so a Graviton migration off an
+    SP-covered ASG instance was counted at full on-demand basis with no headroom
+    ceiling (live: c5.large + t3.large, $57.78/mo of phantom savings).
+    """
+    return coh_resource_type(rec)
 
 
 def _co_instance_id(rec: dict[str, Any]) -> str:

@@ -716,3 +716,65 @@ def test_dynamodb_reserved_gate_demotes_counted_recs() -> None:
     assert removed == pytest.approx(80.0)
     assert all(r["Counted"] is False for r in opt + coh)
     assert "DynamoDB reserved capacity" in opt[0]["CommitmentCoverageNote"]
+
+
+# --------------------------------------------------------------------------- #
+# CoH ASG wrapper — Jarir-M2 live regression (2026-07-09)
+# --------------------------------------------------------------------------- #
+def test_coh_resource_type_handles_autoscaling_group_wrapper() -> None:
+    # Verbatim shape from Jarir-M2: CoH nests EC2 recs under ec2AutoScalingGroup,
+    # not just ec2Instance. Reading only ec2Instance returned "" -> empty family ->
+    # "not covered" -> a Graviton migration off an SP-covered c5.large was counted
+    # with no headroom ceiling ($57.78/mo phantom across two ASG recs).
+    rec = {
+        "currentResourceDetails": {
+            "ec2AutoScalingGroup": {
+                "configuration": {"instance": {"type": "c5.large"}, "type": "SingleInstanceType"}
+            }
+        }
+    }
+    assert coh_resource_type(rec) == "c5.large"
+
+
+def test_ec2_adapter_type_extractor_is_wrapper_agnostic() -> None:
+    from services.adapters.ec2 import _coh_instance_type
+
+    asg = {"currentResourceDetails": {"ec2AutoScalingGroup": {
+        "configuration": {"instance": {"type": "t3.large"}, "type": "SingleInstanceType"}}}}
+    inst = {"currentResourceDetails": {"ec2Instance": {
+        "configuration": {"instance": {"type": "m5.xlarge"}}}}}
+    assert _coh_instance_type(asg) == "t3.large"
+    assert _coh_instance_type(inst) == "m5.xlarge"
+    assert _coh_instance_type({}) == ""
+
+
+def test_sp_covered_asg_rec_demotes_without_headroom() -> None:
+    # End-to-end: an SP-covered c5.large ASG rec with no uncovered on-demand must
+    # demote; the same rec with real overflow on that exact type stays counted.
+    from services.adapters.ec2 import _coh_instance_type
+
+    rec = {"currentResourceDetails": {"ec2AutoScalingGroup": {
+        "configuration": {"instance": {"type": "c5.large"}}}}, "estimatedMonthlySavings": 34.86}
+    cov = CommitmentCoverage(region="eu-central-1", ec2_sp_families=frozenset({"c5"}),
+                             uncovered_on_demand={"ec2:c7i.2xlarge": 1113.38})  # c5.large absent -> $0
+    counted, advisory = split_by_commitment(
+        [rec],
+        is_covered=lambda r: cov.covers_ec2(_coh_instance_type(r)),
+        gross_of=lambda r: r["estimatedMonthlySavings"],
+        note_of=lambda r, g: cov.ec2_note(_coh_instance_type(r), g),
+        ceiling_of=lambda r: cov.realizable_ceiling("ec2", _coh_instance_type(r)),
+        key_of=lambda r: normalize_type(_coh_instance_type(r)),
+    )
+    assert counted == [] and len(advisory) == 1
+    assert advisory[0]["AdvisoryEstimate"] == pytest.approx(34.86)
+
+    cov2 = replace(cov, uncovered_on_demand={"ec2:c5.large": 500.0})
+    counted2, advisory2 = split_by_commitment(
+        [rec],
+        is_covered=lambda r: cov2.covers_ec2(_coh_instance_type(r)),
+        gross_of=lambda r: r["estimatedMonthlySavings"],
+        note_of=lambda r, g: cov2.ec2_note(_coh_instance_type(r), g),
+        ceiling_of=lambda r: cov2.realizable_ceiling("ec2", _coh_instance_type(r)),
+        key_of=lambda r: normalize_type(_coh_instance_type(r)),
+    )
+    assert len(counted2) == 1 and advisory2 == []
