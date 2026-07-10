@@ -18,6 +18,57 @@ from services._aws_errors import record_aws_error
 
 LOW_CPU_THRESHOLD: int = 20
 
+# Peak `DatabaseMemoryUsagePercentage` above which a one-size-down node cannot be
+# guaranteed to hold the working set. AWS's node ladder leaves the smaller size
+# with only ~36-48% of the current maxmemory (cache.t4g.micro is 36% of
+# cache.t4g.small; cache.r5.large is 50% of cache.r5.xlarge), so 35% is the
+# family-agnostic bound below which the data provably fits. Deliberately
+# conservative: rejecting a valid downsize under-reports (safe), while a rec that
+# would OOM the cache and be reverted is not a realizable saving at all.
+MAX_MEMORY_HEADROOM_PCT: float = 35.0
+
+
+def _memory_signals(cloudwatch: Any, cluster_id: str, start_time: Any, end_time: Any) -> tuple[float | None, float | None]:
+    """Peak memory usage % and total evictions for a cache cluster.
+
+    Returns ``(None, None)`` when the metrics cannot be read — the caller then
+    withholds the downsize lever rather than assuming the working set fits. An
+    unreadable signal is not evidence of headroom (lesson C8).
+    """
+    peak_pct: float | None = None
+    evictions: float | None = None
+    try:
+        mem = cloudwatch.get_metric_statistics(
+            Namespace="AWS/ElastiCache",
+            MetricName="DatabaseMemoryUsagePercentage",
+            Dimensions=[{"Name": "CacheClusterId", "Value": cluster_id}],
+            StartTime=start_time,
+            EndTime=end_time,
+            Period=3600,
+            Statistics=["Maximum"],
+        )
+        points = mem.get("Datapoints") or []
+        if points:
+            peak_pct = max(dp["Maximum"] for dp in points)
+    except Exception:  # noqa: BLE001 — absence of evidence, not evidence of headroom
+        return None, None
+
+    try:
+        evict = cloudwatch.get_metric_statistics(
+            Namespace="AWS/ElastiCache",
+            MetricName="Evictions",
+            Dimensions=[{"Name": "CacheClusterId", "Value": cluster_id}],
+            StartTime=start_time,
+            EndTime=end_time,
+            Period=3600,
+            Statistics=["Sum"],
+        )
+        evictions = sum(dp["Sum"] for dp in (evict.get("Datapoints") or []))
+    except Exception:  # noqa: BLE001
+        return peak_pct, None
+
+    return peak_pct, evictions
+
 GRAVITON_FAMILIES: tuple[str, ...] = (
     "m7g",
     "r7g",
@@ -174,6 +225,20 @@ def get_enhanced_elasticache_checks(ctx: ScanContext) -> dict[str, Any]:
                                     if family in SMALLEST_SIZES and size == SMALLEST_SIZES[family]:
                                         continue
 
+                            # Low CPU alone does not make a downsize executable: the
+                            # working set must also FIT the smaller node. One size
+                            # down leaves only ~36-48% of the current maxmemory
+                            # (t4g.micro is 36% of t4g.small; r5.large is 50% of
+                            # r5.xlarge), so a node above MAX_MEMORY_HEADROOM_PCT
+                            # cannot be guaranteed to fit. A rec that would have to
+                            # be reverted is not a realizable saving.
+                            peak_mem_pct, evictions = _memory_signals(cloudwatch, cluster_id, start_time, end_time)
+                            memory_ok = (
+                                peak_mem_pct is not None
+                                and peak_mem_pct <= MAX_MEMORY_HEADROOM_PCT
+                                and (evictions or 0) == 0
+                            )
+
                             checks["underutilized_clusters"].append(
                                 {
                                     "ClusterId": cluster_id,
@@ -183,6 +248,9 @@ def get_enhanced_elasticache_checks(ctx: ScanContext) -> dict[str, Any]:
                                     # node, not just one (elasticache H1).
                                     "NumNodes": num_nodes,
                                     "AvgCPU": round(avg_cpu, 2),
+                                    "PeakMemoryUsagePct": round(peak_mem_pct, 2) if peak_mem_pct is not None else None,
+                                    "Evictions": evictions,
+                                    "MemoryHeadroomOk": memory_ok,
                                     "Recommendation": "Downsize node type or consider smaller instance family",
                                     "EstimatedSavings": "30-50%",
                                     "CheckCategory": "Underutilized Cluster",

@@ -234,6 +234,23 @@ will eventually both count it. This is the single most common real finding.
   `factor`/`* 0.` multipliers against a price; each is a fabricated dollar until it is
   two live prices. Then check every "real delta" fix actually probes both legs strictly.
 
+- **C10 — Idle is not the same as resizable. A recommendation you would have to
+  revert is not a saving.** The ElastiCache downsize lever was gated on
+  `CPUUtilization` alone (14-day avg < 20%). But AWS's node ladder leaves the next
+  size down with only **~36-48% of the current maxmemory** (`cache.t4g.micro` is 36%
+  of `cache.t4g.small`; `cache.r5.large` is 50% of `cache.r5.xlarge`), so a node can
+  be CPU-idle and still not fit. Executing such a rec evicts the working set and gets
+  rolled back — the "saving" was never realizable. Now gated on peak
+  `DatabaseMemoryUsagePercentage` <= 35% **and** zero `Evictions`; an unreadable metric
+  withholds the dollar (absence of evidence is not evidence of headroom — **C8**), and
+  the delta survives as `PotentialMonthlySavings`. *Real: bnc, ap-southeast-1 — the
+  four counted nodes did fit (peaks 34.6% / 1.0%), so the $103.66 was right by luck,
+  not by check; `ibis-prod` sits 0.4pp under the bound.* **Sweep:** every rightsizing
+  lever must gate on the dimension that BINDS the resource, not just the one that
+  looks idle — memory for caches/DBs, IOPS/throughput for volumes, connections for
+  proxies. CPU is rarely the binding constraint on the thing you are shrinking.
+  Cousin of the EBS guard that refuses to delete an in-use volume.
+
 ## D. Render / tab / count semantics (`counted == rendered`, both directions)
 
 - **D1 — Counted-but-invisible (render desync).** Savings summed into the headline

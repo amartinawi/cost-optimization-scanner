@@ -52,7 +52,10 @@ def test_elasticache_one_counted_lever_per_cluster():
 
     recs = [
         {"ClusterId": "c1", "NodeType": "cache.r6g.xlarge", "NumNodes": 1, "CheckCategory": "Valkey Migration", "EstimatedSavings": "Valkey..."},
-        {"ClusterId": "c1", "NodeType": "cache.r6g.xlarge", "NumNodes": 1, "CheckCategory": "Underutilized Cluster", "EstimatedSavings": "30-50%"},
+        {"ClusterId": "c1", "NodeType": "cache.r6g.xlarge", "NumNodes": 1, "CheckCategory": "Underutilized Cluster", "EstimatedSavings": "30-50%",
+         # Downsizing is gated on memory headroom as well as CPU; this test covers
+         # the one-counted-lever-per-cluster dedup, so grant the headroom.
+         "MemoryHeadroomOk": True, "PeakMemoryUsagePct": 5.0, "Evictions": 0.0},
         {"ClusterId": "c1", "NodeType": "cache.r6g.xlarge", "NumNodes": 1, "CheckCategory": "Reserved Nodes Opportunity", "EstimatedSavings": "30-60%"},
     ]
     # Underutilized (H3) is the live current->one-size-down delta:
