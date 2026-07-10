@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (AMI false zero; DMS flat-% fabrication)
+- **AMI snapshot savings were falsely zeroed ($161.60/mo).** `get_ebs_snapshot_actuals`
+  filtered the Cost-Explorer `SERVICE` dimension on
+  `"Amazon Elastic Compute Cloud - Compute"`, but EBS snapshot storage bills under
+  `"EC2 - Other"`. The filter matched nothing, returned `$0.00`, and the C8 reconciler
+  read that as "nothing billed -> nothing realizable", demoting all 74 AMI recs while
+  Cost Explorer itself answered fine (no warning). **A fail-closed ceiling is only safe
+  when its query is right.** Now scoped by region and matched on the usage type
+  (`EBS:Snapshot*`); a `$0` pool alongside priced recommendations raises a
+  contradiction warning instead of being trusted. Live: billed pool `$173.06/mo`, AMI
+  restored to `$161.60`.
+- **DMS counted a fabricated 35% ($74.09/mo).** `_DMS_SAVINGS_FACTORS` credited
+  "35% of instance monthly (one-size-down)" against `dms.r5.large` — the smallest size
+  in its family, with no one-size-down target to represent. Replaced by the concrete
+  `current -> one-size-down` live price delta; a candidate with no priceable smaller
+  target is now a `$0` advisory. `PricingEngine.get_dms_instance_monthly_price` gains
+  `allow_fallback=False` (with its own cache namespace) so a hypothetical class cannot
+  be priced against the DMS fallback constant. Recurring class **C9**.
+
 ### Fixed (RDS snapshot savings failed OPEN when Cost Explorer was unavailable)
 `reconcile_snapshot_savings` opened with `if not backup_actuals: return snaps`, so an
 unreadable Cost-Explorer backup read skipped the cap entirely and counted the raw

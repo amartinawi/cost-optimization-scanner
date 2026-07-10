@@ -206,9 +206,33 @@ will eventually both count it. This is the single most common real finding.
   permission is missing.* **Sweep:** for every `except`/empty-result path feeding a
   counted number, ask *"does this skip a ceiling?"* Compare the same account scanned
   with and without `ce:GetCostAndUsage`; the counted total must never rise when
-  evidence is removed. Same class as the EBS delete guard that failed open on
+  evidence is removed. **Corollary — a fail-closed ceiling is only safe when its
+  query is RIGHT.** A wrong billing query returns `$0`, which is indistinguishable
+  from "nothing billed" and demotes real savings. *Real: EBS snapshot storage bills
+  under CE service `"EC2 - Other"`, not `"Amazon Elastic Compute Cloud - Compute"`;
+  filtering the latter zeroed **$161.60/mo** of genuine AMI savings on bnc while CE
+  itself answered fine (no warning).* Scope such reads by **usage type**, not
+  service, and warn when a `$0` pool contradicts priced recommendations. Same class as the EBS delete guard that failed open on
   `InvalidVolume.NotFound` (C-series) and the EKS surcharge counted from a config
   field (**C7**).
+
+- **C9 — A flat percentage is a fabricated dollar, and a pricing *fallback* turns a
+  "real price delta" back into one.** `dms.py` counted `35% of instance monthly
+  (one-size-down)` — `_DMS_SAVINGS_FACTORS = {"Instance Optimization": 0.35}` — in an
+  adapter whose docstring claimed *"No flat fallbacks."* *Real: bnc, ap-southeast-1 —
+  **$74.09/mo** (the whole DMS tab) credited against `replication-instance-staging`, a
+  `dms.r5.large`, which is the **smallest size in the r5 family**: there was no
+  one-size-down target for the 35% to represent.* Same class as ElastiCache **H3**
+  (flat 0.30) and OpenSearch **H4** (flat 0.25). Replace with the concrete
+  `current -> one-size-down` price delta; when no priceable target exists, emit a **$0
+  advisory**. **The trap when you fix it:** `PricingEngine.get_*_monthly_price` returns
+  a documented *fallback constant* for an unknown SKU, so pricing the non-existent
+  `dms.r5.medium` yields a number and `current - fallback` is fabrication wearing a
+  real-price costume. Probe hypothetical classes with `allow_fallback=False` (added to
+  `get_dms_instance_monthly_price`), and give strict lookups their **own cache
+  namespace** — a cached fallback must never satisfy a strict read. **Sweep:** grep for
+  `factor`/`* 0.` multipliers against a price; each is a fabricated dollar until it is
+  two live prices. Then check every "real delta" fix actually probes both legs strictly.
 
 ## D. Render / tab / count semantics (`counted == rendered`, both directions)
 

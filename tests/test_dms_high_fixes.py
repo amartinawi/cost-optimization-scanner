@@ -44,6 +44,16 @@ SINGLE_AZ_MONTHLY = 54.385  # $0.0745/hr
 MULTI_AZ_MONTHLY = 108.77  # $0.149/hr
 PER_AZ_DELTA = round(MULTI_AZ_MONTHLY - SINGLE_AZ_MONTHLY, 2)  # 54.39
 
+# One-size-down of the fixture class dms.t3.medium. A rightsizing saving is the
+# CONCRETE price delta between the two, never a flat fraction of the instance
+# price (the old 0.35 proxy credited $74.09/mo on bnc against a dms.r5.large,
+# which has no smaller sibling at all).
+SMALLER_CLASS = "dms.t3.small"
+SMALLER_SINGLE_AZ_MONTHLY = 27.19
+SMALLER_MULTI_AZ_MONTHLY = 54.38
+SINGLE_AZ_DOWNSIZE_DELTA = round(SINGLE_AZ_MONTHLY - SMALLER_SINGLE_AZ_MONTHLY, 2)
+MULTI_AZ_DOWNSIZE_DELTA = round(MULTI_AZ_MONTHLY - SMALLER_MULTI_AZ_MONTHLY, 2)
+
 
 # --------------------------------------------------------------------------- #
 # Test doubles
@@ -157,17 +167,45 @@ class _FakeDmsPricing:
     hard failure — that proves the adapter consumes the new method (H1).
     """
 
-    def __init__(self, single: float = SINGLE_AZ_MONTHLY, multi: float = MULTI_AZ_MONTHLY, *, zero: bool = False) -> None:
+    def __init__(
+        self,
+        single: float = SINGLE_AZ_MONTHLY,
+        multi: float = MULTI_AZ_MONTHLY,
+        *,
+        zero: bool = False,
+        smaller_priced: bool = True,
+    ) -> None:
         self.single = single
         self.multi = multi
         self.zero = zero
+        # When False, the one-size-down class has no live SKU. A strict
+        # (allow_fallback=False) lookup must then return 0.0, so the adapter
+        # emits a $0 advisory instead of pricing a downsize against a fallback.
+        self.smaller_priced = smaller_priced
+        # Classes with a live Pricing-API SKU. dms.r5.medium is deliberately absent:
+        # the r5 family starts at .large, so its "one size down" does not exist.
+        self.known = {"dms.t3.medium", "dms.r5.large"}
         self.calls: list[tuple[str, bool]] = []
+        self.strict_calls: list[tuple[str, bool]] = []
 
-    def get_dms_instance_monthly_price(self, instance_class: str, *, multi_az: bool = False) -> float:
+    def get_dms_instance_monthly_price(
+        self, instance_class: str, *, multi_az: bool = False, allow_fallback: bool = True
+    ) -> float:
         self.calls.append((instance_class, multi_az))
+        if not allow_fallback:
+            self.strict_calls.append((instance_class, multi_az))
         if self.zero:
             return 0.0
-        return self.multi if multi_az else self.single
+        if instance_class == SMALLER_CLASS:
+            if not self.smaller_priced:
+                # Unknown SKU: strict lookup reports absence; the fallback-allowed
+                # path would hand back a fabricated constant.
+                return 0.0 if not allow_fallback else self.single
+            return SMALLER_MULTI_AZ_MONTHLY if multi_az else SMALLER_SINGLE_AZ_MONTHLY
+        if instance_class in self.known:
+            return self.multi if multi_az else self.single
+        # Any other class (e.g. dms.r5.medium) has no live SKU at all.
+        return 0.0 if not allow_fallback else self.single
 
     def get_instance_monthly_price(self, *a: Any, **k: Any) -> float:  # pragma: no cover - guard
         raise AssertionError("adapter must use get_dms_instance_monthly_price, not get_instance_monthly_price")
@@ -352,16 +390,21 @@ def test_scan_single_az_rightsizing_uses_single_az_sku(monkeypatch: pytest.Monke
 
     findings = DmsModule().scan(ctx)
 
-    # 35% of the Single-AZ monthly price (deterministic InstanceUsg SKU).
-    assert findings.total_monthly_savings == pytest.approx(SINGLE_AZ_MONTHLY * 0.35)
+    # The CONCRETE current -> one-size-down delta on the Single-AZ SKU, not a
+    # flat fraction of the instance price.
+    assert findings.total_monthly_savings == pytest.approx(SINGLE_AZ_DOWNSIZE_DELTA, abs=0.02)
     assert ("dms.t3.medium", False) in pricing.calls
+    assert (SMALLER_CLASS, False) in pricing.calls
     assert ("dms.t3.medium", True) not in pricing.calls
+    # Both legs of the delta must be strict lookups (no fallback fabrication).
+    assert ("dms.t3.medium", False) in pricing.strict_calls
+    assert (SMALLER_CLASS, False) in pricing.strict_calls
     assert findings.total_recommendations == 1
 
 
 def test_scan_multi_az_prod_rightsizing_uses_multi_az_sku(monkeypatch: pytest.MonkeyPatch) -> None:
     # A Multi-AZ but production (no non-prod keyword) instance is NOT eligible
-    # for the Multi-AZ lever; it must still price the rightsizing 35% on the
+    # for the Multi-AZ lever; it must still price the rightsizing DELTA on the
     # Multi-AZ SKU (H1: the AZ flag flows into the deterministic lookup).
     rec = _rec("dms-prod-2", multi_az=True)
     _patch_shim(monkeypatch, [rec], {"instance_rightsizing": [rec], "unused_instances": [], "serverless_migration": []})
@@ -371,7 +414,7 @@ def test_scan_multi_az_prod_rightsizing_uses_multi_az_sku(monkeypatch: pytest.Mo
     findings = DmsModule().scan(ctx)
 
     assert "multi_az_review" not in findings.sources
-    assert findings.total_monthly_savings == pytest.approx(MULTI_AZ_MONTHLY * 0.35)
+    assert findings.total_monthly_savings == pytest.approx(MULTI_AZ_DOWNSIZE_DELTA, abs=0.02)
     assert ("dms.t3.medium", True) in pricing.calls
     assert findings.total_recommendations == 1
 
@@ -468,7 +511,7 @@ def test_scan_unused_counts_full_instance_cost(monkeypatch: pytest.MonkeyPatch) 
     findings = DmsModule().scan(ctx)
 
     assert findings.total_monthly_savings == pytest.approx(SINGLE_AZ_MONTHLY * 1.0)
-    assert findings.total_monthly_savings != pytest.approx(SINGLE_AZ_MONTHLY * 0.35)
+    assert findings.total_monthly_savings != pytest.approx(SINGLE_AZ_DOWNSIZE_DELTA)
     assert ("dms.t3.medium", False) in pricing.calls
     assert findings.total_recommendations == 1
 
@@ -478,7 +521,10 @@ def test_scan_unused_counts_full_instance_cost(monkeypatch: pytest.MonkeyPatch) 
     assert enriched["EstimatedMonthlySavings"] == pytest.approx(SINGLE_AZ_MONTHLY * 1.0)
     assert enriched["Counted"] is True
     assert enriched["EstimatedSavings"] == f"${SINGLE_AZ_MONTHLY * 1.0:.2f}/month"
-    assert enriched["AuditBasis"]["factor"] == 1.0
+    # No `factor` key anywhere: the only lever that recovers a fixed fraction is
+    # termination, and that fraction is 1.0 — the formula states it outright.
+    assert "factor" not in enriched["AuditBasis"]
+    assert enriched["AuditBasis"]["instance_monthly"] == pytest.approx(SINGLE_AZ_MONTHLY, abs=0.01)
     assert enriched["AuditBasis"]["formula"] == "full instance monthly (terminate)"
 
 
@@ -494,10 +540,15 @@ def test_scan_rightsizing_rec_renders_counted_dollar(monkeypatch: pytest.MonkeyP
     findings = DmsModule().scan(ctx)
 
     enriched = findings.sources["instance_rightsizing"].recommendations[0]
-    assert enriched["EstimatedMonthlySavings"] == pytest.approx(SINGLE_AZ_MONTHLY * 0.35)
+    assert enriched["EstimatedMonthlySavings"] == pytest.approx(SINGLE_AZ_DOWNSIZE_DELTA, abs=0.02)
     assert enriched["Counted"] is True
-    assert enriched["EstimatedSavings"] == f"${SINGLE_AZ_MONTHLY * 0.35:.2f}/month"
-    assert enriched["AuditBasis"]["factor"] == 0.35
+    assert enriched["EstimatedSavings"] == f"${SINGLE_AZ_DOWNSIZE_DELTA:.2f}/month"
+    # The audit trail names both real prices — no `factor`, no percentage proxy.
+    basis = enriched["AuditBasis"]
+    assert "factor" not in basis
+    assert basis["current_class"] == "dms.t3.medium" and basis["target_class"] == SMALLER_CLASS
+    assert basis["current_monthly"] == pytest.approx(SINGLE_AZ_MONTHLY, abs=0.01)
+    assert basis["target_monthly"] == pytest.approx(SMALLER_SINGLE_AZ_MONTHLY, abs=0.01)
 
 
 def test_scan_pricing_miss_renders_prose_not_counted(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -512,7 +563,11 @@ def test_scan_pricing_miss_renders_prose_not_counted(monkeypatch: pytest.MonkeyP
 
     assert findings.total_monthly_savings == 0.0
     enriched = findings.sources["instance_rightsizing"].recommendations[0]
-    assert "EstimatedMonthlySavings" not in enriched
+    # A rightsizing candidate we cannot price from two real SKUs is a $0 advisory,
+    # never a fabricated fraction of the instance price.
+    assert enriched["Counted"] is False
+    assert enriched["EstimatedMonthlySavings"] == 0.0
+    assert "advisory" in enriched["EstimatedSavings"]
 
 
 # --------------------------------------------------------------------------- #
@@ -588,3 +643,76 @@ def test_shim_outer_non_permission_routes_to_warn() -> None:
     assert ctx.warnings and ctx.warnings[0][0] == "dms"
     assert ctx.permissions == []
     assert result["recommendations"] == []
+
+
+# --------------------------------------------------------------------------- #
+# bnc live regression (2026-07-10): flat-% fabrication -> concrete price delta
+# --------------------------------------------------------------------------- #
+def test_one_size_down_ladder():
+    from services.adapters.dms import _one_size_down
+
+    assert _one_size_down("dms.r5.xlarge") == "dms.r5.large"
+    assert _one_size_down("dms.c5.2xlarge") == "dms.c5.xlarge"
+    assert _one_size_down("dms.t3.micro") is None      # smallest rung
+    assert _one_size_down("dms.r5.bogus") is None
+    assert _one_size_down("r5.large") is None          # missing dms. prefix
+    assert _one_size_down("") is None
+
+
+def test_smallest_in_family_is_zero_advisory_not_a_fabricated_percentage(monkeypatch):
+    """bnc: replication-instance-staging is dms.r5.large — the smallest r5.
+
+    The old code credited 35% of $211.70 = $74.09/mo against a downsize target
+    that does not exist. There is nothing to price, so the rec is a $0 advisory.
+    """
+    rec = _rec("dms-r5", multi_az=False, klass="dms.r5.large")
+    _patch_shim(monkeypatch, [rec], {"instance_rightsizing": [rec], "unused_instances": [], "serverless_migration": []})
+    pricing = _FakeDmsPricing()
+    findings = DmsModule().scan(_ctx(pricing))
+
+    assert findings.total_monthly_savings == 0.0
+    enriched = findings.sources["instance_rightsizing"].recommendations[0]
+    assert enriched["Counted"] is False
+    assert "no live Pricing-API SKU for dms.r5.medium" in enriched["EstimatedSavings"]
+    assert "no priceable one-size-down target" in enriched["EstimatedSavings"]
+    # dms.r5.medium was probed STRICTLY, so its absence could not be papered over
+    # by the DMS fallback constant.
+    assert ("dms.r5.medium", False) in pricing.strict_calls
+    assert ("dms.r5.medium", False) not in [c for c in pricing.calls if c not in pricing.strict_calls]
+
+
+def test_downsize_never_prices_target_against_a_fallback_rate(monkeypatch):
+    """A non-existent target must not be priced via the DMS fallback constant.
+
+    get_dms_instance_monthly_price returns FALLBACK_DMS_INSTANCE_MONTHLY for an
+    unknown SKU, so a naive delta would be current - fallback: a fabricated
+    number wearing a real-price costume.
+    """
+    rec = _rec("dms-x", multi_az=False)  # dms.t3.medium -> dms.t3.small
+    _patch_shim(monkeypatch, [rec], {"instance_rightsizing": [rec], "unused_instances": [], "serverless_migration": []})
+    pricing = _FakeDmsPricing(smaller_priced=False)   # target has no live SKU
+    findings = DmsModule().scan(_ctx(pricing))
+
+    assert findings.total_monthly_savings == 0.0
+    enriched = findings.sources["instance_rightsizing"].recommendations[0]
+    assert enriched["Counted"] is False
+    assert "no live Pricing-API SKU for dms.t3.small" in enriched["EstimatedSavings"]
+    # The target was probed strictly (allow_fallback=False), so the DMS fallback
+    # constant could not masquerade as its price.
+    assert (SMALLER_CLASS, False) in pricing.strict_calls
+
+
+def test_pricing_engine_strict_lookup_is_not_satisfied_by_a_cached_fallback():
+    """A cached fallback price must never satisfy an allow_fallback=False lookup."""
+    from core.pricing_engine import PricingEngine
+
+    class _NoSku:
+        def get_products(self, **_kw):
+            return {"PriceList": []}          # SKU never resolves
+
+    pe = PricingEngine(region_code="ap-southeast-1", pricing_client=_NoSku())
+    # Warm the cache via the fallback-allowed path.
+    fallback_price = pe.get_dms_instance_monthly_price("dms.r5.medium", allow_fallback=True)
+    assert fallback_price > 0                  # a fabricated constant
+    # The strict path must still report "no such SKU".
+    assert pe.get_dms_instance_monthly_price("dms.r5.medium", allow_fallback=False) == 0.0
