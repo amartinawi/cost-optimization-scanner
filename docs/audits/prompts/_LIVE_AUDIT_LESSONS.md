@@ -216,6 +216,24 @@ will eventually both count it. This is the single most common real finding.
   `InvalidVolume.NotFound` (C-series) and the EKS surcharge counted from a config
   field (**C7**).
 
+- **C9 — A flat percentage is a fabricated dollar, and a pricing *fallback* turns a
+  "real price delta" back into one.** `dms.py` counted `35% of instance monthly
+  (one-size-down)` — `_DMS_SAVINGS_FACTORS = {"Instance Optimization": 0.35}` — in an
+  adapter whose docstring claimed *"No flat fallbacks."* *Real: bnc, ap-southeast-1 —
+  **$74.09/mo** (the whole DMS tab) credited against `replication-instance-staging`, a
+  `dms.r5.large`, which is the **smallest size in the r5 family**: there was no
+  one-size-down target for the 35% to represent.* Same class as ElastiCache **H3**
+  (flat 0.30) and OpenSearch **H4** (flat 0.25). Replace with the concrete
+  `current -> one-size-down` price delta; when no priceable target exists, emit a **$0
+  advisory**. **The trap when you fix it:** `PricingEngine.get_*_monthly_price` returns
+  a documented *fallback constant* for an unknown SKU, so pricing the non-existent
+  `dms.r5.medium` yields a number and `current - fallback` is fabrication wearing a
+  real-price costume. Probe hypothetical classes with `allow_fallback=False` (added to
+  `get_dms_instance_monthly_price`), and give strict lookups their **own cache
+  namespace** — a cached fallback must never satisfy a strict read. **Sweep:** grep for
+  `factor`/`* 0.` multipliers against a price; each is a fabricated dollar until it is
+  two live prices. Then check every "real delta" fix actually probes both legs strictly.
+
 ## D. Render / tab / count semantics (`counted == rendered`, both directions)
 
 - **D1 — Counted-but-invisible (render desync).** Savings summed into the headline

@@ -1119,7 +1119,9 @@ class PricingEngine:
         premium = optimized - standard
         return premium if premium > 0 else 0.0
 
-    def get_dms_instance_monthly_price(self, instance_class: str, *, multi_az: bool = False) -> float:
+    def get_dms_instance_monthly_price(
+        self, instance_class: str, *, multi_az: bool = False, allow_fallback: bool = True
+    ) -> float:
         """$/month for a DMS replication instance in self._region, AZ-aware.
 
         Pins the ``AWSDatabaseMigrationSvc`` Replication-Server SKU by exact
@@ -1136,26 +1138,50 @@ class PricingEngine:
                 ``"dms.t3.medium"`` or ``"t3.medium"``); normalized to
                 ``dms.<type>`` for the usagetype match.
             multi_az: When True, selects the Multi-AZ SKU.
+            allow_fallback: When False, a missing SKU returns ``0.0`` instead of
+                the documented fallback, and raises no pricing warning. Callers
+                probing whether a *hypothetical* class exists (e.g. the
+                one-size-down target of a rightsizing rec) must pass ``False``:
+                otherwise a class that does not exist — ``dms.r5.medium`` — prices
+                to a fallback constant and a fabricated delta is counted against
+                it.
 
         Returns:
             Monthly on-demand price in USD (730 hours). Returns the documented
-            fallback (× fallback_multiplier; ×2 for Multi-AZ) when the live SKU
-            is unavailable.
+            fallback (× fallback_multiplier; ×2 for Multi-AZ) when the live SKU is
+            unavailable, or ``0.0`` when ``allow_fallback`` is False.
         """
         clean = instance_class.strip()
         clean = f"dms.{clean[len('dms.'):] if clean.startswith('dms.') else clean}"
-        key = ("dms_instance", clean, "Multi-AZ" if multi_az else "Single-AZ")
-        if (cached := self._get_cached(key)) is not None:
-            return cached
+        az = "Multi-AZ" if multi_az else "Single-AZ"
+        # Two cache namespaces: a fallback price must never satisfy a strict
+        # (allow_fallback=False) lookup, or a fabricated number leaks into a
+        # caller that explicitly asked for a real SKU only.
+        key = ("dms_instance", clean, az)
+        strict_key = ("dms_instance_real", clean, az)
+
+        if allow_fallback:
+            if (cached := self._get_cached(key)) is not None:
+                return cached
+        elif (cached_strict := self._get_cached(strict_key)) is not None:
+            return cached_strict
+
         price = self._fetch_dms_instance_price(clean, multi_az=multi_az)
         if price is None:
+            if not allow_fallback:
+                self._cache.set(strict_key, 0.0)  # SKU genuinely absent
+                return 0.0
             fallback = FALLBACK_DMS_INSTANCE_MONTHLY * (FALLBACK_DMS_MULTI_AZ_FACTOR if multi_az else 1.0)
             price = self._use_fallback(
                 fallback * self._fallback_multiplier,
                 f"Pricing API unavailable for DMS {clean} "
                 f"({'Multi-AZ' if multi_az else 'Single-AZ'}) in {self._region}; using fallback",
             )
+            self._cache.set(key, price)
+            return price
+
         self._cache.set(key, price)
+        self._cache.set(strict_key, price)  # a real price satisfies both paths
         return price
 
     def get_sagemaker_instance_monthly(self, instance_type: str) -> float:
