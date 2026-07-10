@@ -279,6 +279,10 @@ def test_underutilized_lever_prices_every_node(monkeypatch: pytest.MonkeyPatch) 
         "Recommendation": "Downsize node type or consider smaller instance family",
         "EstimatedSavings": "30-50%",
         "CheckCategory": "Underutilized Cluster",
+        # Memory headroom proven: this test is about pricing every node (H1).
+        "MemoryHeadroomOk": True,
+        "PeakMemoryUsagePct": 5.0,
+        "Evictions": 0.0,
     }
     monkeypatch.setattr(
         adapter_mod, "get_enhanced_elasticache_checks", lambda c: {"recommendations": [dict(rec)]}
@@ -307,6 +311,10 @@ def test_underutilized_lever_advisory_when_target_unpriceable(monkeypatch: pytes
         "Recommendation": "Downsize node type",
         "EstimatedSavings": "30-50%",
         "CheckCategory": "Underutilized Cluster",
+        # Memory headroom proven: this test is about pricing every node (H1).
+        "MemoryHeadroomOk": True,
+        "PeakMemoryUsagePct": 5.0,
+        "Evictions": 0.0,
     }
     monkeypatch.setattr(
         adapter_mod, "get_enhanced_elasticache_checks", lambda c: {"recommendations": [dict(rec)]}
@@ -401,3 +409,81 @@ def test_cloudwatch_transient_error_is_warn_not_permission() -> None:
     assert not ctx.permissions, "a throttle is not a permission gap"
     assert ctx.warnings, "transient CloudWatch failure must surface as a warning"
     assert not [r for r in recs if r["CheckCategory"] == "Underutilized Cluster"]
+
+
+# --------------------------------------------------------------------------- #
+# bnc live audit (2026-07-10): a downsize must FIT, not merely be idle.
+# One size down leaves only ~36-48% of the current maxmemory, so low CPU alone
+# cannot justify the move. A rec that would have to be reverted is not a saving.
+# --------------------------------------------------------------------------- #
+def _underutilized(**over):
+    rec = {
+        "ClusterId": "c1",
+        "Engine": "redis",
+        "NodeType": "cache.t4g.medium",
+        "NumNodes": 1,
+        "AvgCPU": 3.0,
+        "MemoryHeadroomOk": True,
+        "PeakMemoryUsagePct": 5.0,
+        "Evictions": 0.0,
+        "Recommendation": "Downsize node type or consider smaller instance family",
+        "EstimatedSavings": "30-50%",
+        "CheckCategory": "Underutilized Cluster",
+    }
+    rec.update(over)
+    return rec
+
+
+def _scan_with(rec, monkeypatch):
+    import services.adapters.elasticache as ec_adapter
+
+    monkeypatch.setattr(
+        ec_adapter, "get_enhanced_elasticache_checks",
+        lambda _ctx: {"recommendations": [rec]},
+    )
+    pe = SimpleNamespace(
+        get_instance_monthly_price=lambda _svc, node_type, engine=None: {
+            "cache.t4g.medium": 69.35, "cache.t4g.small": 35.04,
+        }.get(node_type, 0.0)
+    )
+    ctx = SimpleNamespace(
+        region="ap-southeast-1", pricing_engine=pe, pricing_multiplier=1.0, fast_mode=False,
+        cost_hub_splits={"elasticache": []}, commitment_coverage=None,
+        client=lambda _n: None, warn=lambda *a, **k: None, permission_issue=lambda *a, **k: None,
+    )
+    return ec_adapter.ElasticacheModule().scan(ctx)
+
+
+def test_downsize_counted_when_working_set_fits(monkeypatch):
+    findings = _scan_with(_underutilized(), monkeypatch)
+    assert findings.total_monthly_savings == pytest.approx(69.35 - 35.04, abs=0.02)
+    rec = list(findings.sources["enhanced_checks"].recommendations)[0]
+    assert rec["Counted"] is True
+    assert "working set fits cache.t4g.small" in rec["AuditBasis"]["memory_headroom"]
+
+
+def test_downsize_withheld_when_memory_would_not_fit(monkeypatch):
+    findings = _scan_with(_underutilized(MemoryHeadroomOk=False, PeakMemoryUsagePct=72.0), monkeypatch)
+    assert findings.total_monthly_savings == 0.0
+    rec = list(findings.sources["enhanced_checks"].recommendations)[0]
+    assert rec["Counted"] is False
+    assert rec["PotentialMonthlySavings"] == pytest.approx(69.35 - 35.04, abs=0.02)
+    assert "exceeds the 35.0% headroom" in rec["AuditBasis"]["withheld"]
+
+
+def test_downsize_withheld_when_memory_metrics_unreadable(monkeypatch):
+    # Absence of evidence is not evidence of headroom (C8).
+    findings = _scan_with(
+        _underutilized(MemoryHeadroomOk=False, PeakMemoryUsagePct=None, Evictions=None), monkeypatch
+    )
+    assert findings.total_monthly_savings == 0.0
+    rec = list(findings.sources["enhanced_checks"].recommendations)[0]
+    assert rec["Counted"] is False
+    assert "cannot prove the working set fits" in rec["AuditBasis"]["withheld"]
+
+
+def test_evictions_block_the_downsize(monkeypatch):
+    # Low memory % but the cache is already evicting -> it is not oversized.
+    findings = _scan_with(_underutilized(MemoryHeadroomOk=False, PeakMemoryUsagePct=10.0, Evictions=41.0), monkeypatch)
+    assert findings.total_monthly_savings == 0.0
+    assert list(findings.sources["enhanced_checks"].recommendations)[0]["Counted"] is False

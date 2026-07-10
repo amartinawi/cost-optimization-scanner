@@ -8,7 +8,7 @@ from core.contracts import ServiceFindings, SourceBlock
 from services._base import BaseServiceModule
 from services._coh_dedup import coh_key, coh_savings, is_renderable_coh_rec
 from services.commitment_coverage import demote_coh_by_commitment, demote_covered_in_place
-from services.elasticache import get_enhanced_elasticache_checks
+from services.elasticache import MAX_MEMORY_HEADROOM_PCT, get_enhanced_elasticache_checks
 
 # x86/Intel ElastiCache node family -> its same-size Graviton (ARM) equivalent.
 # The realizable Graviton saving is the exact per-node price delta, NOT a flat
@@ -242,7 +242,13 @@ class ElasticacheModule(BaseServiceModule):
                         "AmazonElastiCache", target_type, engine=engine
                     )
                 delta = round((monthly_node - target_node) * num_nodes, 2)
-                if target_type and target_node > 0 and delta > 0:
+                # Low CPU says the node is idle; it does not say the data FITS one
+                # size down (that node has only ~36-48% of the current maxmemory).
+                # A downsize that would evict the working set has to be reverted, so
+                # it is not a realizable saving. Unreadable memory metrics are not
+                # evidence of headroom -> withhold the dollar (fail closed).
+                memory_ok = rec.get("MemoryHeadroomOk") is True
+                if target_type and target_node > 0 and delta > 0 and memory_ok:
                     rec["EstimatedMonthlySavings"] = delta
                     rec["AuditBasis"] = {
                         "lever": "Underutilized cluster downsizing",
@@ -253,6 +259,11 @@ class ElasticacheModule(BaseServiceModule):
                         ),
                         "region": region,
                         "metric_window": "CloudWatch CPUUtilization (underutilized)",
+                        "memory_headroom": (
+                            f"peak DatabaseMemoryUsagePercentage {rec.get('PeakMemoryUsagePct')}% "
+                            f"<= {MAX_MEMORY_HEADROOM_PCT}% and {rec.get('Evictions')} evictions "
+                            f"— working set fits {target_type}"
+                        ),
                         "formula": (
                             f"({round(monthly_node, 2)} − {round(target_node, 2)}) × "
                             f"{num_nodes} node(s) = ${delta}/mo"
@@ -260,6 +271,19 @@ class ElasticacheModule(BaseServiceModule):
                         "num_nodes": num_nodes,
                         "engine": engine,
                     }
+                elif target_type and target_node > 0 and delta > 0 and not memory_ok:
+                    # Priceable, but the data will not fit the smaller node.
+                    peak = rec.get("PeakMemoryUsagePct")
+                    reason = (
+                        f"peak memory {peak}% exceeds the {MAX_MEMORY_HEADROOM_PCT}% headroom "
+                        f"needed to fit {target_type}"
+                        if peak is not None
+                        else "memory-usage metrics unavailable — cannot prove the working set fits"
+                    )
+                    rec["EstimatedMonthlySavings"] = 0.0
+                    rec["Counted"] = False
+                    rec["PotentialMonthlySavings"] = delta
+                    rec["AuditBasis"] = {"lever": "Underutilized cluster downsizing", "withheld": reason}
                 else:
                     # Smallest size, unmappable target, or unpriceable target →
                     # cannot quantify a concrete downsizing delta → $0 advisory.

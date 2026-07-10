@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (ElastiCache downsize was CPU-gated only — a rec that would not fit)
+`services/elasticache.py` recommended downsizing any cache node whose 14-day average
+`CPUUtilization` sat below 20%, without checking whether the working set fits the
+smaller node. AWS's ladder leaves the next size down with only **~36-48%** of the
+current maxmemory (`cache.t4g.micro` is 36% of `cache.t4g.small`), so a CPU-idle node
+can still be memory-bound; executing the rec evicts the data and gets reverted, and a
+saving you must undo was never realizable. The lever now also requires peak
+`DatabaseMemoryUsagePercentage` <= `MAX_MEMORY_HEADROOM_PCT` (35%) **and** zero
+`Evictions`. Unreadable memory metrics withhold the dollar (fail closed); the delta is
+preserved as `PotentialMonthlySavings` on a $0 advisory naming the reason. Live on bnc
+all four nodes fit (peaks 34.6% / 1.0%), so the $103.66 is unchanged — but it was right
+by luck rather than by check. Recurring class **C10**.
+
 ### Fixed (AMI false zero; DMS flat-% fabrication)
 - **AMI snapshot savings were falsely zeroed ($161.60/mo).** `get_ebs_snapshot_actuals`
   filtered the Cost-Explorer `SERVICE` dimension on
