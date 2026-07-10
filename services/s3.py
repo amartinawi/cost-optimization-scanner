@@ -13,6 +13,7 @@ from typing import Any
 from botocore.config import Config  # type: ignore[import-untyped]
 from botocore.exceptions import (  # type: ignore[import-untyped]
     ClientError,
+    ConnectionClosedError,
     ConnectTimeoutError,
     EndpointConnectionError,
     ReadTimeoutError,
@@ -57,15 +58,28 @@ _LIVE_S3_REGIONS: set[str] = set()
 
 
 def _is_endpoint_unreachable(exc: BaseException) -> bool:
-    """Return True for errors indicating the CloudWatch endpoint is unreachable."""
-    if isinstance(exc, (ConnectTimeoutError, EndpointConnectionError, ReadTimeoutError)):
+    """Return True for errors indicating the endpoint (S3 or CloudWatch) is unreachable.
+
+    ``ConnectionClosedError`` — "Connection was closed before we received a valid
+    response from endpoint URL" — is included: afs-prod's me-central-1 buckets raised
+    it rather than a connect timeout, so the region was never retired and every bucket
+    there paid the full retry budget again.
+    """
+    if isinstance(
+        exc, (ConnectTimeoutError, EndpointConnectionError, ReadTimeoutError, ConnectionClosedError)
+    ):
         return True
     if isinstance(exc, ClientError):
         code = exc.response.get("Error", {}).get("Code", "")
         if code in ("RequestTimeout", "EndpointConnectionError", "ServiceUnavailable"):
             return True
     msg = str(exc).lower()
-    return "connect timeout" in msg or "read timeout" in msg or "endpoint" in msg and "unreachable" in msg
+    return (
+        "connect timeout" in msg
+        or "read timeout" in msg
+        or "connection was closed" in msg
+        or ("endpoint" in msg and "unreachable" in msg)
+    )
 
 
 def _bucket_cloudwatch_client(ctx: ScanContext, bucket_region: str) -> Any | None:

@@ -29,11 +29,12 @@ def reconcile_against_billed(
     billed: float | None,
     *,
     pool_label: str,
+    pool_share: float | None,
     savings_key: str = "EstimatedMonthlySavings",
     grant_hint: str = "grant ce:GetCostAndUsage to quantify",
     on_contradiction: Callable[[str], None] | None = None,
 ) -> tuple[list[dict[str, Any]], float]:
-    """Cap ``recs``' upper-bound savings at ``billed``; demote when unsubstantiated.
+    """Cap ``recs``' upper-bound savings at their SHARE of ``billed``.
 
     Args:
         recs: Recommendations carrying a positive numeric upper-bound saving.
@@ -41,6 +42,11 @@ def reconcile_against_billed(
             means the read failed (unsubstantiated). ``<= 0`` means Cost Explorer
             answered and nothing is billed — either way nothing is realizable.
         pool_label: Human name of the billed pool, for the audit trail.
+        pool_share: The flagged resources' fraction (0..1) of that pool. The billed
+            pool covers **every** resource of its kind in the region, not only the
+            ones flagged here, so the realizable ceiling is ``billed * pool_share``
+            — never the whole pool. ``None`` means the share could not be measured,
+            and the bounds demote rather than claim an unknown fraction.
         savings_key: The numeric savings field to cap.
         grant_hint: What the operator can do to make the bound quantifiable.
 
@@ -50,6 +56,12 @@ def reconcile_against_billed(
         preserved as ``PotentialMonthlySavings``, and an advisory
         ``EstimatedSavings`` string, so a numeric-summing consumer cannot pick up
         a demoted advisory.
+
+    Capping at the *whole* pool silently asserts that the flagged resources ARE the
+    pool. Live: afs-prod/eu-west-1 flagged 317 unused AMIs whose snapshots are 23.7%
+    of the region's snapshot footprint, yet the un-shared cap credited 100% of the
+    $5,124.78/mo `EBS:SnapshotUsage` bill — $3,911.50/mo of savings that would
+    survive deleting every one of them, since 2,259 other snapshots keep billing.
     """
     def _sav(rec: dict[str, Any]) -> float:
         try:
@@ -59,10 +71,13 @@ def reconcile_against_billed(
 
     upper = sum(_sav(r) for r in recs)
     pool = float(billed) if billed is not None else 0.0
-    substantiated = billed is not None and pool > 0
+    share = min(max(float(pool_share), 0.0), 1.0) if pool_share is not None else 0.0
+    # The ceiling is this subset's slice of the billed pool, not the whole pool.
+    ceiling = pool * share
+    substantiated = billed is not None and pool > 0 and pool_share is not None and share > 0
     factor = 1.0
-    if substantiated and upper > 0 and pool < upper:
-        factor = pool / upper
+    if substantiated and upper > 0 and ceiling < upper:
+        factor = ceiling / upper
 
     # A $0 pool alongside real priced recs is contradictory: those resources exist
     # and are sized, so AWS bills *something*. Far more likely the billing query is
@@ -87,26 +102,38 @@ def reconcile_against_billed(
             new["Counted"] = False
             new[savings_key] = 0.0
             new["PotentialMonthlySavings"] = round(value, 2)
-            reason = grant_hint if billed is None else f"{pool_label} bills $0.00/mo"
+            if billed is None:
+                reason = grant_hint
+                basis = f"no Cost Explorer actual for {pool_label} — upper bound retained as advisory (not counted)"
+            elif pool <= 0:
+                reason = f"{pool_label} bills $0.00/mo"
+                basis = f"{pool_label} bills $0.00/mo — nothing realizable"
+            else:
+                reason = f"share of {pool_label} could not be measured"
+                basis = (
+                    f"{pool_label} bills ${pool:,.2f}/mo but the flagged resources' share of it could not "
+                    f"be measured — counting the whole pool would credit spend that survives this action"
+                )
             new["EstimatedSavings"] = f"up to ${value:.2f}/month — advisory ({reason})"
-            new["ReconciliationBasis"] = (
-                f"no Cost Explorer actual for {pool_label} — upper bound retained as advisory (not counted)"
-                if billed is None
-                else f"{pool_label} bills $0.00/mo — nothing realizable"
-            )
+            new["ReconciliationBasis"] = basis
         else:
             capped = round(value * factor, 2)
             new[savings_key] = capped
             new["ActualBilledPool"] = round(pool, 2)
+            new["AttributableShare"] = round(share, 4)
+            new["AttributableCeiling"] = round(ceiling, 2)
             if factor < 1.0:
                 new["Reconciled"] = True
                 new["ReconciliationFactor"] = round(factor, 4)
                 new["UpperBoundBeforeReconciliation"] = round(value, 2)
                 new["EstimatedSavings"] = (
-                    f"${capped:.2f}/month (reconciled to actual billed {pool_label} via Cost Explorer)"
+                    f"${capped:.2f}/month (reconciled to this subset's {share:.1%} share of the "
+                    f"${pool:,.2f}/mo billed {pool_label}, via Cost Explorer)"
                 )
             else:
-                new["ReconciliationBasis"] = f"not capped — upper bound <= actual billed {pool_label}"
+                new["ReconciliationBasis"] = (
+                    f"not capped — upper bound <= this subset's {share:.1%} share of billed {pool_label}"
+                )
                 new["EstimatedSavings"] = f"${capped:.2f}/month"
             counted += capped
         out.append(new)

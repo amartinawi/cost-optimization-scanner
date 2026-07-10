@@ -251,6 +251,22 @@ will eventually both count it. This is the single most common real finding.
   proxies. CPU is rarely the binding constraint on the thing you are shrinking.
   Cousin of the EBS guard that refuses to delete an in-use volume.
 
+- **C11 — A billed pool covers EVERY resource of its kind, not just the ones you
+  flagged. Cap at the subset's SHARE of the pool, never at the pool.** The C8
+  reconciler capped an upper bound at the whole billed pool, which silently asserts
+  the flagged resources *are* the pool. *Real: afs-prod, eu-west-1 — 317 unused AMIs
+  are backed by 744 of the region's 3,003 snapshots (**23.7%** of the 576,495 GiB
+  estate), yet the un-shared cap credited **100% of the $5,124.78/mo**
+  `EBS:SnapshotUsage` bill. **$3,911.50/mo** of that survives deleting every flagged
+  AMI, because 2,259 other snapshots keep billing.* The tell is a counted figure that
+  matches the billed pool almost exactly — that is not corroboration, it is the cap
+  binding at 100%. Ceiling = `billed x (flagged_footprint / total_footprint)`, with
+  numerator and denominator measured on the same basis; an unmeasurable share demotes
+  (**C8**), because an unknown fraction of a pool is not a saving. **Sweep:** every
+  reconciled tab — if `counted ≈ ActualBilledPool`, the share is missing.
+  `services/rds_logic.reconcile_snapshot_savings` has the same shape (bnc: capped to
+  $411.80 = 100% of billed backup storage, ignoring automated backups).
+
 ## D. Render / tab / count semantics (`counted == rendered`, both directions)
 
 - **D1 — Counted-but-invisible (render desync).** Savings summed into the headline

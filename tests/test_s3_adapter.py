@@ -480,3 +480,17 @@ def test_shared_session_config_bounds_the_connect_phase():
     assert cfg.connect_timeout == 10, "an unbounded connect timeout can stall a scan for minutes"
     assert cfg.read_timeout == 60
     assert _total_attempts(cfg) == 11  # adaptive retries still absorb throttling
+
+
+def test_connection_closed_counts_as_unreachable():
+    """afs-prod's me-central-1 buckets raised ConnectionClosedError, not a timeout.
+
+    The classifier missed it, so UAE was never retired and every bucket there paid
+    the retry budget again.
+    """
+    from botocore.exceptions import ConnectionClosedError
+
+    exc = ConnectionClosedError(endpoint_url="https://b.s3.me-central-1.amazonaws.com/?website")
+    assert _s3mod._is_endpoint_unreachable(exc) is True
+    # An auth/existence failure is NOT an unreachable endpoint.
+    assert _s3mod._is_endpoint_unreachable(_ClientError({"Error": {"Code": "403"}}, "HeadBucket")) is False
