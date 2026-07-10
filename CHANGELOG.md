@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (a billed pool is not the flagged subset's saving — AMI overstated $3,911.50/mo)
+`services/_reconcile.reconcile_against_billed` capped an upper bound at the **whole**
+billed pool, which silently asserts the flagged resources *are* the pool. *Real:
+afs-prod / eu-west-1 — 317 unused AMIs are backed by 744 of the region's 3,003 snapshots
+(**23.7%** of a 576,495 GiB estate), yet the un-shared cap credited **100% of the
+$5,124.78/mo** billed `EBS:SnapshotUsage`. **$3,911.50/mo** of that survives deleting
+every flagged AMI, because 2,259 other snapshots keep billing.* The counted figure
+matching the billed pool almost exactly was not corroboration — it was the cap binding
+at 100%.
+
+`reconcile_against_billed` now takes a required `pool_share`, and the ceiling is
+`billed x share`. `services/ami.region_snapshot_footprint_gib` measures the denominator
+(the region's whole self-owned snapshot estate) on the same full-size basis as the
+numerator. An unmeasurable share **demotes** rather than claiming an unknown fraction of
+the pool. Live: ami `$5,124.67 -> $1,215.13` (share 0.2371), headline
+`$16,589.51 -> $12,679.97`. Recurring class **C11**.
+
+Also: `_is_endpoint_unreachable` now recognises botocore's `ConnectionClosedError`
+("Connection was closed before we received a valid response"), which afs-prod's
+me-central-1 buckets raised instead of a connect timeout — so UAE was never retired and
+every bucket there paid the retry budget again.
+
+**Known, unfixed:** `services/rds_logic.reconcile_snapshot_savings` has the same
+whole-pool defect (bnc: capped to $411.80 = 100% of billed backup storage, ignoring
+automated backups and unflagged snapshots). It needs its own denominator.
+
 ### Fixed (ElastiCache downsize was CPU-gated only — a rec that would not fit)
 `services/elasticache.py` recommended downsizing any cache node whose 14-day average
 `CPUUtilization` sat below 20%, without checking whether the working set fits the

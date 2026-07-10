@@ -81,9 +81,20 @@ class _FakeEc2:
         image_attr_exc: Exception | None = None,
         snap_bytes: dict[str, int] | None = None,
         snap_exc: Exception | None = None,
+        region_snapshots: list[dict] | None = None,
     ) -> None:
+        # The region's whole snapshot estate. AMI savings are capped at the flagged
+        # snapshots' SHARE of the billed EBS:SnapshotUsage pool, so this is the
+        # denominator. Defaults to exactly the flagged snapshots (share = 1.0), which
+        # keeps tests written about *capping* testing capping.
+        if region_snapshots is None:
+            region_snapshots = [
+                {"SnapshotId": sid, "FullSnapshotSizeInBytes": b}
+                for sid, b in (snap_bytes or {}).items()
+            ]
         self._paginators = {
             "describe_images": _Pager([{"Images": images}]),
+            "describe_snapshots": _Pager([{"Snapshots": region_snapshots}]),
             "describe_instances": _Pager([{"Reservations": []}]),
             "describe_launch_templates": _Pager([{"LaunchTemplates": []}]),
             "describe_fleets": (
@@ -561,3 +572,46 @@ def test_snapshot_actuals_match_usage_type_not_service():
     dumped = json.dumps(captured.get("Filter"))
     assert "SERVICE" not in dumped
     assert "REGION" in dumped
+
+
+def test_ami_savings_limited_to_its_share_of_the_snapshot_estate():
+    """afs-prod: 317 unused AMIs held 23.7% of the region's snapshot footprint.
+
+    Capping at the whole billed pool credited 100% of the $5,124.78/mo bill --
+    $3,911.50/mo that survives deleting them, because 2,259 other snapshots keep
+    billing. The ceiling is the SHARE of the pool, never the pool.
+    """
+    # Flagged AMI holds 100 GiB; the region's estate is 400 GiB -> 25% share.
+    ec2 = _FakeEc2(
+        images=[_ami("ami-free", 200)],
+        snap_bytes={"snap-ami-free": 100 * 1024**3},
+        region_snapshots=[
+            {"SnapshotId": "snap-ami-free", "FullSnapshotSizeInBytes": 100 * 1024**3},
+            {"SnapshotId": "snap-other-1", "FullSnapshotSizeInBytes": 300 * 1024**3},
+        ],
+    )
+    findings = AmiModule().scan(_make_ctx(ec2, billed_snapshot_pool=1000.0))
+    rec = list(findings.sources["old_amis"].recommendations)[0]
+    # Upper bound 100GiB x rate = $5.00; its 25% share of the $1000 pool is $250,
+    # which exceeds the bound -> counted in full, NOT scaled up to the pool.
+    assert findings.total_monthly_savings == pytest.approx(100.0 * SNAPSHOT_RATE, abs=0.02)
+    assert rec["AttributableShare"] == pytest.approx(0.25)
+
+    # Now make the bound exceed its share: a $10 pool -> 25% share = $2.50 ceiling.
+    findings2 = AmiModule().scan(_make_ctx(ec2, billed_snapshot_pool=10.0))
+    rec2 = list(findings2.sources["old_amis"].recommendations)[0]
+    assert findings2.total_monthly_savings == pytest.approx(2.50, abs=0.02)
+    assert rec2["Reconciled"] is True
+    assert rec2["AttributableCeiling"] == pytest.approx(2.50)
+    assert findings2.total_monthly_savings < 10.0   # never the whole pool
+
+
+def test_ami_demoted_when_snapshot_estate_cannot_be_enumerated():
+    """Cannot measure the share -> cannot claim a fraction of the pool (C8)."""
+    ec2 = _FakeEc2(images=[_ami("ami-free", 200)], snap_bytes={"snap-ami-free": 100 * 1024**3})
+    ec2._paginators["describe_snapshots"] = _RaisingPager(RuntimeError("AccessDenied"))
+    findings = AmiModule().scan(_make_ctx(ec2, billed_snapshot_pool=10_000.0))
+    assert findings.total_monthly_savings == 0.0
+    rec = list(findings.sources["old_amis"].recommendations)[0]
+    assert rec["Counted"] is False
+    assert "share of EBS snapshot storage could not be measured" in rec["EstimatedSavings"]

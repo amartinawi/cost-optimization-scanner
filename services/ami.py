@@ -103,6 +103,37 @@ def _snapshot_storage_gb(
     return incremental_gb, all_snapshot_ids, shared_snapshot_ids, estimated
 
 
+def region_snapshot_footprint_gib(ctx: ScanContext) -> float | None:
+    """Total full size (GiB) of every self-owned EBS snapshot in the region.
+
+    The denominator for attributing billed ``EBS:SnapshotUsage`` to a subset of
+    snapshots. AWS bills the *unique blocks* of the whole snapshot estate; the
+    flagged AMIs' backing snapshots are only part of it, so their realizable share
+    of that bill is their share of the estate — never the whole bill.
+
+    Returns ``None`` when the estate cannot be enumerated, so the caller demotes
+    rather than assume the flagged snapshots are 100% of it.
+    """
+    total = 0.0
+    try:
+        paginator = ctx.client("ec2").get_paginator("describe_snapshots")
+        for page in paginator.paginate(OwnerIds=["self"]):
+            for snap in page.get("Snapshots", []):
+                full_bytes = snap.get("FullSnapshotSizeInBytes")
+                if full_bytes:
+                    total += float(full_bytes) / (1024**3)
+                else:
+                    # Same fallback the per-AMI sizing uses, so numerator and
+                    # denominator are measured on the same basis.
+                    total += float(snap.get("VolumeSize", 0) or 0)
+    except Exception as e:  # noqa: BLE001 — cannot attribute -> caller demotes
+        record_aws_error(
+            ctx, e, service="ami", context="DescribeSnapshots (region snapshot footprint) failed"
+        )
+        return None
+    return total if total > 0 else None
+
+
 def compute_ami_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> dict[str, Any]:
     """Compute AMI deletion-candidate checks.
 
