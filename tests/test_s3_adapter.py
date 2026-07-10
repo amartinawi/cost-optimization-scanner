@@ -380,3 +380,103 @@ class TestEnhancedSavingsStringsParse:
     )
     def test_parse_dollar_savings_handles_all_enhanced_strings(self, savings_str, expected):
         assert parse_dollar_savings(savings_str) == pytest.approx(expected)
+
+
+# --------------------------------------------------------------------------- #
+# afs-prod live incident (2026-07-10): an unreachable bucket region hung the scan
+#
+# me-south-1 was ENABLED and opted-in, but its endpoint was unroutable from the
+# scanning host. Per-bucket S3 calls used the shared session config (10 adaptive
+# retries x 60s default connect timeout ~= 10 min/call); with 68 buckets there the
+# scan produced no report after 81 minutes.
+# --------------------------------------------------------------------------- #
+from types import SimpleNamespace
+
+import services.s3 as _s3mod
+from botocore.exceptions import ClientError as _ClientError
+from botocore.exceptions import ConnectTimeoutError as _ConnectTimeout
+
+
+def _reset_region_caches():
+    _s3mod._DEAD_S3_REGIONS.clear()
+    _s3mod._LIVE_S3_REGIONS.clear()
+
+
+class _DeadEndpoint:
+    def __init__(self):
+        self.calls = 0
+
+    def head_bucket(self, Bucket):  # noqa: N803
+        self.calls += 1
+        raise _ConnectTimeout(endpoint_url="https://b.s3.me-south-1.amazonaws.com/")
+
+
+class _Answers403:
+    def __init__(self):
+        self.calls = 0
+
+    def head_bucket(self, Bucket):  # noqa: N803
+        self.calls += 1
+        raise _ClientError({"Error": {"Code": "403"}}, "HeadBucket")
+
+
+def _warn_ctx():
+    warns = []
+    return SimpleNamespace(warn=lambda m, service=None: warns.append(m)), warns
+
+
+def test_unreachable_region_is_probed_once_then_cached():
+    _reset_region_caches()
+    ctx, warns = _warn_ctx()
+    client = _DeadEndpoint()
+    assert _s3mod._s3_region_reachable(ctx, client, "me-south-1", "b1") is False
+    # Every subsequent bucket in that region short-circuits: no second probe, and
+    # crucially no per-bucket S3 call that would each burn the retry budget.
+    for i in range(2, 70):
+        assert _s3mod._s3_region_reachable(ctx, client, "me-south-1", f"b{i}") is False
+    assert client.calls == 1, "probed once per region, not once per bucket"
+    assert len(warns) == 1, "one warning per dead region"
+    assert "skipping all remaining buckets" in warns[0]
+
+
+def test_endpoint_that_answers_403_is_reachable():
+    # An auth/existence error proves the endpoint responded — only connect/read
+    # timeouts retire a region. Treating 403 as dead would silently drop buckets.
+    _reset_region_caches()
+    ctx, warns = _warn_ctx()
+    client = _Answers403()
+    assert _s3mod._s3_region_reachable(ctx, client, "eu-west-1", "b1") is True
+    assert _s3mod._s3_region_reachable(ctx, None, "eu-west-1", "b2") is True  # cached
+    assert client.calls == 1
+    assert warns == []
+
+
+def _total_attempts(cfg):
+    """Total attempts a Config permits, normalising botocore's two spellings.
+
+    botocore rewrites `max_attempts: N` -> `total_max_attempts: N + 1` in place the
+    first time a client is built from a Config. These Configs are module-level, so
+    the surviving key depends on test order — normalise instead of guessing.
+    """
+    r = cfg.retries or {}
+    if "total_max_attempts" in r:
+        return r["total_max_attempts"]
+    return r["max_attempts"] + 1
+
+
+def test_bucket_s3_client_uses_bounded_timeouts_not_the_shared_config():
+    cfg = _s3mod._BUCKET_S3_TIMEOUT_CONFIG
+    assert cfg.connect_timeout == 5
+    assert cfg.read_timeout == 10
+    # Worst case per call: 3 attempts x 5s connect = 15s, not 10 x 60s = 10 min.
+    assert _total_attempts(cfg) == 3
+    assert cfg.connect_timeout * _total_attempts(cfg) <= 20
+
+
+def test_shared_session_config_bounds_the_connect_phase():
+    from core.session import AwsSessionFactory
+
+    cfg = AwsSessionFactory(region="eu-west-1")._retry_config
+    assert cfg.connect_timeout == 10, "an unbounded connect timeout can stall a scan for minutes"
+    assert cfg.read_timeout == 60
+    assert _total_attempts(cfg) == 11  # adaptive retries still absorb throttling

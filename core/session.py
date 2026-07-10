@@ -20,8 +20,17 @@ class AwsSessionFactory:
         self._region = region
         self._profile = profile
         self._session: boto3.Session | None = None
+        # Adaptive retries absorb throttling, but botocore's DEFAULT 60s connect
+        # timeout combined with 10 attempts lets a single unreachable endpoint
+        # block one call for ~10 minutes — enough to hang an entire scan when a
+        # region's endpoint is unroutable from the host (VPN/firewall), even
+        # though the region is enabled. Bound the connect phase; leave the read
+        # timeout generous, since legitimate Cost-Explorer and Pricing calls are
+        # slow to respond but quick to connect.
         self._retry_config = Config(
             retries={"max_attempts": 10, "mode": "adaptive"},
+            connect_timeout=10,
+            read_timeout=60,
         )
 
     def session(self) -> boto3.Session:

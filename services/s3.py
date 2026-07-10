@@ -35,7 +35,25 @@ _BUCKET_CW_TIMEOUT_CONFIG: Config = Config(
     retries={"max_attempts": 2, "mode": "standard"},
 )
 
+# The same bound for the per-bucket S3 calls (GetBucketWebsite, lifecycle,
+# versioning, ListObjectsV2 ...). These go to the BUCKET's region, which may be
+# unreachable from the scanning host even when the region is enabled — a VPN or
+# firewall is enough. Under the shared session config (10 adaptive attempts, 60s
+# default connect timeout) a single such call stalls for up to ten minutes, and a
+# region holding dozens of buckets hangs the whole scan (afs-prod: 68 buckets in
+# me-south-1, no report after 81 minutes).
+_BUCKET_S3_TIMEOUT_CONFIG: Config = Config(
+    connect_timeout=5,
+    read_timeout=10,
+    retries={"max_attempts": 2, "mode": "standard"},
+)
+
 _DEAD_CW_REGIONS: set[str] = set()
+# Regions whose S3 endpoint proved unreachable, and those proven reachable. Both
+# are session-scoped so one failure retires a region for every remaining bucket
+# instead of paying the timeout again per bucket.
+_DEAD_S3_REGIONS: set[str] = set()
+_LIVE_S3_REGIONS: set[str] = set()
 
 
 def _is_endpoint_unreachable(exc: BaseException) -> bool:
@@ -74,6 +92,52 @@ def _mark_region_dead(ctx: ScanContext, bucket_region: str, reason: str) -> None
         f"skipping S3 size metrics for all remaining buckets in this region ({reason})",
         service="s3",
     )
+
+
+def _bucket_s3_client(ctx: ScanContext, bucket_region: str) -> Any:
+    """S3 client for ``bucket_region`` with tight timeouts (never the shared config)."""
+    factory = ctx.clients._factory  # AwsSessionFactory  # noqa: SLF001
+    return factory.session().client(
+        "s3",
+        region_name=bucket_region,
+        config=_BUCKET_S3_TIMEOUT_CONFIG,
+    )
+
+
+def _mark_s3_region_dead(ctx: ScanContext, bucket_region: str, reason: str) -> None:
+    """Retire a region whose S3 endpoint is unreachable, once per scan."""
+    if bucket_region in _DEAD_S3_REGIONS:
+        return
+    _DEAD_S3_REGIONS.add(bucket_region)
+    ctx.warn(
+        f"S3 endpoint unreachable for region {bucket_region}; skipping all remaining "
+        f"buckets in this region ({reason}). Their sizes and lifecycle findings are "
+        f"absent from this report.",
+        service="s3",
+    )
+
+
+def _s3_region_reachable(ctx: ScanContext, s3_client: Any, bucket_region: str, bucket_name: str) -> bool:
+    """True if ``bucket_region``'s S3 endpoint answers; cached per region.
+
+    Probes once per region with a bounded ``HeadBucket``. Any *answer* — including
+    403/404 — proves the endpoint is reachable; only a connect/read timeout retires
+    the region. Without this, every bucket in an unreachable region pays the full
+    retry budget before its calls give up.
+    """
+    if bucket_region in _DEAD_S3_REGIONS:
+        return False
+    if bucket_region in _LIVE_S3_REGIONS:
+        return True
+    try:
+        s3_client.head_bucket(Bucket=bucket_name)
+    except Exception as e:  # noqa: BLE001
+        if _is_endpoint_unreachable(e):
+            _mark_s3_region_dead(ctx, bucket_region, str(e)[:80])
+            return False
+        # A ClientError (403/404/301) means the endpoint answered — region is live.
+    _LIVE_S3_REGIONS.add(bucket_region)
+    return True
 
 S3_STORAGE_COSTS: dict[str, float] = {
     "STANDARD": 0.023,
@@ -889,17 +953,29 @@ def get_s3_bucket_analysis(
                 if bucket_region is None:
                     bucket_region = "us-east-1"
 
-                bucket_s3_client = ctx.client("s3", region=bucket_region)
+                # Tight-timeout client: the shared session config allows 10 adaptive
+                # retries against a 60s default connect timeout, so one unreachable
+                # bucket region stalls the scan for ~10 minutes per call.
+                bucket_s3_client = _bucket_s3_client(ctx, bucket_region)
 
             except Exception as e:
                 _route_bucket_error(
                     ctx, bucket_name, e, action="s3:GetBucketLocation"
                 )
                 bucket_region = ctx.region
-                bucket_s3_client = ctx.client("s3")
+                bucket_s3_client = _bucket_s3_client(ctx, ctx.region)
                 analysis.setdefault("permission_issues", []).append(
                     {"bucket": bucket_name, "issue": "location_access", "error": str(e)}
                 )
+
+            # Retire an unreachable bucket region after the first failure rather than
+            # paying the timeout for every bucket it holds. A bucket in a dead region
+            # contributes no size/lifecycle findings, so skip it outright.
+            if not _s3_region_reachable(ctx, bucket_s3_client, bucket_region, bucket_name):
+                analysis.setdefault("permission_issues", []).append(
+                    {"bucket": bucket_name, "issue": "region_unreachable", "error": bucket_region}
+                )
+                continue
 
             bucket_info: dict[str, Any] = {
                 "Name": bucket_name,
@@ -1231,14 +1307,19 @@ def get_enhanced_s3_checks(
             try:
                 location_response = s3.get_bucket_location(Bucket=bucket_name)
                 bucket_region = location_response.get("LocationConstraint") or "us-east-1"
-                bucket_s3_client = (
-                    ctx.client("s3", region=bucket_region)
-                    if bucket_region != ctx.region
-                    else ctx.client("s3")
-                )
+                # Bounded client + the session-scoped dead-region cache, exactly as in
+                # get_s3_bucket_analysis. This second bucket loop previously used the
+                # shared session config (10 adaptive attempts x 60s connect), so an
+                # unreachable bucket region hung the scan here even once the first
+                # loop had learned to skip it.
+                bucket_s3_client = _bucket_s3_client(ctx, bucket_region)
             except Exception as e:
                 _route_bucket_error(ctx, bucket_name, e, action="s3:GetBucketLocation")
-                bucket_s3_client = ctx.client("s3")
+                bucket_region = ctx.region
+                bucket_s3_client = _bucket_s3_client(ctx, ctx.region)
+
+            if not _s3_region_reachable(ctx, bucket_s3_client, bucket_region, bucket_name):
+                continue
 
             try:
                 multipart_response = bucket_s3_client.list_multipart_uploads(Bucket=bucket_name)
