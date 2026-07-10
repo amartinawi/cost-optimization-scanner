@@ -206,7 +206,13 @@ will eventually both count it. This is the single most common real finding.
   permission is missing.* **Sweep:** for every `except`/empty-result path feeding a
   counted number, ask *"does this skip a ceiling?"* Compare the same account scanned
   with and without `ce:GetCostAndUsage`; the counted total must never rise when
-  evidence is removed. Same class as the EBS delete guard that failed open on
+  evidence is removed. **Corollary — a fail-closed ceiling is only safe when its
+  query is RIGHT.** A wrong billing query returns `$0`, which is indistinguishable
+  from "nothing billed" and demotes real savings. *Real: EBS snapshot storage bills
+  under CE service `"EC2 - Other"`, not `"Amazon Elastic Compute Cloud - Compute"`;
+  filtering the latter zeroed **$161.60/mo** of genuine AMI savings on bnc while CE
+  itself answered fine (no warning).* Scope such reads by **usage type**, not
+  service, and warn when a `$0` pool contradicts priced recommendations. Same class as the EBS delete guard that failed open on
   `InvalidVolume.NotFound` (C-series) and the EKS surcharge counted from a config
   field (**C7**).
 

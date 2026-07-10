@@ -54,6 +54,7 @@ class AmiModule(BaseServiceModule):
             billed,
             pool_label="EBS snapshot storage",
             grant_hint="grant ce:GetCostAndUsage to corroborate against billed EBS:SnapshotUsage",
+            on_contradiction=lambda msg: ctx.warn(msg, service="ami"),
         )
         old_recs, unused_recs = reconciled[:n_old], reconciled[n_old:]
 

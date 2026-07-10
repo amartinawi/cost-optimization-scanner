@@ -21,7 +21,7 @@ account. Removing evidence must never increase counted savings.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable
 
 
 def reconcile_against_billed(
@@ -31,6 +31,7 @@ def reconcile_against_billed(
     pool_label: str,
     savings_key: str = "EstimatedMonthlySavings",
     grant_hint: str = "grant ce:GetCostAndUsage to quantify",
+    on_contradiction: Callable[[str], None] | None = None,
 ) -> tuple[list[dict[str, Any]], float]:
     """Cap ``recs``' upper-bound savings at ``billed``; demote when unsubstantiated.
 
@@ -63,6 +64,17 @@ def reconcile_against_billed(
     if substantiated and upper > 0 and pool < upper:
         factor = pool / upper
 
+    # A $0 pool alongside real priced recs is contradictory: those resources exist
+    # and are sized, so AWS bills *something*. Far more likely the billing query is
+    # wrong (e.g. filtering the wrong CE service) than that storage is free. Surface
+    # it — a fail-closed ceiling is only safe when its query is right.
+    if billed is not None and pool <= 0 and upper > 0 and on_contradiction is not None:
+        on_contradiction(
+            f"Cost Explorer reports $0.00/mo billed {pool_label}, yet {sum(1 for r in recs if _sav(r) > 0)} "
+            f"priced recommendation(s) total ${upper:,.2f}/mo. Demoting them to advisory — verify the "
+            f"billing query (usage-type/service filter) before trusting this $0."
+        )
+
     out: list[dict[str, Any]] = []
     counted = 0.0
     for rec in recs:
@@ -75,7 +87,8 @@ def reconcile_against_billed(
             new["Counted"] = False
             new[savings_key] = 0.0
             new["PotentialMonthlySavings"] = round(value, 2)
-            new["EstimatedSavings"] = f"up to ${value:.2f}/month — advisory ({grant_hint})"
+            reason = grant_hint if billed is None else f"{pool_label} bills $0.00/mo"
+            new["EstimatedSavings"] = f"up to ${value:.2f}/month — advisory ({reason})"
             new["ReconciliationBasis"] = (
                 f"no Cost Explorer actual for {pool_label} — upper bound retained as advisory (not counted)"
                 if billed is None

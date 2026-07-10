@@ -30,9 +30,15 @@ def get_ebs_snapshot_actuals(ctx: ScanContext) -> float | None:
 
     AMI/EBS snapshot savings are computed from a snapshot's **full** size, but AWS
     bills only the *unique changed blocks* across a snapshot chain — so the figure
-    is an upper bound. Cost Explorer's ``EBS:SnapshotUsage`` usage type is the real
-    billed total and is a valid (tighter) ceiling for the whole region's snapshot
-    savings.
+    is an upper bound. Cost Explorer's ``EBS:Snapshot*`` usage types are the real
+    billed total and a valid (tighter) ceiling for the region's snapshot savings.
+
+    Matched on **usage type, not service**: EBS snapshot storage bills under the CE
+    service ``"EC2 - Other"``, not ``"Amazon Elastic Compute Cloud - Compute"``.
+    Filtering on the latter returned $0, which the caller read as "nothing billed"
+    and used to demote every AMI rec — a **false zero** of $161.60/mo on bnc. A
+    fail-closed ceiling is only safe when its query is right, so this scopes by
+    region and matches the usage type directly.
 
     Returns:
         Billed $/month for the last complete calendar month, or ``None`` when the
@@ -57,12 +63,7 @@ def get_ebs_snapshot_actuals(ctx: ScanContext) -> float | None:
             Granularity="MONTHLY",
             Metrics=["UnblendedCost"],
             GroupBy=[{"Type": "DIMENSION", "Key": "USAGE_TYPE"}],
-            Filter={
-                "And": [
-                    {"Dimensions": {"Key": "SERVICE", "Values": ["Amazon Elastic Compute Cloud - Compute"]}},
-                    {"Dimensions": {"Key": "REGION", "Values": [ctx.region]}},
-                ]
-            },
+            Filter={"Dimensions": {"Key": "REGION", "Values": [ctx.region]}},
         )
     except ClientError as exc:
         code = exc.response.get("Error", {}).get("Code", "")
@@ -83,7 +84,8 @@ def get_ebs_snapshot_actuals(ctx: ScanContext) -> float | None:
     for period in resp.get("ResultsByTime", []):
         for group in period.get("Groups", []):
             key = (group.get("Keys") or [""])[0]
-            if "SnapshotUsage" not in key:
+            # e.g. APS1-EBS:SnapshotUsage, APS1-EBS:SnapshotUsage.Archive
+            if "EBS:Snapshot" not in key:
                 continue
             billed += float(group.get("Metrics", {}).get("UnblendedCost", {}).get("Amount", 0) or 0.0)
     return billed

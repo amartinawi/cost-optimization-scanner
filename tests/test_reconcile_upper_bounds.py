@@ -83,3 +83,45 @@ def test_invariant_removing_evidence_never_raises_counted(billed) -> None:
     assert with_evidence <= 50.0 + 0.02   # never exceeds the upper bound either
     if billed is not None:
         assert with_evidence <= billed + 0.02   # nor the billed pool
+
+
+# --------------------------------------------------------------------------- #
+# bnc live regression (2026-07-10): a fail-closed ceiling is only safe if the
+# billing query is RIGHT. A wrong CE service filter returned $0 and looked
+# identical to "nothing billed", falsely zeroing $161.60/mo of real AMI savings.
+# --------------------------------------------------------------------------- #
+def test_zero_pool_with_priced_recs_raises_a_contradiction_warning() -> None:
+    warnings: list[str] = []
+    out, counted = reconcile_against_billed(
+        _recs(3, 10.0), 0.0, pool_label="EBS snapshot storage",
+        on_contradiction=warnings.append,
+    )
+    assert counted == 0.0                       # still fails closed
+    assert all(r["Counted"] is False for r in out)
+    assert len(warnings) == 1
+    msg = warnings[0]
+    assert "$0.00/mo billed EBS snapshot storage" in msg
+    assert "$30.00/mo" in msg                    # the contradicted total
+    assert "verify the billing query" in msg
+
+
+def test_no_contradiction_warning_when_pool_unreadable() -> None:
+    # None means "we could not read it" — not a contradiction, just unsubstantiated.
+    warnings: list[str] = []
+    reconcile_against_billed(_recs(3, 10.0), None, pool_label="x", on_contradiction=warnings.append)
+    assert warnings == []
+
+
+def test_no_contradiction_warning_when_nothing_priced() -> None:
+    warnings: list[str] = []
+    reconcile_against_billed([], 0.0, pool_label="x", on_contradiction=warnings.append)
+    assert warnings == []
+
+
+def test_advisory_message_blames_permissions_only_when_ce_unreadable() -> None:
+    unreadable, _ = reconcile_against_billed(_recs(1, 10.0), None, pool_label="P", grant_hint="grant ce:X")
+    assert "grant ce:X" in unreadable[0]["EstimatedSavings"]
+    # CE answered with $0 — do NOT tell the operator to grant a permission they have.
+    zero, _ = reconcile_against_billed(_recs(1, 10.0), 0.0, pool_label="P", grant_hint="grant ce:X")
+    assert "grant ce:X" not in zero[0]["EstimatedSavings"]
+    assert "P bills $0.00/mo" in zero[0]["EstimatedSavings"]

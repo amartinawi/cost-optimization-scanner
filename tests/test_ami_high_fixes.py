@@ -28,6 +28,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
+import json
+
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -529,3 +531,33 @@ def test_ami_savings_capped_at_billed_snapshot_pool():
     rec = list(findings.sources["old_amis"].recommendations)[0]
     assert rec["Reconciled"] is True
     assert rec["UpperBoundBeforeReconciliation"] == pytest.approx(100.0 * SNAPSHOT_RATE)
+
+
+def test_snapshot_actuals_match_usage_type_not_service():
+    """EBS snapshots bill under CE service 'EC2 - Other'.
+
+    Regression: filtering SERVICE == 'Amazon Elastic Compute Cloud - Compute'
+    matched nothing, returned $0, and falsely demoted $161.60/mo of real AMI
+    savings on bnc. Scope by region; match the usage type.
+    """
+    from services.advisor import get_ebs_snapshot_actuals
+
+    captured = {}
+
+    class _Ce:
+        def get_cost_and_usage(self, **kw):
+            captured.update(kw)
+            return {"ResultsByTime": [{"Groups": [
+                {"Keys": ["APS1-EBS:SnapshotUsage"], "Metrics": {"UnblendedCost": {"Amount": "173.06"}}},
+                {"Keys": ["APS1-EBS:SnapshotUsage.Archive"], "Metrics": {"UnblendedCost": {"Amount": "10.00"}}},
+                {"Keys": ["APS1-BoxUsage:t3.small"], "Metrics": {"UnblendedCost": {"Amount": "500.00"}}},
+            ]}]}
+
+    ctx = SimpleNamespace(region="ap-southeast-1", client=lambda n: _Ce() if n == "ce" else None,
+                          warn=lambda *a, **k: None, permission_issue=lambda *a, **k: None)
+    assert get_ebs_snapshot_actuals(ctx) == pytest.approx(183.06)   # both snapshot lines, not BoxUsage
+
+    # The filter must NOT constrain SERVICE (snapshots live under "EC2 - Other").
+    dumped = json.dumps(captured.get("Filter"))
+    assert "SERVICE" not in dumped
+    assert "REGION" in dumped
