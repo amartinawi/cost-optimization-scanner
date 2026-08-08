@@ -494,3 +494,27 @@ def test_connection_closed_counts_as_unreachable():
     assert _s3mod._is_endpoint_unreachable(exc) is True
     # An auth/existence failure is NOT an unreachable endpoint.
     assert _s3mod._is_endpoint_unreachable(_ClientError({"Error": {"Code": "403"}}, "HeadBucket")) is False
+
+
+def test_counted_bucket_rec_carries_numeric_mirror():
+    """M360 audit (B3): the counted lifecycle rec carried its dollar only in
+    SavingsDelta + the string; standard-numeric consumers saw $0 while
+    EstimatedMonthlyCost (the bucket COST) sat right beside it."""
+    from services.s3 import _finalize_bucket_savings
+
+    rec = {"Name": "b", "EstimatedMonthlyCost": 82.47}
+    _finalize_bucket_savings(rec, 37.03, "lifecycle_missing", True, 3366.0, False)
+    assert rec["Counted"] is True
+    assert rec["EstimatedSavings"] == "$37.03/month"
+    assert rec["EstimatedMonthlySavings"] == 37.03      # numeric mirror present
+    assert rec["EstimatedMonthlyCost"] == 82.47         # cost untouched, distinct
+
+
+def test_zero_savings_bucket_stays_advisory_without_numeric():
+    from services.s3 import _finalize_bucket_savings
+
+    rec = {"Name": "b"}
+    _finalize_bucket_savings(rec, 0.0, "lifecycle_missing", True, 10.0, False)
+    assert rec["Counted"] is False
+    assert "EstimatedMonthlySavings" not in rec
+    assert rec.get("Advisory") is True

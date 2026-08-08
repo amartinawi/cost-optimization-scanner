@@ -906,6 +906,46 @@ def _assess_bucket_coldness(
     return "cold" if total_get_requests == 0 else "warm"
 
 
+def _finalize_bucket_savings(
+    bucket_info: dict[str, Any],
+    savings: float,
+    opportunity_key: str,
+    has_gap: bool,
+    standard_gb: float,
+    fast_mode: bool,
+) -> None:
+    """Stamp the savings fields + Counted state onto a bucket rec (in place).
+
+    Counted branch keeps string AND numeric in lockstep (B2/B3 — M360 live
+    audit): a JSON consumer reading standard numeric fields must see the same
+    figure the string carries, and must never mistake ``EstimatedMonthlyCost``
+    (the bucket's COST) for it.
+    """
+    if savings > 0:
+        bucket_info["SavingsDelta"] = savings
+        bucket_info["EstimatedSavings"] = f"${savings:.2f}/month"
+        bucket_info["EstimatedMonthlySavings"] = round(savings, 2)
+        bucket_info["Counted"] = True
+        return
+    bucket_info["SavingsDelta"] = 0.0
+    # F1/F2 — a $0 bucket has no defensible counted saving. Mark it
+    # Counted=False (the standard flag every other adapter uses) so the
+    # reporter renders it as advisory and excludes it from the headline count.
+    bucket_info["Counted"] = False
+    if opportunity_key == "static_website":
+        bucket_info["EstimatedSavings"] = "$0.00/month - data transfer dependent (CloudFront CDN)"
+    elif has_gap and (standard_gb > 0 or fast_mode):
+        # Real transition gap, but no cold-access evidence (metrics off, or
+        # fast-mode sample) — advise, don't invent dollars.
+        bucket_info["Advisory"] = True
+        bucket_info["EstimatedSavings"] = (
+            "$0.00/month - enable S3 Storage Class Analysis or request "
+            "metrics to quantify (no access-pattern evidence)"
+        )
+    else:
+        bucket_info["EstimatedSavings"] = "$0.00/month"
+
+
 def get_s3_bucket_analysis(
     ctx: ScanContext,
     fast_mode: bool,
@@ -1199,33 +1239,9 @@ def get_s3_bucket_analysis(
                         f"{COLD_LOOKBACK_DAYS}d (request metrics)"
                     )
 
-            if savings > 0:
-                bucket_info["SavingsDelta"] = savings
-                bucket_info["EstimatedSavings"] = f"${savings:.2f}/month"
-                bucket_info["Counted"] = True
-            else:
-                bucket_info["SavingsDelta"] = 0.0
-                # F1/F2 — a $0 bucket has no defensible counted saving. Mark it
-                # Counted=False (the standard flag every other adapter uses) so the
-                # reporter renders it as advisory and excludes it from the headline
-                # count, instead of the bespoke "Advisory" flag the reporter's
-                # count logic did not recognise (336 $0 cards were being shown as
-                # "counted" on the S3 tab header).
-                bucket_info["Counted"] = False
-                if opportunity_key == "static_website":
-                    bucket_info["EstimatedSavings"] = (
-                        "$0.00/month - data transfer dependent (CloudFront CDN)"
-                    )
-                elif has_gap and (standard_gb > 0 or fast_mode):
-                    # Real transition gap, but no cold-access evidence (metrics
-                    # off, or fast-mode sample) — advise, don't invent dollars.
-                    bucket_info["Advisory"] = True
-                    bucket_info["EstimatedSavings"] = (
-                        "$0.00/month - enable S3 Storage Class Analysis or request "
-                        "metrics to quantify (no access-pattern evidence)"
-                    )
-                else:
-                    bucket_info["EstimatedSavings"] = "$0.00/month"
+            _finalize_bucket_savings(
+                bucket_info, savings, opportunity_key, has_gap, standard_gb, fast_mode
+            )
 
             bucket_metrics.append(bucket_info)
             analysis["optimization_opportunities"].append(bucket_info)
