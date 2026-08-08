@@ -122,6 +122,37 @@ class TestSummary:
         )
         assert ScanResultBuilder._counted_recommendations(f) == 5
 
+    def test_summary_carries_projected_commitment_fields(self) -> None:
+        """Verify summary includes projected_commitment_monthly_savings and projected_commitment_basis."""
+        findings: dict[str, ServiceFindings] = {
+            "commitment_analysis": ServiceFindings(
+                service_name="Commitment Analysis",
+                total_recommendations=0,
+                total_monthly_savings=0.0,
+                sources={},
+                extras={"projected_commitment_monthly_savings": 1234.56,
+                        "projected_commitment_basis": "Compute SP path"},
+            )
+        }
+        summary = ScanResultBuilder._summary(findings)
+        assert summary["projected_commitment_monthly_savings"] == 1234.56
+        assert summary["projected_commitment_basis"] == "Compute SP path"
+        assert "total_monthly_savings" in summary  # headline untouched
+
+    def test_summary_projected_defaults_when_absent(self) -> None:
+        """Verify summary defaults when commitment_analysis service is absent."""
+        findings: dict[str, ServiceFindings] = {
+            "ec2": ServiceFindings(
+                service_name="EC2",
+                total_recommendations=0,
+                total_monthly_savings=0.0,
+                sources={}
+            )
+        }
+        summary = ScanResultBuilder._summary(findings)
+        assert summary["projected_commitment_monthly_savings"] == 0.0
+        assert summary["projected_commitment_basis"] == ""
+
 
 class TestSerialize:
     """Tests for ScanResultBuilder._serialize field filtering."""

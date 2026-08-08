@@ -120,8 +120,15 @@ class ScanResultBuilder:
             for f in findings.values()
             if ScanResultBuilder._rendered_recommendations(f) > 0 or f.total_count > 0
         )
+        commitment = findings.get("commitment_analysis")
+        extras = dict(commitment.extras) if commitment is not None and commitment.extras else {}
         return {
             "total_services_scanned": scanned,
             "total_recommendations": sum(ScanResultBuilder._counted_recommendations(f) for f in findings.values()),
             "total_monthly_savings": sum(f.total_monthly_savings for f in findings.values()),
+            # Projections are reported BESIDE the counted headline, never inside
+            # it (commitment deep-dive spec, non-overlap rule).
+            "projected_commitment_monthly_savings": float(
+                extras.get("projected_commitment_monthly_savings", 0.0) or 0.0),
+            "projected_commitment_basis": str(extras.get("projected_commitment_basis", "") or ""),
         }
