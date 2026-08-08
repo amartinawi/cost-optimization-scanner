@@ -112,14 +112,6 @@ class CommitmentAnalysisModule(BaseServiceModule):
         StatCardSpec(label="SP Coverage", source_path="extras.sp_coverage_rate", formatter="percent"),
         StatCardSpec(label="RI Utilization", source_path="extras.ri_utilization_rate", formatter="percent"),
         StatCardSpec(label="RI Coverage", source_path="extras.ri_coverage_rate", formatter="percent"),
-        StatCardSpec(
-            label="Uncovered On-Demand", source_path="extras.uncovered_ondemand_monthly_total",
-            formatter="currency",
-        ),
-        StatCardSpec(
-            label="Projected Savings", source_path="extras.projected_commitment_monthly_savings",
-            formatter="currency",
-        ),
     )
 
     grouping = GroupingSpec(by="check_category")
