@@ -508,3 +508,11 @@ def test_aurora_grouped_registered_for_rec_sources():
 
     for src in ("instance_optimization", "io_tier_analysis", "serverless_v2"):
         assert PHASE_B_HANDLERS.get(("aurora", src)) is _render_aurora_grouped
+
+
+def test_coh_scenario_extractor_reads_detailed_configuration():
+    from reporter_phase_b import _coh_recommended_scenario
+
+    rec = {"recommendedResourceDetails": {"ec2ReservedInstances": {"configuration": {
+        "term": "ThreeYears", "paymentOption": "AllUpfront"}}}}
+    assert _coh_recommended_scenario(rec) == ("3yr", "All Upfront")

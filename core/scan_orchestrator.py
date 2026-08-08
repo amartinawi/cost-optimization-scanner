@@ -124,6 +124,10 @@ class ScanOrchestrator:
             # Reservation / Savings Plans recommendations all live under
             # the commitment_analysis tab from now on.
             "EC2ReservedInstances": "commitment_analysis",
+            # LIVE-VERIFIED 2026-08-09: real payloads spell these with a
+            # lowercase c2 — without the aliases the recs silently dropped.
+            "Ec2ReservedInstances": "commitment_analysis",
+            "Ec2InstanceSavingsPlans": "commitment_analysis",
             "RdsReservedInstances": "commitment_analysis",
             "ElastiCacheReservedInstances": "commitment_analysis",
             "OpenSearchReservedInstances": "commitment_analysis",
