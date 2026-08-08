@@ -328,6 +328,17 @@ These caused *false positives* in our own sweeps — check them before reporting
 - **F3 — Grouped rendering is not a render desync.** EC2/EBS CoH recs render as a
   few action-grouped cards with every resource listed inside `<li>` items; a low
   "rec-item card count" vs a high rec count is by design.
+- **F5 — Compute Optimizer recs nest their dollars in the rank-1 option.** A CO
+  rec (EC2 `recommendationOptions`, EBS `volumeRecommendationOptions`) carries
+  its saving at `options[0].savingsOpportunity.estimatedMonthlySavings.value` —
+  no flat savings field at all. A flat-field sweep false-flags every CO rec as
+  "counted-but-$0" AND a per-tab reconciliation shows a phantom delta equal to
+  the CO dollars (afs-prod: $66 = 3 x $22 EBS IOPS rightsizing, correctly summed
+  by the adapter and rendered by reporter_phase_b). Read the nested shape before
+  flagging. Same family as F1/F2. Also projection-style advisories exist outside
+  commitment_analysis: `eks_cost/node_group_optimization` Spot/Graviton what-ifs
+  are born-advisory with a non-zero `monthly_savings` (the counted dollar lives
+  in the EC2 tab) — exempt them like B1-ii before asserting a leak.
 - **F4 — AWS-supplied annotations are not our bug.** A CoH `estimatedSavingsPercentage`
   that disagrees ~1pp with `savings/cost` is AWS's rounding; we display the actual
   `$`. Synthetic Snapshots/AMIs tabs (D3) and the RDS-snapshots-stay-counted (cap

@@ -7,6 +7,92 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (commitment deep-dive — per-type RI/SP purchase matrix, projected savings fact)
+The Commitment Analysis tab's purchase recommendations expand from a single
+narrow matrix (RI: EC2 only; SP: `COMPUTE_SP` only — 12 CE calls) into a full
+per-instance-type purchase advisor covering every CE-supported commitment: RI
+across EC2, RDS, ElastiCache, Redshift, OpenSearch, and DynamoDB (2 terms x 3
+payments each = 36 cells), plus SP across `COMPUTE_SP` / `EC2_INSTANCE_SP` /
+`SAGEMAKER_SP` (18 cells) — 54 cells total, always on. Adapter CE cost rises
+from ~$0.12 to ~$0.54/scan for the matrix (~$0.62/scan total for the adapter).
+Two open questions from the design phase are now settled: DynamoDB **is**
+supported by `GetReservationPurchaseRecommendation`, but through a distinct
+`ReservedCapacityDetails.DynamoDBCapacityDetails` shape with no instance type
+or platform (capacity units instead); OpenSearch's CE `Service` string is the
+current `"Amazon OpenSearch Service"`, not the legacy Elasticsearch name.
+
+New pure-logic module `services/commitment_scenarios.py` (no boto3, no ctx —
+raw CE response dicts in, normalized cards out) parses each matrix cell and
+groups them into two card shapes:
+
+- **`ri_type`** — one card per `(service, instance_type, region, platform)`,
+  the 6-cell term x payment scenario table, `recommended_count`,
+  `current_ondemand_monthly`, `risk_pct` ("still saves if usage stays >= N%
+  of today"), and `break_even_months` (`upfront / net_saving`; `None` means
+  the scenario never breaks even at its savings rate — rendered as that
+  phrase, never `0.0`). Coverage context (`coverage_pct` /
+  `uncovered_monthly`) joins from the already-prefetched
+  `ctx.commitment_coverage`, but only for the scan region and only when
+  exactly one platform exists for that `(service, type, region)` — an
+  uncovered-on-demand key is platform-agnostic and cannot be fairly split
+  across ambiguous platforms, so the join fails closed (omitted, never a
+  fabricated figure) rather than guessing.
+- **`sp_commitment`** — one card per SP type (no instance type; SPs are
+  account-level), same scenario shape plus `hourly_commitment` and the
+  services each type spans (Compute SP: EC2 + Lambda + Fargate; SageMaker
+  SP: SageMaker only).
+
+Both card kinds are `Counted=False` projections whose `monthly_savings`
+carries the best cell's dollar (the existing B1-ii convention: a projection
+legitimately carries a non-zero numeric that is never summed into the
+counted headline). RI cells with zero/negative savings are dropped at the
+parser — never zero-filled, never candidates for "best". SP cells are kept
+whenever the cell's `hourly_commitment` is positive even if `monthly_savings`
+is `0` (a whole SP-type matrix can legitimately net $0 while AWS still
+recommends the commitment); those cells are greyed at render and excluded
+from the AWS-recommended marker and from best-path math, rather than dropped
+at the parser.
+
+`projected_savings()` computes one non-overlapping best-path figure across
+instruments, since a Savings Plan and an EC2 RI discount the *same* on-demand
+spend: the compute group is `max(best Compute/EC2-Instance SP, sum of EC2 RI
+cards)`, never their sum; RDS/ElastiCache/Redshift/OpenSearch/DynamoDB RIs are
+disjoint services and sum safely; SageMaker SP overlaps nothing and adds on
+top. `merge_coh_concurrence()` folds a matching Cost-Hub RI/SP purchase rec
+into the winning card as a "CoH concurs: $X/mo" line (matched via the CoH
+`currentResourceType`, e.g. `EC2ReservedInstances`, `OpenSearch`'s legacy
+`EsReservedInstances` alias) instead of rendering a duplicate CoH card; CoH
+has no DynamoDB reservation-purchase type, so DynamoDB cards never carry a
+concurrence line. Unmatched CoH recs still render through the existing
+`cost_optimization_hub` source.
+
+`services/adapters/commitment_analysis.py`'s `_fetch_purchase_cards` fans out
+all 54 cells (each an independent CE call — a denied/throttled cell degrades
+only that cell via the existing `_route_ce_error`, never the whole card), and
+`core/result_builder.py` adds two additive summary fields —
+`projected_commitment_monthly_savings` / `projected_commitment_basis` —
+reported *beside*, never inside, `total_monthly_savings` (`total_recommendations`
+and the regression-gated headline are untouched).
+
+Reporting (`reporter_phase_b.py`): a new `_render_commitment_purchase_cards`
+handler (registered for `("commitment_analysis", "purchase_recommendations")`)
+renders one section per instrument, savings-ordered, each with its type-cards
+inside; the term x payment table marks AWS's recommended cell and greys
+zero/negative cells (excluded from best-path math, never AWS-recommended even
+when `recommended_scenario` still points at one — every scenario in a card
+can legitimately net $0). The EC2 section carries a new SP-vs-RI comparison
+strip — best EC2 RI total vs the best Compute/EC2-Instance SP cell — stated as
+an aggregate-level trade-off only, since AWS's SP recommendation API returns
+no per-instance-type breakdown to compare against. `html_report_generator.py`
+adds a "Projected commitment" executive-summary fact (rendered only when the
+figure is `> 0`) and two new Commitment-Analysis stat cards ("Uncovered
+On-Demand", "Projected Savings") via `_SERVICE_STATS_CONFIG`.
+
+`tools/output_audit.py` gains sweep **S14**: recomputes the summary's
+projected figure from the actual `ri_type`/`sp_commitment` cards via the same
+`projected_savings()` the adapter calls, and fails if the two disagree by more
+than $0.50.
+
 ### Fixed (a billed pool is not the flagged subset's saving — AMI overstated $3,911.50/mo)
 `services/_reconcile.reconcile_against_billed` capped an upper bound at the **whole**
 billed pool, which silently asserts the flagged resources *are* the pool. *Real:

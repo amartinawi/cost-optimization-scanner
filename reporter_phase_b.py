@@ -2312,6 +2312,343 @@ def _render_fargate_savings_plan(recommendations: List[Rec], source_name: str, s
     return content
 
 
+# ── Commitment purchase-recommendation cards (services.commitment_scenarios) ─
+# Per-type term x payment scenario cards. Every card here is a projection —
+# it shows what buying the commitment WOULD save, never a counted dollar
+# (commitment deep-dive spec, non-overlap rule; cards carry Counted=False).
+
+_SP_LABELS: Dict[str, Tuple[str, str]] = {
+    "COMPUTE_SP": ("Compute Savings Plan", "EC2 + Lambda + Fargate"),
+    "EC2_INSTANCE_SP": ("EC2 Instance Savings Plan", "EC2 (family-locked)"),
+    "SAGEMAKER_SP": ("SageMaker Savings Plan", "SageMaker only"),
+}
+
+_INSTRUMENT_ORDER = [
+    "EC2", "RDS", "ElastiCache", "OpenSearch", "Redshift", "DynamoDB",
+    "COMPUTE_SP", "EC2_INSTANCE_SP", "SAGEMAKER_SP",
+]
+
+_COMMITMENT_TERMS: Tuple[str, ...] = ("1yr", "3yr")
+_COMMITMENT_PAYMENTS: Tuple[str, ...] = ("No Upfront", "Partial Upfront", "All Upfront")
+
+# SR-2-style advisory line (see _render_generic_other_rec): a projection is
+# never a counted dollar, so every card says so plainly rather than dumping a
+# raw savings figure that would read as authoritative.
+_COMMITMENT_ADVISORY_CHIP = (
+    '<p class="savings muted"><strong>Advisory:</strong> projection &mdash; requires '
+    "purchase to realize; not added to the tab total.</p>"
+)
+
+
+def _render_scenario_table(card: Rec) -> str:
+    """Term x payment table; the AWS-recommended cell gets the marker class."""
+    scenarios = card.get("scenarios") or []
+    if not scenarios:
+        return ""
+
+    is_ri = card.get("card_kind") == "ri_type"
+    ondemand = float(card.get("current_ondemand_monthly", 0) or 0) if is_ri else 0.0
+    recommended_idx = card.get("recommended_scenario")
+    by_key = {(s.get("term"), s.get("payment")): i for i, s in enumerate(scenarios)}
+
+    out = "<table class='rec-table ri-scenarios__table'><thead><tr><th>Term</th>"
+    for payment in _COMMITMENT_PAYMENTS:
+        out += f"<th>{payment}</th>"
+    out += "</tr></thead><tbody>"
+
+    for term in _COMMITMENT_TERMS:
+        out += f"<tr><td>{term}</td>"
+        for payment in _COMMITMENT_PAYMENTS:
+            idx = by_key.get((term, payment))
+            if idx is None:
+                out += "<td class='muted'>&mdash;</td>"
+                continue
+
+            scenario = scenarios[idx]
+            savings = float(scenario.get("monthly_savings", 0) or 0)
+            upfront = float(scenario.get("upfront", 0) or 0)
+            is_recommended = idx == recommended_idx
+            is_zero = savings <= 0
+            # A $0 cell is kept (data point, not a recommendation) but must
+            # never carry the recommended marker even when recommended_scenario
+            # points at it — Task 2's max() still yields an index when every
+            # scenario in a card nets $0 (F1).
+            show_recommended = is_recommended and not is_zero
+
+            cell_classes = []
+            if show_recommended:
+                cell_classes.append("scenario-cell--recommended")
+            if is_zero:
+                cell_classes.append("muted")
+            class_attr = f" class='{' '.join(cell_classes)}'" if cell_classes else ""
+
+            # RI cells derive the discount from THIS card's on-demand baseline
+            # at render time (never a stored discount field); SP cells show
+            # the hourly commitment and CE's own savings percentage instead.
+            details = [f"upfront ${upfront:,.2f}"]
+            if is_ri:
+                if ondemand > 0 and not is_zero:
+                    discount = 100.0 * savings / ondemand
+                    details.append(f"{discount:.1f}% off")
+            else:
+                hourly = scenario.get("hourly_commitment")
+                if hourly is not None:
+                    details.insert(0, f"${float(hourly):.4f}/hr")
+                pct = scenario.get("savings_pct")
+                if pct is not None:
+                    details.append(f"{float(pct):.1f}% off")
+
+            money = "$0.00/mo" if is_zero else f"${savings:,.2f}/mo"
+            label = (
+                ' <span class="scenario-cell__label">recommended</span>' if show_recommended else ""
+            )
+            out += (
+                f"<td{class_attr}>{money}{label}"
+                f"<br><span class='muted'>{'; '.join(details)}</span></td>"
+            )
+        out += "</tr>"
+    out += "</tbody></table>"
+    return out
+
+
+def _render_break_even_risk_line(card: Rec) -> str:
+    """'break-even {n} mo — still saves if usage stays >= {risk_pct}% of today'.
+
+    ``break_even_months is None`` means the scenario never breaks even at its
+    savings rate — that phrase is rendered verbatim, never 0.0 or blank.
+    """
+    scenarios = card.get("scenarios") or []
+    idx = card.get("recommended_scenario")
+    if not scenarios or idx is None or not (0 <= idx < len(scenarios)):
+        return ""
+
+    scenario = scenarios[idx]
+    be = scenario.get("break_even_months")
+    if be is None:
+        be_text = "never breaks even at this savings rate"
+    elif float(be) == 0.0:
+        be_text = "immediate"
+    else:
+        be_text = f"{float(be):,.1f} mo"
+    line = f"<p class='muted'>break-even {be_text}"
+    risk_pct = card.get("risk_pct")
+    if risk_pct is not None:
+        line += f" &mdash; still saves if usage stays &gt;= {float(risk_pct):.1f}% of today"
+    line += "</p>"
+    return line
+
+
+def _render_ri_type_card(card: Rec) -> str:
+    """One RI-type card: title, coverage (if known), scenario matrix, risk line.
+
+    ``instance_type``/``region``/``platform`` come off the CE API response, so
+    they are html.escaped before use. DynamoDB cards have no platform and an
+    instance_type that reads as a capacity-units string; empty segments are
+    skipped so the title never prints a trailing '— —' or an empty '()'.
+    """
+    instance_type = html.escape(str(card.get("instance_type") or ""))
+    region = html.escape(str(card.get("region") or ""))
+    platform = html.escape(str(card.get("platform") or ""))
+    count = card.get("recommended_count", 0)
+
+    title_parts = [f"{instance_type} x{count}"]
+    if region:
+        title_parts.append(region)
+    if platform:
+        title_parts.append(platform)
+    # Tenancy/offering-class only earn a title segment when they carry
+    # information beyond AWS's own defaults (Shared tenancy, Standard RIs) —
+    # appending them unconditionally would clutter every ordinary card.
+    tenancy = html.escape(str(card.get("tenancy") or ""))
+    if tenancy and tenancy != "Shared":
+        title_parts.append(tenancy)
+    offering_class = html.escape(str(card.get("offering_class") or ""))
+    if offering_class and offering_class != "STANDARD":
+        title_parts.append(offering_class)
+
+    out = "<div class='commitment-card'>"
+    out += f"<h5>{' &mdash; '.join(title_parts)}</h5>"
+    out += _COMMITMENT_ADVISORY_CHIP
+
+    ondemand = card.get("current_ondemand_monthly")
+    if ondemand is not None:
+        out += f"<p class='muted'>Current on-demand: ${float(ondemand):,.2f}/mo</p>"
+
+    # Coverage renders ONLY when the fields exist — a card may carry both or
+    # neither (fail-closed omission when coverage was unknown or
+    # platform-ambiguous); never fabricate a 0% for absent data.
+    if "coverage_pct" in card:
+        line = f"<p class='muted'>Existing RI coverage: {float(card['coverage_pct']):.1f}%"
+        if "uncovered_monthly" in card:
+            line += f" covered &mdash; ${float(card['uncovered_monthly']):,.2f}/mo still on-demand"
+        line += "</p>"
+        out += line
+    elif "uncovered_monthly" in card:
+        # coverage_pct can be fail-closed omitted (M4: uncovered exceeds
+        # on-demand, a differently-scoped measurement) while the dollar
+        # figure itself is still known — render it rather than dropping it.
+        out += (
+            f"<p class='muted'>${float(card['uncovered_monthly']):,.2f}/mo still on-demand "
+            "(coverage % unavailable)</p>"
+        )
+
+    out += _render_scenario_table(card)
+    out += _render_break_even_risk_line(card)
+    if "coh_concurs_monthly" in card:
+        out += f"<p class='muted'>CoH concurs: ${float(card['coh_concurs_monthly']):,.2f}/mo</p>"
+    out += "</div>"
+    return out
+
+
+def _render_sp_commitment_card(card: Rec) -> str:
+    """One Savings Plan card — hourly commitment, term x payment matrix.
+
+    EC2_INSTANCE_SP is the one SP type CE ties to a family dimension (see
+    ``services.commitment_scenarios.sp_cell_from_response``): its scope line
+    reads "family-scoped" rather than "account-level, no instance type", and
+    when the winning cell carried an ``instance_families`` list (propagated
+    onto the card by ``build_sp_cards``) it renders a "Families:" line.
+    """
+    sp_type = card.get("sp_type", "")
+    label, services = _SP_LABELS.get(sp_type, (sp_type, ""))
+
+    out = "<div class='commitment-card'>"
+    out += f"<h5>{html.escape(label)}</h5>"
+    if sp_type == "EC2_INSTANCE_SP":
+        out += (
+            "<p class='muted'>This is a family-scoped commitment "
+            "&mdash; it applies only to the instance family(ies) purchased.</p>"
+        )
+        families = card.get("instance_families") or []
+        if families:
+            out += f"<p class='muted'>Families: {html.escape(', '.join(str(f) for f in families))}</p>"
+    else:
+        out += (
+            "<p class='muted'>This is an account-level commitment "
+            "&mdash; Savings Plans carry no instance type.</p>"
+        )
+    if services:
+        out += f"<p class='muted'>Services spanned: {html.escape(services)}</p>"
+    out += _COMMITMENT_ADVISORY_CHIP
+    out += _render_scenario_table(card)
+    out += _render_break_even_risk_line(card)
+    if "coh_concurs_monthly" in card:
+        out += f"<p class='muted'>CoH concurs: ${float(card['coh_concurs_monthly']):,.2f}/mo</p>"
+    out += "</div>"
+    return out
+
+
+def _commitment_instrument(card: Rec) -> str:
+    """Grouping key: ``service`` for ri_type cards, ``sp_type`` for sp_commitment."""
+    if card.get("card_kind") == "sp_commitment":
+        return str(card.get("sp_type") or "")
+    return str(card.get("service") or "")
+
+
+# Savings Plan types that can cover EC2 instance usage. SAGEMAKER_SP covers
+# only SageMaker, so it is never a candidate for the EC2 SP-vs-RI comparison.
+_EC2_ELIGIBLE_SP_TYPES = ("COMPUTE_SP", "EC2_INSTANCE_SP")
+
+
+def _best_ec2_eligible_sp(groups: Dict[str, List[Rec]]) -> Rec | None:
+    """Highest-``monthly_savings`` sp_commitment card among COMPUTE_SP/EC2_INSTANCE_SP.
+
+    Aggregate-level only: AWS's purchase-recommendation API returns one
+    account-wide cell per SP type, never a per-instance-type breakdown, so
+    this compares the best whole-account SP cell against the EC2 RI path's
+    combined total — never a fabricated per-type SP figure.
+    """
+    candidates = [c for t in _EC2_ELIGIBLE_SP_TYPES for c in groups.get(t, [])]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda c: float(c.get("monthly_savings", 0) or 0))
+
+
+def _render_sp_vs_ri_strip(ec2_ri_total: float, best_sp: Rec | None) -> str:
+    """Aggregate-level comparison strip: best EC2 RI path vs best compute-SP cell.
+
+    Aggregate only — AWS emits no per-type SP detail and we do not invent it.
+    A ``$0`` ``best_sp`` (a real, ruled-in card shape) must not render a strip
+    claiming a "$0.00 leads" comparison, so a zero or missing SP figure
+    suppresses the strip the same as a zero/absent EC2 RI total. The
+    trade-off sentence depends on which SP type won: a Compute SP covers
+    Lambda/Fargate too and survives family changes; an EC2 Instance SP is
+    the opposite bet — deeper discount, but family/region-locked.
+    """
+    sp_dollars = float(best_sp.get("monthly_savings", 0) or 0) if best_sp else 0.0
+    if best_sp is None or sp_dollars <= 0 or ec2_ri_total <= 0:
+        return ""
+    winner = "Savings Plan" if sp_dollars >= ec2_ri_total else "Reserved Instances"
+    if best_sp.get("sp_type") == "EC2_INSTANCE_SP":
+        tradeoff = (
+            "Trade-off: an EC2 Instance Savings Plan is family- and "
+            "region-scoped &mdash; a deeper discount than a Compute SP, but "
+            "it does not cover Lambda/Fargate and strands the commitment on "
+            "family migration."
+        )
+    else:
+        tradeoff = (
+            "Trade-off: a Compute SP also covers Lambda and Fargate and survives "
+            "family changes; RIs can carry a capacity reservation."
+        )
+    return (
+        '<div class="sp-vs-ri">'
+        f"<strong>SP vs RI:</strong> best Savings Plan ${sp_dollars:,.2f}/mo vs "
+        f"EC2 RIs ${ec2_ri_total:,.2f}/mo &mdash; {winner} leads. "
+        f"{tradeoff}"
+        "</div>"
+    )
+
+
+def _render_commitment_purchase_cards(recs: List[Rec], source_name: str, descriptions: Dict) -> str:
+    """Sections per instrument (savings-ordered), type-cards inside.
+
+    Groups purchase-recommendation cards (``services.commitment_scenarios``)
+    by instrument — ``service`` for RI-type cards, ``sp_type`` for
+    account-level Savings Plan cards — and renders one section per
+    instrument, ordered by that instrument's combined best-path savings
+    (descending). Called by: HTMLReportGenerator._get_detailed_recommendations.
+    """
+    if not recs:
+        return ""
+
+    groups: Dict[str, List[Rec]] = {}
+    for card in recs:
+        if not isinstance(card, dict):
+            continue
+        groups.setdefault(_commitment_instrument(card), []).append(card)
+
+    def _group_total(cards: List[Rec]) -> float:
+        return sum(float(c.get("monthly_savings", 0) or 0) for c in cards)
+
+    def _sort_key(instrument: str) -> Tuple[float, int]:
+        order = (
+            _INSTRUMENT_ORDER.index(instrument)
+            if instrument in _INSTRUMENT_ORDER
+            else len(_INSTRUMENT_ORDER)
+        )
+        return (-_group_total(groups[instrument]), order)
+
+    best_sp = _best_ec2_eligible_sp(groups)
+
+    content = ""
+    for instrument in sorted(groups, key=_sort_key):
+        cards = groups[instrument]
+        is_sp = cards[0].get("card_kind") == "sp_commitment"
+        label = _SP_LABELS.get(instrument, (instrument, ""))[0] if is_sp else instrument
+        total = _group_total(cards)
+
+        content += f'<div class="rec-item{_priority_class(cards[0])}">'
+        content += f"<h4>{html.escape(label)} &mdash; ${total:,.2f}/mo best-path (projection)</h4>"
+        if instrument == "EC2" and not is_sp:
+            content += _render_sp_vs_ri_strip(total, best_sp)
+        for card in cards:
+            content += _render_sp_commitment_card(card) if is_sp else _render_ri_type_card(card)
+        content += "</div>"
+
+    return content
+
+
 def _render_cost_hub_source(recommendations: List[Rec], source_name: str, service_data: Dict) -> str:
     """Renders Cost Optimization Hub recommendations as a human-readable table.
 
@@ -2537,6 +2874,7 @@ PHASE_B_HANDLERS: Dict[Tuple[str, str], Callable] = {
     ("containers", "cost_optimization_hub"): _render_cost_hub_source,
     ("commitment_analysis", "cost_optimization_hub"): _render_cost_hub_source,
     ("commitment_analysis", "fargate_savings_plan"): _render_fargate_savings_plan,
+    ("commitment_analysis", "purchase_recommendations"): _render_commitment_purchase_cards,
     ("ec2", "enhanced_checks"): _render_ec2_enhanced_checks,
     ("ec2", "cost_optimization_hub"): _render_ec2_cost_hub,
     ("ec2", "compute_optimizer"): _render_ec2_compute_optimizer,

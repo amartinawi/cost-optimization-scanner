@@ -4,7 +4,7 @@ Analyzes AWS Cost Explorer data to surface under-utilized commitments,
 coverage gaps, expiring commitments, and purchase recommendations.
 
 AWS API cost: Cost Explorer charges $0.01 per API request. This adapter
-makes ~20 calls per scan (~$0.20/scan). The calls are:
+makes ~62 calls per scan (~$0.62/scan). The calls are:
 
 1. ``get_savings_plans_utilization`` — overall SP utilization rate (1 call)
 2. ``get_savings_plans_utilization_details`` — per-SP utilization and the
@@ -13,9 +13,9 @@ makes ~20 calls per scan (~$0.20/scan). The calls are:
 4. ``get_reservation_utilization`` — RI utilization rate (1 call)
 5. ``get_reservation_coverage`` — RI coverage rate (1 call)
 6. ``get_savings_plans_purchase_recommendation`` — SP purchase matrix
-   (6 calls: COMPUTE_SP across 2 terms x 3 payment options)
+   (18 calls: 3 SP types x 2 terms x 3 payment options)
 7. ``get_reservation_purchase_recommendation`` — RI purchase matrix
-   (6 calls: EC2 across 2 terms x 3 payment options)
+   (36 calls: 6 RI services x 2 terms x 3 payment options)
 8. ``get_savings_plans_purchase_recommendation`` — account coverage-ratio
    proxy for the Fargate SP view (1 call)
 9. ``get_cost_and_usage`` — SP-eligible Fargate on-demand legs (1 call)
@@ -31,6 +31,18 @@ from botocore.exceptions import ClientError  # type: ignore[import-untyped]
 from core.contracts import GroupingSpec, ServiceFindings, SourceBlock, StatCardSpec
 from services._base import BaseServiceModule
 from services.commitment_logic import DEFAULT_COVERAGE_RATIO, fargate_sp_analysis
+from services.commitment_scenarios import (
+    PAYMENTS,
+    RI_SERVICES,
+    SP_TYPES,
+    TERMS,
+    build_ri_type_cards,
+    build_sp_cards,
+    merge_coh_concurrence,
+    projected_savings,
+    ri_cells_from_response,
+    sp_cell_from_response,
+)
 
 # Compute Savings Plans cover Fargate (ECS + EKS); ECS-on-EC2 bills as EC2.
 # Ephemeral storage and data transfer are NOT SP-eligible.
@@ -82,8 +94,9 @@ class CommitmentAnalysisModule(BaseServiceModule):
     Uses Cost Explorer to detect under-utilized commitments, coverage gaps,
     expiring commitments, and purchase recommendations.
 
-    CE API cost: ~$0.20 per scan (~20 calls at $0.01 each including the
-    6-combination SP and RI purchase matrices).
+    CE API cost: ~$0.62 per scan (~62 calls at $0.01 each including the full
+    RI (6 services) and SP (3 types) purchase matrices, each across 2 terms
+    x 3 payment options).
     """
 
     key: str = "commitment_analysis"
@@ -136,41 +149,35 @@ class CommitmentAnalysisModule(BaseServiceModule):
         ri_util_recs, ri_util_rate = self._check_ri_utilization(ctx, ce, tp)
         ri_cov_recs, ri_cov_rate = self._check_ri_coverage(ctx, ce, tp)
         expiry_recs = self._check_expiring(ctx, ce, tp)
-        purchase_recs = self._check_purchase_recommendations(ctx, ce)
+        purchase_cards, projected, basis, cost_hub_recs = self._fetch_purchase_cards(ctx, ce)
         fargate_sp_recs, fargate_sp_extras = self._check_fargate_savings_plan(ctx, ce, tp)
 
-        # Cost Optimization Hub RI / Savings Plans purchase recommendations
-        # the orchestrator routed here after the standalone CoH tab retired.
-        cost_hub_recs = ctx.cost_hub_splits.get("commitment_analysis", [])
-
-        # Commitment "buy" recommendations — purchase scenarios (CE matrix + CoH
-        # RI/SP recs) and coverage gaps — are a SEPARATE lever from rightsizing.
-        # Their savings overlap the per-service rightsizing/Graviton recs on the
-        # SAME resources (e.g. an RDS RI on db.r5.8xlarge vs downsizing it), so
-        # summing them into one headline double-counts. Mark them advisory
-        # (Counted=False): shown prominently, excluded from the summed total.
-        # Genuine waste on EXISTING commitments (under-utilization, expiring)
-        # stays counted — that is money already being spent.
+        # Commitment "buy" recs (CE matrix + unmatched CoH RI/SP recs) and
+        # coverage gaps are a SEPARATE lever from rightsizing — they overlap
+        # per-service rightsizing/Graviton recs on the SAME resource (e.g. an
+        # RDS RI vs downsizing it), so summing both double-counts. Advisory
+        # (Counted=False): shown, never summed. Existing-commitment waste
+        # (under-utilization, expiring) stays counted. CoH recs merged into a
+        # card's coh_concurs_monthly by _fetch_purchase_cards are not
+        # re-emitted here.
         for r in sp_cov_recs + ri_cov_recs + cost_hub_recs:
             r["Counted"] = False
 
-        all_recs = sp_util_recs + sp_cov_recs + ri_util_recs + ri_cov_recs + expiry_recs + purchase_recs
-        total_savings = sum(
-            r.get("monthly_savings", 0.0) for r in all_recs if r.get("Counted", True)
-        )
+        all_recs = sp_util_recs + sp_cov_recs + ri_util_recs + ri_cov_recs + expiry_recs + purchase_cards
+        total_savings = sum(r.get("monthly_savings", 0.0) for r in all_recs if r.get("Counted", True))
 
         exp_30 = sum(1 for r in expiry_recs if r.get("severity") == "HIGH")
         exp_60 = sum(1 for r in expiry_recs if r.get("severity") == "MEDIUM")
         exp_90 = sum(1 for r in expiry_recs if r.get("severity") == "LOW")
+
+        coverage = getattr(ctx, "commitment_coverage", None)
 
         return ServiceFindings(
             service_name="Commitment Analysis",
             total_recommendations=len(all_recs) + len(cost_hub_recs),
             total_monthly_savings=round(total_savings, 2),
             sources={
-                "cost_optimization_hub": SourceBlock(
-                    count=len(cost_hub_recs), recommendations=tuple(cost_hub_recs)
-                ),
+                "cost_optimization_hub": SourceBlock(count=len(cost_hub_recs), recommendations=tuple(cost_hub_recs)),
                 "sp_utilization": SourceBlock(
                     count=len(sp_util_recs),
                     recommendations=tuple(sp_util_recs),
@@ -195,8 +202,8 @@ class CommitmentAnalysisModule(BaseServiceModule):
                     extras={"expiring_30d": exp_30, "expiring_60d": exp_60, "expiring_90d": exp_90},
                 ),
                 "purchase_recommendations": SourceBlock(
-                    count=len(purchase_recs),
-                    recommendations=tuple(purchase_recs),
+                    count=len(purchase_cards),
+                    recommendations=tuple(purchase_cards),
                 ),
                 "fargate_savings_plan": SourceBlock(
                     count=len(fargate_sp_recs),
@@ -209,6 +216,15 @@ class CommitmentAnalysisModule(BaseServiceModule):
                 "sp_coverage_rate": sp_cov_rate,
                 "ri_utilization_rate": ri_util_rate,
                 "ri_coverage_rate": ri_cov_rate,
+                "projected_commitment_monthly_savings": projected,
+                "projected_commitment_basis": basis,
+                # None (JSON null) — not 0.0 — when there is no coverage data
+                # to sum: a measured $0 must mean "zero uncovered on-demand",
+                # never "coverage was unavailable".
+                "uncovered_ondemand_monthly_total": (
+                    round(sum(coverage.uncovered_on_demand.values()), 2)
+                    if coverage is not None and coverage.uncovered_on_demand else None
+                ),
             },
         )
 
@@ -483,150 +499,32 @@ class CommitmentAnalysisModule(BaseServiceModule):
 
         return recs
 
-    def _check_purchase_recommendations(self, ctx: Any, ce: Any) -> list[dict[str, Any]]:
-        """Fetch Savings Plans and RI purchase recommendations from Cost Explorer.
+    def _fetch_purchase_cards(
+        self, ctx: Any, ce: Any
+    ) -> tuple[list[dict[str, Any]], float, str, list[dict[str, Any]]]:
+        """Fan out the full CE purchase matrix and build per-type scenario cards.
+
+        Every cell is one independent CE call; a denied/throttled cell degrades
+        only that cell (via ``_route_ce_error``). RI cells fan out across
+        ``RI_SERVICES`` (6) x ``TERMS`` (2) x ``PAYMENTS`` (3); SP cells across
+        ``SP_TYPES`` (3) x the same term/payment matrix.
+
+        A CoH RI/SP rec routed here (``ctx.cost_hub_splits["commitment_analysis"]``)
+        that concurs with a built card merges into that card's
+        ``coh_concurs_monthly`` figure (``merge_coh_concurrence``) instead of
+        rendering twice; the unmatched remainder returns for the caller's
+        standalone CoH source.
 
         Args:
             ce: Cost Explorer boto3 client.
 
         Returns:
-            List of purchase recommendation dicts.
+            Tuple of ``(cards, projected_monthly, basis, unmatched_coh_recs)``.
         """
-        recs: list[dict[str, Any]] = []
-
-        recs.extend(self._fetch_sp_recommendations(ctx, ce))
-        recs.extend(self._fetch_ri_recommendations(ctx, ce))
-
-        return recs
-
-    # Reservation / Savings Plans purchase recommendations fan out across
-    # the full (term, payment) matrix so the operator can compare scenarios
-    # rather than relying on a single AWS-default combination. Each call is
-    # independent: if any combination is denied (SCP) or throttles, the
-    # others continue. The Cost Explorer API is rate-limited; the matrix
-    # is small (12 calls per scan) and cached server-side.
-    _SP_TERMS: tuple[tuple[str, str], ...] = (("ONE_YEAR", "1yr"), ("THREE_YEARS", "3yr"))
-    _SP_PAYMENTS: tuple[tuple[str, str], ...] = (
-        ("NO_UPFRONT", "No Upfront"),
-        ("PARTIAL_UPFRONT", "Partial Upfront"),
-        ("ALL_UPFRONT", "All Upfront"),
-    )
-    # Coverage gap (intentional): only Compute Savings Plans (COMPUTE_SP) and
-    # EC2 Reserved Instances are queried below. EC2-Instance / SageMaker SP
-    # types and ElastiCache / RDS / Redshift / OpenSearch RI purchase scenarios
-    # are not modelled here — those surface via the Cost Optimization Hub
-    # buckets routed into this adapter instead.
-    _SP_TYPES: tuple[str, ...] = ("COMPUTE_SP",)
-    # (Cost Explorer API service value, display label). The RI purchase API
-    # rejects "Amazon EC2" — it requires the full "Amazon Elastic Compute Cloud
-    # - Compute" value (see the supported-values error), so all EC2 RI scenarios
-    # silently failed before.
-    _RI_SERVICES: tuple[tuple[str, str], ...] = (
-        ("Amazon Elastic Compute Cloud - Compute", "EC2"),
-    )
-
-    def _fetch_sp_recommendations(self, ctx: Any, ce: Any) -> list[dict[str, Any]]:
-        """Fetch Compute Savings Plans purchase recommendations across the
-        full (term, payment) matrix.
-
-        Six calls per SavingsPlansType: 2 terms times 3 payment options.
-        Each rec carries explicit term and payment metadata so the renderer
-        can surface them on the rec-item title.
-
-        Args:
-            ce: Cost Explorer boto3 client.
-
-        Returns:
-            List of SP purchase recommendation dicts, one per matching
-            (sp_type, term, payment) cell that returned a non-empty result.
-        """
-        recs: list[dict[str, Any]] = []
-
-        for sp_type in self._SP_TYPES:
-            for term_api, term_label in self._SP_TERMS:
-                for payment_api, payment_label in self._SP_PAYMENTS:
-                    scenario = f"({term_label}, {payment_label})"
-                    try:
-                        resp = ce.get_savings_plans_purchase_recommendation(
-                            SavingsPlansType=sp_type,
-                            TermInYears=term_api,
-                            PaymentOption=payment_api,
-                            LookbackPeriodInDays="THIRTY_DAYS",
-                        )
-                    except Exception as e:
-                        _route_ce_error(
-                            ctx,
-                            f"ce:GetSavingsPlansPurchaseRecommendation[{sp_type}/{scenario}]",
-                            e,
-                        )
-                        continue
-
-                    # AWS returns a single recommendation OBJECT (a dict), not a
-                    # list — its Summary holds the aggregate commitment/savings
-                    # for this (term, payment) scenario. (Iterating it as a list
-                    # yields key strings and crashes on .get; field names are the
-                    # …Amount / …ToPurchase variants.)
-                    spr = resp.get("SavingsPlansPurchaseRecommendation", {})
-                    if not isinstance(spr, dict):
-                        continue
-                    summary = spr.get("SavingsPlansPurchaseRecommendationSummary", {})
-                    details = spr.get("SavingsPlansPurchaseRecommendationDetails", [])
-                    monthly_savings = float(summary.get("EstimatedMonthlySavingsAmount", 0) or 0)
-                    hourly_commit = float(summary.get("HourlyCommitmentToPurchase", 0) or 0)
-                    savings_pct = float(summary.get("EstimatedSavingsPercentage", 0) or 0)
-                    upfront = 0.0
-                    if details and isinstance(details[0], dict):
-                        upfront = float(details[0].get("UpfrontCost", 0) or 0)
-
-                    if monthly_savings <= 0 and hourly_commit <= 0:
-                        continue
-
-                    recs.append(
-                        {
-                            "resource_id": f"{sp_type}_{term_label}_{payment_label.lower().replace(' ', '_')}",
-                            "check_type": "purchase",
-                            "check_category": f"SP Purchase Recommendation {scenario}",
-                            "term": term_label,
-                            "payment_option": payment_label,
-                            "sp_type": sp_type,
-                            "current_value": f"${hourly_commit:.4f}/hr commitment",
-                            "recommended_value": (
-                                f"${hourly_commit:.4f}/hr Compute SP ({term_label}, {payment_label})"
-                            ),
-                            "monthly_savings": round(monthly_savings, 2),
-                            "severity": "LOW",
-                            "Counted": False,  # mutually-exclusive alternative
-                            "reason": (
-                                f"{term_label} {payment_label}: ${monthly_savings:.2f}/mo "
-                                f"({savings_pct:.1f}% off) at ${hourly_commit:.4f}/hr commitment, "
-                                f"upfront ${upfront:,.2f}"
-                            ),
-                            "upfront_cost": upfront,
-                        }
-                    )
-
-        return recs
-
-    def _fetch_ri_recommendations(self, ctx: Any, ce: Any) -> list[dict[str, Any]]:
-        """Fetch Reserved Instance purchase recommendations across the
-        full (term, payment) matrix per service.
-
-        Six calls per service: 2 terms times 3 payment options. Each rec
-        carries explicit term and payment metadata so the renderer can
-        surface them on the rec-item title.
-
-        Args:
-            ce: Cost Explorer boto3 client.
-
-        Returns:
-            List of RI purchase recommendation dicts.
-        """
-        recs: list[dict[str, Any]] = []
-
-        for service_api, service_label in self._RI_SERVICES:
-            for term_api, term_label in self._SP_TERMS:
-                for payment_api, payment_label in self._SP_PAYMENTS:
-                    scenario = f"({term_label}, {payment_label})"
+        ri_cells: list[dict[str, Any]] = []
+        for service_api, service_label in RI_SERVICES:
+            for term_api, term_label in TERMS:
+                for payment_api, payment_label in PAYMENTS:
                     try:
                         resp = ce.get_reservation_purchase_recommendation(
                             Service=service_api,
@@ -637,59 +535,46 @@ class CommitmentAnalysisModule(BaseServiceModule):
                     except Exception as e:
                         _route_ce_error(
                             ctx,
-                            f"ce:GetReservationPurchaseRecommendation[{service_label}/{scenario}]",
+                            f"ce:GetReservationPurchaseRecommendation[{service_label}/({term_label}, {payment_label})]",
                             e,
                         )
                         continue
+                    ri_cells.extend(ri_cells_from_response(service_label, term_label, payment_label, resp))
 
-                    for rec in resp.get("Recommendations", []):
-                        details = rec.get("RecommendationDetails", [])
-                        if not details:
-                            continue
-
-                        monthly_savings = sum(
-                            float(d.get("EstimatedMonthlySavings", "0")) for d in details
+        sp_cells: list[dict[str, Any]] = []
+        for sp_type in SP_TYPES:
+            for term_api, term_label in TERMS:
+                for payment_api, payment_label in PAYMENTS:
+                    try:
+                        resp = ce.get_savings_plans_purchase_recommendation(
+                            SavingsPlansType=sp_type,
+                            TermInYears=term_api,
+                            PaymentOption=payment_api,
+                            LookbackPeriodInDays="THIRTY_DAYS",
                         )
-                        upfront_cost = sum(
-                            float(d.get("UpfrontCost", "0")) for d in details
+                    except Exception as e:
+                        _route_ce_error(
+                            ctx,
+                            f"ce:GetSavingsPlansPurchaseRecommendation[{sp_type}/({term_label}, {payment_label})]",
+                            e,
                         )
-                        instance_type = details[0].get("InstanceType", "Unknown")
+                        continue
+                    cell = sp_cell_from_response(sp_type, term_label, payment_label, resp)
+                    if cell:
+                        sp_cells.append(cell)
 
-                        if monthly_savings <= 0:
-                            continue
+        coverage = getattr(ctx, "commitment_coverage", None)
+        uncovered = dict(coverage.uncovered_on_demand) if coverage is not None else {}
+        ri_cards = build_ri_type_cards(ri_cells, uncovered, getattr(ctx, "region", ""))
+        sp_cards = build_sp_cards(sp_cells)
+        projected, basis = projected_savings(ri_cards, sp_cards)
 
-                        recs.append(
-                            {
-                                "resource_id": (
-                                    f"{service_label}_RI_{instance_type}_"
-                                    f"{term_label}_{payment_label.lower().replace(' ', '_')}"
-                                ),
-                                "check_type": "purchase",
-                                "check_category": (
-                                    f"RI Purchase Recommendation {scenario}"
-                                ),
-                                "term": term_label,
-                                "payment_option": payment_label,
-                                "service": service_label,
-                                "current_value": "On-Demand",
-                                "recommended_value": (
-                                    f"Reserved Instance {instance_type} "
-                                    f"({term_label}, {payment_label})"
-                                ),
-                                "monthly_savings": round(monthly_savings, 2),
-                                "severity": "LOW",
-                                "Counted": False,  # mutually-exclusive alternative
-                                "reason": (
-                                    f"{service_label} RI {instance_type} "
-                                    f"{term_label} {payment_label}: "
-                                    f"${monthly_savings:.2f}/mo savings, "
-                                    f"upfront ${upfront_cost:,.2f}"
-                                ),
-                                "upfront_cost": upfront_cost,
-                            }
-                        )
-
-        return recs
+        coh_recs = [r for r in (getattr(ctx, "cost_hub_splits", {}) or {}).get("commitment_analysis", [])
+                    if isinstance(r, dict)]
+        cards, matched_indices = merge_coh_concurrence(ri_cards + sp_cards, coh_recs)
+        matched = set(matched_indices)
+        unmatched_coh = [r for i, r in enumerate(coh_recs) if i not in matched]
+        return cards, projected, basis, unmatched_coh
 
     # ── Fargate Savings Plan view ──────────────────────────────────────────────
 
@@ -891,15 +776,14 @@ class CommitmentAnalysisModule(BaseServiceModule):
             total_recommendations=0,
             total_monthly_savings=0.0,
             sources={
+                "cost_optimization_hub": SourceBlock(count=0, recommendations=()),
                 "sp_utilization": SourceBlock(count=0, recommendations=(), extras={"overall_utilization_rate": 0.0}),
                 "sp_coverage_gaps": SourceBlock(count=0, recommendations=(), extras={"overall_coverage_rate": 0.0}),
                 "ri_utilization": SourceBlock(count=0, recommendations=()),
                 "ri_coverage_gaps": SourceBlock(count=0, recommendations=()),
                 "expiring_commitments": SourceBlock(
-                    count=0,
-                    recommendations=(),
-                    extras={"expiring_30d": 0, "expiring_60d": 0, "expiring_90d": 0},
-                ),
+                    count=0, recommendations=(),
+                    extras={"expiring_30d": 0, "expiring_60d": 0, "expiring_90d": 0}),
                 "purchase_recommendations": SourceBlock(count=0, recommendations=()),
                 "fargate_savings_plan": SourceBlock(count=0, recommendations=(), extras={}),
             },
@@ -908,5 +792,8 @@ class CommitmentAnalysisModule(BaseServiceModule):
                 "sp_coverage_rate": 0.0,
                 "ri_utilization_rate": 0.0,
                 "ri_coverage_rate": 0.0,
+                "projected_commitment_monthly_savings": 0.0,
+                "projected_commitment_basis": "",
+                "uncovered_ondemand_monthly_total": None,
             },
         )

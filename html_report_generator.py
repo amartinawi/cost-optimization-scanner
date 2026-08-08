@@ -174,6 +174,8 @@ _SERVICE_STATS_CONFIG: Dict[str, Dict[str, Any]] = {
             ("SP Coverage", "extras", "sp_coverage_rate"),
             ("RI Utilization", "extras", "ri_utilization_rate"),
             ("RI Coverage", "extras", "ri_coverage_rate"),
+            ("Uncovered On-Demand ($/mo)", "extras", "uncovered_ondemand_monthly_total"),
+            ("Projected Savings ($/mo)", "extras", "projected_commitment_monthly_savings"),
         ],
     },
     "cost_optimization_hub": {
@@ -1275,12 +1277,12 @@ class HTMLReportGenerator:
             font-size: 0.85rem;
         }
         .rec-table th {
-            background: var(--bg-secondary);
+            background: var(--surface);
             color: var(--text-secondary);
             font-weight: 600;
             text-align: left;
             padding: 8px 10px;
-            border-bottom: 2px solid var(--border);
+            border-bottom: 2px solid var(--divider);
             white-space: nowrap;
             font-size: 0.75rem;
             text-transform: uppercase;
@@ -1288,7 +1290,7 @@ class HTMLReportGenerator:
         }
         .rec-table td {
             padding: 7px 10px;
-            border-bottom: 1px solid var(--border);
+            border-bottom: 1px solid var(--divider);
             color: var(--text-primary);
             vertical-align: top;
             font-variant-numeric: tabular-nums;
@@ -1311,9 +1313,9 @@ class HTMLReportGenerator:
         .ri-scenarios {
             margin: 10px 0 16px 0;
             padding: 10px 12px 4px 12px;
-            border: 1px solid var(--border);
+            border: 1px solid var(--divider);
             border-radius: 6px;
-            background: var(--bg-secondary);
+            background: var(--surface);
         }
         .ri-scenarios__header {
             margin: 0 0 6px 0;
@@ -1335,6 +1337,62 @@ class HTMLReportGenerator:
         }
         [data-theme="dark"] .ri-scenarios__row--best td {
             background: rgba(102, 187, 106, 0.16);
+        }
+
+        /* Commitment purchase-recommendation cards — one section per
+         * instrument (RI service or SP type), one card per type inside,
+         * each with its own term x payment matrix. Mirrors .ri-scenarios'
+         * dark-mode pattern for the recommended-cell highlight. */
+        .commitment-card {
+            margin: 8px 0 14px 0;
+            padding: 10px 12px;
+            border: 1px solid var(--divider);
+            border-radius: 6px;
+            background: var(--surface);
+        }
+        .commitment-card h5 {
+            margin: 0 0 6px 0;
+            font-size: 0.95rem;
+            color: var(--text-primary);
+        }
+        .scenario-cell--recommended {
+            background: rgba(46, 125, 50, 0.10);
+            font-weight: 600;
+        }
+        [data-theme="dark"] .scenario-cell--recommended {
+            background: rgba(102, 187, 106, 0.16);
+        }
+        .scenario-cell__label {
+            display: inline-block;
+            margin-left: 4px;
+            font-size: 0.65rem;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            color: var(--text-secondary);
+        }
+
+        /* Shared muted-text utility (used across the report, not just
+         * commitment cards), the EC2 SP-vs-RI comparison strip, and the
+         * smaller/dimmer inline note inside a summary fact. All three use
+         * CSS custom properties that are already theme-aware via :root /
+         * [data-theme="dark"] above, so no separate dark-mode override is
+         * needed here (unlike the literal rgba() highlights nearby). */
+        .muted {
+            color: var(--text-secondary);
+        }
+        .sp-vs-ri {
+            margin: 8px 0 14px 0;
+            padding: 10px 12px;
+            border: 1px solid var(--divider);
+            border-radius: 6px;
+            background: var(--surface);
+            font-size: 0.85rem;
+            color: var(--text-primary);
+        }
+        .fact-note {
+            font-size: 0.78rem;
+            font-weight: 400;
+            color: var(--text-secondary);
         }
 
         /* Material Chips/Badges */
@@ -2267,6 +2325,21 @@ class HTMLReportGenerator:
         else:
             risks_value = '<span class="summary-fact__qual">none open</span>'
 
+        # Fourth fact, shown only when a commitment projection exists: a
+        # Savings-Plan/RI purchase would save more but requires a purchase to
+        # realize, so it is never folded into the counted headline above.
+        projected = summary.get("projected_commitment_monthly_savings", 0) or 0
+        projected_fact = ""
+        if projected > 0:
+            basis = html.escape(str(summary.get("projected_commitment_basis", "")))
+            projected_fact = (
+                '<div class="summary-fact">'
+                "<dt>Projected commitment</dt>"
+                f'<dd>up to ${projected:,.2f}/mo <span class="fact-note">'
+                f"({basis}; requires purchase &mdash; not in the counted total)</span></dd>"
+                "</div>"
+            )
+
         out = (
             '<section class="summary" aria-labelledby="summary-heading">'
             '<h2 id="summary-heading" class="visually-hidden">Executive Summary</h2>'
@@ -2288,6 +2361,7 @@ class HTMLReportGenerator:
             "<dt>Open risks</dt>"
             f"<dd>{risks_value}</dd>"
             "</div>"
+            f"{projected_fact}"
             "</dl>"
         )
 
@@ -3238,7 +3312,12 @@ class HTMLReportGenerator:
         elif "multi_source_cards" in config:
             for label, sub_key, field in config["multi_source_cards"]:
                 sub_dict = service_data.get(sub_key, {})
-                stats_html += f'<div class="stat-card"><div class="stat-label">{label}</div><div class="value">{sub_dict.get(field, 0)}</div></div>'
+                value = sub_dict.get(field, 0)
+                # A measured 0 means "zero" — a JSON null means the figure
+                # was never computed (e.g. no commitment-coverage data) and
+                # must read as "n/a", never a fabricated $0.
+                display_value = "n/a" if value is None else value
+                stats_html += f'<div class="stat-card"><div class="stat-label">{label}</div><div class="value">{display_value}</div></div>'
         else:
             counts = service_data.get(config.get("count_key", ""), {})
             for label, field in config["cards"]:
