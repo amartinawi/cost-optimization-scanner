@@ -744,6 +744,10 @@ def get_enhanced_rds_checks(
                                     # the same figure the headline counts via
                                     # parse_dollar_savings (counted == rendered).
                                     "EstimatedMonthlySavings": snap_sv,
+                                    # A size-unreported snapshot is an ADVISORY —
+                                    # rendered, never counted (D4: advisories must
+                                    # not inflate the recommendation count).
+                                    **({"Counted": False} if snap_sv <= 0 else {}),
                                     "CheckCategory": "Old RDS Snapshots",
                                     "instanceFinding": (f"{age_days} days old ({snap_allocated_storage}GB)"),
                                     "AuditBasis": {
@@ -811,6 +815,9 @@ def get_enhanced_rds_checks(
                                         # Numeric counterpart to the string (counted
                                         # == rendered at the field level).
                                         "EstimatedMonthlySavings": snap_sv,
+                                        # Size-unreported -> advisory, never counted
+                                        # (D4; see the manual-snapshot site above).
+                                        **({"Counted": False} if snap_sv <= 0 else {}),
                                         "CheckCategory": ("Old Aurora Cluster Snapshots"),
                                         "instanceFinding": (
                                             f"{age_days} days old Aurora"

@@ -258,6 +258,9 @@ class EbsModule(BaseServiceModule):
             size = rec.get("Size", 0)
             per_vol = gp2_to_gp3_net_savings(size, delta_per_gb, gp3_iops_rate)
             rec["EstimatedSavings"] = f"${per_vol:.2f}/month"
+            # Numeric mirror of the string (B2/B3 lockstep); the tab total sums
+            # the raw per_vol below, so this never re-sums.
+            rec["EstimatedMonthlySavings"] = round(per_vol, 2)
             rec["AuditBasis"] = {
                 "metric": "gp2→gp3 storage delta net of gp3 IOPS parity",
                 "rate_per_gb_month": round(delta_per_gb, 6),

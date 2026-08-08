@@ -628,6 +628,10 @@ def get_enhanced_ec2_checks(
                                                         " downsizing"
                                                     ),
                                                     "EstimatedSavings": f"${idle_savings:.2f}/month if terminated",
+                                                    # Numeric mirror of the string (B2/B3
+                                                    # lockstep); the tab total parses the
+                                                    # string, so this never re-sums.
+                                                    "EstimatedMonthlySavings": round(idle_savings, 2),
                                                     "PricingBasis": idle_basis,
                                                     "CheckCategory": "Idle Instances",
                                                 }
@@ -655,6 +659,8 @@ def get_enhanced_ec2_checks(
                                                         f" - consider downsizing to {rs_target}"
                                                     ),
                                                     "EstimatedSavings": f"${rs_savings:.2f}/month if rightsized",
+                                                    # Numeric mirror of the string (B2/B3).
+                                                    "EstimatedMonthlySavings": round(rs_savings, 2),
                                                     "PricingBasis": rs_basis,
                                                     "CheckCategory": ("Rightsizing Opportunities"),
                                                 }
@@ -929,6 +935,9 @@ def get_auto_scaling_checks(ctx: ScanContext) -> dict[str, Any]:
                                     "InstanceType": instance_type,
                                     "Recommendation": ("Large instance type in ASG - verify rightsizing"),
                                     "EstimatedSavings": (f"${asg_node_savings:.2f}/month per node if rightsized"),
+                                    # Numeric mirror of the string's PER-NODE figure
+                                    # (B2/B3) — matches what the tab total parses.
+                                    "EstimatedMonthlySavings": round(asg_node_savings, 2),
                                     "PricingBasis": asg_node_basis,
                                     "CheckCategory": "Oversized ASG Instances",
                                 }
