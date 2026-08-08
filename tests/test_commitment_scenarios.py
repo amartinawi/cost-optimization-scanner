@@ -192,7 +192,7 @@ def test_risk_pct_from_best_cell():
 
 def test_coverage_join_and_missing_key():
     cells = [_cell()]
-    cards = build_ri_type_cards(cells, {"rds:db.r7i.4xlarge": 3199.65}, "eu-west-1")
+    cards = build_ri_type_cards(cells, {"rds:r7i.4xlarge": 3199.65}, "eu-west-1")
     assert cards[0]["uncovered_monthly"] == pytest.approx(3199.65)
     # coverage_pct = 1 - uncovered/ondemand, floored at 0
     assert cards[0]["coverage_pct"] == pytest.approx(22.0, abs=0.1)
@@ -222,3 +222,90 @@ def test_sp_cards_one_per_type():
     assert cards[0]["card_kind"] == "sp_commitment"
     assert cards[0]["monthly_savings"] == pytest.approx(800.0)
     assert cards[0]["Counted"] is False
+
+
+# --- Fix Round 1: F1-F6 (2026-08-08) ----------------------------------------
+
+
+def test_sp_cards_risk_pct_from_best_cell():
+    """F1: SP cards must compute risk_pct = 100 * (1 - savings/ondemand)."""
+    cells = [
+        {"sp_type": "COMPUTE_SP", "term": "1yr", "payment": "No Upfront",
+         "hourly_commitment": 1.2, "monthly_savings": 500.0, "savings_pct": 20.0,
+         "upfront": 0.0, "estimated_ondemand_monthly": 2500.0},
+        {"sp_type": "COMPUTE_SP", "term": "3yr", "payment": "All Upfront",
+         "hourly_commitment": 1.1, "monthly_savings": 800.0, "savings_pct": 32.0,
+         "upfront": 9000.0, "estimated_ondemand_monthly": 2500.0},
+    ]
+    cards = build_sp_cards(cells)
+    # Best is 800 savings / 2500 ondemand -> risk = 100 * (1 - 800/2500) = 68%
+    assert cards[0]["risk_pct"] == pytest.approx(68.0)
+
+
+def test_sp_cards_two_types_sorted_by_savings():
+    """F4: Multiple SP types should produce separate cards, sorted by monthly_savings desc."""
+    cells = [
+        {"sp_type": "COMPUTE_SP", "term": "1yr", "payment": "No Upfront",
+         "hourly_commitment": 1.0, "monthly_savings": 500.0, "savings_pct": 20.0,
+         "upfront": 0.0, "estimated_ondemand_monthly": 2500.0},
+        {"sp_type": "EC2_INSTANCE_SP", "term": "1yr", "payment": "No Upfront",
+         "hourly_commitment": 0.5, "monthly_savings": 1200.0, "savings_pct": 25.0,
+         "upfront": 0.0, "estimated_ondemand_monthly": 4800.0},
+    ]
+    cards = build_sp_cards(cells)
+    assert len(cards) == 2
+    assert cards[0]["sp_type"] == "EC2_INSTANCE_SP"
+    assert cards[0]["monthly_savings"] == pytest.approx(1200.0)
+    assert cards[1]["sp_type"] == "COMPUTE_SP"
+    assert cards[1]["monthly_savings"] == pytest.approx(500.0)
+
+
+def test_break_even_none_for_unprofitable():
+    """F2: break_even_months should be None when upfront > 0 but monthly_savings <= 0."""
+    cells = [_cell(upfront=100.0, monthly_savings=0.0)]
+    card = build_ri_type_cards(cells, {}, "eu-west-1")[0]
+    assert card["scenarios"][0]["break_even_months"] is None
+
+
+def test_mutations_do_not_affect_originals():
+    """F3: _finish_scenarios must not mutate the original cell dicts passed in."""
+    import copy
+    original_cells = [_cell()]
+    cells_copy = copy.deepcopy(original_cells)
+    build_ri_type_cards(original_cells, {}, "eu-west-1")
+    assert original_cells == cells_copy
+
+
+def test_platform_separates_ri_groups():
+    """F5: Different platforms should create separate cards even for same type/region."""
+    cells = [
+        _cell(platform="Linux/UNIX", monthly_savings=100.0),
+        _cell(platform="Windows", monthly_savings=80.0),
+    ]
+    cards = build_ri_type_cards(cells, {}, "eu-west-1")
+    assert len(cards) == 2
+    assert {c["platform"] for c in cards} == {"Linux/UNIX", "Windows"}
+
+
+def test_coverage_normalized_key_and_region_filter():
+    """F6: Coverage join must use normalized keys and only for scan_region."""
+    cells = [_cell(region="eu-west-1"), _cell(region="us-east-1")]
+    # Normalized key for "db.r7i.4xlarge" is "r7i.4xlarge"
+    uncovered = {"rds:r7i.4xlarge": 1000.0}
+    cards = build_ri_type_cards(cells, uncovered, "eu-west-1")
+    # eu-west-1 card should have coverage (scan_region match)
+    eu_card = [c for c in cards if c["region"] == "eu-west-1"][0]
+    assert "uncovered_monthly" in eu_card
+    assert eu_card["uncovered_monthly"] == pytest.approx(1000.0)
+    # us-east-1 card should not have coverage (region mismatch)
+    us_card = [c for c in cards if c["region"] == "us-east-1"][0]
+    assert "uncovered_monthly" not in us_card
+    assert "coverage_pct" not in us_card
+
+
+def test_coverage_normalized_key_with_db_prefix():
+    """F6: normalize_type strips db. prefix; key should be rds:r7i.4xlarge, not rds:db.r7i.4xlarge."""
+    cells = [_cell(region="eu-west-1")]
+    uncovered = {"rds:r7i.4xlarge": 500.0}
+    cards = build_ri_type_cards(cells, uncovered, "eu-west-1")
+    assert cards[0]["uncovered_monthly"] == pytest.approx(500.0)

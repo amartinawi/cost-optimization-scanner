@@ -60,6 +60,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from services.commitment_coverage import normalize_type
+
 # (CE service string, display label). EC2's long form is required (the short
 # "Amazon EC2" is rejected). See module docstring for the doc source of each
 # string, including the OpenSearch correction and DynamoDB caveat.
@@ -198,29 +200,37 @@ _SCENARIO_ORDER = {(t, p): i for i, (t, p) in enumerate(
 
 
 def _finish_scenarios(cells: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
-    """Sort cells canonically, add break_even_months, return (scenarios, best_idx)."""
+    """Sort cells canonically, add break_even_months, return (scenarios, best_idx).
+
+    Mutates the cell dicts it is handed; callers pass copies.
+    """
     scenarios = sorted(cells, key=lambda c: _SCENARIO_ORDER.get((c["term"], c["payment"]), 99))
     for s in scenarios:
         net = s["monthly_savings"]
-        s["break_even_months"] = round(s["upfront"] / net, 1) if s["upfront"] > 0 and net > 0 else 0.0
+        if s["upfront"] <= 0:
+            s["break_even_months"] = 0.0
+        elif net > 0:
+            s["break_even_months"] = round(s["upfront"] / net, 1)
+        else:
+            s["break_even_months"] = None
     best = max(range(len(scenarios)), key=lambda i: scenarios[i]["monthly_savings"])
     return scenarios, best
 
 
 def build_ri_type_cards(cells: list[dict[str, Any]], uncovered: dict[str, float],
                         scan_region: str) -> list[dict[str, Any]]:
-    """Group RI cells into one card per (service, instance_type, region).
+    """Group RI cells into one card per (service, instance_type, region, platform).
 
     Coverage context joins from ``uncovered`` (CommitmentCoverage.uncovered_on_demand,
-    keyed ``"{service}:{type}"``); a missing key omits the fields entirely —
-    an unknown coverage is not a 0% coverage (C8).
+    keyed ``"{service}:{normalized_type}"``), but only for cards in the scan_region;
+    a missing key omits the fields entirely — an unknown coverage is not a 0% coverage.
     """
-    groups: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    groups: dict[tuple[str, str, str, str], list[dict[str, Any]]] = {}
     for c in cells:
-        groups.setdefault((c["service"], c["instance_type"], c["region"]), []).append(c)
+        groups.setdefault((c["service"], c["instance_type"], c["region"], c["platform"]), []).append(c)
 
     cards: list[dict[str, Any]] = []
-    for (service, itype, region), group in groups.items():
+    for (service, itype, region, platform), group in groups.items():
         scenarios, best = _finish_scenarios([dict(c) for c in group])
         best_cell = scenarios[best]
         ondemand = best_cell["ondemand_monthly"]
@@ -229,7 +239,7 @@ def build_ri_type_cards(cells: list[dict[str, Any]], uncovered: dict[str, float]
             "service": service,
             "instance_type": itype,
             "region": region,
-            "platform": best_cell["platform"],
+            "platform": platform,
             "recommended_count": best_cell["count"],
             "current_ondemand_monthly": ondemand,
             "scenarios": [
@@ -245,11 +255,14 @@ def build_ri_type_cards(cells: list[dict[str, Any]], uncovered: dict[str, float]
             months = _TERM_MONTHS.get(best_cell["term"], 12)
             card["risk_pct"] = round(
                 100.0 * (best_cell["recurring_monthly"] + best_cell["upfront"] / months) / ondemand, 1)
-        key = f"{_COVERAGE_SERVICE.get(service, service.lower())}:{itype}"
-        if key in uncovered:
-            card["uncovered_monthly"] = round(uncovered[key], 2)
-            if ondemand > 0:
-                card["coverage_pct"] = round(max(0.0, 100.0 * (1 - uncovered[key] / ondemand)), 1)
+        if region == scan_region:
+            cov_service = _COVERAGE_SERVICE.get(service, service.lower())
+            normalized_itype = normalize_type(itype)
+            key = f"{cov_service}:{normalized_itype}"
+            if key in uncovered:
+                card["uncovered_monthly"] = round(uncovered[key], 2)
+                if ondemand > 0:
+                    card["coverage_pct"] = round(max(0.0, 100.0 * (1 - uncovered[key] / ondemand)), 1)
         card["AuditBasis"] = {
             "source": "ce:GetReservationPurchaseRecommendation",
             "lookback_days": 30,
@@ -271,7 +284,7 @@ def build_sp_cards(cells: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for sp_type, group in groups.items():
         scenarios, best = _finish_scenarios([dict(c) for c in group])
         best_cell = scenarios[best]
-        cards.append({
+        card: dict[str, Any] = {
             "card_kind": "sp_commitment",
             "sp_type": sp_type,
             "scenarios": [
@@ -287,6 +300,11 @@ def build_sp_cards(cells: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "lookback_days": 30,
                 "basis": "AWS-computed purchase recommendation; projection, not counted",
             },
-        })
+        }
+        estimated_ondemand = best_cell.get("estimated_ondemand_monthly", 0.0)
+        if estimated_ondemand > 0:
+            card["risk_pct"] = round(
+                100.0 * (1 - best_cell["monthly_savings"] / estimated_ondemand), 1)
+        cards.append(card)
     cards.sort(key=lambda c: -c["monthly_savings"])
     return cards
