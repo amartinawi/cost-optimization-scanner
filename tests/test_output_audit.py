@@ -435,3 +435,24 @@ def test_extract_rate_assertions_skips_non_rate_numerics():
     rec["AuditBasis"] = {"rate": 0.095, "age_days": 130, "size_gb": 9, "region": "x"}
     fields = {r["field"] for r in extract_rate_assertions(data)}
     assert "rate" in fields and "age_days" not in fields and "size_gb" not in fields
+
+
+# ------------------------------------------ S14 projected commitment reconcile
+
+
+def test_projected_commitment_reconciles():
+    from tools.output_audit import sweep_projected_commitment
+
+    data = make_report()
+    data["services"]["commitment_analysis"] = {
+        "service_name": "Commitment Analysis", "total_recommendations": 0,
+        "total_monthly_savings": 0.0,
+        "sources": {"purchase_recommendations": {"count": 1, "recommendations": [
+            {"card_kind": "ri_type", "service": "RDS", "instance_type": "x",
+             "region": "eu-west-1", "Counted": False, "monthly_savings": 1000.0,
+             "scenarios": [], "recommended_scenario": 0}]}},
+    }
+    data["summary"]["projected_commitment_monthly_savings"] = 1000.0
+    assert _fails(sweep_projected_commitment(data)) == []
+    data["summary"]["projected_commitment_monthly_savings"] = 999999.0
+    assert _fails(sweep_projected_commitment(data))

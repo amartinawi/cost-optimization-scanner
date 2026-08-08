@@ -18,6 +18,8 @@ Sweeps (lesson class in parentheses):
     S10 log triage         console warnings classified into coverage gaps
     S11 dropped-coh        CoH "no service bucket" warnings (E2)
     S12 permission-gaps    permission_issues, ce:GetCostAndUsage called out (C8)
+    S13 tab-reconcile      each tab total == sum of its counted rec dollars
+    S14 projected-commit   summary projected figure recomputes from commitment cards
 
 Usage:
     python3 tools/output_audit.py <report.html | scan.json> [--log console.log] [--json]
@@ -310,6 +312,31 @@ def sweep_html_render(data: dict[str, Any], html_text: str) -> list[Finding]:
     return out
 
 
+def sweep_projected_commitment(data: dict[str, Any]) -> list[Finding]:
+    """S14 — summary projected figure recomputes from the commitment cards."""
+    reported = float(data.get("summary", {}).get("projected_commitment_monthly_savings", 0) or 0)
+    svc = data.get("services", {}).get("commitment_analysis", {})
+    recs = [r for s in (svc.get("sources") or {}).values() if isinstance(s, dict)
+            for r in s.get("recommendations", []) if isinstance(r, dict)]
+    ri = [r for r in recs if r.get("card_kind") == "ri_type"]
+    sp = [r for r in recs if r.get("card_kind") == "sp_commitment"]
+    if not ri and not sp:
+        if reported > 0:
+            return [_finding("S14-projected", "FAIL", "commitment_analysis",
+                             f"summary projects ${reported:,.2f}/mo but no purchase cards exist")]
+        return []
+    try:
+        from services.commitment_scenarios import projected_savings
+    except ImportError:
+        return [_finding("S14-projected", "WARN", "commitment_analysis",
+                         "cannot recompute projection: services package not importable")]
+    expected, _ = projected_savings(ri, sp)
+    if abs(expected - reported) > 0.5:
+        return [_finding("S14-projected", "FAIL", "commitment_analysis",
+                         f"summary ${reported:,.2f} != recomputed ${expected:,.2f} from cards")]
+    return []
+
+
 def sweep_warnings(data: dict[str, Any]) -> list[Finding]:
     """S11/S12 — dropped CoH buckets (E2) and permission gaps (C8)."""
     out: list[Finding] = []
@@ -412,6 +439,7 @@ def run_sweeps(data: dict[str, Any], html_text: str | None = None,
     findings += sweep_string_numeric(data)
     findings += sweep_pool_cap(data)
     findings += sweep_summary_semantics(data)
+    findings += sweep_projected_commitment(data)
     findings += sweep_tab_reconcile(data)
     findings += sweep_negative(data)
     findings += sweep_warnings(data)
