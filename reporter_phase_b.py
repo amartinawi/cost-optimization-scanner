@@ -2851,7 +2851,62 @@ def source_type_label(service_key: str, source_name: str) -> str:
     return label
 
 
+def _render_aurora_grouped(recs: List[Rec], source_name: str, service_data: Dict) -> str:
+    """Render aurora recs grouped BY FINDING, one card per check category.
+
+    The generic per-rec path rendered one near-identical card per DB instance
+    (Jarir-M2 live audit: 9 duplicate "Aurora Graviton Migration" cards). This
+    mirrors the sanctioned EC2-CoH grouped-action pattern (lesson F3): one card
+    per finding, resources as list items. Groups sort by COUNTED total desc;
+    an advisory (Counted=False) resource is listed with its marker but never
+    joins the group total (counted == rendered, D-series).
+    """
+    groups: Dict[str, List[Rec]] = {}
+    for rec in recs:
+        if not isinstance(rec, dict) or rec.get("finding") == "OPTIMIZED":
+            continue
+        category = str(
+            rec.get("CheckCategory") or rec.get("check_category")
+            or rec.get("recommended_value") or "Aurora Optimization"
+        )
+        groups.setdefault(category, []).append(rec)
+
+    def _dollars(rec: Rec) -> float:
+        val = rec.get("EstimatedMonthlySavings", rec.get("monthly_savings", 0))
+        try:
+            return float(val or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _counted_total(members: List[Rec]) -> float:
+        return sum(_dollars(r) for r in members if r.get("Counted") is not False)
+
+    content = ""
+    for category, members in sorted(groups.items(), key=lambda kv: -_counted_total(kv[1])):
+        members = sorted(members, key=_dollars, reverse=True)
+        total = _counted_total(members)
+        content += f'<div class="rec-item{_priority_class(members[0])}">'
+        content += f"<h4>{html.escape(category)} ({len(members)} resources)</h4>"
+        content += f'<p class="savings"><strong>Total Monthly Savings:</strong> ${total:,.2f}</p>'
+        content += "<p><strong>Resources:</strong></p><ul>"
+        for rec in members:
+            rid = str(rec.get("DBInstanceIdentifier") or rec.get("cluster_id")
+                      or rec.get("resource_id") or "N/A")
+            sizes = ""
+            if rec.get("CurrentSize") and rec.get("TargetSize"):
+                sizes = f" — {html.escape(str(rec['CurrentSize']))} &rarr; {html.escape(str(rec['TargetSize']))}"
+            marker = " <em>(advisory — not in the total)</em>" if rec.get("Counted") is False else ""
+            content += (f"<li><code>{html.escape(rid)}</code>{sizes}: "
+                        f"${_dollars(rec):,.2f}/month{marker}</li>")
+        content += "</ul></div>"
+    return content
+
+
 PHASE_B_HANDLERS: Dict[Tuple[str, str], Callable] = {
+    # Aurora sources group by finding, not per resource (Jarir-M2 audit).
+    ("aurora", "instance_optimization"): _render_aurora_grouped,
+    ("aurora", "io_tier_analysis"): _render_aurora_grouped,
+    ("aurora", "serverless_v2"): _render_aurora_grouped,
     # Legacy bindings retained for any in-flight scan JSON that predates
     # the compute_optimizer adapter retirement (services/__init__.py,
     # 2026-05-14). New scans never emit these source pairs.

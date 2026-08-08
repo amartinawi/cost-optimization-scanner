@@ -458,3 +458,53 @@ def test_css_defines_muted_sp_vs_ri_and_fact_note():
     assert ".sp-vs-ri {" in css
     assert ".fact-note {" in css
     assert "var(--text-secondary)" in css
+
+
+# --------------------------------------------------------------------------- #
+# Aurora grouped-by-finding rendering (Jarir audit: 9 duplicate Graviton cards)
+# --------------------------------------------------------------------------- #
+
+
+def _aurora_rec(dbid, cat="Aurora Graviton Migration", savings=278.86, counted=True):
+    rec = {"CheckCategory": cat, "DBInstanceIdentifier": dbid, "cluster_id": "prod-commerce",
+           "CurrentSize": "db.r7i.4xlarge", "TargetSize": "db.r6g.4xlarge",
+           "Recommendation": f"Migrate {dbid}", "EstimatedMonthlySavings": savings,
+           "monthly_savings": savings, "EstimatedSavings": f"${savings:,.2f}/month"}
+    if not counted:
+        rec["Counted"] = False
+    return rec
+
+
+def test_aurora_recs_group_into_one_card_per_finding():
+    from reporter_phase_b import _render_aurora_grouped
+
+    recs = [_aurora_rec(f"db-{i}") for i in range(9)]
+    recs.append(_aurora_rec("db-x", cat="Aurora Serverless Candidate", savings=50.0))
+    html = _render_aurora_grouped(recs, "instance_optimization", {})
+    # One grouped card per finding, not one per resource.
+    assert html.count("Aurora Graviton Migration") == 1
+    assert "(9 resources)" in html
+    assert html.count("<li") == 10  # 9 + 1 resources as list items
+    # Group total = sum of its counted recs.
+    assert f"${9 * 278.86:,.2f}" in html
+    # Groups sorted by counted total desc: Graviton section before Serverless.
+    assert html.index("Aurora Graviton Migration") < html.index("Aurora Serverless Candidate")
+
+
+def test_aurora_grouped_advisory_marked_and_not_summed():
+    from reporter_phase_b import _render_aurora_grouped
+
+    recs = [_aurora_rec("db-1", savings=100.0),
+            _aurora_rec("db-2", savings=40.0, counted=False)]
+    html = _render_aurora_grouped(recs, "instance_optimization", {})
+    assert "(2 resources)" in html
+    assert "$100.00" in html          # counted only in the group total
+    assert "$140.00" not in html
+    assert "advisory" in html.lower()  # the demoted resource is marked
+
+
+def test_aurora_grouped_registered_for_rec_sources():
+    from reporter_phase_b import PHASE_B_HANDLERS, _render_aurora_grouped
+
+    for src in ("instance_optimization", "io_tier_analysis", "serverless_v2"):
+        assert PHASE_B_HANDLERS.get(("aurora", src)) is _render_aurora_grouped
