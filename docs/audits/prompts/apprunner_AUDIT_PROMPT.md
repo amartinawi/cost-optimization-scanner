@@ -11,6 +11,8 @@ recommendation must produce a concrete, account-specific dollar saving.
 
 ## PROMPT (copy from here)
 
+> **⚠ STALE vs current adapter** — much of this prompt's "known issues" were resolved in the cost-fidelity remediation; see the defect ledger for OOS-ADAPTER rows. A full re-author is tracked as a follow-up.
+
 > **⚠ Latest live-audit findings (2026-06-30) — read these FIRST, then this prompt.**
 > Before auditing, also read and paste `docs/audits/prompts/_LIVE_AUDIT_LESSONS.md`
 > — the recurring cost-fidelity bug *classes* confirmed in live deep audits (with

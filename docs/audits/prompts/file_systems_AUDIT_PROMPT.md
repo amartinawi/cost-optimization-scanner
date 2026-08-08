@@ -68,12 +68,12 @@ evidence-gated model worth cross-referencing.
 ### Phase 0 — Orient (5-minute map before judging)
 0a. Open `services/adapters/CLAUDE.md` and find the `file_systems.py` row (Live
     Pricing). **Reconcile the doc against reality:** confirm `core/pricing_engine.py`
-    exposes `get_efs_monthly_price_per_gb` (~line 751),
-    `get_efs_ia_access_price_per_gb` (~line 773), and
-    `get_fsx_storage_price_per_gb` (~line 791), and the fallback constants
+    exposes `get_efs_monthly_price_per_gb` (~line 830),
+    `get_efs_ia_access_price_per_gb` (~line 852), and
+    `get_fsx_storage_price_per_gb` (~line 870), and the fallback constants
     `FALLBACK_EFS_GB_MONTH` / `FALLBACK_EFS_GB_MONTH_BY_CLASS` /
     `FALLBACK_EFS_IA_ACCESS_GB` / `FALLBACK_FSX_GB_MONTH` /
-    `FALLBACK_FSX_MULTI_AZ_GB_MONTH` (~lines 232–273) and
+    `FALLBACK_FSX_MULTI_AZ_GB_MONTH` (~lines 258–302) and
     `_EFS_STORAGE_CLASS_LABELS`.
 0b. Confirm module identity in `services/adapters/file_systems.py`:
     `key="file_systems"`, `cli_aliases=("efs","fsx","file_systems")`,
@@ -120,8 +120,9 @@ evidence-gated model worth cross-referencing.
 3. For each **counted** savings figure, re-derive it from the live AWS Pricing
    API and confirm it matches:
    - **EFS** (`AmazonEFS`, attribute `storageClass`): validate the
-     **Standard** ($0.30/GB-mo us-east-1), **IA** ($0.016/GB-mo), **One Zone**,
-     **One Zone-IA**, and the **IA access** rate ($0.01/GB) against the API.
+     **Standard** ($0.30/GB-mo us-east-1), **IA** ($0.025/GB-mo), **One Zone**
+     ($0.16/GB-mo), **One Zone-IA** ($0.0133/GB-mo), and the **IA access** rate
+     ($0.01/GB) against the API.
      Confirm `std_class`/`ia_class` selection (`One Zone` vs `Standard`) follows
      `AvailabilityZoneName`. Confirm the idle saving = `total_gb × std_rate`
      (100%) and the lifecycle NET = `cold_gb × (std − ia) − accessed × ia_access`

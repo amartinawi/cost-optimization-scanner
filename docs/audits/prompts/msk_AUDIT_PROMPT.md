@@ -11,6 +11,8 @@ recommendation must produce a concrete, account-specific dollar saving.
 
 ## PROMPT (copy from here)
 
+> **⚠ STALE vs current adapter** — much of this prompt's "known issues" were resolved in the cost-fidelity remediation; see the defect ledger for OOS-ADAPTER rows. A full re-author is tracked as a follow-up.
+
 > **⚠ Latest live-audit findings (2026-06-30) — read these FIRST, then this prompt.**
 > Before auditing, also read and paste `docs/audits/prompts/_LIVE_AUDIT_LESSONS.md`
 > — the recurring cost-fidelity bug *classes* confirmed in live deep audits (with
@@ -113,9 +115,8 @@ as the model for SKU-pinned, edition/license-correct pricing filters.
      counted in `total_recommendations`** and its 20% string is never quantified.
    - **Serverless migration** — intentionally removed in the helper
      (`list_clusters_v2` loop discards results); confirm nothing re-introduces an
-     unquantified "Variable based on usage" rec. Note the `# TODO` in the adapter
-     about DCU-hour pricing ($0.06/DCU-hour) — serverless comparison is
-     directional only.
+     unquantified "Variable based on usage" rec. The adapter carries no DCU-hour
+     price constant (serverless comparison is directional only).
 3. Trace the adapter savings formula precisely:
    `hourly = get_msk_broker_hourly_price(InstanceType)`;
    `broker_monthly = hourly * 730 * num_brokers`;

@@ -11,6 +11,15 @@ recommendation must produce a concrete, account-specific dollar saving.
 
 ## PROMPT (copy from here)
 
+> **⚠ STALE vs current adapter** — much of this prompt's "known issues" describe
+> the pre-remediation DynamoDB adapter (factor-based `DYNAMODB_SAVINGS_FACTORS`,
+> `0.30` on every table, reserved-capacity counted-not-advisory, GSI invisibility).
+> Those were resolved in the cost-fidelity remediation: the adapter now uses exact
+> `current − target` deltas gated on utilization, `DYNAMODB_ADVISORY_CATEGORIES`
+> demotes Reserved Capacity to advisory, and GSI throughput is read. See the
+> defect ledger (`db-reserved-ledger.md`) for the `OOS-ADAPTER` rows. A full
+> re-author against the current adapter is tracked as a follow-up.
+
 > **⚠ Latest live-audit findings (2026-06-30) — read these FIRST, then this prompt.**
 > Before auditing, also read and paste `docs/audits/prompts/_LIVE_AUDIT_LESSONS.md`
 > — the recurring cost-fidelity bug *classes* confirmed in live deep audits (with

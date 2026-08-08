@@ -112,8 +112,8 @@ advisory (`Counted=False`), arch-aware constants, and the test style I expect
    `normalize_resource_name`, `dedupe_by_authority`);
    `services/advisor.py:get_ecs_compute_optimizer_recommendations` +
    `_normalize_ecs_co_rec` + `_compute_optimizer_opt_in_rec`;
-   `core/pricing_engine.py` (the four container methods ~lines 909–1014 and
-   `FALLBACK_FARGATE_*`/`FALLBACK_ECR_GB_MONTH` ~305–327);
+   `core/pricing_engine.py` (the four container methods ~lines 1206–1307 and
+   `FALLBACK_FARGATE_*`/`FALLBACK_ECR_GB_MONTH` ~342–364);
    `core/scan_orchestrator.py` (`_HUB_SERVICES`, `type_map`);
    `core/result_builder.py`; and the reporter
    (`reporter_phase_b.py:_render_containers_enhanced_checks` ~line 942,
@@ -218,7 +218,9 @@ advisory (`Counted=False`), arch-aware constants, and the test style I expect
    `collect_ecs_fargate_rightsizing_recs` / `_ecr_repo_reclaimable`, but
    `get_ecr_analysis` (service_counts) calls `ecr.describe_repositories()`
    **un-paginated** — confirm whether the count under-reports on accounts with
-   >100 repos (cosmetic, but a coverage gap).
+   >100 repos (cosmetic, but a coverage gap). **FIXED (containers.py:344):
+   describe_repositories now paginated; the un-paginated call survives only as
+   a paginator-unavailable fallback (line 348).**
 9. Hardcoded gates that silently exclude valid resources:
    - ECS rightsizing requires **Container Insights enabled**
      (`_container_insights_enabled`) — services without it produce **no rec at
@@ -242,7 +244,9 @@ advisory (`Counted=False`), arch-aware constants, and the test style I expect
       `ctx.warn`/`ctx.permission_issue`. This is the canonical silent-failure
       class — ECS rightsizing from CO vanishes with no record. Classify
       AccessDenied/Unauthorized → `ctx.permission_issue`, throttling/other →
-      `ctx.warn`.
+      `ctx.warn`. **FIXED (advisor.py:404-419): failures now classified via
+      ctx.permission_issue/ctx.warn — verify the fix holds; no longer a live
+      defect.**
     - `services/adapters/containers.py:scan` wraps `get_container_services_analysis`
       and `get_enhanced_container_checks` in try/except → `ctx.warn` (OK, but a
       blanket warn loses the AccessDenied→permission_issue distinction the inner
@@ -280,13 +284,14 @@ advisory (`Counted=False`), arch-aware constants, and the test style I expect
 15. **Category-name binding in `_render_containers_enhanced_checks`:** the
     grouping dict keys (`ECS Container Insights Required`, `ECS Rightsizing -
     Metric-Backed`, `ECS Over-Provisioned Services`, `Unused ECS Clusters`,
-    `Unused EKS Clusters`, `ECR Lifecycle Missing`, `Other Optimizations`) must
+    `Unused EKS Clusters`, `ECR Lifecycle Management`, `Other Optimizations`) must
     match the `CheckCategory` values the adapter actually emits. The adapter emits
     `ECS Rightsizing - Metric-Backed` (matches) and `ECR Lifecycle Management`
-    (does NOT match `ECR Lifecycle Missing` — it falls through to the
-    `"RepositoryName" in rec` branch). Confirm ECR recs still render and note the
-    category-name drift + the dead `Container Insights Required`/`EKS`/`Unused ECS
-    Clusters` branches.
+    (matches the group key — **FIXED (reporter_phase_b.py:1021,1028): `ECR
+    Lifecycle Management` is now a first-class group key, matched via
+    `check_category in grouped_containers`**). Confirm ECR recs still render and
+    note the dead `Container Insights Required`/`EKS`/`Unused ECS Clusters`
+    branches.
 16. **Counted == rendered:** `total_recommendations = len(enhanced) +
     len(cost_hub) + len(co)` (includes the `Counted=False` ECR advisory);
     `total_monthly_savings` sums only counted heuristic savings + CoH + CO.
@@ -400,7 +405,8 @@ First, the UNIVERSAL catalogue (every adapter), then containers-specific items.
 - **CO helper silent failure** (`get_ecs_compute_optimizer_recommendations`):
   a non-opt-in CO error (AccessDenied/throttling) is `logger.warning`'d and
   returns `[]` with NO `ctx.warn`/`ctx.permission_issue` — ECS CO rightsizing
-  silently vanishes.
+  silently vanishes. **FIXED (advisor.py:404-419): now classified via
+  ctx.permission_issue/ctx.warn.**
 - **`SPOT_SAVINGS_FACTOR = 0.70` is defined but unused** in containers.py — a
   dead pricing constant implying an unimplemented/dropped Fargate→Spot lever
   (the `get_ecs_analysis` text even advertises "Save 70%"). Either wire a
@@ -408,10 +414,12 @@ First, the UNIVERSAL catalogue (every adapter), then containers-specific items.
   Fargate Spot rate, interruptible-workload-gated) or remove it.
 - **Reporter category drift / dead branches**
   (`_render_containers_enhanced_checks`): the adapter emits `ECR Lifecycle
-  Management` but the group key is `ECR Lifecycle Missing`; and the
+  Management` and the group key is now `ECR Lifecycle Management`
+  (**FIXED — reporter_phase_b.py:1021,1028: first-class group key, matched via
+  `check_category in grouped_containers`**); the
   `ECS Container Insights Required` / `Unused ECS Clusters` / `Unused EKS
-  Clusters` groups are never populated by this adapter (EKS is out of scope) →
-  dead renderer branches and a category-name mismatch.
+  Clusters` groups are still never populated by this adapter (EKS is out of
+  scope) → dead renderer branches.
 - **Container-Insights-gated coverage hole**: ECS Fargate rightsizing emits
   *nothing* (not even a `$0` advisory) when Container Insights is disabled, so the
   scan silently under-reports on the common case; consider a `Counted=False`
@@ -424,6 +432,7 @@ First, the UNIVERSAL catalogue (every adapter), then containers-specific items.
 - **Un-paginated `get_ecr_analysis` describe_repositories** (service_counts only)
   under-reports `ecr_repositories` on accounts with >100 repos (cosmetic count,
   not savings, but a coverage inconsistency vs the paginated reclaim path).
+  **FIXED (containers.py:344): now paginated; un-paginated call is fallback only.**
 - **Windows OS license leg**: confirm `get_fargate_windows_os_hourly` is applied
   to both current and target legs (so the delta is correct) and only for Windows
   tasks — a one-sided application would mis-state the Windows Fargate saving.

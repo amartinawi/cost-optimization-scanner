@@ -11,6 +11,8 @@ recommendation must produce a concrete, account-specific dollar saving.
 
 ## PROMPT (copy from here)
 
+> **⚠ STALE vs current adapter** — much of this prompt's "known issues" were resolved in the cost-fidelity remediation; see the defect ledger for OOS-ADAPTER rows. A full re-author is tracked as a follow-up.
+
 > **⚠ Latest live-audit findings (2026-06-30) — read these FIRST, then this prompt.**
 > Before auditing, also read and paste `docs/audits/prompts/_LIVE_AUDIT_LESSONS.md`
 > — the recurring cost-fidelity bug *classes* confirmed in live deep audits (with
@@ -46,11 +48,12 @@ example for cross-source dedup, Cost-Hub consumption, RI demotion, and the
   There is **NO** `services/aurora.py` legacy shim — the adapter and
   `aurora_logic.py` are the whole path.
 - Pricing: `_get_acu_hourly(ctx)` calls **`PricingEngine.get_aurora_acu_hourly()`**
-  (region-correct) with a module fallback `ACU_HOURLY_FALLBACK = 0.06` ×
-  `ctx.pricing_multiplier`; instance pricing reuses
-  **`PricingEngine.get_rds_instance_monthly_price(engine, class)`** (the same
-  method RDS uses). I/O-tier math uses two **module constants**:
-  `IO_COST_PER_MILLION = 0.20` and `IO_OPTIMIZED_PREMIUM_PER_GB = 0.025`;
+  (region-correct) with the pricing-engine fallback
+  `FALLBACK_AURORA_ACU_HOURLY = 0.12` × `ctx.pricing_multiplier`; instance pricing
+  reuses **`PricingEngine.get_rds_instance_monthly_price(engine, class,
+  aurora_io_optimized=…)`** (the same method RDS uses). I/O-tier math uses two
+  **module constants**: `IO_COST_PER_MILLION = 0.20` and
+  `IO_OPTIMIZED_STORAGE_PREMIUM_FALLBACK_PER_GB = 0.125`;
   `HOURS_PER_MONTH = 730`.
 - Aurora consumes **neither Cost Optimization Hub nor Compute Optimizer directly**
   — but beware: the orchestrator buckets **`RdsDbCluster` → `rds`** (NOT
@@ -121,13 +124,14 @@ example for cross-source dedup, Cost-Hub consumption, RI demotion, and the
 3. Validate each rate/constant against the live Pricing API:
    - **ACU**: confirm `get_aurora_acu_hourly` returns the per-ACU $/hr for
      Aurora Serverless v2 (≈ **$0.12/ACU-hr** us-east-1 for standard; **higher**
-     for I/O-Optimized clusters) and that the `ACU_HOURLY_FALLBACK = 0.06`
-     constant is correct — **0.06 looks ~2× low vs the published ~$0.12/ACU-hr**;
-     verify and flag. Confirm `_check_serverless_v2` does **NOT** re-multiply by
+     for I/O-Optimized clusters) and that the `FALLBACK_AURORA_ACU_HOURLY = 0.12`
+     fallback (in `core/pricing_engine.py`) matches the published ~$0.12/ACU-hr.
+     Confirm `_check_serverless_v2` does **NOT** re-multiply by
      `pricing_multiplier` (helper already region-corrects), and that the fallback
      path applies the multiplier exactly once.
    - **I/O tier constants**: validate `IO_COST_PER_MILLION = 0.20` against Aurora
-     Standard's **$0.20 per 1M I/O** and `IO_OPTIMIZED_PREMIUM_PER_GB = 0.025`
+     Standard's **$0.20 per 1M I/O** and
+     `IO_OPTIMIZED_STORAGE_PREMIUM_FALLBACK_PER_GB = 0.125`
      against the I/O-Optimized **storage premium** (Aurora I/O-Optimized storage
      is ~ +$0.025/GB-mo over Standard storage AND charges no per-request I/O).
      Both are us-east-1 module constants embedded in the formula — confirm
@@ -178,7 +182,8 @@ example for cross-source dedup, Cost-Hub consumption, RI demotion, and the
 
 ### Phase 4 — Coverage (works for ALL resources, not a subset)
 8. Confirm `_describe_aurora_clusters` paginates `describe_db_clusters` filtered
-   to `AURORA_ENGINES = ("aurora","aurora-mysql","aurora-postgresql")` and that
+   to `AURORA_ENGINES = ("aurora-mysql","aurora-postgresql")` (the generic
+   `"aurora"` value is rejected by `DescribeDBClusters` and was dropped) and that
    the instance loop paginates `describe_db_instances`. Confirm the
    `DBInstanceStatus == "available"` gate doesn't silently drop a billable
    stopped/`incompatible` instance that still incurs storage cost.
