@@ -205,7 +205,7 @@ def test_ri_utilization_uses_subscription_id_groupby():
         return {"UtilizationsByTime": [{"Groups": [
             {"Attributes": {"subscriptionId": "ri-abc"},
              "Utilization": {"UtilizationPercentage": "40", "TotalAmortizedCost": "100"}},
-        ]}], "Total": {"UtilizationPercentage": "40"}}
+        ]}], "Total": {"UtilizationPercentage": "40", "PurchasedHours": "730"}}
 
     ce.get_reservation_utilization.side_effect = util
     ctx = SimpleNamespace()
@@ -222,7 +222,7 @@ def test_ri_coverage_no_groupby_returns_overall_rate():
 
     def cov(**kw):
         captured.update(kw)
-        return {"Total": {"CoveragePercentage": "85"}}
+        return {"Total": {"CoverageHours": {"CoverageHoursPercentage": "85", "TotalRunningHours": "730"}}}
 
     ce.get_reservation_coverage.side_effect = cov
     ctx = SimpleNamespace()
@@ -315,7 +315,7 @@ def _cov_ce(service_attr: dict):
             "SavingsPlansCoverages": [
                 {
                     "Attributes": service_attr,
-                    "Coverage": {"OnDemandCost": "9578.93", "CoveredCost": "0", "CoveragePercentage": "0"},
+                    "Coverage": {"OnDemandCost": "9578.93", "SpendCoveredBySavingsPlans": "0", "CoveragePercentage": "0"},
                 }
             ]
         }
@@ -333,7 +333,7 @@ def test_sp_coverage_gap_skips_unknown_service():
 def test_sp_coverage_gap_emits_for_known_service():
     mod = CommitmentAnalysisModule()
     tp = {"Start": "2026-06-01", "End": "2026-06-30"}
-    recs, rate = mod._check_sp_coverage(_cov_ctx(), _cov_ce({"service": "Amazon EC2"}), tp)
+    recs, rate = mod._check_sp_coverage(_cov_ctx(), _cov_ce({"SERVICE": "Amazon EC2"}), tp)
     assert len(recs) == 1
     assert recs[0]["resource_id"] == "Amazon EC2"
     assert recs[0]["monthly_savings"] > 0  # 9578.93 × (1-0) × 0.30

@@ -217,7 +217,7 @@ class CommitmentAnalysisModule(BaseServiceModule):
             },
         )
 
-    def _check_sp_utilization(self, ctx: Any, ce: Any, tp: dict[str, str]) -> tuple[list[dict[str, Any]], float]:
+    def _check_sp_utilization(self, ctx: Any, ce: Any, tp: dict[str, str]) -> tuple[list[dict[str, Any]], float | None]:
         """Check Savings Plans utilization rate and flag under-utilized plans.
 
         Args:
@@ -228,12 +228,18 @@ class CommitmentAnalysisModule(BaseServiceModule):
             Tuple of (under-utilized recommendations list, overall rate 0-1).
         """
         recs: list[dict[str, Any]] = []
-        overall_rate = 0.0
+        overall_rate: float | None = None
 
         try:
             resp = ce.get_savings_plans_utilization(TimePeriod=tp)
-            util = resp.get("SavingsPlansUtilizations", {})
-            overall_rate = self._parse_pct(util.get("Total", {}).get("UtilizationPercentage", "0"))
+            # REAL response shape (live-pinned on bnc, 2026-08-09): the figures
+            # nest under Total.Utilization — the previous read of a nonexistent
+            # "SavingsPlansUtilizations" top key silently stuck the rate at 0.0
+            # while the account ran an active $1,953/mo commitment at 82.5%.
+            util = resp.get("Total", {}).get("Utilization", {})
+            if float(util.get("TotalCommitment", 0) or 0) > 0:
+                overall_rate = self._parse_pct(util.get("UtilizationPercentage", "0"))
+            # No commitment held -> None (stat renders "n/a", never a fake 0%).
         except Exception as e:
             _route_ce_error(ctx, "ce:GetSavingsPlansUtilization", e)
             return recs, overall_rate
@@ -242,13 +248,18 @@ class CommitmentAnalysisModule(BaseServiceModule):
             params: dict[str, Any] = {"TimePeriod": tp}
             while True:
                 details = ce.get_savings_plans_utilization_details(**params)
-                for detail in details.get("SavingsPlansUtilizationsDetails", []):
+                # Key is SavingsPlansUtilizationDetails (the old extra-"s"
+                # spelling matched nothing, so per-SP waste never surfaced —
+                # bnc: $342.49/mo unused commitment unreported).
+                for detail in details.get("SavingsPlansUtilizationDetails", []):
                     sp_arn = detail.get("SavingsPlanArn", "")
-                    rate = self._parse_pct(detail.get("UtilizationPercentage", "0"))
+                    d_util = detail.get("Utilization", {})
+                    rate = self._parse_pct(d_util.get("UtilizationPercentage", "0"))
 
                     if rate < self.UTILIZATION_THRESHOLD:
-                        hourly = float(detail.get("AmortizedCommitment", {}).get("TotalHourlyCommitment", "0"))
-                        waste = hourly * (1.0 - rate) * 730
+                        # The window's UnusedCommitment IS the wasted spend for
+                        # the 30-day period (~monthly) — measured, not derived.
+                        waste = float(d_util.get("UnusedCommitment", 0) or 0)
                         recs.append(
                             {
                                 "resource_id": sp_arn,
@@ -270,7 +281,7 @@ class CommitmentAnalysisModule(BaseServiceModule):
 
         return recs, overall_rate
 
-    def _check_sp_coverage(self, ctx: Any, ce: Any, tp: dict[str, str]) -> tuple[list[dict[str, Any]], float]:
+    def _check_sp_coverage(self, ctx: Any, ce: Any, tp: dict[str, str]) -> tuple[list[dict[str, Any]], float | None]:
         """Check Savings Plans coverage by service and flag coverage gaps.
 
         Args:
@@ -296,12 +307,12 @@ class CommitmentAnalysisModule(BaseServiceModule):
                 for entry in coverages:
                     cov = entry.get("Coverage", {})
                     od = float(cov.get("OnDemandCost", "0"))
-                    covered = float(cov.get("CoveredCost", "0"))
+                    covered = float(cov.get("SpendCoveredBySavingsPlans", "0"))  # real CE key (was nonexistent "CoveredCost")
                     total_od += od
                     total_covered += covered
                     rate = self._parse_pct(cov.get("CoveragePercentage", "0"))
                     if rate < self.COVERAGE_GAP_THRESHOLD:
-                        svc = entry.get("Attributes", {}).get("service", "Unknown")
+                        svc = entry.get("Attributes", {}).get("SERVICE", "Unknown")  # CE attribute keys are UPPERCASE
                         # An unattributable coverage gap (CE returned no service —
                         # typical when the account holds NO active Savings Plans, so
                         # all on-demand spend aggregates under "Unknown") is not
@@ -338,7 +349,7 @@ class CommitmentAnalysisModule(BaseServiceModule):
 
         return recs, overall_rate
 
-    def _check_ri_utilization(self, ctx: Any, ce: Any, tp: dict[str, str]) -> tuple[list[dict[str, Any]], float]:
+    def _check_ri_utilization(self, ctx: Any, ce: Any, tp: dict[str, str]) -> tuple[list[dict[str, Any]], float | None]:
         """Check Reserved Instance utilization rate by service.
 
         Args:
@@ -347,10 +358,11 @@ class CommitmentAnalysisModule(BaseServiceModule):
             pricing_multiplier: Regional pricing multiplier.
 
         Returns:
-            Tuple of (under-utilized RI recommendations list, overall rate 0-1).
+            Tuple of (under-utilized RI recommendations list, overall rate 0-1
+            or None when no reservation is visible in the window).
         """
         recs: list[dict[str, Any]] = []
-        overall_rate = 0.0
+        overall_rate: float | None = None
 
         try:
             # GetReservationUtilization only supports SUBSCRIPTION_ID for a
@@ -392,7 +404,10 @@ class CommitmentAnalysisModule(BaseServiceModule):
                 params["NextToken"] = next_token
 
             total = resp.get("Total", {})
-            overall_rate = self._parse_pct(total.get("UtilizationPercentage", "0"))
+            if float(total.get("PurchasedHours", 0) or 0) > 0:
+                overall_rate = self._parse_pct(total.get("UtilizationPercentage", "0"))
+            # Zero purchased hours (no RIs visible to this role/account view)
+            # -> None so the stat renders "n/a", never a fabricated 0%.
         except Exception as e:
             _route_ce_error(ctx, "ce:GetReservationUtilization", e)
 
@@ -402,7 +417,7 @@ class CommitmentAnalysisModule(BaseServiceModule):
     # overall stat-card rate. GetReservationCoverage rejects a SERVICE DIMENSION
     # groupBy, so no per-service RI coverage-gap rec is emitted — and such a rec
     # would overlap the RI purchase recommendations anyway.
-    def _check_ri_coverage(self, ctx: Any, ce: Any, tp: dict[str, str]) -> tuple[list[dict[str, Any]], float]:
+    def _check_ri_coverage(self, ctx: Any, ce: Any, tp: dict[str, str]) -> tuple[list[dict[str, Any]], float | None]:
         """Check Reserved Instance coverage by service.
 
         Args:
@@ -410,10 +425,11 @@ class CommitmentAnalysisModule(BaseServiceModule):
             tp: Time period dict with Start/End keys.
 
         Returns:
-            Tuple of (RI coverage gap recommendations list, overall rate 0-1).
+            Tuple of (RI coverage gap recommendations list, overall rate 0-1
+            or None when no reservation-eligible hours ran in the window).
         """
         recs: list[dict[str, Any]] = []
-        overall_rate = 0.0
+        overall_rate: float | None = None
 
         try:
             # GetReservationCoverage rejects a SERVICE DIMENSION groupBy (only
@@ -422,8 +438,11 @@ class CommitmentAnalysisModule(BaseServiceModule):
             # recommendations anyway, so we take the overall coverage rate only
             # (used by the stat card) without a groupBy.
             resp = ce.get_reservation_coverage(TimePeriod=tp)
-            total = resp.get("Total", {})
-            overall_rate = self._parse_pct(total.get("CoveragePercentage", "0"))
+            # Real shape: Total.CoverageHours.CoverageHoursPercentage (the flat
+            # "CoveragePercentage" key never existed -> rate was stuck at 0.0).
+            hours = resp.get("Total", {}).get("CoverageHours", {})
+            if float(hours.get("TotalRunningHours", 0) or 0) > 0:
+                overall_rate = self._parse_pct(hours.get("CoverageHoursPercentage", "0"))
         except Exception as e:
             _route_ce_error(ctx, "ce:GetReservationCoverage", e)
 
@@ -710,10 +729,10 @@ class CommitmentAnalysisModule(BaseServiceModule):
                 "fargate_savings_plan": SourceBlock(count=0, recommendations=(), extras={}),
             },
             extras={
-                "sp_utilization_rate": 0.0,
-                "sp_coverage_rate": 0.0,
-                "ri_utilization_rate": 0.0,
-                "ri_coverage_rate": 0.0,
+                "sp_utilization_rate": None,
+                "sp_coverage_rate": None,
+                "ri_utilization_rate": None,
+                "ri_coverage_rate": None,
                 "projected_commitment_monthly_savings": 0.0,
                 "projected_commitment_basis": "",
                 "uncovered_ondemand_monthly_total": None,
