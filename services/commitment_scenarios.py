@@ -322,12 +322,23 @@ def build_sp_cards(cells: list[dict[str, Any]]) -> list[dict[str, Any]]:
 # Which CoH reservation-purchase resource-type substrings concur with which RI card
 # service. Maps service label to tuple of acceptable currentResourceType substrings.
 # Source: core/scan_orchestrator.py type_map lines 126-131 (reservation-purchase types).
+# Note: DynamoDB is absent — CoH's type_map has no reservation-purchase type for it
+# (only rightsizing DynamoDBTable), so no CoH recs can concur with DynamoDB RI cards.
 _COH_RI_MATCH = {
     "EC2": ("EC2ReservedInstances",),
     "RDS": ("RdsReservedInstances",),
     "ElastiCache": ("ElastiCacheReservedInstances",),
     "Redshift": ("RedshiftReservedInstances",),
     "OpenSearch": ("OpenSearchReservedInstances", "EsReservedInstances"),
+}
+
+# Which CoH savings-plan resource-type substrings concur with which SP card type.
+# Maps sp_type to tuple of acceptable currentResourceType substrings.
+# Source: core/scan_orchestrator.py type_map lines 132-134 (savings-plan types).
+_COH_SP_MATCH = {
+    "COMPUTE_SP": ("ComputeSavingsPlans",),
+    "EC2_INSTANCE_SP": ("EC2InstanceSavingsPlans",),
+    "SAGEMAKER_SP": ("SageMakerSavingsPlans",),
 }
 
 
@@ -376,7 +387,7 @@ def merge_coh_concurrence(cards: list[dict[str, Any]],
     matching service. Unmatched CoH recs are left for the existing CoH render
     path — nothing is dropped here.
 
-    Multiple CoH recs for the same service accumulate their dollars on the
+    Multiple CoH recs for the same card type accumulate their dollars on the
     matched card (no overwriting).
     """
     out = [dict(c) for c in cards]
@@ -386,7 +397,9 @@ def merge_coh_concurrence(cards: list[dict[str, Any]],
         if dollars <= 0:
             continue
         if "SavingsPlan" in action:
-            targets = [c for c in out if c["card_kind"] == "sp_commitment"]
+            rtype = str(rec.get("currentResourceType") or "")
+            targets = [c for c in out if c["card_kind"] == "sp_commitment"
+                       and any(substr in rtype for substr in _COH_SP_MATCH.get(c["sp_type"], []))]
         elif "Reserved" in action:
             rtype = str(rec.get("currentResourceType") or "")
             targets = [c for c in out if c["card_kind"] == "ri_type"

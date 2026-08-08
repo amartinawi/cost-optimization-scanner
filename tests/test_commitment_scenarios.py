@@ -441,3 +441,36 @@ def test_coh_merge_no_match_leaves_cards_untouched():
     coh = [{"actionType": "PurchaseSavingsPlans", "estimatedMonthlySavings": 10.0}]
     merged = merge_coh_concurrence(cards, coh)
     assert "coh_concurs_monthly" not in merged[0]
+
+
+def test_coh_merge_sp_same_type_matching():
+    # F5: SP CoH rec must match same-type SP card, not richest card of any type.
+    # ComputeSavingsPlans rec should match COMPUTE_SP card, not SAGEMAKER_SP.
+    cards = [_sp_card("COMPUTE_SP", 500.0), _sp_card("SAGEMAKER_SP", 2000.0)]
+    coh = [{"actionType": "PurchaseSavingsPlans", "currentResourceType": "ComputeSavingsPlans",
+            "estimatedMonthlySavings": 100.0}]
+    merged = merge_coh_concurrence(cards, coh)
+    # COMPUTE_SP card (index 0) should have annotation
+    assert merged[0]["coh_concurs_monthly"] == pytest.approx(100.0)
+    # SAGEMAKER_SP card (index 1) should NOT have annotation
+    assert "coh_concurs_monthly" not in merged[1]
+
+
+def test_coh_merge_sp_unmapped_resourcetype_no_match():
+    # F5: SP CoH rec with unmapped resourceType should not annotate any card.
+    cards = [_sp_card("COMPUTE_SP", 500.0), _sp_card("SAGEMAKER_SP", 2000.0)]
+    coh = [{"actionType": "PurchaseSavingsPlans", "currentResourceType": "UnknownSavingsPlan",
+            "estimatedMonthlySavings": 100.0}]
+    merged = merge_coh_concurrence(cards, coh)
+    # Neither card should have annotation (unmapped resource type)
+    assert "coh_concurs_monthly" not in merged[0]
+    assert "coh_concurs_monthly" not in merged[1]
+
+
+def test_coh_merge_ec2_ri_matcher():
+    # F6: Lock in EC2 RI matching via EC2ReservedInstances resource type.
+    cards = [_ri_card("EC2", 1000.0)]
+    coh = [{"actionType": "PurchaseReservedInstances", "currentResourceType": "EC2ReservedInstances",
+            "estimatedMonthlySavings": 850.0}]
+    merged = merge_coh_concurrence(cards, coh)
+    assert merged[0]["coh_concurs_monthly"] == pytest.approx(850.0)
