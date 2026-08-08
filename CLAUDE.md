@@ -15,6 +15,7 @@ AWS cost optimization scanner with modular ServiceModule architecture. **Scope i
 | Service audit results | `docs/audits/SUMMARY.md` |
 | Per-service audit prompts | `docs/audits/prompts/<service>_AUDIT_PROMPT.md` |
 | Recurring audit bug classes + invariant sweeps | `docs/audits/prompts/_LIVE_AUDIT_LESSONS.md` |
+| Output audit protocol (audit real scan outputs) | `docs/audits/OUTPUT_AUDIT_PROTOCOL.md` + `tools/output_audit.py` |
 | Live pricing plan | `docs/LIVE_PRICING_PLAN.md` |
 
 ## Key Architecture
