@@ -1027,6 +1027,15 @@ class HTMLReportGenerator:
             padding: 32px;
             min-height: 300px;
             animation: fadeIn 0.3s var(--ease-out-quart);
+            /* Containment (M360 audit): a panel whose table or unbroken token
+               (ARN, bucket name) exceeds the 1440px container must scroll
+               INSIDE the panel — the page itself never widens, so every tab
+               stays centered like the rest. */
+            overflow-x: auto;
+        }
+        .tab-content table { max-width: 100%; }
+        .tab-content td, .tab-content th, .rec-item {
+            overflow-wrap: anywhere;
         }
         
         .tab-content.active { 
@@ -2232,12 +2241,16 @@ class HTMLReportGenerator:
             .theme-toggle { display: none; }
             .export-btn { display: none; }
             .back-to-top { display: none; }
-            .tab-content { display: block !important; page-break-inside: avoid; }
+            /* Print/PDF: every panel must be visible AND allowed to flow
+               across pages. page-break-inside: avoid on a multi-page panel
+               forces the engine to push/clip whole panels — the "mostly
+               blank pages" PDF bug (M360). Panels break BETWEEN each other;
+               only small units (cards, single tables) avoid internal breaks. */
+            .tab-content { display: block !important; overflow-x: visible; }
+            .tab-content:not(:first-of-type) { page-break-before: always; }
             .rec-item { page-break-inside: avoid; }
             canvas { max-width: 100%; page-break-inside: avoid; }
             .service-section { page-break-after: auto; }
-            .service-section:not(:last-child) { page-break-after: always; }
-            .rec-item { page-break-inside: avoid; }
             .recommendations-table { page-break-inside: avoid; }
         }
         @media (prefers-reduced-motion: reduce) {
