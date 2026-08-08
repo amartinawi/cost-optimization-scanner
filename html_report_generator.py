@@ -1337,6 +1337,38 @@ class HTMLReportGenerator:
             background: rgba(102, 187, 106, 0.16);
         }
 
+        /* Commitment purchase-recommendation cards — one section per
+         * instrument (RI service or SP type), one card per type inside,
+         * each with its own term x payment matrix. Mirrors .ri-scenarios'
+         * dark-mode pattern for the recommended-cell highlight. */
+        .commitment-card {
+            margin: 8px 0 14px 0;
+            padding: 10px 12px;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            background: var(--bg-secondary);
+        }
+        .commitment-card h5 {
+            margin: 0 0 6px 0;
+            font-size: 0.95rem;
+            color: var(--text-primary);
+        }
+        .scenario-cell--recommended {
+            background: rgba(46, 125, 50, 0.10);
+            font-weight: 600;
+        }
+        [data-theme="dark"] .scenario-cell--recommended {
+            background: rgba(102, 187, 106, 0.16);
+        }
+        .scenario-cell__label {
+            display: inline-block;
+            margin-left: 4px;
+            font-size: 0.65rem;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            color: var(--text-secondary);
+        }
+
         /* Material Chips/Badges */
         .badge {
             display: inline-flex;

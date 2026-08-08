@@ -614,3 +614,142 @@ def test_adapter_empty_findings_when_ce_unavailable_has_projection_extras():
     assert "cost_optimization_hub" in findings.sources
     assert findings.sources["cost_optimization_hub"].count == 0
     assert findings.sources["cost_optimization_hub"].recommendations == ()
+
+
+# --- Task 6: Card renderer -----------------------------------------------
+
+
+def test_render_ri_card_has_matrix_and_marked_recommendation():
+    from reporter_phase_b import _render_commitment_purchase_cards
+
+    card = {"card_kind": "ri_type", "service": "RDS", "instance_type": "db.r7i.4xlarge",
+            "region": "eu-west-1", "platform": "aurora-postgresql",
+            "recommended_count": 7, "current_ondemand_monthly": 4102.11,
+            "coverage_pct": 22.0, "uncovered_monthly": 3199.65,
+            "scenarios": [
+                {"term": "1yr", "payment": "No Upfront", "monthly_savings": 1210.40,
+                 "upfront": 0.0, "recurring_monthly": 2891.71, "break_even_months": 0.0},
+                {"term": "3yr", "payment": "All Upfront", "monthly_savings": 1700.0,
+                 "upfront": 12000.0, "recurring_monthly": 1800.0, "break_even_months": 7.1},
+            ],
+            "recommended_scenario": 1, "risk_pct": 51.2,
+            "Counted": False, "monthly_savings": 1700.0,
+            "coh_concurs_monthly": 1650.0}
+    html = _render_commitment_purchase_cards([card], "purchase_recommendations", {})
+    assert "db.r7i.4xlarge" in html and "x7" in html
+    assert "$1,210.40" in html and "$1,700.00" in html      # matrix cells
+    assert "break-even" in html.lower()
+    assert "51.2" in html                                    # risk line
+    assert "22.0%" in html                                   # coverage context
+    assert "CoH concurs" in html
+    assert "projection" in html.lower()                      # advisory chip
+    assert html.count("recommended") >= 1                    # AWS pick marked
+
+
+def test_render_sp_card_states_no_instance_type():
+    from reporter_phase_b import _render_commitment_purchase_cards
+
+    card = {"card_kind": "sp_commitment", "sp_type": "COMPUTE_SP",
+            "scenarios": [{"term": "3yr", "payment": "All Upfront",
+                           "monthly_savings": 800.0, "upfront": 9000.0,
+                           "hourly_commitment": 1.1, "savings_pct": 32.0,
+                           "break_even_months": 11.3}],
+            "recommended_scenario": 0, "Counted": False, "monthly_savings": 800.0}
+    html = _render_commitment_purchase_cards([card], "purchase_recommendations", {})
+    assert "$1.1000/hr" in html
+    assert "EC2 + Lambda + Fargate" in html                  # services spanned
+    assert "account-level" in html.lower()                   # no fake type detail
+
+
+def test_render_groups_by_instrument_and_orders_by_savings():
+    from reporter_phase_b import _render_commitment_purchase_cards
+
+    small = {"card_kind": "ri_type", "service": "ElastiCache", "instance_type": "cache.t3.micro",
+             "region": "eu-west-1", "platform": "redis", "recommended_count": 1,
+             "current_ondemand_monthly": 20.0, "scenarios": [], "recommended_scenario": 0,
+             "Counted": False, "monthly_savings": 5.0}
+    big = {"card_kind": "sp_commitment", "sp_type": "COMPUTE_SP",
+           "scenarios": [], "recommended_scenario": 0, "Counted": False,
+           "monthly_savings": 900.0}
+    html = _render_commitment_purchase_cards([small, big], "purchase_recommendations", {})
+    assert html.index("Compute Savings Plan") < html.index("ElastiCache")
+
+
+def test_render_dynamodb_card_skips_empty_platform_cleanly():
+    """DynamoDB RI cards have no platform and a capacity-units instance_type
+    string; the generic card layout must not crash or print empty parens."""
+    from reporter_phase_b import _render_commitment_purchase_cards
+
+    card = {"card_kind": "ri_type", "service": "DynamoDB", "instance_type": "100 capacity units",
+            "region": "us-east-1", "platform": "", "recommended_count": 5,
+            "current_ondemand_monthly": 900.0,
+            "scenarios": [{"term": "1yr", "payment": "No Upfront", "monthly_savings": 300.0,
+                           "upfront": 0.0, "recurring_monthly": 600.0, "break_even_months": 0.0}],
+            "recommended_scenario": 0, "Counted": False, "monthly_savings": 300.0}
+    html = _render_commitment_purchase_cards([card], "purchase_recommendations", {})
+    assert "100 capacity units" in html
+    assert "()" not in html
+    assert " — —" not in html
+
+
+def test_render_zero_savings_cell_is_greyed_not_recommended():
+    """Ruling: SP $0-savings cells are kept but greyed, never marked recommended."""
+    from reporter_phase_b import _render_commitment_purchase_cards
+
+    card = {"card_kind": "sp_commitment", "sp_type": "SAGEMAKER_SP",
+            "scenarios": [
+                {"term": "1yr", "payment": "No Upfront", "monthly_savings": 0.0,
+                 "upfront": 0.0, "hourly_commitment": 0.2, "savings_pct": 0.0,
+                 "break_even_months": 0.0},
+                {"term": "3yr", "payment": "All Upfront", "monthly_savings": 150.0,
+                 "upfront": 500.0, "hourly_commitment": 0.2, "savings_pct": 18.0,
+                 "break_even_months": 3.3},
+            ],
+            "recommended_scenario": 1, "Counted": False, "monthly_savings": 150.0}
+    html = _render_commitment_purchase_cards([card], "purchase_recommendations", {})
+    assert "scenario-cell--muted" in html or "muted" in html
+    assert "scenario-cell--recommended" in html
+
+
+def test_render_break_even_none_renders_phrase_not_zero():
+    """break_even_months == None means 'never breaks even'; must not print 0.0."""
+    from reporter_phase_b import _render_commitment_purchase_cards
+
+    card = {"card_kind": "ri_type", "service": "Redshift", "instance_type": "ra3.xlplus",
+            "region": "eu-west-1", "platform": "", "recommended_count": 2,
+            "current_ondemand_monthly": 400.0,
+            "scenarios": [{"term": "1yr", "payment": "No Upfront", "monthly_savings": 0.0,
+                           "upfront": 100.0, "recurring_monthly": 400.0, "break_even_months": None}],
+            "recommended_scenario": 0, "Counted": False, "monthly_savings": 0.0}
+    html = _render_commitment_purchase_cards([card], "purchase_recommendations", {})
+    assert "never breaks even" in html.lower()
+    assert "0.0 mo" not in html
+
+
+def test_render_coverage_omitted_when_fields_absent():
+    """RI cards may carry neither coverage_pct nor uncovered_monthly — fail closed."""
+    from reporter_phase_b import _render_commitment_purchase_cards
+
+    card = {"card_kind": "ri_type", "service": "OpenSearch", "instance_type": "r6g.large.search",
+            "region": "us-east-1", "platform": "", "recommended_count": 3,
+            "current_ondemand_monthly": 600.0,
+            "scenarios": [{"term": "1yr", "payment": "No Upfront", "monthly_savings": 100.0,
+                           "upfront": 0.0, "recurring_monthly": 500.0, "break_even_months": 0.0}],
+            "recommended_scenario": 0, "Counted": False, "monthly_savings": 100.0}
+    html = _render_commitment_purchase_cards([card], "purchase_recommendations", {})
+    assert "0%" not in html
+    assert "0.0%" not in html
+
+
+def test_render_empty_recs_returns_empty_string():
+    from reporter_phase_b import _render_commitment_purchase_cards
+
+    assert _render_commitment_purchase_cards([], "purchase_recommendations", {}) == ""
+
+
+def test_render_registered_in_phase_b_handlers():
+    from reporter_phase_b import PHASE_B_HANDLERS, _render_commitment_purchase_cards
+
+    assert PHASE_B_HANDLERS[("commitment_analysis", "purchase_recommendations")] is (
+        _render_commitment_purchase_cards
+    )
