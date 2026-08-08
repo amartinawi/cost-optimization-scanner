@@ -386,8 +386,11 @@ def build_sp_cards(cells: list[dict[str, Any]]) -> list[dict[str, Any]]:
 # Source: core/scan_orchestrator.py type_map lines 126-131 (reservation-purchase types).
 # Note: DynamoDB is absent — CoH's type_map has no reservation-purchase type for it
 # (only rightsizing DynamoDBTable), so no CoH recs can concur with DynamoDB RI cards.
+# LIVE-VERIFIED 2026-08-09: real CoH payloads spell it "Ec2ReservedInstances"
+# (lowercase c2) — matching is case-insensitive and both spellings are listed
+# so neither shape ever silently falls through again.
 _COH_RI_MATCH = {
-    "EC2": ("EC2ReservedInstances",),
+    "EC2": ("EC2ReservedInstances", "Ec2ReservedInstances"),
     "RDS": ("RdsReservedInstances",),
     "ElastiCache": ("ElastiCacheReservedInstances",),
     "Redshift": ("RedshiftReservedInstances",),
@@ -399,7 +402,7 @@ _COH_RI_MATCH = {
 # Source: core/scan_orchestrator.py type_map lines 132-134 (savings-plan types).
 _COH_SP_MATCH = {
     "COMPUTE_SP": ("ComputeSavingsPlans",),
-    "EC2_INSTANCE_SP": ("EC2InstanceSavingsPlans",),
+    "EC2_INSTANCE_SP": ("EC2InstanceSavingsPlans", "Ec2InstanceSavingsPlans"),
     "SAGEMAKER_SP": ("SageMakerSavingsPlans",),
 }
 
@@ -423,14 +426,29 @@ def _coh_rec_instance_type(rec: dict[str, Any], service: str) -> str | None:
     nested_key, type_key = _COH_RI_TYPE_KEY.get(service, (None, None))
     if not nested_key:
         return None
-    summary = rec.get("recommendedResourceSummary") or rec.get("recommendedResourceDetails") or {}
-    if not isinstance(summary, dict):
-        return None
-    block = summary.get(nested_key)
-    if not isinstance(block, dict):
-        return None
-    itype = block.get(type_key)
-    return str(itype) if itype else None
+    for field in ("recommendedResourceDetails", "recommendedResourceSummary"):
+        details = rec.get(field)
+        if not isinstance(details, dict):
+            continue
+        block = details.get(nested_key)
+        if not isinstance(block, dict):
+            continue
+        # GetRecommendation nests the type one level deeper, under
+        # "configuration" (live-pinned 2026-08-09); older/synthetic shapes
+        # carry it flat on the block.
+        cfg = block.get("configuration")
+        source = cfg if isinstance(cfg, dict) else block
+        itype = source.get(type_key)
+        if itype:
+            return str(itype)
+    # ListRecommendations shape: recommendedResourceSummary is a plain STRING,
+    # "{count} {type} {platform} in {region} ..." — the type is token 2.
+    summary_str = rec.get("recommendedResourceSummary")
+    if isinstance(summary_str, str):
+        tokens = summary_str.split()
+        if len(tokens) >= 2 and "." in tokens[1]:
+            return tokens[1]
+    return None
 
 
 def _ri_targets_for_rec(rec: dict[str, Any], service_targets: list[dict[str, Any]]
@@ -528,11 +546,11 @@ def merge_coh_concurrence(cards: list[dict[str, Any]],
         if "SavingsPlan" in action:
             rtype = str(rec.get("currentResourceType") or "")
             targets = [c for c in out if c["card_kind"] == "sp_commitment"
-                       and any(substr in rtype for substr in _COH_SP_MATCH.get(c["sp_type"], []))]
+                       and any(substr.lower() in rtype.lower() for substr in _COH_SP_MATCH.get(c["sp_type"], []))]
         elif "Reserved" in action:
             rtype = str(rec.get("currentResourceType") or "")
             service_targets = [c for c in out if c["card_kind"] == "ri_type"
-                              and any(substr in rtype for substr in _COH_RI_MATCH.get(c["service"], []))]
+                              and any(substr.lower() in rtype.lower() for substr in _COH_RI_MATCH.get(c["service"], []))]
             targets = _ri_targets_for_rec(rec, service_targets)
         else:
             continue

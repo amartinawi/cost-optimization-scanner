@@ -2165,12 +2165,15 @@ def _coh_recommended_scenario(rec: Rec) -> Tuple[str, str]:
             or {}
         )
         if isinstance(nested, dict) and nested:
-            summary = nested
+            # GetRecommendation shape nests term/paymentOption one level deeper
+            # under "configuration" (live-pinned 2026-08-09).
+            cfg = nested.get("configuration")
+            summary = cfg if isinstance(cfg, dict) else nested
 
     raw_term = (summary.get("term") if isinstance(summary, dict) else "") or ""
     raw_payment = (summary.get("paymentOption") if isinstance(summary, dict) else "") or ""
 
-    term = "3yr" if "3" in str(raw_term) else "1yr"
+    term = "3yr" if ("3" in str(raw_term) or "three" in str(raw_term).lower()) else "1yr"
     payment_token = str(raw_payment).upper()
     if "ALL" in payment_token:
         payment = "All Upfront"

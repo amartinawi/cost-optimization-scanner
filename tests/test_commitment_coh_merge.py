@@ -90,3 +90,56 @@ def test_coh_merge_ri_typed_rec_wrong_service_stays_unmatched():
     merged, matched = merge_coh_concurrence([rds_card], coh)
     assert "coh_concurs_monthly" not in merged[0]
     assert matched == []
+
+
+# --- Live CoH payload shapes (pinned 2026-08-09 on afs-prod) -----------------
+
+
+def test_live_lowercase_spelling_matches_ec2_card():
+    cards = [_ri_card("EC2", 1000.0)]
+    coh = [{"actionType": "PurchaseReservedInstances",
+            "currentResourceType": "Ec2ReservedInstances",   # live spelling
+            "estimatedMonthlySavings": 900.0}]
+    merged, matched = merge_coh_concurrence(cards, coh)
+    assert matched == [0]
+    assert merged[0]["coh_concurs_monthly"] == pytest.approx(900.0)
+
+
+def test_detailed_shape_configuration_type_lands_on_matching_card():
+    small = dict(_ri_card("EC2", 100.0), instance_type="c5a.4xlarge")
+    rich = dict(_ri_card("EC2", 5000.0), instance_type="m5.large")
+    coh = [{"actionType": "PurchaseReservedInstances",
+            "currentResourceType": "Ec2ReservedInstances",
+            "estimatedMonthlySavings": 400.0,
+            "recommendedResourceDetails": {"ec2ReservedInstances": {"configuration": {
+                "instanceType": "c5a.4xlarge", "term": "ThreeYears"}}}}]
+    merged, matched = merge_coh_concurrence([small, rich], coh)
+    assert matched == [0]
+    assert merged[0].get("coh_concurs_monthly") == pytest.approx(400.0)   # typed match
+    assert "coh_concurs_monthly" not in merged[1]                          # not the richest
+
+
+def test_string_summary_type_token_lands_on_matching_card():
+    small = dict(_ri_card("EC2", 100.0), instance_type="r6i.4xlarge")
+    rich = dict(_ri_card("EC2", 5000.0), instance_type="m5.large")
+    coh = [{"actionType": "PurchaseReservedInstances",
+            "currentResourceType": "Ec2ReservedInstances",
+            "estimatedMonthlySavings": 1985.77,
+            "recommendedResourceSummary":
+                "4 r6i.4xlarge Windows (Amazon VPC) in eu-west-1 with three years term (AllUpfront)"}]
+    merged, matched = merge_coh_concurrence([small, rich], coh)
+    assert matched == [0]
+    assert merged[0].get("coh_concurs_monthly") == pytest.approx(1985.77)
+    assert "coh_concurs_monthly" not in merged[1]
+
+
+def test_string_summary_type_absent_from_cards_stays_unmatched():
+    cards = [dict(_ri_card("EC2", 5000.0), instance_type="m5.large")]
+    coh = [{"actionType": "PurchaseReservedInstances",
+            "currentResourceType": "Ec2ReservedInstances",
+            "estimatedMonthlySavings": 2427.28,
+            "recommendedResourceSummary":
+                "8 c5a.4xlarge Red Hat Enterprise Linux in eu-west-1 with three years term (AllUpfront)"}]
+    merged, matched = merge_coh_concurrence(cards, coh)
+    assert matched == []                                # renders standalone, no guessing
+    assert "coh_concurs_monthly" not in merged[0]

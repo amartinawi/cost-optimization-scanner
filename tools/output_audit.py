@@ -73,8 +73,15 @@ def parse_dollar(text: Any) -> float:
 
 
 def rec_dollar(rec: dict[str, Any]) -> float:
-    """Read a rec's dollar from every savings-bearing field shape (F1/F2/F5)."""
-    for key in ("EstimatedMonthlySavings", "estimatedMonthlySavings", "EstimatedMonthlyCost", "monthly_savings"):
+    """Read a rec's dollar from every savings-bearing field shape (F1/F2/F5).
+
+    ``EstimatedMonthlyCost`` is the LAST resort (after the parsed string):
+    on unattached-volume recs it IS the recoverable dollar (F2), but on any
+    rec that also carries a real savings signal it is just the resource's
+    COST — an S3 bucket rec carried cost $82.47 beside savings $37.03, and
+    the old cost-before-string order fabricated a $45 phantom (M360 audit).
+    """
+    for key in ("EstimatedMonthlySavings", "estimatedMonthlySavings", "monthly_savings"):
         val = rec.get(key)
         if isinstance(val, (int, float)) and val:
             return float(val)
@@ -86,7 +93,11 @@ def rec_dollar(rec: dict[str, Any]) -> float:
                 "estimatedMonthlySavings", {}).get("value")
             if isinstance(val, (int, float)) and val:
                 return float(val)
-    return parse_dollar(rec.get("EstimatedSavings", ""))
+    parsed = parse_dollar(rec.get("EstimatedSavings", ""))
+    if parsed:
+        return parsed
+    cost = rec.get("EstimatedMonthlyCost")
+    return float(cost) if isinstance(cost, (int, float)) and cost else 0.0
 
 
 def load_report(path: Path | str) -> dict[str, Any]:

@@ -98,7 +98,9 @@ def _by_category(findings) -> dict[str, dict[str, Any]]:
 def test_one_size_down_steps_the_search_suffix_ladder() -> None:
     assert _one_size_down("r6g.2xlarge.search") == "r6g.xlarge.search"
     assert _one_size_down("m5.xlarge.search") == "m5.large.search"
-    assert _one_size_down("c5.large.search") == "c5.medium.search"
+    # c5.medium.search is NOT a real SKU (c5 floors at large) — the old
+    # assertion pinned a nonexistent downsize target (bnc live audit).
+    assert _one_size_down("c5.large.search") is None
     # legacy .elasticsearch suffix is preserved
     assert _one_size_down("r5.4xlarge.elasticsearch") == "r5.2xlarge.elasticsearch"
 
@@ -467,3 +469,13 @@ def test_extended_support_fails_closed_on_ce_error():
     ctx = SimpleNamespace(client=lambda _n: ce, warn=lambda m, s=None: warns.append(m))
     assert _extended_support_breakdown(ctx) == (0.0, {})   # never invent a charge
     assert warns
+
+
+def test_one_size_down_respects_large_floor():
+    """r5-class OpenSearch families have no size below large — probing
+    r5.medium.search wasted a Pricing API call before failing closed (bnc)."""
+    from services.adapters.opensearch import _one_size_down
+
+    assert _one_size_down("r5.large.search") is None
+    assert _one_size_down("r5.xlarge.search") == "r5.large.search"
+    assert _one_size_down("t3.medium.search") is not None  # t3 goes smaller

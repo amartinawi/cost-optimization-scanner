@@ -47,6 +47,11 @@ _X86_TO_GRAVITON_FAMILY: dict[str, str] = {
 
 # Standard OpenSearch instance size ladder (ascending). Used to derive the
 # one-size-down downsize target for an underutilized domain (OpenSearch C3).
+# Families whose smallest OpenSearch size is "large" (t2/t3/m3 offer smaller).
+_LARGE_FLOOR_FAMILIES: frozenset[str] = frozenset(
+    {"r5", "r6g", "r6gd", "m5", "m6g", "c5", "c6g", "i3", "im4gn", "or1", "r7g", "m7g", "c7g"}
+)
+
 _SIZE_LADDER: tuple[str, ...] = (
     "micro",
     "small",
@@ -83,7 +88,14 @@ def _one_size_down(instance_type: str | None) -> str | None:
     idx = _SIZE_LADDER.index(size)
     if idx == 0:
         return None
-    parts[1] = _SIZE_LADDER[idx - 1]
+    target_size = _SIZE_LADDER[idx - 1]
+    # Size floor: most memory/compute-optimized OpenSearch families start at
+    # "large" — probing e.g. r5.medium.search wastes a Pricing API call and a
+    # warning line before failing closed (bnc live audit, 2026-08-09).
+    family = parts[0]
+    if family in _LARGE_FLOOR_FAMILIES and _SIZE_LADDER.index(target_size) < _SIZE_LADDER.index("large"):
+        return None
+    parts[1] = target_size
     return ".".join(parts)
 
 

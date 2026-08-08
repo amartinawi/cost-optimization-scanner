@@ -489,3 +489,14 @@ def test_network_asg_born_advisory_source_exempt():
     }
     data["summary"]["total_services_scanned"] = 3
     assert _fails(sweep_advisory_leak(data)) == []
+
+
+def test_rec_dollar_cost_field_is_last_resort():
+    """M360 audit: an S3 rec carries EstimatedMonthlyCost (the bucket's COST,
+    $82.47) beside its real savings string ($37.03) — cost must never shadow
+    the savings signal. Cost-only recs (unattached volumes, F2) still work."""
+    s3_style = {"EstimatedMonthlyCost": 82.47, "EstimatedSavings": "$37.03/month",
+                "SavingsDelta": 37.03, "Counted": True}
+    assert rec_dollar(s3_style) == pytest.approx(37.03)
+    unattached = {"EstimatedMonthlyCost": 25.0}   # F2: cost IS the recoverable
+    assert rec_dollar(unattached) == pytest.approx(25.0)
