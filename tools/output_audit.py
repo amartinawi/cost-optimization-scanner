@@ -43,8 +43,17 @@ Finding = dict[str, str]
 # What-if buy/coverage projections legitimately carry a non-zero numeric (B1-ii).
 PROJECTION_SERVICES = {"commitment_analysis"}
 # Source-level projections: born-advisory what-ifs whose counted dollar lives in
-# another tab (eks node groups are EC2 instances — the EC2 tab counts them).
-PROJECTION_SOURCES = {("eks_cost", "node_group_optimization")}
+# another tab (eks node groups are EC2 instances — the EC2 tab counts them;
+# network ASG rightsizing is advisory by design, adapters CLAUDE.md).
+PROJECTION_SOURCES = {("eks_cost", "node_group_optimization"),
+                      ("network", "auto_scaling_groups")}
+
+# B1-iii (Jarir-M2 audit, user-ratified 2026-08-09): a COMMITMENT-DEMOTED rec
+# (split_by_commitment/_demote) deliberately keeps its indicative numeric —
+# the renderer shows "$X — covered by your SP/RI" — and marks itself with
+# these fields. Nothing sums the numeric (S1/S13 guard that). A Counted=False
+# rec with a non-zero numeric and NO marker is still a genuine B1 leak.
+_DEMOTION_MARKERS = ("CommitmentCoverageNote", "AdvisoryEstimate")
 
 _DOLLAR = re.compile(r"\$([0-9,]+\.?[0-9]*)")
 _SNAP_ID = re.compile(r"snap-[0-9a-f]{8,17}")
@@ -126,6 +135,8 @@ def sweep_advisory_leak(data: dict[str, Any]) -> list[Finding]:
     out: list[Finding] = []
     for key, src, rec in _iter_recs(data):
         if key in PROJECTION_SERVICES or (key, src) in PROJECTION_SOURCES or _is_counted(rec):
+            continue
+        if any(m in rec for m in _DEMOTION_MARKERS):  # B1-iii demotion shape
             continue
         for field in _NUMERIC_FIELDS:
             val = rec.get(field)

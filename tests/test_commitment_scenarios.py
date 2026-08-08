@@ -761,3 +761,45 @@ def test_ri_and_sp_cards_carry_low_severity():
 # tests/test_commitment_coh_merge.py to keep this file under the 800-line cap.
 
 
+
+
+# --- Jarir-M2 live-audit fixes (J-1): CE location names vs region codes ------
+
+
+def test_adapter_normalizes_ce_location_names_to_region_codes(monkeypatch):
+    """CE details carry location names ("EU (Frankfurt)"); the coverage join,
+    scan-region sort, and region tags all key on region codes. J-1: the adapter
+    must normalize before building cards, else coverage context is dead on
+    every real account (proven live on Jarir-M2: $13,343/mo uncovered, zero
+    coverage lines rendered)."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    from services.adapters.commitment_analysis import CommitmentAnalysisModule
+
+    class _FrankfurtCe(_MatrixCe):
+        def get_reservation_purchase_recommendation(self, Service, LookbackPeriodInDays,
+                                                    TermInYears, PaymentOption):
+            if "Relational" not in Service:
+                return {"Recommendations": []}
+            d = _rds_detail()
+            d["InstanceDetails"]["RDSInstanceDetails"]["Region"] = "EU (Frankfurt)"
+            return _ri_resp([d])
+
+    coverage = SimpleNamespace(
+        uncovered_on_demand={"rds:r7i.4xlarge": 3199.65},
+        has_any_commitment=True,
+    )
+    ce = _FrankfurtCe()
+    ctx = SimpleNamespace(
+        region="eu-central-1", fast_mode=True, pricing_multiplier=1.0, pricing_engine=None,
+        commitment_coverage=coverage, cost_hub_splits={},
+        client=lambda name, region=None: ce if name == "ce" else MagicMock(),
+        warn=MagicMock(), permission_issue=MagicMock(),
+    )
+    findings = CommitmentAnalysisModule().scan(ctx)
+    cards = [r for r in findings.sources["purchase_recommendations"].recommendations
+             if isinstance(r, dict) and r.get("card_kind") == "ri_type"]
+    assert len(cards) == 1
+    assert cards[0]["region"] == "eu-central-1"          # normalized, not "EU (Frankfurt)"
+    assert cards[0]["uncovered_monthly"] == pytest.approx(3199.65)  # join now fires
+    assert "coverage_pct" in cards[0]

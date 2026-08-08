@@ -31,18 +31,7 @@ from botocore.exceptions import ClientError  # type: ignore[import-untyped]
 from core.contracts import GroupingSpec, ServiceFindings, SourceBlock, StatCardSpec
 from services._base import BaseServiceModule
 from services.commitment_logic import DEFAULT_COVERAGE_RATIO, fargate_sp_analysis
-from services.commitment_scenarios import (
-    PAYMENTS,
-    RI_SERVICES,
-    SP_TYPES,
-    TERMS,
-    build_ri_type_cards,
-    build_sp_cards,
-    merge_coh_concurrence,
-    projected_savings,
-    ri_cells_from_response,
-    sp_cell_from_response,
-)
+from services.commitment_purchase_fetch import fetch_purchase_cards
 
 # Compute Savings Plans cover Fargate (ECS + EKS); ECS-on-EC2 bills as EC2.
 # Ephemeral storage and data transfer are NOT SP-eligible.
@@ -502,79 +491,12 @@ class CommitmentAnalysisModule(BaseServiceModule):
     def _fetch_purchase_cards(
         self, ctx: Any, ce: Any
     ) -> tuple[list[dict[str, Any]], float, str, list[dict[str, Any]]]:
-        """Fan out the full CE purchase matrix and build per-type scenario cards.
+        """Delegate the CE purchase-matrix fan-out to the fetch module.
 
-        Every cell is one independent CE call; a denied/throttled cell degrades
-        only that cell (via ``_route_ce_error``). RI cells fan out across
-        ``RI_SERVICES`` (6) x ``TERMS`` (2) x ``PAYMENTS`` (3); SP cells across
-        ``SP_TYPES`` (3) x the same term/payment matrix.
-
-        A CoH RI/SP rec routed here (``ctx.cost_hub_splits["commitment_analysis"]``)
-        that concurs with a built card merges into that card's
-        ``coh_concurs_monthly`` figure (``merge_coh_concurrence``) instead of
-        rendering twice; the unmatched remainder returns for the caller's
-        standalone CoH source.
-
-        Args:
-            ce: Cost Explorer boto3 client.
-
-        Returns:
-            Tuple of ``(cards, projected_monthly, basis, unmatched_coh_recs)``.
+        See ``services/commitment_purchase_fetch.fetch_purchase_cards`` for the
+        full contract: (cards, projected_monthly, basis, unmatched_coh_recs).
         """
-        ri_cells: list[dict[str, Any]] = []
-        for service_api, service_label in RI_SERVICES:
-            for term_api, term_label in TERMS:
-                for payment_api, payment_label in PAYMENTS:
-                    try:
-                        resp = ce.get_reservation_purchase_recommendation(
-                            Service=service_api,
-                            LookbackPeriodInDays="THIRTY_DAYS",
-                            TermInYears=term_api,
-                            PaymentOption=payment_api,
-                        )
-                    except Exception as e:
-                        _route_ce_error(
-                            ctx,
-                            f"ce:GetReservationPurchaseRecommendation[{service_label}/({term_label}, {payment_label})]",
-                            e,
-                        )
-                        continue
-                    ri_cells.extend(ri_cells_from_response(service_label, term_label, payment_label, resp))
-
-        sp_cells: list[dict[str, Any]] = []
-        for sp_type in SP_TYPES:
-            for term_api, term_label in TERMS:
-                for payment_api, payment_label in PAYMENTS:
-                    try:
-                        resp = ce.get_savings_plans_purchase_recommendation(
-                            SavingsPlansType=sp_type,
-                            TermInYears=term_api,
-                            PaymentOption=payment_api,
-                            LookbackPeriodInDays="THIRTY_DAYS",
-                        )
-                    except Exception as e:
-                        _route_ce_error(
-                            ctx,
-                            f"ce:GetSavingsPlansPurchaseRecommendation[{sp_type}/({term_label}, {payment_label})]",
-                            e,
-                        )
-                        continue
-                    cell = sp_cell_from_response(sp_type, term_label, payment_label, resp)
-                    if cell:
-                        sp_cells.append(cell)
-
-        coverage = getattr(ctx, "commitment_coverage", None)
-        uncovered = dict(coverage.uncovered_on_demand) if coverage is not None else {}
-        ri_cards = build_ri_type_cards(ri_cells, uncovered, getattr(ctx, "region", ""))
-        sp_cards = build_sp_cards(sp_cells)
-        projected, basis = projected_savings(ri_cards, sp_cards)
-
-        coh_recs = [r for r in (getattr(ctx, "cost_hub_splits", {}) or {}).get("commitment_analysis", [])
-                    if isinstance(r, dict)]
-        cards, matched_indices = merge_coh_concurrence(ri_cards + sp_cards, coh_recs)
-        matched = set(matched_indices)
-        unmatched_coh = [r for i, r in enumerate(coh_recs) if i not in matched]
-        return cards, projected, basis, unmatched_coh
+        return fetch_purchase_cards(ctx, ce, _route_ce_error)
 
     # ── Fargate Savings Plan view ──────────────────────────────────────────────
 

@@ -70,6 +70,16 @@ will eventually both count it. This is the single most common real finding.
   you buy*"), which is a projection, not a counted-resource saving the headline
   dropped by accident; exclude those projection sources before asserting. **Detect:**
   the sweep in the appendix (all numeric fields, projection sources excluded).
+- **B1-iii — The COMMITMENT-DEMOTION shape is a sanctioned exception** (user-
+  ratified 2026-08-09, Jarir-M2 live audit). A rec demoted by
+  `split_by_commitment`/`_demote` keeps its indicative numeric
+  (`estimatedMonthlySavings`/`EstimatedMonthlySavings`) so the card can render
+  "$X — covered by your SP/RI"; it self-identifies via `CommitmentCoverageNote`
+  + `AdvisoryEstimate`. Nothing may sum the numeric (S1/S13 enforce). A
+  `Counted=False` rec with a non-zero numeric and NO demotion marker remains a
+  genuine B1 leak. The `network/auto_scaling_groups` source is born-advisory
+  with an indicative numeric by design (like `eks_cost/node_group_optimization`)
+  — exempt at source level, not rec level.
 - **B2 — The `EstimatedSavings` STRING and `EstimatedMonthlySavings` NUMERIC must
   agree to the cent in EVERY branch.** A reconciliation capped the string
   (`$4.84/month`) but left the numeric uncapped (`13.30`) — a +$719.60 field
