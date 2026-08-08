@@ -302,8 +302,10 @@ class EC2Module(BaseServiceModule):
                 is_covered=lambda r: cov.covers_ec2(family_of(r)),
                 gross_of=gross_of,
                 note_of=lambda r, g: cov.ec2_note(family_of(r), g),
-                ceiling_of=(lambda r: cov.realizable_ceiling("ec2", family_of(r))) if has_ceiling else None,
-                key_of=family_of,
+                # Scan-scoped ledger: all five source splits below spend ONE
+                # headroom pool per exact type (EC2-1 — a call-local budget let
+                # each source re-spend the full ceiling, up to 5x).
+                take_of=(lambda r, g: cov.take_headroom("ec2", family_of(r), g)) if has_ceiling else None,
             )
 
         def _co_type(r: dict[str, Any]) -> str:

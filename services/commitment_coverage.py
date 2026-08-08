@@ -148,6 +148,12 @@ class CommitmentCoverage:
     uncovered_on_demand: Mapping[str, float] = field(default_factory=dict)
     sp_utilization_pct: float | None = None
     sp_unused_monthly: float | None = None
+    # Scan-scoped C6 spending ledger: pool-key -> $ already counted against the
+    # ceiling by ANY demotion call this scan. The dataclass is frozen but the
+    # dict CONTENTS are mutable by design — every call site (CoH gate,
+    # enhanced-checks gate, ec2's five source splits, rds AND aurora) must draw
+    # from one pool, or each call re-spends the full ceiling (RDS-1/EC2-1).
+    _spent: dict[str, float] = field(default_factory=dict, init=False, repr=False, compare=False)
 
     # --- coverage predicates (per service) --------------------------------
     def covers_ec2(self, instance_type: str) -> bool:
@@ -229,6 +235,36 @@ class CommitmentCoverage:
         if not self.uncovered_on_demand:
             return None
         return self.uncovered_on_demand.get(f"{service}:{normalize_type(resource_type)}")
+
+    def _pool_key(self, service: str, resource_type: str) -> str:
+        """Ledger key for a type's headroom pool, unified across CE service dims.
+
+        rds and aurora bill under ONE Cost-Explorer service dimension, so the
+        fetch writes the same pool under both service keys — the ledger must
+        spend it once, not once per key.
+        """
+        pool = _CE_SERVICE_DIM.get(service, service)
+        return f"{pool}:{normalize_type(resource_type)}"
+
+    def take_headroom(self, service: str, resource_type: str, gross: float) -> bool:
+        """Atomically spend ``gross`` from the type's SCAN-WIDE headroom pool.
+
+        True -> the caller keeps the rec counted (the gross fits the remaining
+        uncovered on-demand for this exact type, across every demotion call in
+        the scan); False -> demote. Missing/zero ceiling is False (fail
+        closed). This is the C6 layer-2 invariant enforced globally: a type's
+        total counted rightsizing can never exceed its real uncovered
+        on-demand, no matter how many rec sources feed it.
+        """
+        ceiling = self.realizable_ceiling(service, resource_type)
+        if ceiling is None or ceiling <= 0:
+            return False
+        key = self._pool_key(service, resource_type)
+        spent = self._spent.get(key, 0.0)
+        if gross <= ceiling - spent:
+            self._spent[key] = spent + gross
+            return True
+        return False
 
     @property
     def has_any_commitment(self) -> bool:
@@ -322,6 +358,7 @@ def split_by_commitment(
     note_of: Callable[[dict[str, Any], float], str],
     ceiling_of: Callable[[dict[str, Any]], float | None] | None = None,
     key_of: Callable[[dict[str, Any]], str] | None = None,
+    take_of: Callable[[dict[str, Any], float], bool] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Split recs into (counted, advisory) by active-commitment coverage.
 
@@ -342,15 +379,28 @@ def split_by_commitment(
     for rec in recs:
         (candidates if is_covered(rec) else counted).append(rec)
 
-    if ceiling_of is None:
+    if ceiling_of is None and take_of is None:
         # Layer-1: demote every candidate.
         advisory = [_demote(rec, gross_of(rec), note_of) for rec in candidates]
         return counted, advisory
 
-    # Layer-2: greedy fill up to each family's uncovered-on-demand ceiling.
+    # Layer-2: greedy fill up to the type's uncovered-on-demand ceiling.
+    # Prefer take_of — the SCAN-scoped ledger on CommitmentCoverage — so every
+    # demotion call in the scan draws from one pool (a call-local budget lets
+    # each rec source re-spend the full ceiling; RDS-1/EC2-1). The
+    # ceiling_of/key_of path survives for pure single-call use.
+    advisory: list[dict[str, Any]] = []
+    if take_of is not None:
+        for rec in sorted(candidates, key=lambda r: gross_of(r), reverse=True):
+            gross = gross_of(rec)
+            if take_of(rec, gross):
+                counted.append(rec)
+            else:
+                advisory.append(_demote(rec, gross, note_of))
+        return counted, advisory
+
     _key = key_of or (lambda _r: "")
     budgets: dict[str, float] = {}
-    advisory: list[dict[str, Any]] = []
     for rec in sorted(candidates, key=lambda r: gross_of(r), reverse=True):
         ceiling = ceiling_of(rec)
         gross = gross_of(rec)
@@ -455,18 +505,15 @@ def demote_covered_in_place(
         and rec_gross(rec) > 0
         and coverage.covers(service, type_of(rec), engine_of(rec) if engine_of else "")
     ]
-    budgets: dict[str, float] = {}
     removed = 0.0
     for rec in sorted(candidates, key=rec_gross, reverse=True):
         rtype = type_of(rec)
         gross = rec_gross(rec)
-        key = normalize_type(rtype)
-        if key not in budgets:
-            ceiling = coverage.realizable_ceiling(service, rtype)
-            budgets[key] = ceiling if ceiling and ceiling > 0 else 0.0
-        if gross <= budgets[key]:
-            budgets[key] -= gross  # realizable on-demand overflow — stays counted
-            continue
+        # Scan-scoped ledger (not a call-local budget): the CoH gate, this
+        # gate, and every other adapter drawing on the same CE pool spend ONE
+        # ceiling per exact type (RDS-1/EC2-1; rds+aurora share a pool).
+        if coverage.take_headroom(service, rtype, gross):
+            continue  # realizable on-demand overflow — stays counted
         rec["Counted"] = False
         rec["AdvisoryEstimate"] = gross
         rec["CommitmentCoverageNote"] = coverage.ri_note(service, rtype, gross)
@@ -497,10 +544,9 @@ def demote_coh_by_commitment(
         is_covered=lambda r: coverage.covers(service, coh_resource_type(r)),
         gross_of=gross_of,
         note_of=lambda r, g: coverage.ri_note(service, coh_resource_type(r), g),
-        ceiling_of=(lambda r: coverage.realizable_ceiling(service, coh_resource_type(r))) if has_ceiling else None,
-        # Budget key must match the ceiling key (exact type), so sibling sizes
-        # never share a headroom budget.
-        key_of=lambda r: normalize_type(coh_resource_type(r)),
+        # Scan-scoped ledger: exact-type pool shared with every other demotion
+        # call in the scan (RDS-1/EC2-1).
+        take_of=(lambda r, g: coverage.take_headroom(service, coh_resource_type(r), g)) if has_ceiling else None,
     )
 
 

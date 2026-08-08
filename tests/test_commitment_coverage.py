@@ -778,3 +778,73 @@ def test_sp_covered_asg_rec_demotes_without_headroom() -> None:
         key_of=lambda r: normalize_type(_coh_instance_type(r)),
     )
     assert len(counted2) == 1 and advisory2 == []
+
+
+# --------------------------------------------------------------------------- #
+# C6 scan-scoped headroom ledger (verification findings RDS-1 / EC2-1 / AUR-B)
+# --------------------------------------------------------------------------- #
+def test_c6_headroom_ledger_shared_across_demotion_calls() -> None:
+    """The CE headroom ceiling is a per-scan POOL: two demotion calls (the CoH
+    gate then the enhanced-checks gate, or ec2's five source splits) must not
+    each spend the full ceiling."""
+    cov = CommitmentCoverage(
+        region="us-east-1",
+        rds_ri_families=frozenset({"r7i"}),
+        uncovered_on_demand={"rds:r7i.4xlarge": 200.0},
+    )
+    first = [{"DBInstanceClass": "db.r7i.4xlarge", "EstimatedMonthlySavings": 180.0, "Counted": True}]
+    second = [{"DBInstanceClass": "db.r7i.4xlarge", "EstimatedMonthlySavings": 180.0, "Counted": True}]
+
+    def _t(r):
+        return r["DBInstanceClass"]
+
+    assert demote_covered_in_place(first, cov, "rds", _t) == 0.0  # 180 <= 200: counted
+    assert first[0]["Counted"] is True
+    removed = demote_covered_in_place(second, cov, "rds", _t)  # only $20 of pool left
+    assert removed == pytest.approx(180.0)
+    assert second[0]["Counted"] is False
+
+
+def test_c6_rds_and_aurora_share_one_ce_pool() -> None:
+    """Aurora bills under the RDS CE service dimension — the fetch writes the
+    same pool under both keys, so spending must be unified, not doubled."""
+    cov = CommitmentCoverage(
+        region="us-east-1",
+        rds_ri_families=frozenset({"r6g"}),
+        uncovered_on_demand={"rds:r6g.large": 200.0, "aurora:r6g.large": 200.0},
+    )
+    rds_recs = [{"DBInstanceClass": "db.r6g.large", "EstimatedMonthlySavings": 180.0, "Counted": True}]
+    aur_recs = [
+        {"CurrentSize": "db.r6g.large", "monthly_savings": 180.0,
+         "EstimatedMonthlySavings": 180.0, "Counted": True}
+    ]
+    assert demote_covered_in_place(rds_recs, cov, "rds", lambda r: r["DBInstanceClass"]) == 0.0
+    removed = demote_covered_in_place(
+        aur_recs, cov, "aurora", lambda r: r.get("CurrentSize") or "",
+        zero_keys=("monthly_savings", "EstimatedMonthlySavings"),
+    )
+    assert removed == pytest.approx(180.0)
+    assert aur_recs[0]["Counted"] is False
+
+
+def test_c6_coh_and_local_gates_share_ledger() -> None:
+    """demote_coh_by_commitment and demote_covered_in_place spend one ledger."""
+    cov = CommitmentCoverage(
+        region="us-east-1",
+        rds_ri_families=frozenset({"r7i"}),
+        uncovered_on_demand={"rds:r7i.4xlarge": 200.0},
+    )
+    coh = [{
+        "estimatedMonthlySavings": 180.0,
+        "currentResourceDetails": {
+            "rdsDbInstance": {"configuration": {"instance": {"dbInstanceClass": "db.r7i.4xlarge"}}}
+        },
+    }]
+    counted, advisory = demote_coh_by_commitment(
+        coh, cov, "rds", lambda r: float(r.get("estimatedMonthlySavings") or 0)
+    )
+    assert len(counted) == 1 and advisory == []
+    local = [{"DBInstanceClass": "db.r7i.4xlarge", "EstimatedMonthlySavings": 180.0, "Counted": True}]
+    removed = demote_covered_in_place(local, cov, "rds", lambda r: r["DBInstanceClass"])
+    assert removed == pytest.approx(180.0)
+    assert local[0]["Counted"] is False
