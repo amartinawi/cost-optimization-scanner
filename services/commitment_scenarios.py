@@ -317,3 +317,73 @@ def build_sp_cards(cells: list[dict[str, Any]]) -> list[dict[str, Any]]:
         cards.append(card)
     cards.sort(key=lambda c: -c["monthly_savings"])
     return cards
+
+
+# Which CoH resource-type substrings concur with which RI card service.
+_COH_RI_MATCH = {"EC2": "Ec2Instance", "RDS": "RdsDb", "ElastiCache": "ElastiCache",
+                 "Redshift": "Redshift", "OpenSearch": "OpenSearch"}
+
+
+def projected_savings(ri_cards: list[dict[str, Any]],
+                      sp_cards: list[dict[str, Any]]) -> tuple[float, str]:
+    """Best non-overlapping purchase path across instruments (spec section
+    "Projected figure + non-overlap rule").
+
+    SP and RI discount the SAME on-demand spend, so within the compute group
+    the winner is max(best SP type, sum of EC2 RI cards) — never the sum.
+    Disjoint RI services (RDS/ElastiCache/Redshift/OpenSearch) sum safely;
+    SageMaker SP overlaps nothing else and adds on top.
+    """
+    ec2_ri_total = sum(c["monthly_savings"] for c in ri_cards if c["service"] == "EC2")
+    compute_sp_best = max(
+        (c["monthly_savings"] for c in sp_cards if c["sp_type"] in ("COMPUTE_SP", "EC2_INSTANCE_SP")),
+        default=0.0)
+    if compute_sp_best >= ec2_ri_total:
+        group1, group1_basis = compute_sp_best, "Compute SP path"
+    else:
+        group1, group1_basis = ec2_ri_total, "EC2 RI path"
+
+    group2 = sum(c["monthly_savings"] for c in ri_cards
+                 if c["service"] in ("RDS", "ElastiCache", "Redshift", "OpenSearch"))
+    group3 = max((c["monthly_savings"] for c in sp_cards if c["sp_type"] == "SAGEMAKER_SP"),
+                 default=0.0)
+
+    total = round(group1 + group2 + group3, 2)
+    parts = []
+    if group1 > 0:
+        parts.append(group1_basis)
+    if group2 > 0:
+        parts.append("service RIs (RDS/ElastiCache/Redshift/OpenSearch)")
+    if group3 > 0:
+        parts.append("SageMaker SP")
+    return total, " + ".join(parts) if parts else "no purchase recommendations"
+
+
+def merge_coh_concurrence(cards: list[dict[str, Any]],
+                          coh_recs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Annotate cards with a "CoH concurs: $X/mo" figure instead of rendering
+    duplicate CoH purchase cards. Returns new card dicts (no input mutation).
+
+    Match: an SP-purchase CoH rec concurs with the same-type SP card; an
+    RI-purchase CoH rec concurs with the highest-savings RI card of the
+    matching service. Unmatched CoH recs are left for the existing CoH render
+    path — nothing is dropped here.
+    """
+    out = [dict(c) for c in cards]
+    for rec in coh_recs:
+        action = str(rec.get("actionType") or rec.get("recommendedAction") or "")
+        dollars = float(rec.get("estimatedMonthlySavings") or 0)
+        if dollars <= 0:
+            continue
+        if "SavingsPlan" in action:
+            targets = [c for c in out if c["card_kind"] == "sp_commitment"]
+        elif "Reserved" in action:
+            rtype = str(rec.get("currentResourceType") or "")
+            targets = [c for c in out if c["card_kind"] == "ri_type"
+                       and _COH_RI_MATCH.get(c["service"], "\x00") in rtype]
+        else:
+            continue
+        if targets:
+            best = max(targets, key=lambda c: c["monthly_savings"])
+            best["coh_concurs_monthly"] = round(dollars, 2)
+    return out

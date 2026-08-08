@@ -350,3 +350,62 @@ def test_sp_cards_mutations_do_not_affect_originals():
     cells_copy = copy.deepcopy(original_cells)
     build_sp_cards(original_cells)
     assert original_cells == cells_copy
+
+
+# --- Task 3: Projection + CoH merge -------------------------------------------
+
+
+from services.commitment_scenarios import merge_coh_concurrence, projected_savings
+
+
+def _ri_card(service="RDS", savings=1000.0):
+    return {"card_kind": "ri_type", "service": service, "instance_type": "x",
+            "region": "eu-west-1", "Counted": False, "monthly_savings": savings,
+            "scenarios": [], "recommended_scenario": 0}
+
+
+def _sp_card(sp_type="COMPUTE_SP", savings=1500.0):
+    return {"card_kind": "sp_commitment", "sp_type": sp_type, "Counted": False,
+            "monthly_savings": savings, "scenarios": [], "recommended_scenario": 0}
+
+
+def test_projected_compute_group_takes_max_not_sum():
+    # EC2 RIs total 1000, Compute SP 1500 -> group1 = 1500 (max), never 2500.
+    total, basis = projected_savings([_ri_card("EC2", 1000.0)], [_sp_card("COMPUTE_SP", 1500.0)])
+    assert total == pytest.approx(1500.0)
+    assert "Compute SP" in basis
+
+
+def test_projected_sp_types_overlap_each_other():
+    # Compute SP 1500 vs EC2-Instance SP 1600 -> 1600, not 3100.
+    total, _ = projected_savings([], [_sp_card("COMPUTE_SP", 1500.0),
+                                      _sp_card("EC2_INSTANCE_SP", 1600.0)])
+    assert total == pytest.approx(1600.0)
+
+
+def test_projected_disjoint_ri_services_sum():
+    total, _ = projected_savings(
+        [_ri_card("RDS", 1000.0), _ri_card("ElastiCache", 200.0)], [])
+    assert total == pytest.approx(1200.0)
+
+
+def test_projected_sagemaker_adds_on_top():
+    total, _ = projected_savings([_ri_card("RDS", 1000.0)],
+                                 [_sp_card("SAGEMAKER_SP", 300.0)])
+    assert total == pytest.approx(1300.0)
+
+
+def test_coh_merge_annotates_matching_card():
+    cards = [_ri_card("RDS", 1000.0)]
+    coh = [{"actionType": "PurchaseReservedInstances", "currentResourceType": "RdsDbInstance",
+            "estimatedMonthlySavings": 950.0}]
+    merged = merge_coh_concurrence(cards, coh)
+    assert merged[0]["coh_concurs_monthly"] == pytest.approx(950.0)
+    assert "coh_concurs_monthly" not in cards[0]  # input not mutated
+
+
+def test_coh_merge_no_match_leaves_cards_untouched():
+    cards = [_ri_card("RDS", 1000.0)]
+    coh = [{"actionType": "PurchaseSavingsPlans", "estimatedMonthlySavings": 10.0}]
+    merged = merge_coh_concurrence(cards, coh)
+    assert "coh_concurs_monthly" not in merged[0]
