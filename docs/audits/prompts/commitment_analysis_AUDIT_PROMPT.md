@@ -15,6 +15,65 @@ rightsizing levers they overlap.**
 
 ## PROMPT (copy from here)
 
+> **⚠ Commitment deep-dive shipped (2026-08-08) — read this before Phase 1/4/6 below.**
+> `purchase_recommendations` was rewired end to end. Where this prompt still
+> describes the OLD shape (SP purchase matrix = `COMPUTE_SP` only; RI purchase
+> matrix = EC2 only via the single `_RI_SERVICES` entry; `_fetch_sp_recommendations`
+> / `_fetch_ri_recommendations`; "only `cost_optimization_hub` and
+> `fargate_savings_plan` have dedicated handlers" in Phase 6 point 19), treat the
+> following as current instead — see `services/commitment_scenarios.py` and
+> `docs/superpowers/specs/2026-08-08-commitment-deep-dive-design.md` for full detail:
+>
+> - **Matrix breadth.** RI now spans all 6 CE-supported services — EC2, RDS,
+>   ElastiCache, Redshift, OpenSearch, DynamoDB (`RI_SERVICES` in
+>   `commitment_scenarios.py`) — x 2 terms x 3 payments = 36 cells. SP spans all 3
+>   CE-supported types — `COMPUTE_SP`, `EC2_INSTANCE_SP`, `SAGEMAKER_SP`
+>   (`SP_TYPES`) — x 2 x 3 = 18 cells. 54 cells total, always on
+>   (~$0.54/scan of the adapter's ~$0.62/scan CE cost), fanned out by
+>   `_fetch_purchase_cards`; each cell is an independent `ce.get_*` call routed
+>   through the existing `_route_ce_error` on failure, so one denied/throttled
+>   cell degrades only that cell's scenario table, never the whole card.
+> - **Two card shapes**, both `card_kind`-tagged, both `Counted=False`:
+>   - `ri_type` — one per `(service, instance_type, region, platform)`:
+>     `recommended_count`, `current_ondemand_monthly`, `scenarios` (list of
+>     `{term, payment, monthly_savings, upfront, recurring_monthly,
+>     break_even_months}`), `recommended_scenario` (index into `scenarios`),
+>     `risk_pct`, optionally `coverage_pct` / `uncovered_monthly` (omitted —
+>     never fabricated — when the card's region isn't the scan region or more
+>     than one platform shares the same `(service, type, region)`), optionally
+>     `coh_concurs_monthly`. DynamoDB cards have no `platform` and an
+>     `instance_type` string that reads as a capacity-unit count (CE reports
+>     DynamoDB RI detail under `ReservedCapacityDetails`, not `InstanceDetails`
+>     — there is no per-instance identity to report).
+>   - `sp_commitment` — one per SP type: `sp_type`, the same `scenarios` shape
+>     plus `hourly_commitment`/`savings_pct` per cell, `risk_pct`, optionally
+>     `coh_concurs_monthly`. No instance type — SPs are account-level.
+> - **B1-ii applies to both card kinds.** Every purchase card is
+>   `Counted=False` yet legitimately carries a non-zero `monthly_savings` (the
+>   best cell's projected dollar, per the house B1-ii convention already used
+>   for other born-advisory what-ifs — see `_LIVE_AUDIT_LESSONS.md` F5 and
+>   `tools/output_audit.py` `PROJECTION_SERVICES`). This is by design, not a
+>   leak: `scan()` never sums a `Counted=False` rec into `total_monthly_savings`,
+>   and `core/result_builder.py` reports the AWS-best-path total separately as
+>   `summary.projected_commitment_monthly_savings` /
+>   `projected_commitment_basis` (additive fields, beside the counted headline,
+>   never inside it). A zero/negative-saving cell is dropped by the parser
+>   before it ever reaches a card — it cannot be the one showing a stray
+>   positive `monthly_savings` on a `Counted=False` rec.
+> - **`purchase_recommendations` now HAS a dedicated Phase-B handler** —
+>   `reporter_phase_b._render_commitment_purchase_cards`, registered for
+>   `("commitment_analysis", "purchase_recommendations")`. It groups cards by
+>   instrument (RI `service` / SP `sp_type`), savings-ordered, renders the term
+>   x payment matrix with the AWS-recommended cell marked and zero/negative
+>   cells greyed, and adds the EC2-only SP-vs-RI comparison strip. Phase 6
+>   point 19's claim that this source falls through to
+>   `render_generic_per_rec` is no longer true.
+> - **New sweep S14** (`tools/output_audit.py::sweep_projected_commitment`)
+>   recomputes `summary.projected_commitment_monthly_savings` from the scan's
+>   own `ri_type`/`sp_commitment` cards via the same `projected_savings()` the
+>   adapter calls, and FAILs on a >$0.005 disagreement — run it alongside the
+>   Phase 7 tooling pass.
+
 > **⚠ Latest live-audit findings (2026-06-30) — read these FIRST, then this prompt.**
 > Before auditing, also read and paste `docs/audits/prompts/_LIVE_AUDIT_LESSONS.md`
 > — the recurring cost-fidelity bug *classes* confirmed in live deep audits (with
