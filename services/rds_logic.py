@@ -121,19 +121,27 @@ def partition_enhanced(
 def reconcile_snapshot_savings(
     snaps: list[dict[str, Any]],
     backup_actuals: dict[str, float] | None,
+    backup_footprint: dict[str, dict[str, float]] | None = None,
 ) -> list[dict[str, Any]]:
-    """Cap snapshot upper-bound savings at actual billed backup, per engine pool.
+    """Cap snapshot upper-bound savings at the flagged SHARE of billed backup.
 
     Snapshot savings use provisioned size (an upper bound). When Cost Explorer
     reports the *actual* billed backup for the region (``services.advisor.
-    get_rds_backup_actuals``), cap each engine group's snapshot savings at it:
-    manual snapshots are a subset of total backup spend, so the actual is a valid
-    (tighter) ceiling. Capping is applied when the actual is a POSITIVE number
-    below the group's summed upper bound. A 0/missing/unreadable actual means the
-    upper bound cannot be substantiated against billing, so those recs are demoted
-    to $0 advisories (the bound survives as ``PotentialMonthlySavings``) — never
-    counted. Failing this check open would overstate, since actual backup bytes sit
-    well below provisioned size. Advisory/size-unknown snaps (no ``$``) pass through.
+    get_rds_backup_actuals``), that pool covers EVERY backup byte — automated
+    backups and all manual snapshots — not just the flagged old snapshots, so
+    capping at the whole pool silently credits the region's entire backup bill
+    to the flagged subset (C11). The ceiling is therefore ``billed x
+    (flagged_gb / total_gb)`` with both footprints on the same provisioned-GB
+    basis (``backup_footprint`` from ``get_enhanced_rds_checks``: flagged old
+    manual snapshots vs all manual snapshots + one retained copy per
+    automated-backup-enabled instance). Capping is applied when that effective
+    ceiling is a POSITIVE number below the group's summed upper bound. A
+    0/missing/unreadable actual — or an unmeasurable footprint share — means
+    the upper bound cannot be substantiated against billing, so those recs are
+    demoted to $0 advisories (the bound survives as ``PotentialMonthlySavings``)
+    — never counted. Failing this check open would overstate, since actual
+    backup bytes sit well below provisioned size. Advisory/size-unknown snaps
+    (no ``$``) pass through.
 
     Returns a new list; capped recs are copies with an updated EstimatedSavings
     and AuditBasis (``reconciled_to_actual_billed`` / ``reconciliation_factor``).
@@ -155,11 +163,24 @@ def reconcile_snapshot_savings(
     aurora = [s for s in snaps if _is_aurora(s)]
     standard = [s for s in snaps if not _is_aurora(s)]
     out: list[dict[str, Any]] = []
+    footprints = backup_footprint or {}
     for group_key, items in (("aurora", aurora), ("standard", standard)):
         cap = backup_actuals.get(group_key)
         upper = sum(enhanced_savings(s) for s in items)
-        apply_cap = cap is not None and 0 < cap < upper
-        factor = (cap / upper) if (cap is not None and apply_cap and upper) else 1.0
+        # C11 — scale the billed pool to the flagged snapshots' share of the
+        # total backup footprint (same provisioned-GB basis on both axes). An
+        # unmeasurable share demotes below: an unknown fraction of a pool is
+        # not a saving (C8).
+        fp = footprints.get(group_key) or {}
+        flagged_gb = float(fp.get("flagged_gb") or 0.0)
+        total_gb = float(fp.get("total_gb") or 0.0)
+        share: float | None = None
+        effective_cap: float | None = None
+        if cap is not None and cap > 0 and total_gb > 0 and flagged_gb > 0:
+            share = min(1.0, flagged_gb / total_gb)
+            effective_cap = cap * share
+        apply_cap = effective_cap is not None and 0 < effective_cap < upper
+        factor = (effective_cap / upper) if (apply_cap and upper and effective_cap is not None) else 1.0
         for s in items:
             sv = enhanced_savings(s)
             if sv <= 0:  # advisory / size-unknown — leave untouched
@@ -171,6 +192,10 @@ def reconcile_snapshot_savings(
             basis = dict(s.get("AuditBasis", {}))
             if cap is not None and cap > 0:
                 basis["actual_billed_backup_pool"] = round(cap, 2)
+            if share is not None:
+                basis["billed_pool_share"] = round(share, 6)
+                basis["flagged_footprint_gb"] = round(flagged_gb, 1)
+                basis["total_footprint_gb"] = round(total_gb, 1)
             if apply_cap:
                 capped_sv = round(sv * factor, 2)
                 new_rec["EstimatedSavings"] = (
@@ -182,21 +207,29 @@ def reconcile_snapshot_savings(
                 # overstated the saving (confirmed +$719.60 in the field). Keep the
                 # numeric and the string in lockstep (cardinal-sin: no overstated $).
                 new_rec["EstimatedMonthlySavings"] = capped_sv
-                basis["reconciled_to_actual_billed"] = round(cap, 2)  # type: ignore[arg-type]
+                basis["reconciled_to_actual_billed"] = round(effective_cap, 2)  # type: ignore[arg-type]
                 basis["reconciliation_factor"] = round(factor, 4)
                 basis["upper_bound_before_reconciliation"] = round(sv, 2)
                 new_rec["Reconciled"] = True
-            elif cap is not None and cap > 0:
-                basis["reconciliation"] = "not capped — upper bound <= actual billed backup"
+            elif effective_cap is not None:
+                basis["reconciliation"] = "not capped — upper bound <= share-scaled billed backup"
             else:
-                # F5 — there is no Cost Explorer actual to validate the
-                # provisioned-size upper bound, so counting it would overstate the
-                # saving (actual backup bytes are typically well below provisioned
-                # size). Demote to a $0 advisory that still surfaces the upper-bound
+                # F5/C11 — either there is no Cost Explorer actual to validate
+                # the provisioned-size upper bound, or the flagged snapshots'
+                # share of the backup footprint is unmeasurable; counting would
+                # overstate (actual backup bytes sit well below provisioned
+                # size, and an unknown fraction of a pool is not a saving).
+                # Demote to a $0 advisory that still surfaces the upper-bound
                 # figure for manual review but is never summed into the headline.
-                basis["reconciliation"] = (
-                    "no Cost Explorer actual available — upper bound retained as advisory (not counted)"
-                )
+                if cap is not None and cap > 0:
+                    basis["reconciliation"] = (
+                        "billed backup pool present but the flagged snapshots' footprint "
+                        "share is unmeasurable — upper bound retained as advisory (not counted; C11)"
+                    )
+                else:
+                    basis["reconciliation"] = (
+                        "no Cost Explorer actual available — upper bound retained as advisory (not counted)"
+                    )
                 new_rec["Counted"] = False
                 # A Counted=False advisory must carry a 0 numeric — leaving the
                 # uncapped upper bound here would let any numeric-summing consumer
@@ -220,6 +253,7 @@ def resolve_rds_findings(
     *,
     coh_recs: list[dict[str, Any]] | None = None,
     backup_actuals: dict[str, float] | None = None,
+    backup_footprint: dict[str, dict[str, float]] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], float, int]:
     """De-duplicate cost findings across sources; demote RI to advisory.
 
@@ -254,8 +288,9 @@ def resolve_rds_findings(
     coh_keys = {coh_rds_key(r) for r in coh_recs} - {""}
 
     concrete, snaps, advisory = partition_enhanced(enhanced_recs)
-    # Cap snapshot upper-bound savings at actual billed backup (Cost Explorer).
-    snaps = reconcile_snapshot_savings(snaps, backup_actuals)
+    # Cap snapshot upper-bound savings at the flagged share of actual billed
+    # backup (Cost Explorer pool x provisioned-GB footprint share — C11).
+    snaps = reconcile_snapshot_savings(snaps, backup_actuals, backup_footprint)
 
     # Candidate single-remediation cost findings, excluding CoH-covered ids.
     # Each tuple: (authority, savings, origin, key, rec).

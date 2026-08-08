@@ -929,7 +929,7 @@ def test_zero_size_snapshot_counted_but_adds_zero_to_total():
     # Ample billed backup corroborates the $23 upper bound; the size-unknown
     # snapshot is advisory and contributes 0 either way.
     _coh, _co, kept_enh, savings, count = resolve_rds_findings(
-        [], enhanced, backup_actuals={"aurora": 10_000.0}
+        [], enhanced, backup_actuals={"aurora": 10_000.0}, backup_footprint=_FULL_SHARE
     )
     assert savings == pytest.approx(23.0)   # advisory snapshot adds 0
     assert count == 2                        # both rendered/counted
@@ -1033,12 +1033,21 @@ def _snap(engine, savings_str, cat="Old Aurora Cluster Snapshots"):
     return {"engine": engine, "CheckCategory": cat, "EstimatedSavings": savings_str}
 
 
+# Full-share footprint: flagged == total, so the C11 share is 1.0 and the billed
+# pool caps exactly as it did before the share-cap change. Tests probing the
+# share itself pass their own footprint.
+_FULL_SHARE = {
+    "aurora": {"flagged_gb": 1.0, "total_gb": 1.0},
+    "standard": {"flagged_gb": 1.0, "total_gb": 1.0},
+}
+
+
 def test_reconcile_caps_when_actual_below_upper():
     from services.rds_logic import enhanced_savings, reconcile_snapshot_savings
 
     snaps = [_snap("aurora-mysql", "$100.00/month (upper bound)"),
              _snap("aurora-mysql", "$100.00/month (upper bound)")]
-    out = reconcile_snapshot_savings(snaps, {"aurora": 50.0, "standard": 0.0})
+    out = reconcile_snapshot_savings(snaps, {"aurora": 50.0, "standard": 0.0}, _FULL_SHARE)
     assert sum(enhanced_savings(s) for s in out) == pytest.approx(50.0)
     assert all(s.get("Reconciled") for s in out)
     assert all(s["AuditBasis"]["reconciled_to_actual_billed"] == 50.0 for s in out)
@@ -1048,7 +1057,7 @@ def test_reconcile_noop_when_actual_above_upper():
     from services.rds_logic import enhanced_savings, reconcile_snapshot_savings
 
     snaps = [_snap("aurora-mysql", "$100.00/month (upper bound)")]
-    out = reconcile_snapshot_savings(snaps, {"aurora": 500.0})
+    out = reconcile_snapshot_savings(snaps, {"aurora": 500.0}, _FULL_SHARE)
     assert sum(enhanced_savings(s) for s in out) == pytest.approx(100.0)
     assert not any(s.get("Reconciled") for s in out)
 
@@ -1067,7 +1076,7 @@ def test_reconcile_caps_numeric_field_in_lockstep_with_string():
         _snap("aurora-mysql", "$100.00/month (upper bound)"),
     ]
     # upper = 200, cap = 50 -> factor 0.25 -> each rec capped to 25.00
-    out = reconcile_snapshot_savings(snaps, {"aurora": 50.0, "standard": 0.0})
+    out = reconcile_snapshot_savings(snaps, {"aurora": 50.0, "standard": 0.0}, _FULL_SHARE)
     for s in out:
         assert enhanced_savings(s) == pytest.approx(25.0)  # string
         assert s["EstimatedMonthlySavings"] == pytest.approx(25.0)  # numeric agrees
@@ -1091,6 +1100,48 @@ def test_reconcile_advisory_demote_zeroes_numeric():
     assert rec["Counted"] is False
     assert rec["EstimatedMonthlySavings"] == 0.0
     assert rec["PotentialMonthlySavings"] == pytest.approx(80.0)
+
+
+def test_reconcile_c11_share_scales_billed_pool():
+    """C11: the billed pool covers EVERY backup byte, not just flagged snapshots.
+
+    Ceiling = billed x (flagged footprint / total footprint), both on the same
+    provisioned-GB basis. Regression: the cap previously bound at 100% of the
+    pool, crediting the region's whole backup bill to a few old snapshots.
+    """
+    from services.rds_logic import enhanced_savings, reconcile_snapshot_savings
+
+    snaps = [_snap("mysql", "$142.50/month (upper bound)", cat="Old RDS Snapshots")]
+    out = reconcile_snapshot_savings(
+        snaps,
+        {"standard": 95.0},
+        backup_footprint={"standard": {"flagged_gb": 1500.0, "total_gb": 11500.0}},
+    )
+    # share = 1500/11500; effective ceiling = 95 x share = $12.39, NOT $95.
+    expected = round(95.0 * (1500.0 / 11500.0), 2)
+    assert sum(enhanced_savings(s) for s in out) == pytest.approx(expected, abs=0.01)
+    rec = out[0]
+    assert rec["EstimatedMonthlySavings"] == pytest.approx(expected, abs=0.01)
+    assert rec["AuditBasis"]["billed_pool_share"] == pytest.approx(1500.0 / 11500.0, abs=1e-4)
+    assert rec["AuditBasis"]["flagged_footprint_gb"] == pytest.approx(1500.0)
+    assert rec["AuditBasis"]["total_footprint_gb"] == pytest.approx(11500.0)
+
+
+def test_reconcile_c11_unmeasurable_share_demotes():
+    """A billed pool with no measurable footprint share is not a saving (C8/C11):
+    an unknown fraction of a pool must demote, never bind at 100%."""
+    from services.rds_logic import reconcile_snapshot_savings
+
+    for footprint in (None, {}, {"standard": {"flagged_gb": 0.0, "total_gb": 0.0}}):
+        out = reconcile_snapshot_savings(
+            [_snap("mysql", "$142.50/month (upper bound)", cat="Old RDS Snapshots")],
+            {"standard": 95.0},
+            backup_footprint=footprint,
+        )
+        rec = out[0]
+        assert rec["Counted"] is False, footprint
+        assert rec["EstimatedMonthlySavings"] == 0.0
+        assert rec["PotentialMonthlySavings"] == pytest.approx(142.5)
 
 
 def test_reconcile_demotes_when_actual_missing_or_zero():
@@ -1120,7 +1171,7 @@ def test_reconcile_counts_when_actual_corroborates():
     from services.rds_logic import enhanced_savings, reconcile_snapshot_savings
 
     out = reconcile_snapshot_savings(
-        [_snap("aurora-mysql", "$100.00/month (upper bound)")], {"aurora": 250.0}
+        [_snap("aurora-mysql", "$100.00/month (upper bound)")], {"aurora": 250.0}, _FULL_SHARE
     )
     assert sum(enhanced_savings(s) for s in out) == pytest.approx(100.0)
     assert out[0].get("Counted") is not False
@@ -1133,7 +1184,7 @@ def test_reconcile_per_engine_independent():
         _snap("aurora-mysql", "$200.00/month (upper bound)"),
         _snap("mysql", "$400.00/month (upper bound)", cat="Old RDS Snapshots"),
     ]
-    out = reconcile_snapshot_savings(snaps, {"aurora": 50.0, "standard": 100.0})
+    out = reconcile_snapshot_savings(snaps, {"aurora": 50.0, "standard": 100.0}, _FULL_SHARE)
     by_eng = {s["engine"]: enhanced_savings(s) for s in out}
     assert by_eng["aurora-mysql"] == pytest.approx(50.0)
     assert by_eng["mysql"] == pytest.approx(100.0)
@@ -1145,7 +1196,9 @@ def test_resolve_applies_backup_actuals_cap():
     enhanced = [{"resourceArn": "arn:aws:rds:ap-south-1:1:cluster-snapshot:a", "engine": "aurora-mysql",
                  "CheckCategory": "Old Aurora Cluster Snapshots",
                  "EstimatedSavings": "$300.00/month (upper bound)"}]
-    _coh, _co, kept, savings, count = resolve_rds_findings([], enhanced, backup_actuals={"aurora": 72.0})
+    _coh, _co, kept, savings, count = resolve_rds_findings(
+        [], enhanced, backup_actuals={"aurora": 72.0}, backup_footprint=_FULL_SHARE
+    )
     assert savings == pytest.approx(72.0)
     assert count == 1
 
@@ -1169,7 +1222,7 @@ def test_reconcile_records_actual_when_not_capped():
     from services.rds_logic import reconcile_snapshot_savings
 
     snaps = [_snap("aurora-mysql", "$100.00/month (upper bound)")]
-    out = reconcile_snapshot_savings(snaps, {"aurora": 500.0})  # actual >= upper -> no cap
+    out = reconcile_snapshot_savings(snaps, {"aurora": 500.0}, _FULL_SHARE)  # actual >= upper -> no cap
     assert not out[0].get("Reconciled")
     ab = out[0]["AuditBasis"]
     assert ab["actual_billed_backup_pool"] == 500.0

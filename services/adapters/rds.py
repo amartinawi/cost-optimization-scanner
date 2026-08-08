@@ -91,11 +91,13 @@ class RdsModule(BaseServiceModule):
         co_recs = [r for r in co_raw if r.get("ResourceId") != "compute-optimizer-service"]
 
         enhanced_recs: list[dict[str, Any]] = []
+        backup_footprint: dict[str, dict[str, float]] | None = None
         try:
             enhanced_result = get_enhanced_rds_checks(
                 ctx, ctx.pricing_multiplier, ctx.old_snapshot_days, ctx.fast_mode
             )
             enhanced_recs = enhanced_result.get("recommendations", [])
+            backup_footprint = enhanced_result.get("backup_footprint") or None
         except Exception as e:
             ctx.warn(f"[rds] enhanced checks failed: {e}", service="rds")
 
@@ -124,7 +126,11 @@ class RdsModule(BaseServiceModule):
                 ctx.warn(f"[rds] backup actuals lookup failed: {e}", service="rds")
 
         coh_kept, co_kept, enhanced_kept, savings, total_recs = resolve_rds_findings(
-            co_recs, enhanced_recs, coh_recs=coh_recs, backup_actuals=backup_actuals
+            co_recs,
+            enhanced_recs,
+            coh_recs=coh_recs,
+            backup_actuals=backup_actuals,
+            backup_footprint=backup_footprint,
         )
 
         # Active-commitment demotion: a DB instance already covered by an RDS

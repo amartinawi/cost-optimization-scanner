@@ -332,6 +332,21 @@ def get_enhanced_rds_checks(
         "non_prod_scheduling": [],
     }
 
+    # C11 share-cap inputs (services/rds_logic.reconcile_snapshot_savings): the
+    # provisioned-GB footprint of the flagged (old) manual snapshots vs the
+    # region's total backup footprint — all manual snapshots plus one retained
+    # copy of each automated-backup-enabled instance. Same provisioned-size
+    # basis on both axes so the billed backup pool can be scaled to the flagged
+    # snapshots' share of it instead of binding at 100% of the pool.
+    backup_footprint: dict[str, dict[str, float]] = {
+        "aurora": {"flagged_gb": 0.0, "total_gb": 0.0},
+        "standard": {"flagged_gb": 0.0, "total_gb": 0.0},
+    }
+
+    def _footprint_group(engine_name: Any) -> dict[str, float]:
+        key = "aurora" if "aurora" in str(engine_name or "").lower() else "standard"
+        return backup_footprint[key]
+
     # Map cluster id -> StorageType so Aurora member-instance pricing can select
     # the right storage-mode SKU (aurora-iopt1 = I/O-Optimized, else Standard).
     clusters_by_id: dict[str, dict[str, Any]] = {}
@@ -361,6 +376,12 @@ def get_enhanced_rds_checks(
 
                 if db_instance_status not in ["available", "stopped"]:
                     continue
+
+                if backup_retention:
+                    # One retained automated-backup copy per instance, on the
+                    # provisioned basis (C11 denominator; the free backup
+                    # allotment equals 100% of provisioned storage).
+                    _footprint_group(engine)["total_gb"] += float(instance.get("AllocatedStorage") or 0)
 
                 # CloudWatch DatabaseConnections evidence shared by the Multi-AZ
                 # and scheduling checks. Computed once per instance; None means
@@ -718,6 +739,8 @@ def get_enhanced_rds_checks(
                     create_time = snapshot.get("SnapshotCreateTime")
                     snap_allocated_storage = snapshot.get("AllocatedStorage", 0)
                     snap_engine = snapshot.get("Engine")
+                    # Every manual snapshot joins the C11 denominator.
+                    _footprint_group(snap_engine)["total_gb"] += float(snap_allocated_storage or 0)
 
                     if create_time:
                         age_days = (datetime.now(create_time.tzinfo) - create_time).days
@@ -726,6 +749,7 @@ def get_enhanced_rds_checks(
                             snap_est, snap_formula, snap_sv = _snapshot_savings_text(
                                 snap_allocated_storage, snap_rate
                             )
+                            _footprint_group(snap_engine)["flagged_gb"] += float(snap_allocated_storage or 0)
                             checks["old_snapshots"].append(
                                 {
                                     "SnapshotId": snapshot_id,
@@ -788,6 +812,8 @@ def get_enhanced_rds_checks(
                         # Cluster snapshots are Aurora; price at the Aurora backup
                         # rate ($0.021/GB-mo), not the standard RDS rate (C-A1).
                         snap_engine = snapshot.get("Engine") or "aurora"
+                        # Every manual cluster snapshot joins the C11 denominator.
+                        _footprint_group(snap_engine)["total_gb"] += float(cluster_allocated_storage or 0)
 
                         if create_time:
                             age_days = (datetime.now(create_time.tzinfo) - create_time).days
@@ -796,6 +822,7 @@ def get_enhanced_rds_checks(
                                 snap_est, snap_formula, snap_sv = _snapshot_savings_text(
                                     cluster_allocated_storage, snap_rate
                                 )
+                                _footprint_group(snap_engine)["flagged_gb"] += float(cluster_allocated_storage or 0)
                                 checks["old_snapshots"].append(
                                     {
                                         "SnapshotId": snapshot_id,
@@ -850,4 +877,4 @@ def get_enhanced_rds_checks(
         for item in items:
             recommendations.append(item)
 
-    return {"recommendations": recommendations, **checks}
+    return {"recommendations": recommendations, "backup_footprint": backup_footprint, **checks}
