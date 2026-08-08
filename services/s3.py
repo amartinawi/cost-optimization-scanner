@@ -833,6 +833,11 @@ def _ia_object_size_ok(size_bytes: float, object_count: float | None) -> tuple[b
     Returns ``(gate_passes, avg_object_bytes)``. An unreadable object count or
     empty bucket fails the gate (absence of evidence is not evidence — C8);
     the caller demotes to a $0 advisory naming the reason.
+
+    APPROXIMATION: the average is bucket-wide (``SizeBytes`` across all storage
+    classes / ``NumberOfObjects``/AllStorageTypes) because CloudWatch publishes
+    no per-class object count — a bucket dominated by large non-Standard
+    objects can pass the gate while its Standard tail is sub-128 KiB.
     """
     if not object_count or object_count <= 0 or size_bytes <= 0:
         return False, None
@@ -871,7 +876,19 @@ def _bucket_object_count(
         latest = max(dps, key=lambda d: d["Timestamp"])
         return float(latest.get("Average") or 0.0)
     except Exception as e:  # noqa: BLE001
-        logger.debug("S3 NumberOfObjects read failed on %s: %s", bucket_name, e)
+        if _is_access_denied(e) or "AccessDenied" in str(e) or "Unauthorized" in str(e):
+            ctx.permission_issue(
+                f"cloudwatch:GetMetricStatistics (NumberOfObjects) denied on {bucket_name}",
+                service="cloudwatch",
+                action="cloudwatch:GetMetricStatistics",
+            )
+        elif "Throttling" in str(e) or "RequestLimitExceeded" in str(e):
+            ctx.warn(
+                f"cloudwatch:GetMetricStatistics (NumberOfObjects) throttled on {bucket_name}",
+                service="cloudwatch",
+            )
+        else:
+            logger.debug("S3 NumberOfObjects read failed on %s: %s", bucket_name, e)
         return None
 
 
@@ -986,7 +1003,19 @@ def _assess_bucket_coldness(
                 Statistics=["Sum"],
             )
         except Exception as e:  # noqa: BLE001
-            logger.debug("S3 AllRequests corroboration error on %s: %s", bucket_name, e)
+            if _is_access_denied(e) or "AccessDenied" in str(e) or "Unauthorized" in str(e):
+                ctx.permission_issue(
+                    f"cloudwatch:GetMetricStatistics (AllRequests) denied on {bucket_name}",
+                    service="cloudwatch",
+                    action="cloudwatch:GetMetricStatistics",
+                )
+            elif "Throttling" in str(e) or "RequestLimitExceeded" in str(e):
+                ctx.warn(
+                    f"cloudwatch:GetMetricStatistics (AllRequests) throttled on {bucket_name}",
+                    service="cloudwatch",
+                )
+            else:
+                logger.debug("S3 AllRequests corroboration error on %s: %s", bucket_name, e)
             return "unknown"
         if all_resp.get("Datapoints"):
             return "cold"

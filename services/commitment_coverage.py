@@ -256,6 +256,10 @@ class CommitmentCoverage:
         total counted rightsizing can never exceed its real uncovered
         on-demand, no matter how many rec sources feed it.
         """
+        if gross <= 0:
+            # A non-positive gross must never CREDIT the ledger (negative spend
+            # would manufacture headroom for later recs on the type).
+            return True
         ceiling = self.realizable_ceiling(service, resource_type)
         if ceiling is None or ceiling <= 0:
             return False
@@ -399,6 +403,7 @@ def split_by_commitment(
                 advisory.append(_demote(rec, gross, note_of))
         return counted, advisory
 
+    assert ceiling_of is not None  # take_of handled above; both-None returned earlier
     _key = key_of or (lambda _r: "")
     budgets: dict[str, float] = {}
     for rec in sorted(candidates, key=lambda r: gross_of(r), reverse=True):
@@ -867,6 +872,12 @@ def fetch_commitment_coverage(ctx: Any, selected: set[str]) -> CommitmentCoverag
         sp_unused_monthly=unused,
     )
     # CE headroom cap — only worth the calls when something is actually reserved.
+    # ORDERING INVARIANT: dataclasses.replace() re-runs the _spent ledger's
+    # default_factory (init=False fields are skipped), silently resetting it to
+    # {}. That is safe HERE because no adapter has spent headroom yet — but a
+    # replace() introduced anywhere after the scan starts would reintroduce the
+    # RDS-1/EC2-1 double-spend with no failing test. Never replace() a coverage
+    # object that adapters have already drawn on.
     if coverage.has_any_commitment:
         coverage = replace(coverage, uncovered_on_demand=_fetch_uncovered_on_demand(ctx, selected))
     return coverage

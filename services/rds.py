@@ -379,8 +379,14 @@ def get_enhanced_rds_checks(
 
                 if backup_retention:
                     # One retained automated-backup copy per instance, on the
-                    # provisioned basis (C11 denominator; the free backup
-                    # allotment equals 100% of provisioned storage).
+                    # provisioned basis (C11 denominator). KNOWN RESIDUAL: this
+                    # under-counts multi-day retention (incremental copies) and
+                    # ignores that the billed pool is already net of the free
+                    # allotment, so the share leans slightly generous — still
+                    # far tighter than the pre-fix whole-pool cap, and bounded
+                    # by min(1.0, share) and the < upper guard. Aurora members
+                    # report AllocatedStorage ~1 GiB, so the aurora denominator
+                    # is mostly manual snapshots (share pushes toward 1.0).
                     _footprint_group(engine)["total_gb"] += float(instance.get("AllocatedStorage") or 0)
 
                 # CloudWatch DatabaseConnections evidence shared by the Multi-AZ
