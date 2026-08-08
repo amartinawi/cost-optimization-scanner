@@ -186,3 +186,107 @@ def sp_cell_from_response(sp_type: str, term: str, payment: str,
         "estimated_ondemand_monthly": _money(
             summary, "EstimatedOnDemandCostWithCurrentCommitment", "EstimatedOnDemandCost"),
     }
+
+
+_TERM_MONTHS = {"1yr": 12, "3yr": 36}
+# Coverage-join keys use the commitment_coverage service spelling.
+_COVERAGE_SERVICE = {"EC2": "ec2", "RDS": "rds", "ElastiCache": "elasticache",
+                     "Redshift": "redshift", "OpenSearch": "opensearch"}
+
+_SCENARIO_ORDER = {(t, p): i for i, (t, p) in enumerate(
+    (t_lbl, p_lbl) for _, t_lbl in TERMS for _, p_lbl in PAYMENTS)}
+
+
+def _finish_scenarios(cells: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+    """Sort cells canonically, add break_even_months, return (scenarios, best_idx)."""
+    scenarios = sorted(cells, key=lambda c: _SCENARIO_ORDER.get((c["term"], c["payment"]), 99))
+    for s in scenarios:
+        net = s["monthly_savings"]
+        s["break_even_months"] = round(s["upfront"] / net, 1) if s["upfront"] > 0 and net > 0 else 0.0
+    best = max(range(len(scenarios)), key=lambda i: scenarios[i]["monthly_savings"])
+    return scenarios, best
+
+
+def build_ri_type_cards(cells: list[dict[str, Any]], uncovered: dict[str, float],
+                        scan_region: str) -> list[dict[str, Any]]:
+    """Group RI cells into one card per (service, instance_type, region).
+
+    Coverage context joins from ``uncovered`` (CommitmentCoverage.uncovered_on_demand,
+    keyed ``"{service}:{type}"``); a missing key omits the fields entirely —
+    an unknown coverage is not a 0% coverage (C8).
+    """
+    groups: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    for c in cells:
+        groups.setdefault((c["service"], c["instance_type"], c["region"]), []).append(c)
+
+    cards: list[dict[str, Any]] = []
+    for (service, itype, region), group in groups.items():
+        scenarios, best = _finish_scenarios([dict(c) for c in group])
+        best_cell = scenarios[best]
+        ondemand = best_cell["ondemand_monthly"]
+        card: dict[str, Any] = {
+            "card_kind": "ri_type",
+            "service": service,
+            "instance_type": itype,
+            "region": region,
+            "platform": best_cell["platform"],
+            "recommended_count": best_cell["count"],
+            "current_ondemand_monthly": ondemand,
+            "scenarios": [
+                {k: s[k] for k in ("term", "payment", "monthly_savings", "upfront",
+                                   "recurring_monthly", "break_even_months")}
+                for s in scenarios
+            ],
+            "recommended_scenario": best,
+            "Counted": False,
+            "monthly_savings": best_cell["monthly_savings"],
+        }
+        if ondemand > 0:
+            months = _TERM_MONTHS.get(best_cell["term"], 12)
+            card["risk_pct"] = round(
+                100.0 * (best_cell["recurring_monthly"] + best_cell["upfront"] / months) / ondemand, 1)
+        key = f"{_COVERAGE_SERVICE.get(service, service.lower())}:{itype}"
+        if key in uncovered:
+            card["uncovered_monthly"] = round(uncovered[key], 2)
+            if ondemand > 0:
+                card["coverage_pct"] = round(max(0.0, 100.0 * (1 - uncovered[key] / ondemand)), 1)
+        card["AuditBasis"] = {
+            "source": "ce:GetReservationPurchaseRecommendation",
+            "lookback_days": 30,
+            "basis": "AWS-computed purchase recommendation; projection, not counted",
+        }
+        cards.append(card)
+
+    cards.sort(key=lambda c: (c["region"] != scan_region, -c["monthly_savings"]))
+    return cards
+
+
+def build_sp_cards(cells: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Group SP cells into one card per SP type (SPs carry no instance type)."""
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for c in cells:
+        groups.setdefault(c["sp_type"], []).append(c)
+
+    cards: list[dict[str, Any]] = []
+    for sp_type, group in groups.items():
+        scenarios, best = _finish_scenarios([dict(c) for c in group])
+        best_cell = scenarios[best]
+        cards.append({
+            "card_kind": "sp_commitment",
+            "sp_type": sp_type,
+            "scenarios": [
+                {k: s[k] for k in ("term", "payment", "monthly_savings", "upfront",
+                                   "hourly_commitment", "savings_pct", "break_even_months")}
+                for s in scenarios
+            ],
+            "recommended_scenario": best,
+            "Counted": False,
+            "monthly_savings": best_cell["monthly_savings"],
+            "AuditBasis": {
+                "source": "ce:GetSavingsPlansPurchaseRecommendation",
+                "lookback_days": 30,
+                "basis": "AWS-computed purchase recommendation; projection, not counted",
+            },
+        })
+    cards.sort(key=lambda c: -c["monthly_savings"])
+    return cards

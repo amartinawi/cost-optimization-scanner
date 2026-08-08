@@ -12,6 +12,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from services.commitment_scenarios import (
     RI_SERVICES,
     SP_TYPES,
+    build_ri_type_cards,
+    build_sp_cards,
     ri_cells_from_response,
     sp_cell_from_response,
 )
@@ -139,3 +141,84 @@ def test_ri_cells_dynamodb_uses_reserved_capacity_details():
     assert c["count"] == 5
     assert "100" in c["instance_type"]
     assert c["monthly_savings"] == pytest.approx(300.00)
+
+
+# --- Task 2: Card builders ---------------------------------------------------
+
+
+def _cell(**over):
+    base = {"service": "RDS", "instance_type": "db.r7i.4xlarge", "region": "eu-west-1",
+            "platform": "aurora-postgresql", "count": 7, "term": "1yr",
+            "payment": "No Upfront", "monthly_savings": 1210.40, "upfront": 0.0,
+            "recurring_monthly": 2891.71, "ondemand_monthly": 4102.11}
+    base.update(over)
+    return base
+
+
+def test_cards_group_six_cells_into_one():
+    cells = [_cell(term=t, payment=p, monthly_savings=s)
+             for (t, p, s) in [("1yr", "No Upfront", 1210.40), ("1yr", "Partial Upfront", 1300.0),
+                               ("1yr", "All Upfront", 1350.0), ("3yr", "No Upfront", 1500.0),
+                               ("3yr", "Partial Upfront", 1600.0), ("3yr", "All Upfront", 1700.0)]]
+    cards = build_ri_type_cards(cells, uncovered={}, scan_region="eu-west-1")
+    assert len(cards) == 1
+    card = cards[0]
+    assert card["card_kind"] == "ri_type"
+    assert len(card["scenarios"]) == 6
+    assert card["monthly_savings"] == pytest.approx(1700.0)          # best cell
+    assert card["scenarios"][card["recommended_scenario"]]["monthly_savings"] == pytest.approx(1700.0)
+    assert card["Counted"] is False
+
+
+def test_break_even_months():
+    cells = [_cell(upfront=1200.0, monthly_savings=100.0)]
+    card = build_ri_type_cards(cells, {}, "eu-west-1")[0]
+    assert card["scenarios"][0]["break_even_months"] == pytest.approx(12.0)
+
+
+def test_break_even_zero_upfront_is_zero():
+    card = build_ri_type_cards([_cell(upfront=0.0)], {}, "eu-west-1")[0]
+    assert card["scenarios"][0]["break_even_months"] == 0.0
+
+
+def test_risk_pct_from_best_cell():
+    # risk = (recurring + upfront/term_months) / ondemand for the BEST cell.
+    cells = [_cell(term="3yr", upfront=3600.0, recurring_monthly=2000.0,
+                   monthly_savings=2002.11, ondemand_monthly=4102.11)]
+    card = build_ri_type_cards(cells, {}, "eu-west-1")[0]
+    # (2000 + 3600/36) / 4102.11 = 2100/4102.11 = 51.2%
+    assert card["risk_pct"] == pytest.approx(51.2, abs=0.1)
+
+
+def test_coverage_join_and_missing_key():
+    cells = [_cell()]
+    cards = build_ri_type_cards(cells, {"rds:db.r7i.4xlarge": 3199.65}, "eu-west-1")
+    assert cards[0]["uncovered_monthly"] == pytest.approx(3199.65)
+    # coverage_pct = 1 - uncovered/ondemand, floored at 0
+    assert cards[0]["coverage_pct"] == pytest.approx(22.0, abs=0.1)
+    # Missing key -> fields absent entirely (fail closed, never fabricated 0)
+    bare = build_ri_type_cards(cells, {}, "eu-west-1")[0]
+    assert "uncovered_monthly" not in bare and "coverage_pct" not in bare
+
+
+def test_scan_region_sorts_first():
+    cells = [_cell(region="us-east-1", monthly_savings=9999.0),
+             _cell(instance_type="db.t3.medium", region="eu-west-1", monthly_savings=5.0)]
+    cards = build_ri_type_cards(cells, {}, "eu-west-1")
+    assert cards[0]["region"] == "eu-west-1"
+
+
+def test_sp_cards_one_per_type():
+    cells = [
+        {"sp_type": "COMPUTE_SP", "term": "1yr", "payment": "No Upfront",
+         "hourly_commitment": 1.2, "monthly_savings": 500.0, "savings_pct": 20.0,
+         "upfront": 0.0, "estimated_ondemand_monthly": 2500.0},
+        {"sp_type": "COMPUTE_SP", "term": "3yr", "payment": "All Upfront",
+         "hourly_commitment": 1.1, "monthly_savings": 800.0, "savings_pct": 32.0,
+         "upfront": 9000.0, "estimated_ondemand_monthly": 2500.0},
+    ]
+    cards = build_sp_cards(cells)
+    assert len(cards) == 1
+    assert cards[0]["card_kind"] == "sp_commitment"
+    assert cards[0]["monthly_savings"] == pytest.approx(800.0)
+    assert cards[0]["Counted"] is False
