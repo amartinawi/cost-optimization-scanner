@@ -693,7 +693,13 @@ def test_render_dynamodb_card_skips_empty_platform_cleanly():
 
 
 def test_render_zero_savings_cell_is_greyed_not_recommended():
-    """Ruling: SP $0-savings cells are kept but greyed, never marked recommended."""
+    """Ruling: SP $0-savings cells are kept but greyed, never marked recommended.
+
+    F1 regression: Task 2's max() still yields an index even when every
+    scenario nets $0, so recommended_scenario can point AT a $0 cell. That
+    cell must render muted with NEITHER the recommended class NOR the
+    recommended label.
+    """
     from reporter_phase_b import _render_commitment_purchase_cards
 
     card = {"card_kind": "sp_commitment", "sp_type": "SAGEMAKER_SP",
@@ -705,10 +711,30 @@ def test_render_zero_savings_cell_is_greyed_not_recommended():
                  "upfront": 500.0, "hourly_commitment": 0.2, "savings_pct": 18.0,
                  "break_even_months": 3.3},
             ],
-            "recommended_scenario": 1, "Counted": False, "monthly_savings": 150.0}
+            "recommended_scenario": 0, "Counted": False, "monthly_savings": 150.0}
     html = _render_commitment_purchase_cards([card], "purchase_recommendations", {})
-    assert "scenario-cell--muted" in html or "muted" in html
-    assert "scenario-cell--recommended" in html
+    assert "muted" in html
+    assert "scenario-cell--recommended" not in html
+    assert "recommended</span>" not in html
+
+
+def test_render_all_zero_sp_card_has_no_recommended_marker_anywhere():
+    """F1 sibling: an all-zero SP card renders with no recommended marker at all."""
+    from reporter_phase_b import _render_commitment_purchase_cards
+
+    card = {"card_kind": "sp_commitment", "sp_type": "SAGEMAKER_SP",
+            "scenarios": [
+                {"term": "1yr", "payment": "No Upfront", "monthly_savings": 0.0,
+                 "upfront": 0.0, "hourly_commitment": 0.2, "savings_pct": 0.0,
+                 "break_even_months": 0.0},
+                {"term": "3yr", "payment": "All Upfront", "monthly_savings": 0.0,
+                 "upfront": 0.0, "hourly_commitment": 0.2, "savings_pct": 0.0,
+                 "break_even_months": 0.0},
+            ],
+            "recommended_scenario": 1, "Counted": False, "monthly_savings": 0.0}
+    html = _render_commitment_purchase_cards([card], "purchase_recommendations", {})
+    assert "scenario-cell--recommended" not in html
+    assert "recommended</span>" not in html
 
 
 def test_render_break_even_none_renders_phrase_not_zero():

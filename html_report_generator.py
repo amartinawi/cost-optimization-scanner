@@ -1275,12 +1275,12 @@ class HTMLReportGenerator:
             font-size: 0.85rem;
         }
         .rec-table th {
-            background: var(--bg-secondary);
+            background: var(--surface);
             color: var(--text-secondary);
             font-weight: 600;
             text-align: left;
             padding: 8px 10px;
-            border-bottom: 2px solid var(--border);
+            border-bottom: 2px solid var(--divider);
             white-space: nowrap;
             font-size: 0.75rem;
             text-transform: uppercase;
@@ -1288,7 +1288,7 @@ class HTMLReportGenerator:
         }
         .rec-table td {
             padding: 7px 10px;
-            border-bottom: 1px solid var(--border);
+            border-bottom: 1px solid var(--divider);
             color: var(--text-primary);
             vertical-align: top;
             font-variant-numeric: tabular-nums;
@@ -1311,9 +1311,9 @@ class HTMLReportGenerator:
         .ri-scenarios {
             margin: 10px 0 16px 0;
             padding: 10px 12px 4px 12px;
-            border: 1px solid var(--border);
+            border: 1px solid var(--divider);
             border-radius: 6px;
-            background: var(--bg-secondary);
+            background: var(--surface);
         }
         .ri-scenarios__header {
             margin: 0 0 6px 0;
@@ -1344,9 +1344,9 @@ class HTMLReportGenerator:
         .commitment-card {
             margin: 8px 0 14px 0;
             padding: 10px 12px;
-            border: 1px solid var(--border);
+            border: 1px solid var(--divider);
             border-radius: 6px;
-            background: var(--bg-secondary);
+            background: var(--surface);
         }
         .commitment-card h5 {
             margin: 0 0 6px 0;

@@ -2369,9 +2369,14 @@ def _render_scenario_table(card: Rec) -> str:
             upfront = float(scenario.get("upfront", 0) or 0)
             is_recommended = idx == recommended_idx
             is_zero = savings <= 0
+            # A $0 cell is kept (data point, not a recommendation) but must
+            # never carry the recommended marker even when recommended_scenario
+            # points at it — Task 2's max() still yields an index when every
+            # scenario in a card nets $0 (F1).
+            show_recommended = is_recommended and not is_zero
 
             cell_classes = []
-            if is_recommended:
+            if show_recommended:
                 cell_classes.append("scenario-cell--recommended")
             if is_zero:
                 cell_classes.append("muted")
@@ -2395,7 +2400,7 @@ def _render_scenario_table(card: Rec) -> str:
 
             money = "$0.00/mo" if is_zero else f"${savings:,.2f}/mo"
             label = (
-                ' <span class="scenario-cell__label">recommended</span>' if is_recommended else ""
+                ' <span class="scenario-cell__label">recommended</span>' if show_recommended else ""
             )
             out += (
                 f"<td{class_attr}>{money}{label}"
