@@ -80,9 +80,11 @@ I expect.
 0a. Open `services/adapters/CLAUDE.md` and find the `s3.py` row (Live Pricing,
     `get_s3_monthly_price_per_gb()` via `PricingEngine.for_region(bucket_region)`).
     **Reconcile the doc against reality:** confirm `core/pricing_engine.py`
-    exposes `get_s3_monthly_price_per_gb` (~line 665) and `for_region` (~line 379),
-    and that `_SC_MAP` translates our class keys (`GLACIER_FLEXIBLE_RETRIEVAL` →
-    `GLACIER`, `GLACIER_INSTANT_RETRIEVAL` → `GLACIER_IR`) to the engine's keys.
+    exposes `get_s3_monthly_price_per_gb` (~line 724) and `for_region` (~line 416),
+    and that `_S3_VOLUME_TYPE_BY_CLASS` maps our class keys to the Pricing API
+    `volumeType` value (`GLACIER` → `Amazon Glacier`, `GLACIER_IR` →
+    `Glacier Instant Retrieval`); note the engine pins `volumeType`, not
+    `storageClass`, because the latter is ambiguous across Glacier classes.
 0b. Confirm module identity in `services/adapters/s3.py`: `key="s3"`,
     `cli_aliases=("s3",)`, `display_name="S3"`, `requires_cloudwatch=True`,
     `reads_fast_mode=True`, `required_clients()` → `("s3", "cloudwatch")`.

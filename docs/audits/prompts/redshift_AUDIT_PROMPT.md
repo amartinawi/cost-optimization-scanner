@@ -11,6 +11,8 @@ recommendation must produce a concrete, account-specific dollar saving.
 
 ## PROMPT (copy from here)
 
+> **⚠ STALE vs current adapter** — much of this prompt's "known issues" were resolved in the cost-fidelity remediation; see the defect ledger for OOS-ADAPTER rows. A full re-author is tracked as a follow-up.
+
 > **⚠ Latest live-audit findings (2026-06-30) — read these FIRST, then this prompt.**
 > Before auditing, also read and paste `docs/audits/prompts/_LIVE_AUDIT_LESSONS.md`
 > — the recurring cost-fidelity bug *classes* confirmed in live deep audits (with
@@ -132,10 +134,10 @@ recently-audited **Lambda** adapter (`services/adapters/lambda_svc.py`) and
      — the exact delta is `node_price × 2` (remove 2 nodes), not 24% of the whole
      cluster. Prefer `current − target` to a flat factor (the universal
      reduction-factor-vs-delta issue).
-   - **RA3 managed storage (TODO in code):** the adapter's own TODO notes RA3
-     charges managed storage at **$0.024/GB-mo** that is **not** priced — instance
-     pricing alone undercounts RA3 cluster cost. Validate the RMS rate and whether
-     it belongs in the saving.
+   - **RA3 managed storage (open item in code):** the adapter's own inline
+     note flags that RA3 charges managed storage at **$0.024/GB-mo** that is
+     **not** priced — instance pricing alone undercounts RA3 cluster cost.
+     Validate the RMS rate and whether it belongs in the saving.
    - **Region scaling:** `get_instance_monthly_price` is region-correct; confirm
      no `pricing_multiplier` is applied on top (the adapter correctly omits it) and
      no fallback constant path re-introduces a us-east-1 number.
@@ -328,9 +330,9 @@ recently-audited **Lambda** adapter (`services/adapters/lambda_svc.py`) and
 - **Serverless silent failure + missing client (MEDIUM):** the serverless block is
   a bare `except Exception: pass` (no `ctx.warn`), and `required_clients()` omits
   `redshift-serverless` — the whole serverless path can silently no-op.
-- **RA3 managed storage unpriced + dead constants (MEDIUM/LOW):** the in-code TODO
-  notes RA3 RMS ($0.024/GB-mo) is not priced; `REDSHIFT_NODE_MONTHLY_FALLBACK =
-  200.0`, the `pause` 1.00 factor, and the `pause_resume_scheduling`/
+- **RA3 managed storage unpriced + dead constants (MEDIUM/LOW):** an in-code
+  note flags that RA3 RMS ($0.024/GB-mo) is not priced; `REDSHIFT_NODE_MONTHLY_FALLBACK
+  = 200.0`, the `pause` 1.00 factor, and the `pause_resume_scheduling`/
   `storage_optimization` buckets are all dead (no check populates them, no paused
   cluster is detected). Delete or implement.
 

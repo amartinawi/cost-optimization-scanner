@@ -11,6 +11,8 @@ recommendation must produce a concrete, account-specific dollar saving.
 
 ## PROMPT (copy from here)
 
+> **⚠ STALE vs current adapter** — much of this prompt's "known issues" were resolved in the cost-fidelity remediation; see the defect ledger for OOS-ADAPTER rows. A full re-author is tracked as a follow-up.
+
 > **⚠ Latest live-audit findings (2026-06-30) — read these FIRST, then this prompt.**
 > Before auditing, also read and paste `docs/audits/prompts/_LIVE_AUDIT_LESSONS.md`
 > — the recurring cost-fidelity bug *classes* confirmed in live deep audits (with
@@ -95,7 +97,8 @@ advisory (`Counted=False`) and the test style I expect.
 
 1. Read the full path: `services/adapters/lightsail.py`,
    `services/lightsail.py` (the shim + `LIGHTSAIL_OPTIMIZATION_DESCRIPTIONS` +
-   `_BUNDLE_COSTS` + `_DEFAULT_BUNDLE_COST` + `get_lightsail_bundle_cost` +
+   `_BUNDLE_MONTHLY_LINUX` + `_BUNDLE_MONTHLY_WINDOWS` + `_parse_bundle_id` +
+   `get_lightsail_bundle_cost` +
    `get_enhanced_lightsail_checks`), `core/contracts.py`
    (`ServiceFindings`, `SourceBlock`), `core/scan_context.py`
    (`pricing_multiplier`), `core/result_builder.py`, and the reporter
