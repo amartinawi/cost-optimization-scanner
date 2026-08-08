@@ -116,7 +116,7 @@ def test_ri_services_match_doc_confirmed_strings():
     assert by_label["ElastiCache"] == "Amazon ElastiCache"
     assert by_label["Redshift"] == "Amazon Redshift"
     assert by_label["OpenSearch"] == "Amazon OpenSearch Service"
-    assert by_label["DynamoDB"] == "Amazon DynamoDB"
+    assert by_label["DynamoDB"] == "Amazon DynamoDB Service"
 
 
 def test_sp_types_match_doc_confirmed_enum():

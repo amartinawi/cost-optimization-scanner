@@ -14,11 +14,11 @@ CE API docs on 2026-08-08 (Task 1 Step 0), via ``aws-knowledge``
 * ``Service`` request values confirmed: ``"Amazon Elastic Compute Cloud -
   Compute"`` (EC2), ``"Amazon Relational Database Service"`` (RDS),
   ``"Amazon ElastiCache"``, ``"Amazon Redshift"`` (literal AWS CLI doc
-  example). ``"Amazon DynamoDB"`` is supported by the API (see below) but has
-  no literal documented request example; the string is inferred from this
-  codebase's own established CE ``SERVICE``-dimension convention
-  (``services/commitment_coverage.py:_fetch_dynamodb_reserved``) — lower
-  confidence than the other five, called out again in the task report.
+  example). DynamoDB's value is ``"Amazon DynamoDB Service"`` — LIVE-VERIFIED
+  2026-08-08: the convention-inferred ``"Amazon DynamoDB"`` was rejected with a
+  ValidationException whose supported-values list names ``"Amazon DynamoDB
+  Service"`` verbatim (tadweer-prod live smoke; the same list also names
+  ``"Amazon MemoryDB Service"`` — a possible future seventh RI service).
 * **Correction to the brief's initial guess**: OpenSearch's ``Service``
   string is ``"Amazon OpenSearch Service"``, not the legacy ``"Amazon
   Elasticsearch Service"``. ``API_ESInstanceDetails.html`` documents the
@@ -71,7 +71,8 @@ RI_SERVICES: tuple[tuple[str, str], ...] = (
     ("Amazon ElastiCache", "ElastiCache"),
     ("Amazon Redshift", "Redshift"),
     ("Amazon OpenSearch Service", "OpenSearch"),
-    ("Amazon DynamoDB", "DynamoDB"),
+    # Live-verified: the API's supported-values error names this exact string.
+    ("Amazon DynamoDB Service", "DynamoDB"),
 )
 SP_TYPES: tuple[str, ...] = ("COMPUTE_SP", "EC2_INSTANCE_SP", "SAGEMAKER_SP")
 
