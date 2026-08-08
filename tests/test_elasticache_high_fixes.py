@@ -251,6 +251,26 @@ def test_graviton_unmappable_family_is_zero_advisory(monkeypatch: pytest.MonkeyP
     assert "advisory" in emitted["EstimatedSavings"].lower()
 
 
+def test_graviton_lever_advisory_when_target_unpriceable(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A mappable Graviton target that cannot be PRICED (nonexistent size —
+    # cache.r5.24xlarge maps to cache.r6g.24xlarge, which AWS does not publish —
+    # or a failed Pricing lookup falling back to 0.0) must not turn the delta
+    # into the full current node price. Graviton twin of
+    # test_underutilized_lever_advisory_when_target_unpriceable.
+    rec = _graviton_rec("cache.r5.24xlarge", num_nodes=1)
+    monkeypatch.setattr(
+        adapter_mod, "get_enhanced_elasticache_checks", lambda c: {"recommendations": [dict(rec)]}
+    )
+    pricing = _FakePricing({"cache.r5.24xlarge": 7568.64})  # graviton target price absent → 0.0
+
+    findings = ElasticacheModule().scan(_ctx(pricing_engine=pricing))
+
+    assert findings.total_monthly_savings == 0.0
+    emitted = findings.sources["enhanced_checks"].recommendations[0]
+    assert emitted["Counted"] is False
+    assert emitted["EstimatedMonthlySavings"] == 0.0
+
+
 @pytest.mark.parametrize(
     ("node_type", "expected"),
     [

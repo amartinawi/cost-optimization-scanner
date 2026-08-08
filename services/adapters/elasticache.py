@@ -204,7 +204,11 @@ class ElasticacheModule(BaseServiceModule):
                         "AmazonElastiCache", graviton_type, engine=engine
                     )
                 delta = round((monthly_node - graviton_node) * num_nodes, 2)
-                if graviton_type and delta > 0:
+                # graviton_node > 0 mirrors the downsize branch: a target that
+                # cannot be priced (nonexistent size — r6g/m6g publish no
+                # 24xlarge/10xlarge — or a failed lookup falling back to 0.0)
+                # must not turn the delta into the full current node price.
+                if graviton_type and graviton_node > 0 and delta > 0:
                     rec["EstimatedMonthlySavings"] = delta
                     rec["AuditBasis"] = {
                         "lever": "Graviton migration",
