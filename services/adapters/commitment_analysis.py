@@ -164,9 +164,7 @@ class CommitmentAnalysisModule(BaseServiceModule):
             r["Counted"] = False
 
         all_recs = sp_util_recs + sp_cov_recs + ri_util_recs + ri_cov_recs + expiry_recs + purchase_cards
-        total_savings = sum(
-            r.get("monthly_savings", 0.0) for r in all_recs if r.get("Counted", True)
-        )
+        total_savings = sum(r.get("monthly_savings", 0.0) for r in all_recs if r.get("Counted", True))
 
         exp_30 = sum(1 for r in expiry_recs if r.get("severity") == "HIGH")
         exp_60 = sum(1 for r in expiry_recs if r.get("severity") == "MEDIUM")
@@ -179,9 +177,7 @@ class CommitmentAnalysisModule(BaseServiceModule):
             total_recommendations=len(all_recs) + len(cost_hub_recs),
             total_monthly_savings=round(total_savings, 2),
             sources={
-                "cost_optimization_hub": SourceBlock(
-                    count=len(cost_hub_recs), recommendations=tuple(cost_hub_recs)
-                ),
+                "cost_optimization_hub": SourceBlock(count=len(cost_hub_recs), recommendations=tuple(cost_hub_recs)),
                 "sp_utilization": SourceBlock(
                     count=len(sp_util_recs),
                     recommendations=tuple(sp_util_recs),
@@ -776,15 +772,14 @@ class CommitmentAnalysisModule(BaseServiceModule):
             total_recommendations=0,
             total_monthly_savings=0.0,
             sources={
+                "cost_optimization_hub": SourceBlock(count=0, recommendations=()),
                 "sp_utilization": SourceBlock(count=0, recommendations=(), extras={"overall_utilization_rate": 0.0}),
                 "sp_coverage_gaps": SourceBlock(count=0, recommendations=(), extras={"overall_coverage_rate": 0.0}),
                 "ri_utilization": SourceBlock(count=0, recommendations=()),
                 "ri_coverage_gaps": SourceBlock(count=0, recommendations=()),
                 "expiring_commitments": SourceBlock(
-                    count=0,
-                    recommendations=(),
-                    extras={"expiring_30d": 0, "expiring_60d": 0, "expiring_90d": 0},
-                ),
+                    count=0, recommendations=(),
+                    extras={"expiring_30d": 0, "expiring_60d": 0, "expiring_90d": 0}),
                 "purchase_recommendations": SourceBlock(count=0, recommendations=()),
                 "fargate_savings_plan": SourceBlock(count=0, recommendations=(), extras={}),
             },
@@ -793,5 +788,8 @@ class CommitmentAnalysisModule(BaseServiceModule):
                 "sp_coverage_rate": 0.0,
                 "ri_utilization_rate": 0.0,
                 "ri_coverage_rate": 0.0,
+                "projected_commitment_monthly_savings": 0.0,
+                "projected_commitment_basis": "",
+                "uncovered_ondemand_monthly_total": 0.0,
             },
         )

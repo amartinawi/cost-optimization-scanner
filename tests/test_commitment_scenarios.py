@@ -587,3 +587,30 @@ def test_adapter_suppresses_matched_coh_rec_from_cost_optimization_hub_source():
     cards = [r for r in findings.sources["purchase_recommendations"].recommendations
              if isinstance(r, dict) and r.get("card_kind") == "ri_type"]
     assert cards[0]["coh_concurs_monthly"] == pytest.approx(900.0)
+
+
+def test_adapter_empty_findings_when_ce_unavailable_has_projection_extras():
+    # scan() bails to _empty_findings() when ctx.client("ce") is falsy. That
+    # bailout must still carry the three projection extras keys (fail-closed
+    # zeros/empty-string, since there is no CE data to project from) so
+    # Task 5's summary plumbing can read them unconditionally, and the
+    # cost_optimization_hub source must exist so the sources shape matches
+    # the normal path.
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from services.adapters.commitment_analysis import CommitmentAnalysisModule
+
+    ctx = SimpleNamespace(
+        region="eu-west-1", commitment_coverage=None, cost_hub_splits={},
+        client=lambda name, region=None: None,
+        warn=MagicMock(), permission_issue=MagicMock(),
+    )
+    findings = CommitmentAnalysisModule().scan(ctx)
+
+    assert findings.extras["projected_commitment_monthly_savings"] == 0.0
+    assert findings.extras["projected_commitment_basis"] == ""
+    assert findings.extras["uncovered_ondemand_monthly_total"] == 0.0
+    assert "cost_optimization_hub" in findings.sources
+    assert findings.sources["cost_optimization_hub"].count == 0
+    assert findings.sources["cost_optimization_hub"].recommendations == ()
