@@ -124,6 +124,47 @@ class TestColdnessAssessment:
         monkeypatch.setattr("services.s3._bucket_cloudwatch_client", lambda *a, **k: cw)
         assert _assess_bucket_coldness(self._ctx(), "b", s3_client, "us-east-1") == "unknown"
 
+    def test_ia_object_size_gate(self):
+        """Standard->IA counted delta requires avg object size >= 128 KiB:
+        IA bills a 128 KiB minimum per object and post-Sept-2024 lifecycle
+        rules skip smaller objects entirely — a small-object bucket's "saving"
+        is unrealizable or sign-negative."""
+        from services.s3 import IA_MIN_OBJECT_BYTES, _ia_object_size_ok
+
+        # 500 GB across 20M objects -> ~26 KiB avg -> blocked.
+        ok, avg = _ia_object_size_ok(500 * 1024**3, 20_000_000)
+        assert ok is False and avg is not None and avg < IA_MIN_OBJECT_BYTES
+        # 500 GB across 100k objects -> ~5 MiB avg -> passes.
+        ok, avg = _ia_object_size_ok(500 * 1024**3, 100_000)
+        assert ok is True and avg is not None and avg >= IA_MIN_OBJECT_BYTES
+        # Unreadable count / empty bucket -> fail closed.
+        assert _ia_object_size_ok(500 * 1024**3, None) == (False, None)
+        assert _ia_object_size_ok(500 * 1024**3, 0) == (False, None)
+        assert _ia_object_size_ok(0, 1000) == (False, None)
+
+    def test_bucket_object_count_reads_latest_datapoint(self, monkeypatch):
+        from datetime import UTC, datetime
+        from unittest.mock import MagicMock
+
+        from services.s3 import _bucket_object_count
+
+        cw = MagicMock()
+        cw.get_metric_statistics.return_value = {
+            "Datapoints": [
+                # Deliberately non-chronological — CW does not guarantee order.
+                {"Average": 2000.0, "Timestamp": datetime(2026, 8, 8, tzinfo=UTC)},
+                {"Average": 1000.0, "Timestamp": datetime(2026, 8, 7, tzinfo=UTC)},
+            ]
+        }
+        monkeypatch.setattr("services.s3._bucket_cloudwatch_client", lambda *a, **k: cw)
+        assert _bucket_object_count(MagicMock(), "b", "us-east-1") == 2000.0
+
+        cw.get_metric_statistics.return_value = {"Datapoints": []}
+        assert _bucket_object_count(MagicMock(), "b", "us-east-1") is None
+
+        cw.get_metric_statistics.side_effect = Exception("Throttling")
+        assert _bucket_object_count(MagicMock(), "b", "us-east-1") is None
+
     def test_allrequests_read_failure_is_unknown(self, monkeypatch):
         """A failed AllRequests corroboration read withholds the cold verdict."""
         from unittest.mock import MagicMock

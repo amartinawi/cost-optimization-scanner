@@ -820,6 +820,61 @@ def _cost_from_class_sizes(
     return round(total, 2)
 
 
+# Standard-IA bills a 128 KiB minimum per object, and default lifecycle rules
+# do not transition objects under 128 KiB created after September 2024 — so a
+# small-object bucket's Standard->IA "saving" is unrealizable or sign-negative
+# (the per-object minimum can make IA MORE expensive than Standard).
+IA_MIN_OBJECT_BYTES: int = 128 * 1024
+
+
+def _ia_object_size_ok(size_bytes: float, object_count: float | None) -> tuple[bool, float | None]:
+    """Gate the Standard->IA delta on average object size >= 128 KiB.
+
+    Returns ``(gate_passes, avg_object_bytes)``. An unreadable object count or
+    empty bucket fails the gate (absence of evidence is not evidence — C8);
+    the caller demotes to a $0 advisory naming the reason.
+    """
+    if not object_count or object_count <= 0 or size_bytes <= 0:
+        return False, None
+    avg = size_bytes / object_count
+    return avg >= IA_MIN_OBJECT_BYTES, avg
+
+
+def _bucket_object_count(
+    ctx: ScanContext, bucket_name: str, bucket_region: str
+) -> float | None:
+    """Latest ``NumberOfObjects`` (AllStorageTypes) for the bucket, or None.
+
+    Free daily S3 storage metric — no request-metrics opt-in required. Picks
+    the newest datapoint by Timestamp (CloudWatch does not guarantee
+    chronological order). Any failure returns None; the caller fails closed.
+    """
+    cloudwatch = _bucket_cloudwatch_client(ctx, bucket_region)
+    if cloudwatch is None:
+        return None
+    try:
+        resp = cloudwatch.get_metric_statistics(
+            Namespace="AWS/S3",
+            MetricName="NumberOfObjects",
+            Dimensions=[
+                {"Name": "BucketName", "Value": bucket_name},
+                {"Name": "StorageType", "Value": "AllStorageTypes"},
+            ],
+            StartTime=datetime.now(UTC) - timedelta(days=3),
+            EndTime=datetime.now(UTC),
+            Period=86400,
+            Statistics=["Average"],
+        )
+        dps = resp.get("Datapoints", [])
+        if not dps:
+            return None
+        latest = max(dps, key=lambda d: d["Timestamp"])
+        return float(latest.get("Average") or 0.0)
+    except Exception as e:  # noqa: BLE001
+        logger.debug("S3 NumberOfObjects read failed on %s: %s", bucket_name, e)
+        return None
+
+
 def _assess_bucket_coldness(
     ctx: ScanContext,
     bucket_name: str,
@@ -967,10 +1022,11 @@ def _finalize_bucket_savings(
     if opportunity_key == "static_website":
         bucket_info["EstimatedSavings"] = "$0.00/month - data transfer dependent (CloudFront CDN)"
     elif has_gap and (standard_gb > 0 or fast_mode):
-        # Real transition gap, but no cold-access evidence (metrics off, or
-        # fast-mode sample) — advise, don't invent dollars.
+        # Real transition gap, but no counted dollar: either no cold-access
+        # evidence (metrics off / fast-mode sample), or the 128 KiB IA
+        # object-size gate blocked the transition (specific reason preferred).
         bucket_info["Advisory"] = True
-        bucket_info["EstimatedSavings"] = (
+        bucket_info["EstimatedSavings"] = bucket_info.get("SavingsBlockedReason") or (
             "$0.00/month - enable S3 Storage Class Analysis or request "
             "metrics to quantify (no access-pattern evidence)"
         )
@@ -1261,15 +1317,39 @@ def get_s3_bucket_analysis(
                 )
                 bucket_info["AccessSignal"] = coldness
                 if coldness == "cold":
-                    std_rate = _s3_price_per_gb(ctx, "STANDARD", bucket_region)
-                    ia_rate = _s3_price_per_gb(ctx, "STANDARD_IA", bucket_region)
-                    delta = max(std_rate - ia_rate, 0.0)
-                    savings = round(standard_gb * delta, 2)
-                    bucket_info["PricingBasis"] = (
-                        f"{standard_gb:.1f} GB in S3 Standard x ${delta:.4f}/GB "
-                        f"Standard->Standard-IA delta; 0 GET requests over "
-                        f"{COLD_LOOKBACK_DAYS}d (request metrics)"
+                    object_count = _bucket_object_count(ctx, bucket_name, bucket_region)
+                    size_ok, avg_object_bytes = _ia_object_size_ok(
+                        float(bucket_info.get("SizeBytes") or 0.0), object_count
                     )
+                    if avg_object_bytes is not None:
+                        bucket_info["AvgObjectKiB"] = round(avg_object_bytes / 1024, 1)
+                    if size_ok:
+                        std_rate = _s3_price_per_gb(ctx, "STANDARD", bucket_region)
+                        ia_rate = _s3_price_per_gb(ctx, "STANDARD_IA", bucket_region)
+                        delta = max(std_rate - ia_rate, 0.0)
+                        savings = round(standard_gb * delta, 2)
+                        bucket_info["PricingBasis"] = (
+                            f"{standard_gb:.1f} GB in S3 Standard x ${delta:.4f}/GB "
+                            f"Standard->Standard-IA delta; 0 GET requests over "
+                            f"{COLD_LOOKBACK_DAYS}d (request metrics); avg object "
+                            f"{(avg_object_bytes or 0.0) / 1024:.0f} KiB >= 128 KiB IA minimum"
+                        )
+                    else:
+                        # Cold, but the Standard->IA delta is not realizable:
+                        # IA bills a 128 KiB minimum per object and lifecycle
+                        # skips smaller post-Sept-2024 objects, so the counted
+                        # delta would be zero-to-negative. Demote with the
+                        # specific reason (never the generic no-evidence text).
+                        bucket_info["SavingsBlockedReason"] = (
+                            "$0.00/month - cold, but "
+                            + (
+                                f"average object size {avg_object_bytes / 1024:.0f} KiB is below "
+                                "the 128 KiB Standard-IA minimum (transition unrealizable/negative)"
+                                if avg_object_bytes is not None
+                                else "object count unreadable (NumberOfObjects metric) — "
+                                "cannot verify the 128 KiB Standard-IA minimum"
+                            )
+                        )
 
             _finalize_bucket_savings(
                 bucket_info, savings, opportunity_key, has_gap, standard_gb, fast_mode
