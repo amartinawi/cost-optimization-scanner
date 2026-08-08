@@ -174,6 +174,8 @@ _SERVICE_STATS_CONFIG: Dict[str, Dict[str, Any]] = {
             ("SP Coverage", "extras", "sp_coverage_rate"),
             ("RI Utilization", "extras", "ri_utilization_rate"),
             ("RI Coverage", "extras", "ri_coverage_rate"),
+            ("Uncovered On-Demand", "extras", "uncovered_ondemand_monthly_total"),
+            ("Projected Savings", "extras", "projected_commitment_monthly_savings"),
         ],
     },
     "cost_optimization_hub": {
@@ -2299,6 +2301,21 @@ class HTMLReportGenerator:
         else:
             risks_value = '<span class="summary-fact__qual">none open</span>'
 
+        # Fourth fact, shown only when a commitment projection exists: a
+        # Savings-Plan/RI purchase would save more but requires a purchase to
+        # realize, so it is never folded into the counted headline above.
+        projected = summary.get("projected_commitment_monthly_savings", 0) or 0
+        projected_fact = ""
+        if projected > 0:
+            basis = html.escape(str(summary.get("projected_commitment_basis", "")))
+            projected_fact = (
+                '<div class="summary-fact">'
+                "<dt>Projected commitment</dt>"
+                f'<dd>up to ${projected:,.2f}/mo <span class="fact-note">'
+                f"({basis}; requires purchase &mdash; not in the counted total)</span></dd>"
+                "</div>"
+            )
+
         out = (
             '<section class="summary" aria-labelledby="summary-heading">'
             '<h2 id="summary-heading" class="visually-hidden">Executive Summary</h2>'
@@ -2320,6 +2337,7 @@ class HTMLReportGenerator:
             "<dt>Open risks</dt>"
             f"<dd>{risks_value}</dd>"
             "</div>"
+            f"{projected_fact}"
             "</dl>"
         )
 

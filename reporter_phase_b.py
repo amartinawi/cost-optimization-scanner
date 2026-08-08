@@ -2507,6 +2507,47 @@ def _commitment_instrument(card: Rec) -> str:
     return str(card.get("service") or "")
 
 
+# Savings Plan types that can cover EC2 instance usage. SAGEMAKER_SP covers
+# only SageMaker, so it is never a candidate for the EC2 SP-vs-RI comparison.
+_EC2_ELIGIBLE_SP_TYPES = ("COMPUTE_SP", "EC2_INSTANCE_SP")
+
+
+def _best_ec2_eligible_sp(groups: Dict[str, List[Rec]]) -> Rec | None:
+    """Highest-``monthly_savings`` sp_commitment card among COMPUTE_SP/EC2_INSTANCE_SP.
+
+    Aggregate-level only: AWS's purchase-recommendation API returns one
+    account-wide cell per SP type, never a per-instance-type breakdown, so
+    this compares the best whole-account SP cell against the EC2 RI path's
+    combined total — never a fabricated per-type SP figure.
+    """
+    candidates = [c for t in _EC2_ELIGIBLE_SP_TYPES for c in groups.get(t, [])]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda c: float(c.get("monthly_savings", 0) or 0))
+
+
+def _render_sp_vs_ri_strip(ec2_ri_total: float, best_sp: Rec | None) -> str:
+    """Aggregate-level comparison strip: best EC2 RI path vs best compute-SP cell.
+
+    Aggregate only — AWS emits no per-type SP detail and we do not invent it.
+    A ``$0`` ``best_sp`` (a real, ruled-in card shape) must not render a strip
+    claiming a "$0.00 leads" comparison, so a zero or missing SP figure
+    suppresses the strip the same as a zero/absent EC2 RI total.
+    """
+    sp_dollars = float(best_sp.get("monthly_savings", 0) or 0) if best_sp else 0.0
+    if best_sp is None or sp_dollars <= 0 or ec2_ri_total <= 0:
+        return ""
+    winner = "Savings Plan" if sp_dollars >= ec2_ri_total else "Reserved Instances"
+    return (
+        '<div class="sp-vs-ri">'
+        f"<strong>SP vs RI:</strong> best Savings Plan ${sp_dollars:,.2f}/mo vs "
+        f"EC2 RIs ${ec2_ri_total:,.2f}/mo &mdash; {winner} leads. "
+        "Trade-off: a Compute SP also covers Lambda and Fargate and survives "
+        "family changes; RIs can carry a capacity reservation."
+        "</div>"
+    )
+
+
 def _render_commitment_purchase_cards(recs: List[Rec], source_name: str, descriptions: Dict) -> str:
     """Sections per instrument (savings-ordered), type-cards inside.
 
@@ -2536,6 +2577,8 @@ def _render_commitment_purchase_cards(recs: List[Rec], source_name: str, descrip
         )
         return (-_group_total(groups[instrument]), order)
 
+    best_sp = _best_ec2_eligible_sp(groups)
+
     content = ""
     for instrument in sorted(groups, key=_sort_key):
         cards = groups[instrument]
@@ -2545,6 +2588,8 @@ def _render_commitment_purchase_cards(recs: List[Rec], source_name: str, descrip
 
         content += f'<div class="rec-item{_priority_class(cards[0])}">'
         content += f"<h4>{html.escape(label)} &mdash; ${total:,.2f}/mo best-path</h4>"
+        if instrument == "EC2" and not is_sp:
+            content += _render_sp_vs_ri_strip(total, best_sp)
         for card in cards:
             content += _render_sp_commitment_card(card) if is_sp else _render_ri_type_card(card)
         content += "</div>"

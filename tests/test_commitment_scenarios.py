@@ -779,3 +779,95 @@ def test_render_registered_in_phase_b_handlers():
     assert PHASE_B_HANDLERS[("commitment_analysis", "purchase_recommendations")] is (
         _render_commitment_purchase_cards
     )
+
+
+# --- Task 7: Exec fact + stat cards + SP-vs-RI strip -------------------------
+#
+# `generate_html_report_from_json` reads a JSON *file path* and its return
+# value is the *output file path* it wrote, not the HTML text — neither
+# matches the brief's `html = generate_html_report_from_json(data)` snippet.
+# We drive `HTMLReportGenerator` directly (the same pattern
+# tests/test_reporter_snapshots.py already uses) and read the written file.
+
+
+def test_exec_summary_shows_projected_fact(tmp_path):
+    from html_report_generator import HTMLReportGenerator
+    from tests.test_output_audit import make_report
+
+    data = make_report()
+    data["scan_time"] = "2026-08-08T00:00:00"  # _get_header requires it; make_report() omits it
+    data["summary"]["projected_commitment_monthly_savings"] = 2345.67
+    data["summary"]["projected_commitment_basis"] = "Compute SP path"
+    out_file = tmp_path / "projected_fact.html"
+    HTMLReportGenerator(data).generate_html_report(str(out_file))
+    html_out = out_file.read_text()
+    assert "Projected commitment" in html_out
+    assert "$2,345.67" in html_out
+    assert "Compute SP path" in html_out
+
+
+def test_exec_summary_omits_projected_fact_when_zero(tmp_path):
+    from html_report_generator import HTMLReportGenerator
+    from tests.test_output_audit import make_report
+
+    data = make_report()
+    data["scan_time"] = "2026-08-08T00:00:00"  # _get_header requires it; make_report() omits it
+    out_file = tmp_path / "no_projected_fact.html"
+    HTMLReportGenerator(data).generate_html_report(str(out_file))
+    html_out = out_file.read_text()
+    assert "Projected commitment" not in html_out
+
+
+def test_sp_vs_ri_strip_renders_on_ec2_section():
+    from reporter_phase_b import _render_commitment_purchase_cards
+
+    ec2_ri = {"card_kind": "ri_type", "service": "EC2", "instance_type": "r6i.4xlarge",
+              "region": "eu-west-1", "platform": "Windows", "recommended_count": 3,
+              "current_ondemand_monthly": 4000.0, "scenarios": [], "recommended_scenario": 0,
+              "Counted": False, "monthly_savings": 1000.0}
+    sp = {"card_kind": "sp_commitment", "sp_type": "COMPUTE_SP", "scenarios": [],
+          "recommended_scenario": 0, "Counted": False, "monthly_savings": 1500.0}
+    html = _render_commitment_purchase_cards([ec2_ri, sp], "purchase_recommendations", {})
+    assert "SP vs RI" in html
+    assert "$1,500.00" in html and "$1,000.00" in html
+    assert "Lambda" in html          # flexibility trade-off stated
+
+
+def test_sp_vs_ri_strip_absent_without_ec2_ri():
+    """No EC2 RI cards -> no strip, even with a strong SP card present."""
+    from reporter_phase_b import _render_commitment_purchase_cards
+
+    sp = {"card_kind": "sp_commitment", "sp_type": "COMPUTE_SP", "scenarios": [],
+          "recommended_scenario": 0, "Counted": False, "monthly_savings": 1500.0}
+    html = _render_commitment_purchase_cards([sp], "purchase_recommendations", {})
+    assert "SP vs RI" not in html
+
+
+def test_sp_vs_ri_strip_absent_when_best_sp_is_zero():
+    """Ruling: a $0 best_sp must not render a strip claiming a '$0.00 leads' comparison."""
+    from reporter_phase_b import _render_commitment_purchase_cards
+
+    ec2_ri = {"card_kind": "ri_type", "service": "EC2", "instance_type": "r6i.4xlarge",
+              "region": "eu-west-1", "platform": "Windows", "recommended_count": 3,
+              "current_ondemand_monthly": 4000.0, "scenarios": [], "recommended_scenario": 0,
+              "Counted": False, "monthly_savings": 1000.0}
+    zero_sp = {"card_kind": "sp_commitment", "sp_type": "COMPUTE_SP", "scenarios": [],
+               "recommended_scenario": 0, "Counted": False, "monthly_savings": 0.0}
+    html = _render_commitment_purchase_cards([ec2_ri, zero_sp], "purchase_recommendations", {})
+    assert "SP vs RI" not in html
+
+
+def test_sp_vs_ri_strip_ignores_sagemaker_sp():
+    """SAGEMAKER_SP never covers EC2, so it must never be picked as best_sp."""
+    from reporter_phase_b import _render_commitment_purchase_cards
+
+    ec2_ri = {"card_kind": "ri_type", "service": "EC2", "instance_type": "r6i.4xlarge",
+              "region": "eu-west-1", "platform": "Windows", "recommended_count": 3,
+              "current_ondemand_monthly": 4000.0, "scenarios": [], "recommended_scenario": 0,
+              "Counted": False, "monthly_savings": 1000.0}
+    sagemaker_sp = {"card_kind": "sp_commitment", "sp_type": "SAGEMAKER_SP", "scenarios": [],
+                    "recommended_scenario": 0, "Counted": False, "monthly_savings": 5000.0}
+    html = _render_commitment_purchase_cards([ec2_ri, sagemaker_sp], "purchase_recommendations", {})
+    # No strip at all: the only SP present (SAGEMAKER_SP) is ineligible as best_sp.
+    assert "SP vs RI" not in html
+    assert "sp-vs-ri" not in html
