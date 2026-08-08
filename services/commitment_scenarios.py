@@ -222,12 +222,20 @@ def build_ri_type_cards(cells: list[dict[str, Any]], uncovered: dict[str, float]
     """Group RI cells into one card per (service, instance_type, region, platform).
 
     Coverage context joins from ``uncovered`` (CommitmentCoverage.uncovered_on_demand,
-    keyed ``"{service}:{normalized_type}"``), but only for cards in the scan_region;
-    a missing key omits the fields entirely — an unknown coverage is not a 0% coverage.
+    keyed ``"{service}:{normalized_type}"``), but only for cards in the scan_region
+    AND only when exactly one platform exists for that (service, instance_type, region);
+    uncovered keys are platform-agnostic and cannot be fairly allocated across multiple
+    platforms, so all cards are fail-closed when ambiguous. Missing key omits fields entirely.
     """
     groups: dict[tuple[str, str, str, str], list[dict[str, Any]]] = {}
     for c in cells:
         groups.setdefault((c["service"], c["instance_type"], c["region"], c["platform"]), []).append(c)
+
+    # Count platform groups per (service, instance_type, region) to detect ambiguity.
+    platform_counts: dict[tuple[str, str, str], int] = {}
+    for (service, itype, region, platform), _ in groups.items():
+        key = (service, itype, region)
+        platform_counts[key] = platform_counts.get(key, 0) + 1
 
     cards: list[dict[str, Any]] = []
     for (service, itype, region, platform), group in groups.items():
@@ -255,7 +263,8 @@ def build_ri_type_cards(cells: list[dict[str, Any]], uncovered: dict[str, float]
             months = _TERM_MONTHS.get(best_cell["term"], 12)
             card["risk_pct"] = round(
                 100.0 * (best_cell["recurring_monthly"] + best_cell["upfront"] / months) / ondemand, 1)
-        if region == scan_region:
+        # Join coverage only if exactly one platform exists for this (service, itype, region).
+        if region == scan_region and platform_counts.get((service, itype, region), 0) == 1:
             cov_service = _COVERAGE_SERVICE.get(service, service.lower())
             normalized_itype = normalize_type(itype)
             key = f"{cov_service}:{normalized_itype}"

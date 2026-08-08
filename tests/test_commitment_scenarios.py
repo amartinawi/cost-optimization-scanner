@@ -309,3 +309,44 @@ def test_coverage_normalized_key_with_db_prefix():
     uncovered = {"rds:r7i.4xlarge": 500.0}
     cards = build_ri_type_cards(cells, uncovered, "eu-west-1")
     assert cards[0]["uncovered_monthly"] == pytest.approx(500.0)
+
+
+# --- Fix Round 2: F7 + additional test gaps -----------------------------------
+
+
+def test_coverage_ambiguous_multi_platform_omits_fields():
+    """F7: Multiple platforms for same type/region make coverage unarbitrable; omit fields."""
+    cells = [
+        _cell(platform="Linux/UNIX", region="eu-west-1"),
+        _cell(platform="Windows", region="eu-west-1"),
+    ]
+    uncovered = {"rds:r7i.4xlarge": 500.0}
+    cards = build_ri_type_cards(cells, uncovered, "eu-west-1")
+    # Both cards should lack coverage (ambiguous allocation)
+    for card in cards:
+        assert "uncovered_monthly" not in card
+        assert "coverage_pct" not in card
+
+
+def test_sp_risk_pct_omitted_when_ondemand_zero():
+    """SP risk_pct omitted when estimated_ondemand_monthly <= 0 (fail-closed)."""
+    cells = [
+        {"sp_type": "COMPUTE_SP", "term": "1yr", "payment": "No Upfront",
+         "hourly_commitment": 1.0, "monthly_savings": 100.0, "savings_pct": 50.0,
+         "upfront": 0.0, "estimated_ondemand_monthly": 0.0},
+    ]
+    cards = build_sp_cards(cells)
+    assert "risk_pct" not in cards[0]
+
+
+def test_sp_cards_mutations_do_not_affect_originals():
+    """SP cards must not mutate the original cell dicts passed in."""
+    import copy
+    original_cells = [
+        {"sp_type": "COMPUTE_SP", "term": "1yr", "payment": "No Upfront",
+         "hourly_commitment": 1.0, "monthly_savings": 500.0, "savings_pct": 20.0,
+         "upfront": 0.0, "estimated_ondemand_monthly": 2500.0},
+    ]
+    cells_copy = copy.deepcopy(original_cells)
+    build_sp_cards(original_cells)
+    assert original_cells == cells_copy
