@@ -408,9 +408,10 @@ def test_coh_merge_annotates_matching_card():
     cards = [_ri_card("RDS", 1000.0)]
     coh = [{"actionType": "PurchaseReservedInstances", "currentResourceType": "RdsReservedInstances",
             "estimatedMonthlySavings": 950.0}]
-    merged = merge_coh_concurrence(cards, coh)
+    merged, matched = merge_coh_concurrence(cards, coh)
     assert merged[0]["coh_concurs_monthly"] == pytest.approx(950.0)
     assert "coh_concurs_monthly" not in cards[0]  # input not mutated
+    assert matched == [0]
 
 
 def test_coh_merge_rightsizing_type_does_not_match_ri_card():
@@ -419,8 +420,9 @@ def test_coh_merge_rightsizing_type_does_not_match_ri_card():
     cards = [_ri_card("RDS", 1000.0)]
     coh = [{"actionType": "PurchaseReservedInstances", "currentResourceType": "RdsDbInstance",
             "estimatedMonthlySavings": 950.0}]
-    merged = merge_coh_concurrence(cards, coh)
+    merged, matched = merge_coh_concurrence(cards, coh)
     assert "coh_concurs_monthly" not in merged[0]
+    assert matched == []
 
 
 def test_coh_merge_multiple_recs_accumulate():
@@ -432,15 +434,17 @@ def test_coh_merge_multiple_recs_accumulate():
         {"actionType": "PurchaseReservedInstances", "currentResourceType": "RdsReservedInstances",
          "estimatedMonthlySavings": 450.0},
     ]
-    merged = merge_coh_concurrence(cards, coh)
+    merged, matched = merge_coh_concurrence(cards, coh)
     assert merged[0]["coh_concurs_monthly"] == pytest.approx(950.0)
+    assert matched == [0, 1]
 
 
 def test_coh_merge_no_match_leaves_cards_untouched():
     cards = [_ri_card("RDS", 1000.0)]
     coh = [{"actionType": "PurchaseSavingsPlans", "estimatedMonthlySavings": 10.0}]
-    merged = merge_coh_concurrence(cards, coh)
+    merged, matched = merge_coh_concurrence(cards, coh)
     assert "coh_concurs_monthly" not in merged[0]
+    assert matched == []
 
 
 def test_coh_merge_sp_same_type_matching():
@@ -449,11 +453,12 @@ def test_coh_merge_sp_same_type_matching():
     cards = [_sp_card("COMPUTE_SP", 500.0), _sp_card("SAGEMAKER_SP", 2000.0)]
     coh = [{"actionType": "PurchaseSavingsPlans", "currentResourceType": "ComputeSavingsPlans",
             "estimatedMonthlySavings": 100.0}]
-    merged = merge_coh_concurrence(cards, coh)
+    merged, matched = merge_coh_concurrence(cards, coh)
     # COMPUTE_SP card (index 0) should have annotation
     assert merged[0]["coh_concurs_monthly"] == pytest.approx(100.0)
     # SAGEMAKER_SP card (index 1) should NOT have annotation
     assert "coh_concurs_monthly" not in merged[1]
+    assert matched == [0]
 
 
 def test_coh_merge_sp_unmapped_resourcetype_no_match():
@@ -461,10 +466,11 @@ def test_coh_merge_sp_unmapped_resourcetype_no_match():
     cards = [_sp_card("COMPUTE_SP", 500.0), _sp_card("SAGEMAKER_SP", 2000.0)]
     coh = [{"actionType": "PurchaseSavingsPlans", "currentResourceType": "UnknownSavingsPlan",
             "estimatedMonthlySavings": 100.0}]
-    merged = merge_coh_concurrence(cards, coh)
+    merged, matched = merge_coh_concurrence(cards, coh)
     # Neither card should have annotation (unmapped resource type)
     assert "coh_concurs_monthly" not in merged[0]
     assert "coh_concurs_monthly" not in merged[1]
+    assert matched == []
 
 
 def test_coh_merge_ec2_ri_matcher():
@@ -472,5 +478,112 @@ def test_coh_merge_ec2_ri_matcher():
     cards = [_ri_card("EC2", 1000.0)]
     coh = [{"actionType": "PurchaseReservedInstances", "currentResourceType": "EC2ReservedInstances",
             "estimatedMonthlySavings": 850.0}]
-    merged = merge_coh_concurrence(cards, coh)
+    merged, matched = merge_coh_concurrence(cards, coh)
     assert merged[0]["coh_concurs_monthly"] == pytest.approx(850.0)
+    assert matched == [0]
+
+
+def test_coh_merge_matched_indices_for_match_and_miss():
+    # matched_indices must report positions into coh_recs, not into cards —
+    # a matching rec followed by a non-concurring rec should yield [0], not [1].
+    cards = [_ri_card("RDS", 1000.0)]
+    coh = [
+        {"actionType": "PurchaseReservedInstances", "currentResourceType": "RdsReservedInstances",
+         "estimatedMonthlySavings": 500.0},  # index 0: matches
+        {"actionType": "PurchaseReservedInstances", "currentResourceType": "RdsDbInstance",
+         "estimatedMonthlySavings": 100.0},  # index 1: rightsizing type, no match
+    ]
+    merged, matched = merge_coh_concurrence(cards, coh)
+    assert matched == [0]
+    assert merged[0]["coh_concurs_monthly"] == pytest.approx(500.0)
+
+
+# --- Task 4: Adapter rewiring -------------------------------------------------
+
+
+class _MatrixCe:
+    """CE stub: RDS RI matrix returns one detail; everything else empty."""
+
+    def get_reservation_purchase_recommendation(self, Service, LookbackPeriodInDays,
+                                                TermInYears, PaymentOption):
+        if "Relational" not in Service:
+            return {"Recommendations": []}
+        return _ri_resp([_rds_detail()])
+
+    def get_savings_plans_purchase_recommendation(self, **kwargs):
+        return {}
+
+    # The adapter's other checks call these; empty answers are fine.
+    def get_savings_plans_utilization(self, **kwargs):
+        return {"Total": {}}
+
+    def get_savings_plans_utilization_details(self, **kwargs):
+        return {"SavingsPlansUtilizationDetails": []}
+
+    def get_savings_plans_coverage(self, **kwargs):
+        return {"SavingsPlansCoverages": []}
+
+    def get_reservation_utilization(self, **kwargs):
+        return {"Total": {}}
+
+    def get_reservation_coverage(self, **kwargs):
+        return {"CoveragesByTime": []}
+
+    def get_cost_and_usage(self, **kwargs):
+        return {"ResultsByTime": []}
+
+
+def _commitment_ctx(ce, cost_hub_splits=None):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    return SimpleNamespace(
+        region="eu-west-1", commitment_coverage=None,
+        cost_hub_splits=cost_hub_splits or {},
+        client=lambda name, region=None: ce if name == "ce" else MagicMock(),
+        warn=MagicMock(), permission_issue=MagicMock(),
+    )
+
+
+def test_adapter_emits_ri_type_cards_and_projected_extras():
+    from services.adapters.commitment_analysis import CommitmentAnalysisModule
+
+    ctx = _commitment_ctx(_MatrixCe())
+    findings = CommitmentAnalysisModule().scan(ctx)
+    cards = [r for r in findings.sources["purchase_recommendations"].recommendations
+             if isinstance(r, dict) and r.get("card_kind") == "ri_type"]
+    assert len(cards) == 1
+    assert cards[0]["instance_type"] == "db.r7i.4xlarge"
+    assert findings.extras["projected_commitment_monthly_savings"] == pytest.approx(
+        cards[0]["monthly_savings"])
+    # Projections never count (D4).
+    assert all(r.get("Counted") is False for r in
+               findings.sources["purchase_recommendations"].recommendations
+               if isinstance(r, dict))
+
+
+def test_adapter_suppresses_matched_coh_rec_from_cost_optimization_hub_source():
+    # A CoH rec that concurs with a card must be consumed into that card's
+    # coh_concurs_monthly annotation, not also rendered as a separate CoH rec
+    # (that would double-render the same dollar figure).
+    from services.adapters.commitment_analysis import CommitmentAnalysisModule
+
+    matching = {"actionType": "PurchaseReservedInstances",
+                "currentResourceType": "RdsReservedInstances",
+                "estimatedMonthlySavings": 900.0}
+    non_matching = {"actionType": "PurchaseSavingsPlans",
+                    "currentResourceType": "UnknownSavingsPlan",
+                    "estimatedMonthlySavings": 50.0}
+    ctx = _commitment_ctx(_MatrixCe(), cost_hub_splits={
+        "commitment_analysis": [matching, non_matching],
+    })
+    findings = CommitmentAnalysisModule().scan(ctx)
+
+    coh_source_recs = findings.sources["cost_optimization_hub"].recommendations
+    assert matching not in coh_source_recs
+    assert non_matching in coh_source_recs
+    assert all(r.get("Counted") is False for r in coh_source_recs)
+
+    cards = [r for r in findings.sources["purchase_recommendations"].recommendations
+             if isinstance(r, dict) and r.get("card_kind") == "ri_type"]
+    assert cards[0]["coh_concurs_monthly"] == pytest.approx(900.0)

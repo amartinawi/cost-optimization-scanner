@@ -378,20 +378,28 @@ def projected_savings(ri_cards: list[dict[str, Any]],
 
 
 def merge_coh_concurrence(cards: list[dict[str, Any]],
-                          coh_recs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+                          coh_recs: list[dict[str, Any]]
+                          ) -> tuple[list[dict[str, Any]], list[int]]:
     """Annotate cards with a "CoH concurs: $X/mo" figure instead of rendering
     duplicate CoH purchase cards. Returns new card dicts (no input mutation).
 
     Match: an SP-purchase CoH rec concurs with the same-type SP card; an
     RI-purchase CoH rec concurs with the highest-savings RI card of the
-    matching service. Unmatched CoH recs are left for the existing CoH render
-    path — nothing is dropped here.
+    matching service. Unmatched CoH recs are left for the caller's existing
+    CoH render path — nothing is dropped here.
 
     Multiple CoH recs for the same card type accumulate their dollars on the
     matched card (no overwriting).
+
+    Returns:
+        Tuple of ``(annotated_cards, matched_indices)``. ``matched_indices``
+        holds the positions into ``coh_recs`` that were merged into a card;
+        callers must exclude those recs from any separate CoH render path so
+        a merged rec never also renders as a duplicate CoH card.
     """
     out = [dict(c) for c in cards]
-    for rec in coh_recs:
+    matched_indices: list[int] = []
+    for i, rec in enumerate(coh_recs):
         action = str(rec.get("actionType") or rec.get("recommendedAction") or "")
         dollars = float(rec.get("estimatedMonthlySavings") or 0)
         if dollars <= 0:
@@ -409,4 +417,5 @@ def merge_coh_concurrence(cards: list[dict[str, Any]],
         if targets:
             best = max(targets, key=lambda c: c["monthly_savings"])
             best["coh_concurs_monthly"] = round(best.get("coh_concurs_monthly", 0.0) + dollars, 2)
-    return out
+            matched_indices.append(i)
+    return out, matched_indices
