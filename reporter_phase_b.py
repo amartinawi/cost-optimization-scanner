@@ -2324,7 +2324,7 @@ _SP_LABELS: Dict[str, Tuple[str, str]] = {
 }
 
 _INSTRUMENT_ORDER = [
-    "EC2", "RDS", "ElastiCache", "OpenSearch", "Redshift",
+    "EC2", "RDS", "ElastiCache", "OpenSearch", "Redshift", "DynamoDB",
     "COMPUTE_SP", "EC2_INSTANCE_SP", "SAGEMAKER_SP",
 ]
 
@@ -2424,7 +2424,12 @@ def _render_break_even_risk_line(card: Rec) -> str:
 
     scenario = scenarios[idx]
     be = scenario.get("break_even_months")
-    be_text = "never breaks even at this savings rate" if be is None else f"{float(be):,.1f} mo"
+    if be is None:
+        be_text = "never breaks even at this savings rate"
+    elif float(be) == 0.0:
+        be_text = "immediate"
+    else:
+        be_text = f"{float(be):,.1f} mo"
     line = f"<p class='muted'>break-even {be_text}"
     risk_pct = card.get("risk_pct")
     if risk_pct is not None:
@@ -2451,6 +2456,15 @@ def _render_ri_type_card(card: Rec) -> str:
         title_parts.append(region)
     if platform:
         title_parts.append(platform)
+    # Tenancy/offering-class only earn a title segment when they carry
+    # information beyond AWS's own defaults (Shared tenancy, Standard RIs) —
+    # appending them unconditionally would clutter every ordinary card.
+    tenancy = html.escape(str(card.get("tenancy") or ""))
+    if tenancy and tenancy != "Shared":
+        title_parts.append(tenancy)
+    offering_class = html.escape(str(card.get("offering_class") or ""))
+    if offering_class and offering_class != "STANDARD":
+        title_parts.append(offering_class)
 
     out = "<div class='commitment-card'>"
     out += f"<h5>{' &mdash; '.join(title_parts)}</h5>"
@@ -2469,6 +2483,14 @@ def _render_ri_type_card(card: Rec) -> str:
             line += f" covered &mdash; ${float(card['uncovered_monthly']):,.2f}/mo still on-demand"
         line += "</p>"
         out += line
+    elif "uncovered_monthly" in card:
+        # coverage_pct can be fail-closed omitted (M4: uncovered exceeds
+        # on-demand, a differently-scoped measurement) while the dollar
+        # figure itself is still known — render it rather than dropping it.
+        out += (
+            f"<p class='muted'>${float(card['uncovered_monthly']):,.2f}/mo still on-demand "
+            "(coverage % unavailable)</p>"
+        )
 
     out += _render_scenario_table(card)
     out += _render_break_even_risk_line(card)
@@ -2479,16 +2501,32 @@ def _render_ri_type_card(card: Rec) -> str:
 
 
 def _render_sp_commitment_card(card: Rec) -> str:
-    """One account-level Savings Plan card — no instance type, hourly commitment."""
+    """One Savings Plan card — hourly commitment, term x payment matrix.
+
+    EC2_INSTANCE_SP is the one SP type CE ties to a family dimension (see
+    ``services.commitment_scenarios.sp_cell_from_response``): its scope line
+    reads "family-scoped" rather than "account-level, no instance type", and
+    when the winning cell carried an ``instance_families`` list (propagated
+    onto the card by ``build_sp_cards``) it renders a "Families:" line.
+    """
     sp_type = card.get("sp_type", "")
     label, services = _SP_LABELS.get(sp_type, (sp_type, ""))
 
     out = "<div class='commitment-card'>"
     out += f"<h5>{html.escape(label)}</h5>"
-    out += (
-        "<p class='muted'>This is an account-level commitment "
-        "&mdash; Savings Plans carry no instance type.</p>"
-    )
+    if sp_type == "EC2_INSTANCE_SP":
+        out += (
+            "<p class='muted'>This is a family-scoped commitment "
+            "&mdash; it applies only to the instance family(ies) purchased.</p>"
+        )
+        families = card.get("instance_families") or []
+        if families:
+            out += f"<p class='muted'>Families: {html.escape(', '.join(str(f) for f in families))}</p>"
+    else:
+        out += (
+            "<p class='muted'>This is an account-level commitment "
+            "&mdash; Savings Plans carry no instance type.</p>"
+        )
     if services:
         out += f"<p class='muted'>Services spanned: {html.escape(services)}</p>"
     out += _COMMITMENT_ADVISORY_CHIP
@@ -2532,18 +2570,32 @@ def _render_sp_vs_ri_strip(ec2_ri_total: float, best_sp: Rec | None) -> str:
     Aggregate only — AWS emits no per-type SP detail and we do not invent it.
     A ``$0`` ``best_sp`` (a real, ruled-in card shape) must not render a strip
     claiming a "$0.00 leads" comparison, so a zero or missing SP figure
-    suppresses the strip the same as a zero/absent EC2 RI total.
+    suppresses the strip the same as a zero/absent EC2 RI total. The
+    trade-off sentence depends on which SP type won: a Compute SP covers
+    Lambda/Fargate too and survives family changes; an EC2 Instance SP is
+    the opposite bet — deeper discount, but family/region-locked.
     """
     sp_dollars = float(best_sp.get("monthly_savings", 0) or 0) if best_sp else 0.0
     if best_sp is None or sp_dollars <= 0 or ec2_ri_total <= 0:
         return ""
     winner = "Savings Plan" if sp_dollars >= ec2_ri_total else "Reserved Instances"
+    if best_sp.get("sp_type") == "EC2_INSTANCE_SP":
+        tradeoff = (
+            "Trade-off: an EC2 Instance Savings Plan is family- and "
+            "region-scoped &mdash; a deeper discount than a Compute SP, but "
+            "it does not cover Lambda/Fargate and strands the commitment on "
+            "family migration."
+        )
+    else:
+        tradeoff = (
+            "Trade-off: a Compute SP also covers Lambda and Fargate and survives "
+            "family changes; RIs can carry a capacity reservation."
+        )
     return (
         '<div class="sp-vs-ri">'
         f"<strong>SP vs RI:</strong> best Savings Plan ${sp_dollars:,.2f}/mo vs "
         f"EC2 RIs ${ec2_ri_total:,.2f}/mo &mdash; {winner} leads. "
-        "Trade-off: a Compute SP also covers Lambda and Fargate and survives "
-        "family changes; RIs can carry a capacity reservation."
+        f"{tradeoff}"
         "</div>"
     )
 
@@ -2587,7 +2639,7 @@ def _render_commitment_purchase_cards(recs: List[Rec], source_name: str, descrip
         total = _group_total(cards)
 
         content += f'<div class="rec-item{_priority_class(cards[0])}">'
-        content += f"<h4>{html.escape(label)} &mdash; ${total:,.2f}/mo best-path</h4>"
+        content += f"<h4>{html.escape(label)} &mdash; ${total:,.2f}/mo best-path (projection)</h4>"
         if instrument == "EC2" and not is_sp:
             content += _render_sp_vs_ri_strip(total, best_sp)
         for card in cards:

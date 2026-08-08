@@ -174,8 +174,8 @@ _SERVICE_STATS_CONFIG: Dict[str, Dict[str, Any]] = {
             ("SP Coverage", "extras", "sp_coverage_rate"),
             ("RI Utilization", "extras", "ri_utilization_rate"),
             ("RI Coverage", "extras", "ri_coverage_rate"),
-            ("Uncovered On-Demand", "extras", "uncovered_ondemand_monthly_total"),
-            ("Projected Savings", "extras", "projected_commitment_monthly_savings"),
+            ("Uncovered On-Demand ($/mo)", "extras", "uncovered_ondemand_monthly_total"),
+            ("Projected Savings ($/mo)", "extras", "projected_commitment_monthly_savings"),
         ],
     },
     "cost_optimization_hub": {
@@ -1368,6 +1368,30 @@ class HTMLReportGenerator:
             font-size: 0.65rem;
             text-transform: uppercase;
             letter-spacing: 0.5px;
+            color: var(--text-secondary);
+        }
+
+        /* Shared muted-text utility (used across the report, not just
+         * commitment cards), the EC2 SP-vs-RI comparison strip, and the
+         * smaller/dimmer inline note inside a summary fact. All three use
+         * CSS custom properties that are already theme-aware via :root /
+         * [data-theme="dark"] above, so no separate dark-mode override is
+         * needed here (unlike the literal rgba() highlights nearby). */
+        .muted {
+            color: var(--text-secondary);
+        }
+        .sp-vs-ri {
+            margin: 8px 0 14px 0;
+            padding: 10px 12px;
+            border: 1px solid var(--divider);
+            border-radius: 6px;
+            background: var(--surface);
+            font-size: 0.85rem;
+            color: var(--text-primary);
+        }
+        .fact-note {
+            font-size: 0.78rem;
+            font-weight: 400;
             color: var(--text-secondary);
         }
 
@@ -3288,7 +3312,12 @@ class HTMLReportGenerator:
         elif "multi_source_cards" in config:
             for label, sub_key, field in config["multi_source_cards"]:
                 sub_dict = service_data.get(sub_key, {})
-                stats_html += f'<div class="stat-card"><div class="stat-label">{label}</div><div class="value">{sub_dict.get(field, 0)}</div></div>'
+                value = sub_dict.get(field, 0)
+                # A measured 0 means "zero" — a JSON null means the figure
+                # was never computed (e.g. no commitment-coverage data) and
+                # must read as "n/a", never a fabricated $0.
+                display_value = "n/a" if value is None else value
+                stats_html += f'<div class="stat-card"><div class="stat-label">{label}</div><div class="value">{display_value}</div></div>'
         else:
             counts = service_data.get(config.get("count_key", ""), {})
             for label, field in config["cards"]:

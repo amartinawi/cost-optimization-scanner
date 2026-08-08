@@ -218,9 +218,13 @@ class CommitmentAnalysisModule(BaseServiceModule):
                 "ri_coverage_rate": ri_cov_rate,
                 "projected_commitment_monthly_savings": projected,
                 "projected_commitment_basis": basis,
-                "uncovered_ondemand_monthly_total": round(
-                    sum((coverage.uncovered_on_demand or {}).values()), 2
-                ) if coverage is not None else 0.0,
+                # None (JSON null) — not 0.0 — when there is no coverage data
+                # to sum: a measured $0 must mean "zero uncovered on-demand",
+                # never "coverage was unavailable".
+                "uncovered_ondemand_monthly_total": (
+                    round(sum(coverage.uncovered_on_demand.values()), 2)
+                    if coverage is not None and coverage.uncovered_on_demand else None
+                ),
             },
         )
 
@@ -790,6 +794,6 @@ class CommitmentAnalysisModule(BaseServiceModule):
                 "ri_coverage_rate": 0.0,
                 "projected_commitment_monthly_savings": 0.0,
                 "projected_commitment_basis": "",
-                "uncovered_ondemand_monthly_total": 0.0,
+                "uncovered_ondemand_monthly_total": None,
             },
         )

@@ -128,12 +128,36 @@ def _identity(service_label: str, detail: dict[str, Any]) -> tuple[str, str, str
     return itype or "unknown", inner.get("Region", ""), platform
 
 
+def _ec2_tenancy_and_offering_class(rec: dict[str, Any], detail: dict[str, Any]) -> tuple[str, str]:
+    """EC2-only grouping dimensions CE splits recommendations by.
+
+    ``Tenancy`` lives on the per-detail ``EC2InstanceDetails`` block
+    (AWS-SDK-confirmed field, verified via ``aws-knowledge``
+    ``search_documentation`` on 2026-08-08). ``OfferingClass`` lives one
+    level up, on the recommendation's ``ServiceSpecification.EC2Specification``
+    — NOT inside ``EC2InstanceDetails`` despite that being the natural first
+    guess — but is also checked defensively inside the detail block in case a
+    future/alternate response shape nests it there. Non-EC2 services (whose
+    detail dict has no ``EC2InstanceDetails``) always resolve to ``("", "")``.
+    """
+    inner = (detail.get("InstanceDetails") or {}).get("EC2InstanceDetails", {})
+    tenancy = inner.get("Tenancy") or ""
+    offering_class = (
+        (rec.get("ServiceSpecification") or {}).get("EC2Specification", {}).get("OfferingClass")
+        or inner.get("OfferingClass") or ""
+    )
+    return tenancy, offering_class
+
+
 def ri_cells_from_response(service_label: str, term: str, payment: str,
                            resp: dict[str, Any]) -> list[dict[str, Any]]:
     """Flatten one RI purchase-recommendation response into per-type cells.
 
     Zero-savings details are dropped (a cell that saves nothing is not an
-    option worth rendering, and must never join best-path math).
+    option worth rendering, and must never join best-path math). EC2 details
+    also carry ``tenancy``/``offering_class`` (CE returns separate details for
+    each — the card grouping key must include both or two distinct purchase
+    options silently collapse into one, dropping dollars).
     """
     cells: list[dict[str, Any]] = []
     for rec in resp.get("Recommendations", []) or []:
@@ -144,11 +168,14 @@ def ri_cells_from_response(service_label: str, term: str, payment: str,
             if savings <= 0:
                 continue
             itype, region, platform = _identity(service_label, detail)
+            tenancy, offering_class = _ec2_tenancy_and_offering_class(rec, detail)
             cells.append({
                 "service": service_label,
                 "instance_type": itype,
                 "region": region,
                 "platform": platform,
+                "tenancy": tenancy,
+                "offering_class": offering_class,
                 "count": int(_money(
                     detail,
                     "RecommendedNumberOfInstancesToPurchase",
@@ -166,17 +193,35 @@ def ri_cells_from_response(service_label: str, term: str, payment: str,
 
 def sp_cell_from_response(sp_type: str, term: str, payment: str,
                           resp: dict[str, Any]) -> dict[str, Any] | None:
-    """One scenario cell from an SP purchase-recommendation response, or None."""
+    """One scenario cell from an SP purchase-recommendation response, or None.
+
+    ``SavingsPlansPurchaseRecommendationDetails`` carries one entry per
+    family/region for EC2_INSTANCE_SP BY DESIGN (Compute/SageMaker SP
+    responses typically carry a single detail); ``upfront`` sums
+    ``UpfrontCost`` across ALL details — reading only ``details[0]`` silently
+    drops every family beyond the first. ``instance_families`` collects the
+    sorted set of ``SavingsPlansDetails.InstanceFamily`` values present
+    across details (empty list for account-level SP types with no family
+    dimension) so the card renderer can list them (see M7 in reporter_phase_b).
+    """
     spr = resp.get("SavingsPlansPurchaseRecommendation")
     if not isinstance(spr, dict):
         return None
     summary = spr.get("SavingsPlansPurchaseRecommendationSummary", {})
-    details = spr.get("SavingsPlansPurchaseRecommendationDetails", [])
+    details = spr.get("SavingsPlansPurchaseRecommendationDetails", []) or []
     savings = _money(summary, "EstimatedMonthlySavingsAmount")
     commit = _money(summary, "HourlyCommitmentToPurchase")
     if savings <= 0 and commit <= 0:
         return None
-    upfront = _money(details[0], "UpfrontCost") if details and isinstance(details[0], dict) else 0.0
+    upfront = 0.0
+    families: set[str] = set()
+    for detail in details:
+        if not isinstance(detail, dict):
+            continue
+        upfront += _money(detail, "UpfrontCost")
+        family = (detail.get("SavingsPlansDetails") or {}).get("InstanceFamily")
+        if family:
+            families.add(str(family))
     return {
         "sp_type": sp_type,
         "term": term,
@@ -187,6 +232,7 @@ def sp_cell_from_response(sp_type: str, term: str, payment: str,
         "upfront": round(upfront, 2),
         "estimated_ondemand_monthly": _money(
             summary, "EstimatedOnDemandCostWithCurrentCommitment", "EstimatedOnDemandCost"),
+        "instance_families": sorted(families),
     }
 
 
@@ -227,18 +273,22 @@ def build_ri_type_cards(cells: list[dict[str, Any]], uncovered: dict[str, float]
     uncovered keys are platform-agnostic and cannot be fairly allocated across multiple
     platforms, so all cards are fail-closed when ambiguous. Missing key omits fields entirely.
     """
-    groups: dict[tuple[str, str, str, str], list[dict[str, Any]]] = {}
+    groups: dict[tuple[str, str, str, str, str, str], list[dict[str, Any]]] = {}
     for c in cells:
-        groups.setdefault((c["service"], c["instance_type"], c["region"], c["platform"]), []).append(c)
+        key = (c["service"], c["instance_type"], c["region"], c["platform"],
+               c.get("tenancy", ""), c.get("offering_class", ""))
+        groups.setdefault(key, []).append(c)
 
-    # Count platform groups per (service, instance_type, region) to detect ambiguity.
-    platform_counts: dict[tuple[str, str, str], int] = {}
-    for (service, itype, region, platform), _ in groups.items():
-        key = (service, itype, region)
-        platform_counts[key] = platform_counts.get(key, 0) + 1
+    # Count DISTINCT platforms per (service, instance_type, region) to detect
+    # ambiguity — a tenancy/offering_class split must not inflate this count;
+    # only a genuine second platform makes coverage unarbitrable.
+    platforms_by_key: dict[tuple[str, str, str], set[str]] = {}
+    for (service, itype, region, platform, _tenancy, _offering_class) in groups:
+        platforms_by_key.setdefault((service, itype, region), set()).add(platform)
+    platform_counts = {k: len(v) for k, v in platforms_by_key.items()}
 
     cards: list[dict[str, Any]] = []
-    for (service, itype, region, platform), group in groups.items():
+    for (service, itype, region, platform, tenancy, offering_class), group in groups.items():
         scenarios, best = _finish_scenarios([dict(c) for c in group])
         best_cell = scenarios[best]
         ondemand = best_cell["ondemand_monthly"]
@@ -248,6 +298,8 @@ def build_ri_type_cards(cells: list[dict[str, Any]], uncovered: dict[str, float]
             "instance_type": itype,
             "region": region,
             "platform": platform,
+            "tenancy": tenancy,
+            "offering_class": offering_class,
             "recommended_count": best_cell["count"],
             "current_ondemand_monthly": ondemand,
             "scenarios": [
@@ -258,8 +310,11 @@ def build_ri_type_cards(cells: list[dict[str, Any]], uncovered: dict[str, float]
             "recommended_scenario": best,
             "Counted": False,
             "monthly_savings": best_cell["monthly_savings"],
+            "severity": "LOW",
         }
-        if ondemand > 0:
+        # Omit risk_pct rather than claim a misleading 0% when the best cell
+        # has neither a recurring charge nor an upfront cost to weigh.
+        if ondemand > 0 and (best_cell["recurring_monthly"] > 0 or best_cell["upfront"] > 0):
             months = _TERM_MONTHS.get(best_cell["term"], 12)
             card["risk_pct"] = round(
                 100.0 * (best_cell["recurring_monthly"] + best_cell["upfront"] / months) / ondemand, 1)
@@ -270,8 +325,11 @@ def build_ri_type_cards(cells: list[dict[str, Any]], uncovered: dict[str, float]
             key = f"{cov_service}:{normalized_itype}"
             if key in uncovered:
                 card["uncovered_monthly"] = round(uncovered[key], 2)
-                if ondemand > 0:
-                    card["coverage_pct"] = round(max(0.0, 100.0 * (1 - uncovered[key] / ondemand)), 1)
+                # A differently-scoped measurement (uncovered > ondemand) is
+                # not arithmetically sound as a percentage; omit rather than
+                # clamp to a false 0% — the dollar figure above still stands.
+                if ondemand > 0 and uncovered[key] <= ondemand:
+                    card["coverage_pct"] = round(100.0 * (1 - uncovered[key] / ondemand), 1)
         card["AuditBasis"] = {
             "source": "ce:GetReservationPurchaseRecommendation",
             "lookback_days": 30,
@@ -304,12 +362,15 @@ def build_sp_cards(cells: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "recommended_scenario": best,
             "Counted": False,
             "monthly_savings": best_cell["monthly_savings"],
+            "severity": "LOW",
             "AuditBasis": {
                 "source": "ce:GetSavingsPlansPurchaseRecommendation",
                 "lookback_days": 30,
                 "basis": "AWS-computed purchase recommendation; projection, not counted",
             },
         }
+        if best_cell.get("instance_families"):
+            card["instance_families"] = best_cell["instance_families"]
         estimated_ondemand = best_cell.get("estimated_ondemand_monthly", 0.0)
         if estimated_ondemand > 0:
             card["risk_pct"] = round(
@@ -341,6 +402,55 @@ _COH_SP_MATCH = {
     "SAGEMAKER_SP": ("SageMakerSavingsPlans",),
 }
 
+# Nested per-service key inside a CoH rec's recommendedResourceSummary /
+# recommendedResourceDetails dict, and the type-bearing field name inside
+# that nested block. Mirrors the same routed rec shape reporter_phase_b.py's
+# _coh_recommended_scenario already parses for term/payment.
+_COH_RI_TYPE_KEY = {
+    "EC2": ("ec2ReservedInstances", "instanceType"),
+    "RDS": ("rdsReservedInstances", "instanceType"),
+    "ElastiCache": ("elastiCacheReservedInstances", "instanceType"),
+    "Redshift": ("redshiftReservedInstances", "instanceType"),
+    "OpenSearch": ("openSearchReservedInstances", "instanceType"),
+}
+
+
+def _coh_rec_instance_type(rec: dict[str, Any], service: str) -> str | None:
+    """The instance/node type a CoH RI-purchase rec names, or ``None`` if it
+    carries no recognizable type detail at all (the common bare-summary shape).
+    """
+    nested_key, type_key = _COH_RI_TYPE_KEY.get(service, (None, None))
+    if not nested_key:
+        return None
+    summary = rec.get("recommendedResourceSummary") or rec.get("recommendedResourceDetails") or {}
+    if not isinstance(summary, dict):
+        return None
+    block = summary.get(nested_key)
+    if not isinstance(block, dict):
+        return None
+    itype = block.get(type_key)
+    return str(itype) if itype else None
+
+
+def _ri_targets_for_rec(rec: dict[str, Any], service_targets: list[dict[str, Any]]
+                        ) -> list[dict[str, Any]]:
+    """Narrow same-service RI cards to the one the rec's named type points at.
+
+    A CoH RI-purchase rec that names a concrete instance/node type must only
+    concur with the matching card — attaching it to the richest card of the
+    service regardless of type misattributes the dollar. A rec with no
+    recognizable type at all (the common bare-summary shape) still matches at
+    the service level (the caller's existing ``max()`` picks the richest).
+    A rec that names a type absent from every built card returns ``[]`` so
+    the caller leaves it unmatched (renders standalone) instead of guessing.
+    """
+    if not service_targets:
+        return []
+    named_type = _coh_rec_instance_type(rec, service_targets[0]["service"])
+    if named_type is None:
+        return service_targets
+    return [c for c in service_targets if c.get("instance_type") == named_type]
+
 
 def projected_savings(ri_cards: list[dict[str, Any]],
                       sp_cards: list[dict[str, Any]]) -> tuple[float, str]:
@@ -353,11 +463,18 @@ def projected_savings(ri_cards: list[dict[str, Any]],
     safely; SageMaker SP overlaps nothing else and adds on top.
     """
     ec2_ri_total = sum(c["monthly_savings"] for c in ri_cards if c["service"] == "EC2")
-    compute_sp_best = max(
-        (c["monthly_savings"] for c in sp_cards if c["sp_type"] in ("COMPUTE_SP", "EC2_INSTANCE_SP")),
-        default=0.0)
+    ec2_eligible_sp = [c for c in sp_cards if c["sp_type"] in ("COMPUTE_SP", "EC2_INSTANCE_SP")]
+    best_sp_card = max(ec2_eligible_sp, key=lambda c: c["monthly_savings"], default=None)
+    compute_sp_best = best_sp_card["monthly_savings"] if best_sp_card is not None else 0.0
     if compute_sp_best >= ec2_ri_total:
-        group1, group1_basis = compute_sp_best, "Compute SP path"
+        # Name the actual winning SP type rather than always crediting
+        # "Compute SP" — EC2_INSTANCE_SP can legitimately win this group too.
+        sp_basis = (
+            "EC2 Instance SP path"
+            if best_sp_card is not None and best_sp_card["sp_type"] == "EC2_INSTANCE_SP"
+            else "Compute SP path"
+        )
+        group1, group1_basis = compute_sp_best, sp_basis
     else:
         group1, group1_basis = ec2_ri_total, "EC2 RI path"
 
@@ -383,10 +500,13 @@ def merge_coh_concurrence(cards: list[dict[str, Any]],
     """Annotate cards with a "CoH concurs: $X/mo" figure instead of rendering
     duplicate CoH purchase cards. Returns new card dicts (no input mutation).
 
-    Match: an SP-purchase CoH rec concurs with the same-type SP card; an
-    RI-purchase CoH rec concurs with the highest-savings RI card of the
-    matching service. Unmatched CoH recs are left for the caller's existing
-    CoH render path — nothing is dropped here.
+    Match: an SP-purchase CoH rec concurs with the same-type SP card. An
+    RI-purchase CoH rec that names a concrete instance/node type concurs
+    ONLY with the matching card (or stays unmatched if no card carries that
+    type — see ``_ri_targets_for_rec``); a rec with no recognizable type
+    concurs with the highest-savings RI card of the matching service, as
+    before. Unmatched CoH recs are left for the caller's existing CoH render
+    path — nothing is dropped here.
 
     Multiple CoH recs for the same card type accumulate their dollars on the
     matched card (no overwriting).
@@ -410,8 +530,9 @@ def merge_coh_concurrence(cards: list[dict[str, Any]],
                        and any(substr in rtype for substr in _COH_SP_MATCH.get(c["sp_type"], []))]
         elif "Reserved" in action:
             rtype = str(rec.get("currentResourceType") or "")
-            targets = [c for c in out if c["card_kind"] == "ri_type"
-                       and any(substr in rtype for substr in _COH_RI_MATCH.get(c["service"], []))]
+            service_targets = [c for c in out if c["card_kind"] == "ri_type"
+                              and any(substr in rtype for substr in _COH_RI_MATCH.get(c["service"], []))]
+            targets = _ri_targets_for_rec(rec, service_targets)
         else:
             continue
         if targets:

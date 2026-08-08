@@ -591,11 +591,12 @@ def test_adapter_suppresses_matched_coh_rec_from_cost_optimization_hub_source():
 
 def test_adapter_empty_findings_when_ce_unavailable_has_projection_extras():
     # scan() bails to _empty_findings() when ctx.client("ce") is falsy. That
-    # bailout must still carry the three projection extras keys (fail-closed
-    # zeros/empty-string, since there is no CE data to project from) so
-    # Task 5's summary plumbing can read them unconditionally, and the
-    # cost_optimization_hub source must exist so the sources shape matches
-    # the normal path.
+    # bailout must still carry the three projection extras keys so Task 5's
+    # summary plumbing can read them unconditionally: fail-closed zeros/
+    # empty-string for the projection figures, but None (never a fabricated
+    # 0.0 — M2) for uncovered_ondemand_monthly_total since there is no CE
+    # data to sum. The cost_optimization_hub source must exist so the
+    # sources shape matches the normal path.
     from types import SimpleNamespace
     from unittest.mock import MagicMock
 
@@ -610,264 +611,153 @@ def test_adapter_empty_findings_when_ce_unavailable_has_projection_extras():
 
     assert findings.extras["projected_commitment_monthly_savings"] == 0.0
     assert findings.extras["projected_commitment_basis"] == ""
-    assert findings.extras["uncovered_ondemand_monthly_total"] == 0.0
+    assert findings.extras["uncovered_ondemand_monthly_total"] is None
     assert "cost_optimization_hub" in findings.sources
     assert findings.sources["cost_optimization_hub"].count == 0
     assert findings.sources["cost_optimization_hub"].recommendations == ()
 
 
-# --- Task 6: Card renderer -----------------------------------------------
+# --- Final-review fix wave (2026-08-08): B1, B2, M4-M7, L2, L5 --------------
 
 
-def test_render_ri_card_has_matrix_and_marked_recommendation():
-    from reporter_phase_b import _render_commitment_purchase_cards
-
-    card = {"card_kind": "ri_type", "service": "RDS", "instance_type": "db.r7i.4xlarge",
-            "region": "eu-west-1", "platform": "aurora-postgresql",
-            "recommended_count": 7, "current_ondemand_monthly": 4102.11,
-            "coverage_pct": 22.0, "uncovered_monthly": 3199.65,
-            "scenarios": [
-                {"term": "1yr", "payment": "No Upfront", "monthly_savings": 1210.40,
-                 "upfront": 0.0, "recurring_monthly": 2891.71, "break_even_months": 0.0},
-                {"term": "3yr", "payment": "All Upfront", "monthly_savings": 1700.0,
-                 "upfront": 12000.0, "recurring_monthly": 1800.0, "break_even_months": 7.1},
-            ],
-            "recommended_scenario": 1, "risk_pct": 51.2,
-            "Counted": False, "monthly_savings": 1700.0,
-            "coh_concurs_monthly": 1650.0}
-    html = _render_commitment_purchase_cards([card], "purchase_recommendations", {})
-    assert "db.r7i.4xlarge" in html and "x7" in html
-    assert "$1,210.40" in html and "$1,700.00" in html      # matrix cells
-    assert "break-even" in html.lower()
-    assert "51.2" in html                                    # risk line
-    assert "22.0%" in html                                   # coverage context
-    assert "CoH concurs" in html
-    assert "projection" in html.lower()                      # advisory chip
-    assert html.count("recommended") >= 1                    # AWS pick marked
+def test_sp_cell_sums_upfront_across_multiple_details():
+    """B1: EC2_INSTANCE_SP responses carry one detail per family/region by
+    AWS design; upfront must sum ALL details, not just details[0]."""
+    resp = {"SavingsPlansPurchaseRecommendation": {
+        "SavingsPlansPurchaseRecommendationSummary": {
+            "EstimatedMonthlySavingsAmount": "1200.00",
+            "HourlyCommitmentToPurchase": "2.5",
+        },
+        "SavingsPlansPurchaseRecommendationDetails": [
+            {"UpfrontCost": "300", "SavingsPlansDetails": {"InstanceFamily": "r5"}},
+            {"UpfrontCost": "450", "SavingsPlansDetails": {"InstanceFamily": "m5"}},
+        ],
+    }}
+    cell = sp_cell_from_response("EC2_INSTANCE_SP", "3yr", "Partial Upfront", resp)
+    assert cell["upfront"] == pytest.approx(750.0)
+    assert cell["instance_families"] == ["m5", "r5"]  # sorted
 
 
-def test_render_sp_card_states_no_instance_type():
-    from reporter_phase_b import _render_commitment_purchase_cards
-
-    card = {"card_kind": "sp_commitment", "sp_type": "COMPUTE_SP",
-            "scenarios": [{"term": "3yr", "payment": "All Upfront",
-                           "monthly_savings": 800.0, "upfront": 9000.0,
-                           "hourly_commitment": 1.1, "savings_pct": 32.0,
-                           "break_even_months": 11.3}],
-            "recommended_scenario": 0, "Counted": False, "monthly_savings": 800.0}
-    html = _render_commitment_purchase_cards([card], "purchase_recommendations", {})
-    assert "$1.1000/hr" in html
-    assert "EC2 + Lambda + Fargate" in html                  # services spanned
-    assert "account-level" in html.lower()                   # no fake type detail
-
-
-def test_render_groups_by_instrument_and_orders_by_savings():
-    from reporter_phase_b import _render_commitment_purchase_cards
-
-    small = {"card_kind": "ri_type", "service": "ElastiCache", "instance_type": "cache.t3.micro",
-             "region": "eu-west-1", "platform": "redis", "recommended_count": 1,
-             "current_ondemand_monthly": 20.0, "scenarios": [], "recommended_scenario": 0,
-             "Counted": False, "monthly_savings": 5.0}
-    big = {"card_kind": "sp_commitment", "sp_type": "COMPUTE_SP",
-           "scenarios": [], "recommended_scenario": 0, "Counted": False,
-           "monthly_savings": 900.0}
-    html = _render_commitment_purchase_cards([small, big], "purchase_recommendations", {})
-    assert html.index("Compute Savings Plan") < html.index("ElastiCache")
+def test_sp_cell_families_empty_when_no_family_dimension():
+    """B1: Compute/SageMaker SP details carry no family dimension -> []."""
+    resp = {"SavingsPlansPurchaseRecommendation": {
+        "SavingsPlansPurchaseRecommendationSummary": {
+            "EstimatedMonthlySavingsAmount": "500.00",
+            "HourlyCommitmentToPurchase": "1.0",
+        },
+        "SavingsPlansPurchaseRecommendationDetails": [{"UpfrontCost": "900"}],
+    }}
+    cell = sp_cell_from_response("COMPUTE_SP", "1yr", "No Upfront", resp)
+    assert cell["instance_families"] == []
+    assert cell["upfront"] == pytest.approx(900.0)
 
 
-def test_render_dynamodb_card_skips_empty_platform_cleanly():
-    """DynamoDB RI cards have no platform and a capacity-units instance_type
-    string; the generic card layout must not crash or print empty parens."""
-    from reporter_phase_b import _render_commitment_purchase_cards
-
-    card = {"card_kind": "ri_type", "service": "DynamoDB", "instance_type": "100 capacity units",
-            "region": "us-east-1", "platform": "", "recommended_count": 5,
-            "current_ondemand_monthly": 900.0,
-            "scenarios": [{"term": "1yr", "payment": "No Upfront", "monthly_savings": 300.0,
-                           "upfront": 0.0, "recurring_monthly": 600.0, "break_even_months": 0.0}],
-            "recommended_scenario": 0, "Counted": False, "monthly_savings": 300.0}
-    html = _render_commitment_purchase_cards([card], "purchase_recommendations", {})
-    assert "100 capacity units" in html
-    assert "()" not in html
-    assert " — —" not in html
+def test_sp_card_carries_instance_families_from_best_cell():
+    """M7: build_sp_cards propagates instance_families from the best cell."""
+    cells = [
+        {"sp_type": "EC2_INSTANCE_SP", "term": "1yr", "payment": "No Upfront",
+         "hourly_commitment": 0.5, "monthly_savings": 400.0, "savings_pct": 20.0,
+         "upfront": 0.0, "estimated_ondemand_monthly": 2000.0,
+         "instance_families": ["m5", "r5"]},
+    ]
+    card = build_sp_cards(cells)[0]
+    assert card["instance_families"] == ["m5", "r5"]
 
 
-def test_render_zero_savings_cell_is_greyed_not_recommended():
-    """Ruling: SP $0-savings cells are kept but greyed, never marked recommended.
-
-    F1 regression: Task 2's max() still yields an index even when every
-    scenario nets $0, so recommended_scenario can point AT a $0 cell. That
-    cell must render muted with NEITHER the recommended class NOR the
-    recommended label.
-    """
-    from reporter_phase_b import _render_commitment_purchase_cards
-
-    card = {"card_kind": "sp_commitment", "sp_type": "SAGEMAKER_SP",
-            "scenarios": [
-                {"term": "1yr", "payment": "No Upfront", "monthly_savings": 0.0,
-                 "upfront": 0.0, "hourly_commitment": 0.2, "savings_pct": 0.0,
-                 "break_even_months": 0.0},
-                {"term": "3yr", "payment": "All Upfront", "monthly_savings": 150.0,
-                 "upfront": 500.0, "hourly_commitment": 0.2, "savings_pct": 18.0,
-                 "break_even_months": 3.3},
-            ],
-            "recommended_scenario": 0, "Counted": False, "monthly_savings": 150.0}
-    html = _render_commitment_purchase_cards([card], "purchase_recommendations", {})
-    assert "muted" in html
-    assert "scenario-cell--recommended" not in html
-    assert "recommended</span>" not in html
+def test_sp_card_omits_instance_families_when_absent():
+    cells = [
+        {"sp_type": "COMPUTE_SP", "term": "1yr", "payment": "No Upfront",
+         "hourly_commitment": 1.0, "monthly_savings": 500.0, "savings_pct": 20.0,
+         "upfront": 0.0, "estimated_ondemand_monthly": 2500.0},
+    ]
+    card = build_sp_cards(cells)[0]
+    assert "instance_families" not in card
 
 
-def test_render_all_zero_sp_card_has_no_recommended_marker_anywhere():
-    """F1 sibling: an all-zero SP card renders with no recommended marker at all."""
-    from reporter_phase_b import _render_commitment_purchase_cards
-
-    card = {"card_kind": "sp_commitment", "sp_type": "SAGEMAKER_SP",
-            "scenarios": [
-                {"term": "1yr", "payment": "No Upfront", "monthly_savings": 0.0,
-                 "upfront": 0.0, "hourly_commitment": 0.2, "savings_pct": 0.0,
-                 "break_even_months": 0.0},
-                {"term": "3yr", "payment": "All Upfront", "monthly_savings": 0.0,
-                 "upfront": 0.0, "hourly_commitment": 0.2, "savings_pct": 0.0,
-                 "break_even_months": 0.0},
-            ],
-            "recommended_scenario": 1, "Counted": False, "monthly_savings": 0.0}
-    html = _render_commitment_purchase_cards([card], "purchase_recommendations", {})
-    assert "scenario-cell--recommended" not in html
-    assert "recommended</span>" not in html
+def test_projected_group1_names_ec2_instance_sp_winner():
+    """B2: when EC2_INSTANCE_SP wins group1, basis must say so, not the
+    hardcoded 'Compute SP path'."""
+    total, basis = projected_savings([_ri_card("EC2", 500.0)],
+                                     [_sp_card("EC2_INSTANCE_SP", 1600.0)])
+    assert total == pytest.approx(1600.0)
+    assert basis == "EC2 Instance SP path"
 
 
-def test_render_break_even_none_renders_phrase_not_zero():
-    """break_even_months == None means 'never breaks even'; must not print 0.0."""
-    from reporter_phase_b import _render_commitment_purchase_cards
-
-    card = {"card_kind": "ri_type", "service": "Redshift", "instance_type": "ra3.xlplus",
-            "region": "eu-west-1", "platform": "", "recommended_count": 2,
-            "current_ondemand_monthly": 400.0,
-            "scenarios": [{"term": "1yr", "payment": "No Upfront", "monthly_savings": 0.0,
-                           "upfront": 100.0, "recurring_monthly": 400.0, "break_even_months": None}],
-            "recommended_scenario": 0, "Counted": False, "monthly_savings": 0.0}
-    html = _render_commitment_purchase_cards([card], "purchase_recommendations", {})
-    assert "never breaks even" in html.lower()
-    assert "0.0 mo" not in html
+def test_projected_group1_still_names_compute_sp_winner():
+    total, basis = projected_savings([_ri_card("EC2", 500.0)],
+                                     [_sp_card("COMPUTE_SP", 1600.0)])
+    assert basis == "Compute SP path"
 
 
-def test_render_coverage_omitted_when_fields_absent():
-    """RI cards may carry neither coverage_pct nor uncovered_monthly — fail closed."""
-    from reporter_phase_b import _render_commitment_purchase_cards
-
-    card = {"card_kind": "ri_type", "service": "OpenSearch", "instance_type": "r6g.large.search",
-            "region": "us-east-1", "platform": "", "recommended_count": 3,
-            "current_ondemand_monthly": 600.0,
-            "scenarios": [{"term": "1yr", "payment": "No Upfront", "monthly_savings": 100.0,
-                           "upfront": 0.0, "recurring_monthly": 500.0, "break_even_months": 0.0}],
-            "recommended_scenario": 0, "Counted": False, "monthly_savings": 100.0}
-    html = _render_commitment_purchase_cards([card], "purchase_recommendations", {})
-    assert "0%" not in html
-    assert "0.0%" not in html
+def test_coverage_pct_omitted_when_uncovered_exceeds_ondemand():
+    """M4: uncovered > ondemand is a differently-scoped measurement — omit
+    coverage_pct (fail closed) rather than clamp to a false 0.0%; the dollar
+    figure (uncovered_monthly) still renders."""
+    cells = [_cell(ondemand_monthly=600.0)]
+    uncovered = {"rds:r7i.4xlarge": 2000.0}
+    card = build_ri_type_cards(cells, uncovered, "eu-west-1")[0]
+    assert "coverage_pct" not in card
+    assert card["uncovered_monthly"] == pytest.approx(2000.0)
 
 
-def test_render_empty_recs_returns_empty_string():
-    from reporter_phase_b import _render_commitment_purchase_cards
-
-    assert _render_commitment_purchase_cards([], "purchase_recommendations", {}) == ""
-
-
-def test_render_registered_in_phase_b_handlers():
-    from reporter_phase_b import PHASE_B_HANDLERS, _render_commitment_purchase_cards
-
-    assert PHASE_B_HANDLERS[("commitment_analysis", "purchase_recommendations")] is (
-        _render_commitment_purchase_cards
-    )
+def test_tenancy_splits_ri_cards():
+    """M5: CE splits EC2 RI details by tenancy; the same (service, type,
+    region, platform) with two tenancies must not collapse into one card."""
+    cells = [
+        _cell(service="EC2", tenancy="Shared", monthly_savings=100.0),
+        _cell(service="EC2", tenancy="Dedicated", monthly_savings=50.0),
+    ]
+    cards = build_ri_type_cards(cells, {}, "eu-west-1")
+    assert len(cards) == 2
+    assert {c["tenancy"] for c in cards} == {"Shared", "Dedicated"}
 
 
-# --- Task 7: Exec fact + stat cards + SP-vs-RI strip -------------------------
-#
-# `generate_html_report_from_json` reads a JSON *file path* and its return
-# value is the *output file path* it wrote, not the HTML text — neither
-# matches the brief's `html = generate_html_report_from_json(data)` snippet.
-# We drive `HTMLReportGenerator` directly (the same pattern
-# tests/test_reporter_snapshots.py already uses) and read the written file.
+def test_offering_class_splits_ri_cards():
+    """M5: same for offering_class (Standard vs Convertible)."""
+    cells = [
+        _cell(service="EC2", offering_class="STANDARD", monthly_savings=100.0),
+        _cell(service="EC2", offering_class="CONVERTIBLE", monthly_savings=50.0),
+    ]
+    cards = build_ri_type_cards(cells, {}, "eu-west-1")
+    assert len(cards) == 2
+    assert {c["offering_class"] for c in cards} == {"STANDARD", "CONVERTIBLE"}
 
 
-def test_exec_summary_shows_projected_fact(tmp_path):
-    from html_report_generator import HTMLReportGenerator
-    from tests.test_output_audit import make_report
-
-    data = make_report()
-    data["scan_time"] = "2026-08-08T00:00:00"  # _get_header requires it; make_report() omits it
-    data["summary"]["projected_commitment_monthly_savings"] = 2345.67
-    data["summary"]["projected_commitment_basis"] = "Compute SP path"
-    out_file = tmp_path / "projected_fact.html"
-    HTMLReportGenerator(data).generate_html_report(str(out_file))
-    html_out = out_file.read_text()
-    assert "Projected commitment" in html_out
-    assert "$2,345.67" in html_out
-    assert "Compute SP path" in html_out
+def test_tenancy_split_does_not_break_platform_ambiguity_count():
+    """M5: a tenancy split of the SAME platform must not be mistaken for the
+    F7 multi-platform-ambiguity case — coverage should still join normally."""
+    cells = [
+        _cell(tenancy="Shared", monthly_savings=100.0),
+        _cell(tenancy="Dedicated", monthly_savings=50.0),
+    ]
+    uncovered = {"rds:r7i.4xlarge": 500.0}
+    cards = build_ri_type_cards(cells, uncovered, "eu-west-1")
+    for card in cards:
+        assert "uncovered_monthly" in card
 
 
-def test_exec_summary_omits_projected_fact_when_zero(tmp_path):
-    from html_report_generator import HTMLReportGenerator
-    from tests.test_output_audit import make_report
-
-    data = make_report()
-    data["scan_time"] = "2026-08-08T00:00:00"  # _get_header requires it; make_report() omits it
-    out_file = tmp_path / "no_projected_fact.html"
-    HTMLReportGenerator(data).generate_html_report(str(out_file))
-    html_out = out_file.read_text()
-    assert "Projected commitment" not in html_out
+def test_risk_pct_omitted_when_recurring_and_upfront_both_zero():
+    """L2: recurring_monthly==0 and upfront==0 would make risk_pct a
+    misleading 0.0% (implying zero ongoing exposure); omit instead."""
+    cells = [_cell(recurring_monthly=0.0, upfront=0.0,
+                   monthly_savings=100.0, ondemand_monthly=200.0)]
+    card = build_ri_type_cards(cells, {}, "eu-west-1")[0]
+    assert "risk_pct" not in card
 
 
-def test_sp_vs_ri_strip_renders_on_ec2_section():
-    from reporter_phase_b import _render_commitment_purchase_cards
+def test_ri_and_sp_cards_carry_low_severity():
+    """L5: cards need a severity so the priority filter doesn't dim the whole
+    purchase-recommendations section under any active filter."""
+    ri_cards = build_ri_type_cards([_cell()], {}, "eu-west-1")
+    assert ri_cards[0]["severity"] == "LOW"
+    sp_cards = build_sp_cards([
+        {"sp_type": "COMPUTE_SP", "term": "1yr", "payment": "No Upfront",
+         "hourly_commitment": 1.0, "monthly_savings": 500.0, "savings_pct": 20.0,
+         "upfront": 0.0, "estimated_ondemand_monthly": 2500.0},
+    ])
+    assert sp_cards[0]["severity"] == "LOW"
 
-    ec2_ri = {"card_kind": "ri_type", "service": "EC2", "instance_type": "r6i.4xlarge",
-              "region": "eu-west-1", "platform": "Windows", "recommended_count": 3,
-              "current_ondemand_monthly": 4000.0, "scenarios": [], "recommended_scenario": 0,
-              "Counted": False, "monthly_savings": 1000.0}
-    sp = {"card_kind": "sp_commitment", "sp_type": "COMPUTE_SP", "scenarios": [],
-          "recommended_scenario": 0, "Counted": False, "monthly_savings": 1500.0}
-    html = _render_commitment_purchase_cards([ec2_ri, sp], "purchase_recommendations", {})
-    assert "SP vs RI" in html
-    assert "$1,500.00" in html and "$1,000.00" in html
-    assert "Lambda" in html          # flexibility trade-off stated
-
-
-def test_sp_vs_ri_strip_absent_without_ec2_ri():
-    """No EC2 RI cards -> no strip, even with a strong SP card present."""
-    from reporter_phase_b import _render_commitment_purchase_cards
-
-    sp = {"card_kind": "sp_commitment", "sp_type": "COMPUTE_SP", "scenarios": [],
-          "recommended_scenario": 0, "Counted": False, "monthly_savings": 1500.0}
-    html = _render_commitment_purchase_cards([sp], "purchase_recommendations", {})
-    assert "SP vs RI" not in html
+# M6 (CoH RI typed-instance matching) tests moved to
+# tests/test_commitment_coh_merge.py to keep this file under the 800-line cap.
 
 
-def test_sp_vs_ri_strip_absent_when_best_sp_is_zero():
-    """Ruling: a $0 best_sp must not render a strip claiming a '$0.00 leads' comparison."""
-    from reporter_phase_b import _render_commitment_purchase_cards
-
-    ec2_ri = {"card_kind": "ri_type", "service": "EC2", "instance_type": "r6i.4xlarge",
-              "region": "eu-west-1", "platform": "Windows", "recommended_count": 3,
-              "current_ondemand_monthly": 4000.0, "scenarios": [], "recommended_scenario": 0,
-              "Counted": False, "monthly_savings": 1000.0}
-    zero_sp = {"card_kind": "sp_commitment", "sp_type": "COMPUTE_SP", "scenarios": [],
-               "recommended_scenario": 0, "Counted": False, "monthly_savings": 0.0}
-    html = _render_commitment_purchase_cards([ec2_ri, zero_sp], "purchase_recommendations", {})
-    assert "SP vs RI" not in html
-
-
-def test_sp_vs_ri_strip_ignores_sagemaker_sp():
-    """SAGEMAKER_SP never covers EC2, so it must never be picked as best_sp."""
-    from reporter_phase_b import _render_commitment_purchase_cards
-
-    ec2_ri = {"card_kind": "ri_type", "service": "EC2", "instance_type": "r6i.4xlarge",
-              "region": "eu-west-1", "platform": "Windows", "recommended_count": 3,
-              "current_ondemand_monthly": 4000.0, "scenarios": [], "recommended_scenario": 0,
-              "Counted": False, "monthly_savings": 1000.0}
-    sagemaker_sp = {"card_kind": "sp_commitment", "sp_type": "SAGEMAKER_SP", "scenarios": [],
-                    "recommended_scenario": 0, "Counted": False, "monthly_savings": 5000.0}
-    html = _render_commitment_purchase_cards([ec2_ri, sagemaker_sp], "purchase_recommendations", {})
-    # No strip at all: the only SP present (SAGEMAKER_SP) is ineligible as best_sp.
-    assert "SP vs RI" not in html
-    assert "sp-vs-ri" not in html

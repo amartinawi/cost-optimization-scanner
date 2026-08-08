@@ -137,8 +137,13 @@ Additive fields; `total_monthly_savings` untouched; S1/S7 sweeps unaffected.
    (`db.r7i.4xlarge x7 — eu-west-1 — aurora-postgresql`), coverage context
    line, 6-cell table (rows = term, cols = payment; cell = monthly saving /
    upfront / discount %), AWS-recommended cell visually marked, break-even +
-   risk line beneath. Scan-region first, others region-tagged after. Negative/
-   zero-saving cells render greyed and never join best-path math.
+   risk line beneath. Scan-region first, others region-tagged after.
+   Zero/negative-saving cells split by kind: an RI detail with zero/negative
+   savings is dropped at the parser — it never reaches a card. An SP cell is
+   KEPT whenever its `hourly_commitment > 0`, even at `monthly_savings == 0`
+   (a whole SP-type matrix can legitimately net $0 while AWS still
+   recommends the commitment); that cell renders greyed and is excluded from
+   the AWS-recommended marker and from best-path math, rather than dropped.
 5. EC2 section: SP-vs-RI strip — best EC2 RI total vs best Compute/EC2-Instance
    SP cell, flexibility trade-off stated. Aggregate-level only (AWS emits no
    per-type SP detail; we do not invent it).
@@ -158,7 +163,8 @@ purchase" chip on every card; advisory-only tab still renders (D2); dark mode
 | No SP/RI held (e.g. afs-prod) | Purchase sections still render (CE recommends NEW purchases); coverage context shows 0% |
 | `commitment_coverage` unavailable | Card renders without coverage line — never a fabricated 0 |
 | Upfront = 0 | Break-even "immediate" |
-| Negative/zero net-saving cell | Rendered greyed, excluded from best-path |
+| Negative/zero net-saving RI detail | Dropped at the parser — never reaches a card |
+| Negative/zero net-saving SP cell | Kept (AWS still recommended the commitment); rendered greyed, excluded from best-path |
 | Type in another region | Rendered, region-tagged, included in projected total |
 
 ## Testing (TDD, RED first)
@@ -169,7 +175,7 @@ purchase" chip on every card; advisory-only tab still renders (D2); dark mode
 - Renderer: scenario-table output into the reporter snapshot machinery;
   D2 (tab renders) + D4 (projections don't inflate counts) assertions.
 - Harness: `tools/output_audit.py` sweep — projected figure recomputes from
-  cards to the cent; PROJECTION exemption already covers this tab.
+  cards within a $0.50 tolerance; PROJECTION exemption already covers this tab.
 - Regression gate green throughout:
   `pytest tests/test_regression_snapshot.py tests/test_reporter_snapshots.py`.
 
