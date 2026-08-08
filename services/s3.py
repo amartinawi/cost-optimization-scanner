@@ -831,8 +831,12 @@ def _assess_bucket_coldness(
     Returns one of:
 
     - ``"cold"``  — CloudWatch S3 request metrics are enabled for the whole
-      bucket AND recorded zero GET requests over ``COLD_LOOKBACK_DAYS``. The
-      data is demonstrably untouched, so a lifecycle/Intelligent-Tiering
+      bucket, recorded zero GET requests over ``COLD_LOOKBACK_DAYS``, AND the
+      ``AllRequests`` series proves metric publication was live over the same
+      window (S3 request metrics are best-effort and emit only while
+      publishing, so an empty ``GetRequests`` series alone is
+      indistinguishable from a config that has not been publishing). The data
+      is demonstrably untouched, so a lifecycle/Intelligent-Tiering
       transition to Infrequent Access saves money without incurring retrieval.
     - ``"warm"`` — request metrics show GET activity; an IA transition could
       add retrieval/per-request cost, so no storage saving is credited.
@@ -903,7 +907,35 @@ def _assess_bucket_coldness(
             return "unknown"
         total_get_requests += sum(dp.get("Sum", 0.0) for dp in response.get("Datapoints", []))
 
-    return "cold" if total_get_requests == 0 else "warm"
+    if total_get_requests > 0:
+        return "warm"
+
+    # Zero GETs alone is not proof of coldness: request metrics emit datapoints
+    # only while publication is live, so an empty GetRequests series could mean
+    # the config was enabled mid-window (or delivery lapsed) rather than "no
+    # access". Corroborate with AllRequests on the same filter/window — a live
+    # bucket virtually always records HEAD/PUT/List traffic. No corroborating
+    # datapoints anywhere -> fail closed to "unknown", never "cold".
+    for filter_id in filter_ids:
+        try:
+            all_resp = cloudwatch.get_metric_statistics(
+                Namespace="AWS/S3",
+                MetricName="AllRequests",
+                Dimensions=[
+                    {"Name": "BucketName", "Value": bucket_name},
+                    {"Name": "FilterId", "Value": filter_id},
+                ],
+                StartTime=datetime.now(UTC) - timedelta(days=COLD_LOOKBACK_DAYS),
+                EndTime=datetime.now(UTC),
+                Period=86400,
+                Statistics=["Sum"],
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.debug("S3 AllRequests corroboration error on %s: %s", bucket_name, e)
+            return "unknown"
+        if all_resp.get("Datapoints"):
+            return "cold"
+    return "unknown"
 
 
 def _finalize_bucket_savings(

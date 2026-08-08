@@ -91,7 +91,29 @@ class TestColdnessAssessment:
         }
         assert _assess_bucket_coldness(self._ctx(), "b", s3_client, "us-east-1") == "unknown"
 
-    def test_zero_get_requests_is_cold(self, monkeypatch):
+    def test_zero_gets_with_live_allrequests_is_cold(self, monkeypatch):
+        """Zero GETs counts as cold only when AllRequests proves publication is live."""
+        from unittest.mock import MagicMock
+        s3_client = MagicMock()
+        s3_client.list_bucket_metrics_configurations.return_value = {
+            "MetricsConfigurationList": [{"Id": "EntireBucket"}]
+        }
+        cw = MagicMock()
+
+        def _by_metric(**kwargs):
+            if kwargs.get("MetricName") == "AllRequests":
+                return {"Datapoints": [{"Sum": 310.0}]}  # HEAD/PUT/List traffic recorded
+            return {"Datapoints": []}  # no GETs
+
+        cw.get_metric_statistics.side_effect = _by_metric
+        monkeypatch.setattr("services.s3._bucket_cloudwatch_client", lambda *a, **k: cw)
+        assert _assess_bucket_coldness(self._ctx(), "b", s3_client, "us-east-1") == "cold"
+
+    def test_zero_gets_without_corroboration_is_unknown(self, monkeypatch):
+        """Empty GetRequests AND empty AllRequests is indistinguishable from a
+        metrics config that has not been publishing across the window (S3
+        request metrics are best-effort, emitted only while publication is
+        live) — fail closed to unknown, never cold."""
         from unittest.mock import MagicMock
         s3_client = MagicMock()
         s3_client.list_bucket_metrics_configurations.return_value = {
@@ -100,7 +122,25 @@ class TestColdnessAssessment:
         cw = MagicMock()
         cw.get_metric_statistics.return_value = {"Datapoints": []}
         monkeypatch.setattr("services.s3._bucket_cloudwatch_client", lambda *a, **k: cw)
-        assert _assess_bucket_coldness(self._ctx(), "b", s3_client, "us-east-1") == "cold"
+        assert _assess_bucket_coldness(self._ctx(), "b", s3_client, "us-east-1") == "unknown"
+
+    def test_allrequests_read_failure_is_unknown(self, monkeypatch):
+        """A failed AllRequests corroboration read withholds the cold verdict."""
+        from unittest.mock import MagicMock
+        s3_client = MagicMock()
+        s3_client.list_bucket_metrics_configurations.return_value = {
+            "MetricsConfigurationList": [{"Id": "EntireBucket"}]
+        }
+        cw = MagicMock()
+
+        def _by_metric(**kwargs):
+            if kwargs.get("MetricName") == "AllRequests":
+                raise Exception("ThrottlingException")
+            return {"Datapoints": []}
+
+        cw.get_metric_statistics.side_effect = _by_metric
+        monkeypatch.setattr("services.s3._bucket_cloudwatch_client", lambda *a, **k: cw)
+        assert _assess_bucket_coldness(self._ctx(), "b", s3_client, "us-east-1") == "unknown"
 
     def test_nonzero_get_requests_is_warm(self, monkeypatch):
         from unittest.mock import MagicMock
