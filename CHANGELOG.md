@@ -45,8 +45,13 @@ groups them into two card shapes:
 Both card kinds are `Counted=False` projections whose `monthly_savings`
 carries the best cell's dollar (the existing B1-ii convention: a projection
 legitimately carries a non-zero numeric that is never summed into the
-counted headline). Zero/negative-saving cells are dropped at the parser, not
-zero-filled, and never compete for "best".
+counted headline). RI cells with zero/negative savings are dropped at the
+parser — never zero-filled, never candidates for "best". SP cells are kept
+whenever the cell's `hourly_commitment` is positive even if `monthly_savings`
+is `0` (a whole SP-type matrix can legitimately net $0 while AWS still
+recommends the commitment); those cells are greyed at render and excluded
+from the AWS-recommended marker and from best-path math, rather than dropped
+at the parser.
 
 `projected_savings()` computes one non-overlapping best-path figure across
 instruments, since a Savings Plan and an EC2 RI discount the *same* on-demand
@@ -86,7 +91,7 @@ On-Demand", "Projected Savings") via `_SERVICE_STATS_CONFIG`.
 `tools/output_audit.py` gains sweep **S14**: recomputes the summary's
 projected figure from the actual `ri_type`/`sp_commitment` cards via the same
 `projected_savings()` the adapter calls, and fails if the two disagree by more
-than half a cent.
+than $0.50.
 
 ### Fixed (a billed pool is not the flagged subset's saving — AMI overstated $3,911.50/mo)
 `services/_reconcile.reconcile_against_billed` capped an upper bound at the **whole**

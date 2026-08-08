@@ -38,28 +38,45 @@ rightsizing levers they overlap.**
 >     `recommended_count`, `current_ondemand_monthly`, `scenarios` (list of
 >     `{term, payment, monthly_savings, upfront, recurring_monthly,
 >     break_even_months}`), `recommended_scenario` (index into `scenarios`),
->     `risk_pct`, optionally `coverage_pct` / `uncovered_monthly` (omitted —
->     never fabricated — when the card's region isn't the scan region or more
->     than one platform shares the same `(service, type, region)`), optionally
+>     optionally `risk_pct` (omitted when `current_ondemand_monthly <= 0`),
+>     optionally `coverage_pct` / `uncovered_monthly` (omitted — never
+>     fabricated — when the card's region isn't the scan region or more than
+>     one platform shares the same `(service, type, region)`), optionally
 >     `coh_concurs_monthly`. DynamoDB cards have no `platform` and an
 >     `instance_type` string that reads as a capacity-unit count (CE reports
 >     DynamoDB RI detail under `ReservedCapacityDetails`, not `InstanceDetails`
 >     — there is no per-instance identity to report).
->   - `sp_commitment` — one per SP type: `sp_type`, the same `scenarios` shape
->     plus `hourly_commitment`/`savings_pct` per cell, `risk_pct`, optionally
+>   - `sp_commitment` — one per SP type: `sp_type`, `scenarios` (list of
+>     `{term, payment, monthly_savings, upfront, hourly_commitment,
+>     savings_pct, break_even_months}` — **no** `recurring_monthly`, unlike
+>     `ri_type`), `recommended_scenario`, optionally `risk_pct` (omitted when
+>     the winning cell's `estimated_ondemand_monthly <= 0`), optionally
 >     `coh_concurs_monthly`. No instance type — SPs are account-level.
-> - **B1-ii applies to both card kinds.** Every purchase card is
->   `Counted=False` yet legitimately carries a non-zero `monthly_savings` (the
->   best cell's projected dollar, per the house B1-ii convention already used
->   for other born-advisory what-ifs — see `_LIVE_AUDIT_LESSONS.md` F5 and
->   `tools/output_audit.py` `PROJECTION_SERVICES`). This is by design, not a
->   leak: `scan()` never sums a `Counted=False` rec into `total_monthly_savings`,
->   and `core/result_builder.py` reports the AWS-best-path total separately as
+> - **B1-ii applies to both card kinds, but the zero-cell rule differs by
+>   kind — do not flag a rendered $0 SP card as a leak.** Every purchase card
+>   is `Counted=False` yet legitimately carries a non-zero `monthly_savings`
+>   (the best cell's projected dollar, per the house B1-ii convention already
+>   used for other born-advisory what-ifs — see `_LIVE_AUDIT_LESSONS.md` F5
+>   and `tools/output_audit.py` `PROJECTION_SERVICES`). This is by design, not
+>   a leak: `scan()` never sums a `Counted=False` rec into
+>   `total_monthly_savings`, and `core/result_builder.py` reports the
+>   AWS-best-path total separately as
 >   `summary.projected_commitment_monthly_savings` /
->   `projected_commitment_basis` (additive fields, beside the counted headline,
->   never inside it). A zero/negative-saving cell is dropped by the parser
->   before it ever reaches a card — it cannot be the one showing a stray
->   positive `monthly_savings` on a `Counted=False` rec.
+>   `projected_commitment_basis` (additive fields, beside the counted
+>   headline, never inside it).
+>   - **RI cells**: a zero/negative-saving detail is dropped by
+>     `ri_cells_from_response` before it ever reaches a card — an `ri_type`
+>     card cannot show a stray $0 scenario.
+>   - **SP cells**: `sp_cell_from_response` KEEPS a cell whenever
+>     `hourly_commitment > 0`, even if `monthly_savings == 0` — a whole
+>     `sp_commitment` card's matrix can legitimately net $0 across every term
+>     x payment combination while AWS still recommends the commitment. That
+>     $0 scenario can even land at `recommended_scenario`'s index (it is still
+>     `max()`'d in). The renderer's `show_recommended` guard (Task 6) is what
+>     keeps a $0 cell from ever displaying the "recommended" marker or
+>     counting toward best-path math — grey/excluded at render time, not
+>     dropped at the parser. A $0 `sp_commitment` card in the report is
+>     expected, not a bug.
 > - **`purchase_recommendations` now HAS a dedicated Phase-B handler** —
 >   `reporter_phase_b._render_commitment_purchase_cards`, registered for
 >   `("commitment_analysis", "purchase_recommendations")`. It groups cards by
@@ -71,8 +88,8 @@ rightsizing levers they overlap.**
 > - **New sweep S14** (`tools/output_audit.py::sweep_projected_commitment`)
 >   recomputes `summary.projected_commitment_monthly_savings` from the scan's
 >   own `ri_type`/`sp_commitment` cards via the same `projected_savings()` the
->   adapter calls, and FAILs on a >$0.005 disagreement — run it alongside the
->   Phase 7 tooling pass.
+>   adapter calls, and FAILs on a disagreement greater than $0.50 — run it
+>   alongside the Phase 7 tooling pass.
 
 > **⚠ Latest live-audit findings (2026-06-30) — read these FIRST, then this prompt.**
 > Before auditing, also read and paste `docs/audits/prompts/_LIVE_AUDIT_LESSONS.md`
