@@ -160,7 +160,9 @@ class RdsModule(BaseServiceModule):
             coverage,
             "rds",
             lambda r: str(r.get("DBInstanceClass") or r.get("InstanceClass") or ""),
-            engine_of=lambda r: str(r.get("Engine") or ""),
+            # The shim emits lowercase "engine" (services/rds.py); accept both
+            # casings so the engine-scoped RI branch actually fires.
+            engine_of=lambda r: str(r.get("Engine") or r.get("engine") or ""),
         )
         savings -= enhanced_removed
 

@@ -162,6 +162,45 @@ def test_adapter_real_co_rec_is_counted(monkeypatch):
     assert findings.total_monthly_savings == pytest.approx(40.0)
 
 
+def test_enhanced_engine_scoped_ri_does_not_demote_other_engine(monkeypatch):
+    """Enhanced recs carry lowercase "engine"; the demotion gate must read it so
+    an aurora-mysql RI never demotes a same-family sqlserver instance (RDS RIs
+    are engine-scoped — see normalize_engine / covers_rds)."""
+    from services.commitment_coverage import CommitmentCoverage
+
+    rec = {
+        "DBInstanceIdentifier": "mssql-1",
+        "DBInstanceClass": "db.t3.large",
+        "engine": "sqlserver-se",
+        "Recommendation": "Disable Multi-AZ for dev environment to reduce costs",
+        "EstimatedSavings": "$120.00/month with single-AZ deployment",
+        "CheckCategory": "Multi-AZ Optimization",
+    }
+    monkeypatch.setattr(rds_adapter, "get_rds_compute_optimizer_recommendations", lambda ctx: [])
+    monkeypatch.setattr(
+        rds_adapter, "get_enhanced_rds_checks",
+        lambda ctx, mult, days, fast=False: {"recommendations": [dict(rec)]},
+    )
+    monkeypatch.setattr(rds_adapter, "get_rds_instance_count", lambda ctx: {"total": 1})
+
+    ctx = _FakeCtx()
+    ctx.commitment_coverage = CommitmentCoverage(
+        region="us-east-1",
+        rds_ri_families=frozenset({"t3"}),
+        rds_ri_engine_families=frozenset({("t3", "aurora-mysql")}),
+    )
+    findings = rds_adapter.RdsModule().scan(ctx)
+
+    # Same family (t3) but a different engine: the RI does not cover this
+    # instance, so the counted saving must survive undemoted.
+    assert findings.total_monthly_savings == pytest.approx(120.0)
+    emitted = [
+        r for s in findings.sources.values() for r in s.recommendations
+        if r.get("DBInstanceIdentifier") == "mssql-1"
+    ]
+    assert emitted and emitted[0].get("Counted") is not False
+
+
 # --------------------------------------------------------------------------- #
 # Slice 2 — RDS pricing filters (M3 storage volumeType, M4 Multi-AZ deployment,
 # M2 deterministic backup engine pin)
