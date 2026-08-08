@@ -395,13 +395,45 @@ def test_projected_sagemaker_adds_on_top():
     assert total == pytest.approx(1300.0)
 
 
+def test_projected_dynamodb_in_disjoint_services():
+    # DynamoDB RI should be included in group2 alongside other disjoint services.
+    total, basis = projected_savings(
+        [_ri_card("RDS", 1000.0), _ri_card("DynamoDB", 300.0)], [])
+    assert total == pytest.approx(1300.0)
+    assert "DynamoDB" in basis
+
+
 def test_coh_merge_annotates_matching_card():
+    # Must use real reservation-purchase resource type, not rightsizing type.
     cards = [_ri_card("RDS", 1000.0)]
-    coh = [{"actionType": "PurchaseReservedInstances", "currentResourceType": "RdsDbInstance",
+    coh = [{"actionType": "PurchaseReservedInstances", "currentResourceType": "RdsReservedInstances",
             "estimatedMonthlySavings": 950.0}]
     merged = merge_coh_concurrence(cards, coh)
     assert merged[0]["coh_concurs_monthly"] == pytest.approx(950.0)
     assert "coh_concurs_monthly" not in cards[0]  # input not mutated
+
+
+def test_coh_merge_rightsizing_type_does_not_match_ri_card():
+    # Rightsizing resource type "RdsDbInstance" must NOT match RI cards
+    # (only reservation-purchase types like "RdsReservedInstances" should).
+    cards = [_ri_card("RDS", 1000.0)]
+    coh = [{"actionType": "PurchaseReservedInstances", "currentResourceType": "RdsDbInstance",
+            "estimatedMonthlySavings": 950.0}]
+    merged = merge_coh_concurrence(cards, coh)
+    assert "coh_concurs_monthly" not in merged[0]
+
+
+def test_coh_merge_multiple_recs_accumulate():
+    # Multiple CoH recs for the same service should accumulate, not overwrite.
+    cards = [_ri_card("RDS", 1000.0)]
+    coh = [
+        {"actionType": "PurchaseReservedInstances", "currentResourceType": "RdsReservedInstances",
+         "estimatedMonthlySavings": 500.0},
+        {"actionType": "PurchaseReservedInstances", "currentResourceType": "RdsReservedInstances",
+         "estimatedMonthlySavings": 450.0},
+    ]
+    merged = merge_coh_concurrence(cards, coh)
+    assert merged[0]["coh_concurs_monthly"] == pytest.approx(950.0)
 
 
 def test_coh_merge_no_match_leaves_cards_untouched():

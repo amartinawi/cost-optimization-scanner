@@ -319,9 +319,16 @@ def build_sp_cards(cells: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return cards
 
 
-# Which CoH resource-type substrings concur with which RI card service.
-_COH_RI_MATCH = {"EC2": "Ec2Instance", "RDS": "RdsDb", "ElastiCache": "ElastiCache",
-                 "Redshift": "Redshift", "OpenSearch": "OpenSearch"}
+# Which CoH reservation-purchase resource-type substrings concur with which RI card
+# service. Maps service label to tuple of acceptable currentResourceType substrings.
+# Source: core/scan_orchestrator.py type_map lines 126-131 (reservation-purchase types).
+_COH_RI_MATCH = {
+    "EC2": ("EC2ReservedInstances",),
+    "RDS": ("RdsReservedInstances",),
+    "ElastiCache": ("ElastiCacheReservedInstances",),
+    "Redshift": ("RedshiftReservedInstances",),
+    "OpenSearch": ("OpenSearchReservedInstances", "EsReservedInstances"),
+}
 
 
 def projected_savings(ri_cards: list[dict[str, Any]],
@@ -331,8 +338,8 @@ def projected_savings(ri_cards: list[dict[str, Any]],
 
     SP and RI discount the SAME on-demand spend, so within the compute group
     the winner is max(best SP type, sum of EC2 RI cards) — never the sum.
-    Disjoint RI services (RDS/ElastiCache/Redshift/OpenSearch) sum safely;
-    SageMaker SP overlaps nothing else and adds on top.
+    Disjoint RI services (RDS/ElastiCache/Redshift/OpenSearch/DynamoDB) sum
+    safely; SageMaker SP overlaps nothing else and adds on top.
     """
     ec2_ri_total = sum(c["monthly_savings"] for c in ri_cards if c["service"] == "EC2")
     compute_sp_best = max(
@@ -344,7 +351,7 @@ def projected_savings(ri_cards: list[dict[str, Any]],
         group1, group1_basis = ec2_ri_total, "EC2 RI path"
 
     group2 = sum(c["monthly_savings"] for c in ri_cards
-                 if c["service"] in ("RDS", "ElastiCache", "Redshift", "OpenSearch"))
+                 if c["service"] in ("RDS", "ElastiCache", "Redshift", "OpenSearch", "DynamoDB"))
     group3 = max((c["monthly_savings"] for c in sp_cards if c["sp_type"] == "SAGEMAKER_SP"),
                  default=0.0)
 
@@ -353,7 +360,7 @@ def projected_savings(ri_cards: list[dict[str, Any]],
     if group1 > 0:
         parts.append(group1_basis)
     if group2 > 0:
-        parts.append("service RIs (RDS/ElastiCache/Redshift/OpenSearch)")
+        parts.append("service RIs (RDS/ElastiCache/Redshift/OpenSearch/DynamoDB)")
     if group3 > 0:
         parts.append("SageMaker SP")
     return total, " + ".join(parts) if parts else "no purchase recommendations"
@@ -368,6 +375,9 @@ def merge_coh_concurrence(cards: list[dict[str, Any]],
     RI-purchase CoH rec concurs with the highest-savings RI card of the
     matching service. Unmatched CoH recs are left for the existing CoH render
     path — nothing is dropped here.
+
+    Multiple CoH recs for the same service accumulate their dollars on the
+    matched card (no overwriting).
     """
     out = [dict(c) for c in cards]
     for rec in coh_recs:
@@ -380,10 +390,10 @@ def merge_coh_concurrence(cards: list[dict[str, Any]],
         elif "Reserved" in action:
             rtype = str(rec.get("currentResourceType") or "")
             targets = [c for c in out if c["card_kind"] == "ri_type"
-                       and _COH_RI_MATCH.get(c["service"], "\x00") in rtype]
+                       and any(substr in rtype for substr in _COH_RI_MATCH.get(c["service"], []))]
         else:
             continue
         if targets:
             best = max(targets, key=lambda c: c["monthly_savings"])
-            best["coh_concurs_monthly"] = round(dollars, 2)
+            best["coh_concurs_monthly"] = round(best.get("coh_concurs_monthly", 0.0) + dollars, 2)
     return out
