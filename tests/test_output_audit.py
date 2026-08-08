@@ -456,3 +456,36 @@ def test_projected_commitment_reconciles():
     assert _fails(sweep_projected_commitment(data)) == []
     data["summary"]["projected_commitment_monthly_savings"] = 999999.0
     assert _fails(sweep_projected_commitment(data))
+
+
+# ----------------------- B1-iii: commitment-demotion advisories (Jarir J-2)
+
+
+def test_demotion_marked_advisory_exempt_from_leak_sweep():
+    """A Counted=False rec carrying the demotion markers (CommitmentCoverageNote
+    / AdvisoryEstimate) keeps its indicative numeric BY DESIGN (B1-iii) — the
+    renderer shows it beside the coverage note; nothing sums it."""
+    data = make_report()
+    data["services"]["ebs"]["sources"]["snapshots"]["recommendations"][1].update(
+        {"estimatedMonthlySavings": 332.296, "AdvisoryEstimate": 332.296,
+         "CommitmentCoverageNote": "Covered by an active c6a EC2-Instance Savings Plan"})
+    assert _fails(sweep_advisory_leak(data)) == []
+
+
+def test_markerless_demoted_rec_still_flagged():
+    data = make_report()
+    data["services"]["ebs"]["sources"]["snapshots"]["recommendations"][1][
+        "estimatedMonthlySavings"] = 13.30  # no markers -> genuine B1 leak
+    assert _fails(sweep_advisory_leak(data))
+
+
+def test_network_asg_born_advisory_source_exempt():
+    data = make_report()
+    data["services"]["network"] = {
+        "service_name": "Network", "total_recommendations": 0, "total_monthly_savings": 0.0,
+        "sources": {"auto_scaling_groups": {"count": 1, "recommendations": [
+            {"Counted": False, "EstimatedMonthlySavings": 118.96,
+             "CheckCategory": "Oversized ASG Instances"}]}},
+    }
+    data["summary"]["total_services_scanned"] = 3
+    assert _fails(sweep_advisory_leak(data)) == []
