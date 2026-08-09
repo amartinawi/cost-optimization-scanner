@@ -216,7 +216,39 @@ def test_adapter_prices_recs_zero_advisory() -> None:
     findings = CloudfrontModule().scan(ctx)
 
     assert findings.total_monthly_savings == 0.0
-    assert findings.total_recommendations == 1
+    # CF-1: advisories no longer count as recommendations (Counted=False).
+    assert findings.total_recommendations == 0
     rec = findings.sources["enhanced_checks"].recommendations[0]
     assert rec["EstimatedMonthlySavings"] == 0.0
+    assert rec["Counted"] is False
     assert "PricingWarning" in rec
+
+
+# --------------------------------------------------------------------------- #
+# CF-1/CF-2 — advisory-only means SAYING so: Counted=False per rec, $0 string
+# --------------------------------------------------------------------------- #
+def test_advisory_recs_carry_counted_false_and_zero_string(monkeypatch):
+    import services.adapters.cloudfront as cf_adapter
+    from services.adapters.cloudfront import CloudfrontModule
+    from types import SimpleNamespace
+
+    rec = {
+        "DistributionId": "E123",
+        "CheckCategory": "CloudFront Price Class Optimization",
+        "EstimatedSavings": "20-50% on data transfer costs for regional traffic",
+    }
+    monkeypatch.setattr(
+        cf_adapter, "get_enhanced_cloudfront_checks",
+        lambda c: {"recommendations": [dict(rec)]},
+    )
+    ctx = SimpleNamespace(warn=lambda *a, **k: None)
+    findings = CloudfrontModule().scan(ctx)
+
+    emitted = findings.sources["enhanced_checks"].recommendations[0]
+    assert emitted["Counted"] is False
+    assert emitted["EstimatedMonthlySavings"] == 0.0
+    # B2: the shim's "20-50%" percentage claim must not survive on a $0 card.
+    assert emitted["EstimatedSavings"].startswith("$0.00/month")
+    # D4: advisories inflate neither headline.
+    assert findings.total_recommendations == 0
+    assert findings.total_monthly_savings == 0.0

@@ -250,3 +250,41 @@ def test_co_recs_dedup_against_coh_asg_and_drop_noncost(monkeypatch) -> None:
         for r in findings.sources["compute_optimizer"].recommendations
     }
     assert co_ids == {"i-clean"}
+
+
+def test_asg_enumeration_failure_demotes_heuristics(monkeypatch) -> None:
+    """EC2-4 (C8): a denied autoscaling:DescribeAutoScalingGroups previously
+    RAISED the counted total (per-instance heuristics re-enabled on every ASG
+    member). With membership unknowable, every selected heuristic rec must
+    demote to a $0 advisory — rendered, never summed."""
+    enhanced = [
+        {"InstanceId": "i-maybe-managed", "EstimatedSavings": "$140.16/month",
+         "CheckCategory": "Idle Instances"},
+    ]
+
+    class _BoomPaginator:
+        def paginate(self, **_kw):
+            raise RuntimeError("AccessDenied: DescribeAutoScalingGroups")
+
+    class _BoomAsg:
+        def get_paginator(self, _name):
+            return _BoomPaginator()
+
+    monkeypatch.setattr(ec2_adapter, "get_ec2_compute_optimizer_recommendations", lambda ctx: [])
+    monkeypatch.setattr(ec2_adapter, "get_asg_compute_optimizer_recommendations", lambda ctx: [])
+    monkeypatch.setattr(ec2_adapter, "get_enhanced_ec2_checks", lambda *a, **k: {"recommendations": enhanced})
+    monkeypatch.setattr(ec2_adapter, "get_advanced_ec2_checks", lambda *a, **k: {"recommendations": []})
+    monkeypatch.setattr(ec2_adapter, "get_ec2_instance_count", lambda ctx: 1)
+
+    ctx = _adapter_ctx()
+    ctx.client = lambda name, region=None: _BoomAsg() if name == "autoscaling" else None
+
+    findings = EC2Module().scan(ctx)
+
+    assert findings.total_monthly_savings == pytest.approx(0.0)
+    rendered = [
+        r for block in findings.sources.values() for r in block.recommendations
+        if r.get("InstanceId") == "i-maybe-managed"
+    ]
+    assert rendered and rendered[0]["Counted"] is False
+    assert rendered[0]["AdvisoryEstimate"] == pytest.approx(140.16)

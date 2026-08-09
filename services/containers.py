@@ -321,7 +321,7 @@ def get_enhanced_container_checks(ctx: ScanContext) -> dict[str, Any]:
     EKS is owned by the dedicated ``eks_cost`` adapter and is intentionally NOT
     analyzed here (avoids cross-adapter double display of EKS node groups).
 
-    ECS rightsizing is metric-gated (Container Insights, 7-day window) and
+    ECS rightsizing is metric-gated (standard AWS/ECS metrics, 7-day window) and
     carries the task's real Cpu/Memory/TaskCount + launch type + architecture/OS
     so the adapter can compute a Fargate-priced saving snapped to a valid combo.
     ECR findings are advisory (no deduplicated-layer-storage data to quantify).
@@ -392,7 +392,7 @@ def collect_ecs_fargate_rightsizing_recs(ctx: ScanContext) -> list[dict[str, Any
 
         if ctx.fast_mode and cluster_arns:
             ctx.warn(
-                "fast mode: skipping ECS Container Insights utilization reads; "
+                "fast mode: skipping ECS CloudWatch utilization reads; "
                 "Fargate rightsizing savings not quantified",
                 "containers",
             )
@@ -413,7 +413,14 @@ def collect_ecs_fargate_rightsizing_recs(ctx: ScanContext) -> list[dict[str, Any
             if not service_arns:
                 continue
 
-            container_insights_enabled = _container_insights_enabled(ctx, ecs, cluster_name)
+            # CN-1 — no Container Insights gate: _ecs_service_rightsizing reads
+            # the FREE standard AWS/ECS CPUUtilization/MemoryUtilization
+            # metrics (ClusterName+ServiceName dims), which publish for every
+            # ECS service on EC2 and Fargate regardless of Container Insights
+            # (CI publishes to a DIFFERENT namespace, ECS/ContainerInsights).
+            # The gate silently skipped every non-CI cluster — live: 53
+            # clusters, only 8 produced recs, zero warnings. The rightsizing
+            # helper already abstains fail-closed on empty datapoints.
             for i in range(0, len(service_arns), 10):
                 batch = service_arns[i : i + 10]
                 try:
@@ -422,7 +429,7 @@ def collect_ecs_fargate_rightsizing_recs(ctx: ScanContext) -> list[dict[str, Any
                     _ecs_failure(ctx, f"describe_services({cluster_name})", e)
                     continue
                 for service in services_details.get("services", []):
-                    if not service.get("serviceName") or not container_insights_enabled:
+                    if not service.get("serviceName"):
                         continue
                     rec = _ecs_service_rightsizing(ctx, ecs, cluster_name, service)
                     if rec:
@@ -606,19 +613,6 @@ def _ecr_repo_reclaimable(ctx: ScanContext, ecr: Any, repo_name: str) -> dict[st
         "EstimatedSavings": "Computed from deduplicated layer storage freed",
         "CheckCategory": "ECR Lifecycle Management",
     }
-
-
-def _container_insights_enabled(ctx: ScanContext, ecs: Any, cluster_name: str) -> bool:
-    """Return True if Container Insights is enabled on the cluster."""
-    try:
-        details = ecs.describe_clusters(clusters=[cluster_name], include=["SETTINGS"])
-        cluster = details["clusters"][0] if details.get("clusters") else {}
-        for setting in cluster.get("settings", []):
-            if setting.get("name") == "containerInsights" and setting.get("value") in ("enabled", "enhanced"):
-                return True
-    except Exception as e:
-        _ecs_failure(ctx, f"describe_clusters({cluster_name})", e)
-    return False
 
 
 def _ecs_service_rightsizing(

@@ -507,3 +507,75 @@ def test_trend_access_denied_is_recorded():
     result = analyze_spend_trends(_Ctx())
     assert recorded.get("perm") == ("trend_analysis", "ce:GetCostAndUsage")
     assert result.total_spend == 0.0  # empty trend returned, scan continues
+
+
+def test_dedicated_tenancy_is_zero_advisory():
+    """EC2-3 (C9): the flat 30% was applied to the SHARED-tenancy price, but
+    the real Dedicated->Shared instance-hour delta is ~6% (live SKUs:
+    m5.large Shared $0.096 vs Dedicated $0.102/hr) and the $2/hr dedicated
+    region fee is per-REGION — recovered only when the LAST dedicated
+    instance leaves (A3). No per-instance dollar is defensible without
+    tenancy-pinned pricing -> $0 advisory carrying the indicative figure."""
+    ctx = _fake_ctx(
+        [
+            {
+                "InstanceId": "i-ded",
+                "InstanceType": "m5.large",
+                "State": {"Name": "running"},
+                "PlatformDetails": "Linux/UNIX",
+                "Placement": {"Tenancy": "dedicated"},
+                "Tags": [],
+            }
+        ],
+        hourly=0.096,
+    )
+    recs = get_enhanced_ec2_checks(ctx, 1.0, fast_mode=True)["recommendations"]
+    ded = [r for r in recs if r["CheckCategory"] == "Dedicated Hosts"]
+    assert len(ded) == 1
+    rec = ded[0]
+    assert rec["Counted"] is False
+    assert rec.get("EstimatedMonthlySavings", 0.0) == 0.0
+    assert rec["EstimatedSavings"].startswith("$0.00/month")
+    # Indicative figure preserved for the card (old 30% shape: 0.096*730*0.30).
+    assert rec["AdvisoryEstimate"] == pytest.approx(0.096 * 730 * 0.30, abs=0.01)
+
+
+def test_dedicated_advisory_survives_the_adapter(monkeypatch):
+    """Review blocker (tranche 2): the demoted dedicated-tenancy rec must
+    RENDER as an enhanced advisory — previously the adapter's best_by_instance
+    dropped every $0 enhanced rec outright (no advisory path for enhanced),
+    silently deleting the finding while the shim-level test stayed green."""
+    import services.adapters.ec2 as ec2_adapter
+    from services.adapters.ec2 import EC2Module
+
+    rec = {
+        "InstanceId": "i-ded",
+        "InstanceType": "m5.large",
+        "Tenancy": "dedicated",
+        "EstimatedSavings": "$0.00/month — advisory: real saving is the Dedicated->Shared price delta",
+        "EstimatedMonthlySavings": 0.0,
+        "Counted": False,
+        "AdvisoryEstimate": 21.02,
+        "CheckCategory": "Dedicated Hosts",
+    }
+    monkeypatch.setattr(ec2_adapter, "get_ec2_compute_optimizer_recommendations", lambda ctx: [])
+    monkeypatch.setattr(ec2_adapter, "get_asg_compute_optimizer_recommendations", lambda ctx: [])
+    monkeypatch.setattr(ec2_adapter, "get_enhanced_ec2_checks", lambda *a, **k: {"recommendations": [dict(rec)]})
+    monkeypatch.setattr(ec2_adapter, "get_advanced_ec2_checks", lambda *a, **k: {"recommendations": []})
+    monkeypatch.setattr(ec2_adapter, "get_ec2_instance_count", lambda ctx: 1)
+
+    ctx = SimpleNamespace(
+        cost_hub_splits={"ec2": []},
+        pricing_multiplier=1.0,
+        fast_mode=False,
+        client=lambda name, region=None: None,
+        warn=lambda *a, **k: None,
+        permission_issue=lambda *a, **k: None,
+    )
+    findings = EC2Module().scan(ctx)
+
+    enhanced = findings.sources["enhanced_checks"].recommendations
+    assert len(enhanced) == 1  # rendered, in the ENHANCED block (badge + evidence intact)
+    assert enhanced[0]["Counted"] is False
+    assert enhanced[0]["AdvisoryEstimate"] == 21.02
+    assert findings.total_monthly_savings == 0.0

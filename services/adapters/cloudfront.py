@@ -48,30 +48,30 @@ class CloudfrontModule(BaseServiceModule):
         # Without per-rec PriceClass + measured bytes via the CloudFront
         # CW `BytesDownloaded` metric we cannot quantify honestly. Emit
         # 0 + PricingWarning so the recs surface for human review.
-        savings = 0.0
         for rec in recs:
-            weekly_requests_str = rec.get("WeeklyRequests", "")
-            try:
-                weekly_requests = float(weekly_requests_str)
-            except (ValueError, TypeError):
-                weekly_requests = 0.0
-            if rec.get("CheckCategory") == "CloudFront Unused Distribution":
-                # Unused distribution: $0 saving until traffic resumes.
-                rec["EstimatedMonthlySavings"] = 0.0
-                continue
+            # CF-1 — an advisory-only adapter must SAY so per rec: without an
+            # explicit Counted=False every $0 card counts as a recommendation
+            # (B1 / invariant sweep #3), contradicting this class's own
+            # docstring. CF-2 — the shim's percentage strings ("20-50% on data
+            # transfer...") must not survive on a $0 advisory (B2: string and
+            # numeric agree in every branch).
             rec["EstimatedMonthlySavings"] = 0.0
+            rec["Counted"] = False
+            rec["EstimatedSavings"] = (
+                "$0.00/month — advisory: quantify with the CloudWatch "
+                "BytesDownloaded metric + the distribution's PriceClass"
+            )
             rec["PricingWarning"] = (
                 "requires CW BytesDownloaded metric and distribution PriceClass "
                 "for quantified savings"
             )
-            _ = weekly_requests  # documented; not used in current honest path.
-
-        savings = round(savings, 2)
 
         return ServiceFindings(
             service_name="CloudFront",
-            total_recommendations=len(recs),
-            total_monthly_savings=savings,
+            # Every rec above is unconditionally demoted; the count is 0 by
+            # construction (result_builder recounts from Counted regardless).
+            total_recommendations=0,
+            total_monthly_savings=0.0,
             sources={"enhanced_checks": SourceBlock(count=len(recs), recommendations=tuple(recs))},
             optimization_descriptions={
                 "enhanced_checks": {
