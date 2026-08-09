@@ -307,8 +307,11 @@ def test_advanced_checks_renderer_excludes_demoted_recs() -> None:
          "CommitmentCoverageNote": "Covered by an active Savings Plan"},
     ]
     html = _render_ec2_advanced_checks(recs, "advanced_ec2_checks", {})
-    assert "$140.16/month" not in html
+    # The dollar may appear ONLY inside the advisory framing (AUR-G makes the
+    # masked figure visible); it must never read as a counted saving.
     assert "advisory" in html
+    assert "$0.00/month — advisory ($140.16/month if realizable)" in html
+    assert "<strong>Estimated Savings:</strong> $140.16/month" not in html
 
 
 def test_advanced_checks_renderer_sums_only_counted_recs() -> None:

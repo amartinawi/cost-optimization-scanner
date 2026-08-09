@@ -688,16 +688,26 @@ class PricingEngine:
         """
         normalized = engine.lower().strip()
         resolved_license = _normalize_rds_license_model(license_model, normalized)
-        key = (
-            "rds_instance",
+        key_parts = (
             normalized,
             instance_class,
             "Multi-AZ" if multi_az else "Single-AZ",
             resolved_license,
             "io-opt" if aurora_io_optimized else "std",
         )
-        if (cached := self._get_cached(key)) is not None:
-            return cached
+        # Two cache namespaces, mirroring get_dms_instance_monthly_price: a
+        # fallback price must never satisfy a strict (allow_fallback=False)
+        # lookup, or a fabricated number leaks into a caller that explicitly
+        # asked for a real SKU only. Sharing one key would let any earlier
+        # fallback-permitting caller (the RDS adapter prices with the default)
+        # poison the Aurora Graviton probe.
+        key = ("rds_instance", *key_parts)
+        strict_key = ("rds_instance_real", *key_parts)
+        if allow_fallback:
+            if (cached := self._get_cached(key)) is not None:
+                return cached
+        elif (cached_strict := self._get_cached(strict_key)) is not None:
+            return cached_strict
         price = self._fetch_rds_instance_price(
             normalized,
             instance_class,
@@ -710,8 +720,9 @@ class PricingEngine:
                 # A class that does not exist for a family (db.r7g when only
                 # db.r6g is offered) would otherwise price to the flat RDS
                 # fallback constant, and a delta computed against that constant
-                # is pure fabrication. Return 0.0 so the caller abstains. Not
-                # cached: a later fallback-permitting call must still get one.
+                # is pure fabrication. Cache the absence in the strict namespace
+                # so the probe is not repeated per instance.
+                self._cache.set(strict_key, 0.0)
                 return 0.0
             fallback = FALLBACK_RDS_INSTANCE_MONTHLY * (FALLBACK_RDS_MULTI_AZ_FACTOR if multi_az else 1.0)
             price = self._use_fallback(
@@ -719,7 +730,11 @@ class PricingEngine:
                 f"Pricing API unavailable for RDS {instance_class} {normalized} "
                 f"({'Multi-AZ' if multi_az else 'Single-AZ'}) in {self._region}; using fallback",
             )
+            self._cache.set(key, price)
+            return price
+        # A real SKU satisfies both namespaces.
         self._cache.set(key, price)
+        self._cache.set(strict_key, price)
         return price
 
     def get_rds_backup_storage_price_per_gb(self, engine: str | None = None) -> float:

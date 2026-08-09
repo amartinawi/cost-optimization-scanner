@@ -450,3 +450,23 @@ def test_graviton_delta_refuses_a_fallback_priced_target() -> None:
     assert [r for r in recs if r.get("check_type") == "instance_graviton"] == []
     # Both legs must ask for the live SKU only.
     assert all(c.get("allow_fallback") is False for c in calls if "allow_fallback" in c)
+
+
+def test_strict_rds_lookup_is_not_satisfied_by_a_cached_fallback() -> None:
+    """The RDS adapter prices with allow_fallback=True and would otherwise
+    poison the Aurora Graviton probe through a shared cache key."""
+    from unittest.mock import MagicMock
+
+    from core.pricing_engine import PricingEngine
+
+    pricing = MagicMock()
+    pricing.get_products.return_value = {"PriceList": []}  # no live SKU, ever
+    engine = PricingEngine(region_code="us-east-1", pricing_client=pricing)
+
+    lenient = engine.get_rds_instance_monthly_price("aurora-mysql", "db.r9z.large")
+    assert lenient > 0, "the lenient path still returns the documented fallback"
+
+    strict = engine.get_rds_instance_monthly_price(
+        "aurora-mysql", "db.r9z.large", allow_fallback=False
+    )
+    assert strict == 0.0, "a fallback must never satisfy a strict lookup"

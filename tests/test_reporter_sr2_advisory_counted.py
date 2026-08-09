@@ -208,3 +208,30 @@ def test_advisory_card_without_a_figure_is_unchanged() -> None:
     html = _render_generic_other_rec("", rec, "enhanced_checks")
     assert "advisory (not added to the tab total)" in html
     assert "if realizable" not in html
+
+
+def test_grouped_advisory_card_names_the_masked_total() -> None:
+    """The network/monitoring grouped renderer had the same blind spot as the
+    per-rec one: the tranche-6 demotions park their exposure in
+    PotentialMonthlySavings, and it must reach the card."""
+    from reporter_phase_b import _grouped_text_savings_line
+
+    group = [
+        {"Counted": False, "EstimatedMonthlySavings": 0.0, "PotentialMonthlySavings": 32.85},
+        {"Counted": False, "EstimatedMonthlySavings": 0.0, "PotentialMonthlySavings": 7.30},
+    ]
+    html = _grouped_text_savings_line(group)
+    assert "$0.00/month — advisory" in html
+    assert "40.15" in html
+
+
+def test_grouped_counted_card_is_unaffected() -> None:
+    from reporter_phase_b import _grouped_text_savings_line
+
+    group = [
+        {"EstimatedMonthlySavings": 16.43},
+        {"Counted": False, "EstimatedMonthlySavings": 0.0, "PotentialMonthlySavings": 99.0},
+    ]
+    html = _grouped_text_savings_line(group)
+    assert "$16.43/month" in html
+    assert "99" not in html

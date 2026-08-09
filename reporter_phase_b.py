@@ -109,6 +109,21 @@ def _grouped_text_savings_line(group: List[Rec]) -> str:
         return ""
     if total > 0:
         return f'<p class="savings"><strong>Estimated Savings:</strong> ${total:,.2f}/month</p>'
+    # AUR-G, grouped form: name the group's masked figure rather than showing a
+    # bare $0.00. The network and monitoring levers demoted in tranche 6 park
+    # their exposure in PotentialMonthlySavings, and it must reach the card.
+    masked = 0.0
+    for rec in group:
+        for key in ("AdvisoryEstimate", "PotentialMonthlySavings"):
+            value = rec.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+                masked += float(value)
+                break
+    if masked > 0:
+        return (
+            '<p class="savings"><strong>Estimated Savings:</strong> $0.00/month — advisory '
+            f"(${masked:,.2f}/month if realizable)</p>"
+        )
     return '<p class="savings"><strong>Estimated Savings:</strong> $0.00/month — advisory</p>'
 
 
