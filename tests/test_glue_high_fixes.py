@@ -33,7 +33,6 @@ import services.adapters.glue as glue_adapter
 import services.glue as glue_shim
 from services._savings import parse_dollar_savings
 from services.adapters.glue import (
-    DEFAULT_DEV_ENDPOINT_DPU,
     DEV_ENDPOINT_MONTHLY_HOURS,
     GLUE_DPU_HOURLY,
     GlueModule,
@@ -136,11 +135,14 @@ def _dev_rec(**kw: Any) -> dict[str, Any]:
         ({"WorkerType": "G.1X", "NumberOfWorkers": 5}, 5.0, "worker_type"),
         ({"WorkerType": "G.025X", "NumberOfWorkers": 2}, 0.5, "worker_type"),
         ({"NumberOfNodes": 3}, 3.0, "number_of_nodes"),
-        ({}, DEFAULT_DEV_ENDPOINT_DPU, "default_5_dpu"),
-        # Zero workers is falsy -> fall through to default (not a 0-DPU endpoint).
-        ({"WorkerType": "G.1X", "NumberOfWorkers": 0}, DEFAULT_DEV_ENDPOINT_DPU, "default_5_dpu"),
-        # Unknown worker type -> multiplier unknown -> fall through, never guess.
-        ({"WorkerType": "Nope", "NumberOfWorkers": 3}, DEFAULT_DEV_ENDPOINT_DPU, "default_5_dpu"),
+        # GL-4: an unreadable footprint returns 0 so the caller abstains. It used
+        # to return AWS's 5-DPU default and count $1,606/month on a quantity
+        # nobody measured.
+        ({}, 0.0, "unknown"),
+        # Zero workers is falsy -> unknown, NOT a fabricated default.
+        ({"WorkerType": "G.1X", "NumberOfWorkers": 0}, 0.0, "unknown"),
+        # Unknown worker type -> multiplier unknown -> abstain, never guess.
+        ({"WorkerType": "Nope", "NumberOfWorkers": 3}, 0.0, "unknown"),
         # Worker footprint absent but legacy node count present.
         ({"WorkerType": "G.2X", "NumberOfWorkers": None, "NumberOfNodes": 2}, 2.0, "number_of_nodes"),
     ],
@@ -161,24 +163,36 @@ def test_dev_endpoint_g2x_multiplier_not_raw_worker_count() -> None:
 # --------------------------------------------------------------------------- #
 # scan() — dev endpoint priced from its DPU footprint and COUNTED (glue H2)
 # --------------------------------------------------------------------------- #
-def test_default_dev_endpoint_counted_at_five_dpu(monkeypatch: pytest.MonkeyPatch) -> None:
-    rec = _dev_rec()  # no footprint -> 5-DPU default
+def test_unreadable_dpu_footprint_abstains_instead_of_counting_1606(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GL-4 — the 5-DPU default counted $1,606/month on a fabricated quantity,
+    the same class as the WorkSpaces STANDARD default (WS-3) and the MSK
+    3-broker default (MSK-5)."""
+    rec = _dev_rec()  # no footprint at all
+    _patch_checks(monkeypatch, _result({"dev_endpoints": [rec]}))
+
+    ctx = _ctx()
+    findings = GlueModule().scan(ctx)
+
+    assert findings.total_monthly_savings == 0.0
+    emitted = findings.sources["dev_endpoints"].recommendations[0]
+    assert emitted["Counted"] is False
+    assert emitted["EstimatedMonthlySavings"] == 0.0
+    assert emitted["EstimatedSavings"].startswith("$0.00")
+    assert "1,606" not in emitted["EstimatedSavings"]
+    assert emitted["AuditBasis"]["dpu_basis"] == "unknown"
+    # The finding still renders, and the gap is surfaced rather than swallowed.
+    assert any("DPU footprint" in msg for _svc, msg in getattr(ctx, "warnings", []))
+
+
+def test_unknown_worker_type_abstains(monkeypatch: pytest.MonkeyPatch) -> None:
+    rec = _dev_rec(worker_type="G.99X", num_workers=4)
     _patch_checks(monkeypatch, _result({"dev_endpoints": [rec]}))
 
     findings = GlueModule().scan(_ctx())
-
-    expected = round(5.0 * GLUE_DPU_HOURLY * DEV_ENDPOINT_MONTHLY_HOURS, 2)  # 1606.0
-    assert expected == 1606.0
-    assert findings.total_monthly_savings == pytest.approx(expected)
-    emitted = findings.sources["dev_endpoints"].recommendations[0]
-    assert emitted["Counted"] is True
-    assert emitted["EstimatedMonthlySavings"] == pytest.approx(expected)
-    # Counted == rendered: the displayed string carries the same dollar.
-    assert emitted["EstimatedSavings"] == "$1,606.00/month"
-    assert "316" not in emitted["EstimatedSavings"]
-    assert emitted["AuditBasis"]["dpu_count"] == 5.0
-    assert emitted["AuditBasis"]["dpu_basis"] == "default_5_dpu"
-    assert emitted["AuditBasis"]["rate_per_dpu_hour"] == 0.44
+    assert findings.total_monthly_savings == 0.0
+    assert findings.sources["dev_endpoints"].recommendations[0]["Counted"] is False
 
 
 def test_worker_type_dev_endpoint_counted_with_multiplier(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -207,7 +221,7 @@ def test_legacy_node_count_dev_endpoint_counted(monkeypatch: pytest.MonkeyPatch)
 
 
 def test_pricing_multiplier_applied_once(monkeypatch: pytest.MonkeyPatch) -> None:
-    rec = _dev_rec()  # 5 DPU default
+    rec = _dev_rec(num_nodes=5)  # explicit 5-DPU footprint
     _patch_checks(monkeypatch, _result({"dev_endpoints": [rec]}))
 
     findings = GlueModule().scan(_ctx(pricing_multiplier=1.5))
@@ -234,7 +248,7 @@ def test_counted_equals_rendered_string(monkeypatch: pytest.MonkeyPatch) -> None
 # scan() — job rightsizing stays $0 advisory; count hygiene (glue C2)
 # --------------------------------------------------------------------------- #
 def test_job_rightsizing_is_zero_advisory_not_counted(monkeypatch: pytest.MonkeyPatch) -> None:
-    dev = _dev_rec()  # counted
+    dev = _dev_rec(num_nodes=5)  # counted
     job = {
         "JobName": "etl-1",
         "MaxCapacity": 20,
@@ -288,14 +302,15 @@ def test_shim_drops_hardcoded_316_and_carries_dpu_fields() -> None:
 def test_integration_shim_to_adapter_counts_dev_endpoint() -> None:
     glue_client = _FakeGlueClient(
         jobs=[{"Name": "big-job", "MaxCapacity": 20, "WorkerType": None, "NumberOfWorkers": 0}],
-        dev_endpoints=[{"EndpointName": "ep1", "Status": "READY"}],  # default 5 DPU
+        dev_endpoints=[{"EndpointName": "ep1", "Status": "READY", "NumberOfNodes": 5}],
         crawlers=[{"Name": "c1", "Schedule": {"ScheduleExpression": "cron(0 1 * * ? *)"}}],
     )
     ctx = _ctx(client=lambda name, **kw: glue_client)
 
     findings = GlueModule().scan(ctx)
 
-    # Dev endpoint counted at the 5-DPU default; job rightsizing is $0 advisory.
+    # Dev endpoint counted at its reported 5-DPU footprint; job rightsizing is
+    # $0 advisory.
     assert findings.total_monthly_savings == pytest.approx(1606.0)
     assert findings.total_recommendations == 1
     dev = findings.sources["dev_endpoints"].recommendations[0]
