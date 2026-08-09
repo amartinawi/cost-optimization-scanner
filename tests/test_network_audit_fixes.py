@@ -637,3 +637,82 @@ def test_net04_asg_generic_error_is_warning() -> None:
     assert not ctx.permissions
     service, msg = ctx.warnings[0]
     assert service == "ec2"
+
+
+# --------------------------------------------------------------------------- #
+# NET-A / NET-F — the VPC interface-endpoint double-count and the threshold
+# whose rationale belonged to gateway endpoints.
+#
+# The duplicate lever had NO test asserting its dollar at all, which is how an
+# endpoint could be priced by both loops for eight scans without anything
+# failing.
+# --------------------------------------------------------------------------- #
+def _interface(endpoint_id: str, *, service: str = "ssm", subnets: int = 2, env: str | None = None) -> dict:
+    ep = {
+        "VpcEndpointId": endpoint_id,
+        "VpcId": "vpc-a",
+        "VpcEndpointType": "Interface",
+        "ServiceName": f"com.amazonaws.us-east-1.{service}",
+        "SubnetIds": [f"s{i}" for i in range(subnets)],
+        "State": "available",
+    }
+    if env is not None:
+        ep["Tags"] = [{"Key": "Environment", "Value": env}]
+    return ep
+
+
+def _endpoint_checks(endpoints: list[dict]) -> dict:
+    ec2 = _FakeEc2(
+        vpcs_pages=[{"Vpcs": [{"VpcId": "vpc-a"}]}],
+        vpce_pages=[{"VpcEndpoints": endpoints}],
+    )
+    eng = SimpleNamespace(get_vpc_endpoint_monthly_price=lambda: 7.30)
+    return get_vpc_endpoints_checks(_ctx(ec2, pricing_engine=eng))
+
+
+def test_nonprod_duplicate_endpoint_is_counted_exactly_once() -> None:
+    """NET-A: an endpoint that is BOTH nonprod-tagged AND a duplicate of its
+    service used to be priced by both loops."""
+    out = _endpoint_checks([_interface(f"vpce-{i}", env="dev") for i in range(3)])
+
+    nonprod_total = sum(r["EstimatedMonthlySavings"] for r in out["interface_endpoints_in_nonprod"])
+    duplicate_total = sum(r["EstimatedMonthlySavings"] for r in out["duplicate_endpoints"])
+
+    # 3 endpoints x 2 AZs x $7.30, counted once - by the nonprod lever only.
+    assert nonprod_total == pytest.approx(3 * 2 * 7.30)
+    assert duplicate_total == 0.0
+
+
+def test_duplicate_ceiling_excludes_endpoints_the_nonprod_lever_owns() -> None:
+    """Even the advisory ceiling must not re-report an already-counted endpoint."""
+    out = _endpoint_checks([_interface("vpce-1"), _interface("vpce-2", env="dev")])
+    dup = out["duplicate_endpoints"][0]
+    # vpce-2 is the surplus endpoint AND nonprod-owned, so the ceiling is $0.
+    assert dup["PotentialMonthlySavings"] == 0.0
+    assert "excluded from this ceiling" in dup["PricingWarning"]
+
+
+def test_duplicate_endpoints_are_advisory_not_counted() -> None:
+    """NET-D class: the rec's own text asks the reader to review whether each is
+    needed - removability is not established, so it must not count."""
+    out = _endpoint_checks([_interface("vpce-1"), _interface("vpce-2"), _interface("vpce-3")])
+    dup = out["duplicate_endpoints"][0]
+    assert dup["Counted"] is False
+    assert dup["EstimatedMonthlySavings"] == 0.0
+    assert dup["EstimatedSavings"].startswith("$0.00")
+    # The figure survives for the reader: 2 surplus x 2 AZs x $7.30.
+    assert dup["PotentialMonthlySavings"] == pytest.approx(2 * 2 * 7.30)
+
+
+def test_exactly_two_endpoints_are_flagged() -> None:
+    """NET-F: the old `> 2` threshold silently exempted the exactly-2 case on a
+    route-table rationale that applies to GATEWAY endpoints, not interface ones."""
+    out = _endpoint_checks([_interface("vpce-1"), _interface("vpce-2")])
+    assert len(out["duplicate_endpoints"]) == 1
+    assert out["duplicate_endpoints"][0]["EndpointCount"] == 2
+    assert "route table" not in out["duplicate_endpoints"][0]["Recommendation"].lower()
+
+
+def test_a_single_endpoint_per_service_is_not_flagged() -> None:
+    out = _endpoint_checks([_interface("vpce-1", service="ssm"), _interface("vpce-2", service="ec2")])
+    assert out["duplicate_endpoints"] == []
