@@ -448,18 +448,45 @@ class OpensearchModule(BaseServiceModule):
                 # OS-2 — EBSOptions.VolumeSize is PER DATA NODE; the recoverable
                 # storage on delete is volume x node count, like the instance leg.
                 storage_monthly = ebs * instance_count * GP3_PRICE_PER_GB_MONTH * ctx.pricing_multiplier
-                value = (instance_monthly * instance_count) + storage_monthly
+                # OS-7 — dedicated master and UltraWarm nodes bill on top of the
+                # data nodes and are deleted with the domain. Omitting them
+                # under-counted every domain with a master tier, which is a
+                # common production default.
+                extra_monthly = 0.0
+                extra_basis: dict[str, Any] = {}
+                for label, type_key, count_key in (
+                    ("master", "DedicatedMasterType", "DedicatedMasterCount"),
+                    ("warm", "WarmType", "WarmCount"),
+                ):
+                    node_type = rec.get(type_key)
+                    node_count = int(rec.get(count_key) or 0)
+                    if not node_type or node_count <= 0 or ctx.pricing_engine is None:
+                        continue
+                    node_rate = ctx.pricing_engine.get_instance_monthly_price("AmazonES", node_type)
+                    if node_rate <= 0:
+                        # No live SKU: omit the leg rather than guess a rate.
+                        extra_basis[f"{label}_leg"] = f"omitted — no live SKU for {node_type}"
+                        continue
+                    extra_monthly += node_rate * node_count
+                    extra_basis[f"{label}_type"] = node_type
+                    extra_basis[f"{label}_count"] = node_count
+                    extra_basis[f"{label}_rate_monthly"] = round(node_rate, 4)
+                value = (instance_monthly * instance_count) + storage_monthly + extra_monthly
                 audit_basis = {
                     "instance_rate_monthly": round(instance_monthly, 4),
                     "instance_count": instance_count,
                     "storage_gb_per_node": ebs,
                     "gp3_rate_per_gb_month": GP3_PRICE_PER_GB_MONTH,
                     "region_multiplier": round(ctx.pricing_multiplier, 4),
+                    **extra_basis,
                     "formula": (
                         "instance_rate x count + storage_gb_per_node x count x gp3_rate "
-                        "x region_multiplier"
+                        "x region_multiplier + master/warm node rates x their counts"
                     ),
                 }
+                # OS-9 — a Reserved Instance covers INSTANCE HOURS ONLY. Record
+                # the non-instance legs so a commitment demotion can keep them.
+                rec["NonInstanceMonthlySavings"] = round(storage_monthly, 2)
             elif "storage" in category.lower():
                 # gp2 -> gp3 migration delta (OpenSearch H3): the realizable
                 # saving is the per-GB price *difference*, not a flat fraction of
@@ -586,6 +613,30 @@ class OpensearchModule(BaseServiceModule):
         # is realizable only up to that type's uncovered on-demand spend. Storage-tier recs
         # carry no InstanceType and are never RI-covered, so they pass through untouched.
         savings -= demote_covered_in_place(recs, coverage, "opensearch", lambda r: r.get("InstanceType") or "")
+
+        # OS-9 — an OpenSearch Reserved Instance covers instance hours, NOT the
+        # domain's EBS storage: deleting an RI-covered idle domain still frees
+        # every provisioned GB. Demoting the whole idle rec therefore threw away
+        # a realizable saving. Re-promote the storage leg alone, and only for
+        # recs the COMMITMENT gate demoted (a rec demoted for lack of idle
+        # corroboration has no evidence of idleness at all and must stay $0).
+        for rec in recs:
+            if rec.get("CheckCategory") != "Idle Domain":
+                continue
+            if rec.get("Counted") is not False or not rec.get("CommitmentCoverageNote"):
+                continue
+            storage_leg = float(rec.get("NonInstanceMonthlySavings") or 0.0)
+            if storage_leg <= 0:
+                continue
+            gross = float(rec.get("AdvisoryEstimate") or 0.0)
+            rec["Counted"] = True
+            rec["EstimatedMonthlySavings"] = storage_leg
+            rec["InstanceLegCoveredByReservation"] = round(max(gross - storage_leg, 0.0), 2)
+            rec["CommitmentCoverageNote"] = (
+                f"{rec['CommitmentCoverageNote']} — instance hours are reserved, but the "
+                "domain's EBS storage is not, so the storage leg stays counted"
+            )
+            savings += storage_leg
 
         savings += coh_total
 
