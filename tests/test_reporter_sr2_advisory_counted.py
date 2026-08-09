@@ -161,3 +161,50 @@ def test_generic_other_rec_lowercase_coh_savings_renders_clean() -> None:
     assert "$5.00/month" in html
     assert "30.0%" in html
     assert "Estimatedmonthlysavings" not in html
+
+
+# --------------------------------------------------------------------------- #
+# AUR-G — a demoted rec's masked figure must reach the card.
+#
+# Commitment demotion zeroes the numerics and sets Counted=False, so the card
+# printed "$0.00/month — advisory" and the gross preserved in AdvisoryEstimate
+# was invisible. The same applied to every evidence-gated lever that parks its
+# figure in PotentialMonthlySavings.
+# --------------------------------------------------------------------------- #
+def test_advisory_card_names_the_commitment_masked_figure() -> None:
+    from reporter_phase_b import _render_generic_other_rec
+
+    rec = {
+        "CheckCategory": "Aurora Graviton Migration",
+        "DBInstanceIdentifier": "aurora-1",
+        "Counted": False,
+        "EstimatedMonthlySavings": 0.0,
+        "AdvisoryEstimate": 418.20,
+        "CommitmentCoverageNote": "covered by a Reserved DB Instance",
+    }
+    html = _render_generic_other_rec("", rec, "enhanced_checks")
+    assert "advisory (not added to the tab total" in html
+    assert "418.20" in html
+
+
+def test_advisory_card_names_a_potential_figure() -> None:
+    from reporter_phase_b import _render_generic_other_rec
+
+    rec = {
+        "CheckCategory": "API Gateway Stage Cache",
+        "ApiId": "api1",
+        "Counted": False,
+        "EstimatedMonthlySavings": 0.0,
+        "PotentialMonthlySavings": 2774.0,
+    }
+    html = _render_generic_other_rec("", rec, "enhanced_checks")
+    assert "2,774.00" in html
+
+
+def test_advisory_card_without_a_figure_is_unchanged() -> None:
+    from reporter_phase_b import _render_generic_other_rec
+
+    rec = {"CheckCategory": "Whatever", "resource_id": "r1", "Counted": False}
+    html = _render_generic_other_rec("", rec, "enhanced_checks")
+    assert "advisory (not added to the tab total)" in html
+    assert "if realizable" not in html
