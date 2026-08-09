@@ -241,3 +241,15 @@ def test_coh_input_list_not_mutated(monkeypatch):
     _patch_sources(monkeypatch, [], co=co)
     ContainersModule().scan(_ctx(cost_hub_splits={"containers": coh}))
     assert coh == [{"resourceArn": "arn:aws:ecs:::service/clu/web", "estimatedMonthlySavings": 100.0}]
+
+
+def test_no_container_insights_gate() -> None:
+    """CN-1: ECS rightsizing reads the FREE standard AWS/ECS metrics
+    (ClusterName+ServiceName), which publish for every service regardless of
+    Container Insights — CI publishes to a different namespace entirely. The
+    gate silently skipped every non-CI cluster (live: 53 clusters, 8 with
+    recs, zero warnings). Gate and helper removed; the rightsizing helper's
+    empty-datapoints abstain is the real fail-closed guard."""
+    import services.containers as shim
+
+    assert not hasattr(shim, "_container_insights_enabled")
