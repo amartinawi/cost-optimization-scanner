@@ -56,30 +56,50 @@ def _get_instance_monthly(ctx: Any, instance_type: str) -> float:
 _CW_PERIOD_1D: int = 86400  # AWS CloudWatch max Period for ≤15-day queries.
 
 
-def _get_cloudwatch_invocations_sum(cw: Any, endpoint_name: str, days: int = IDLE_ENDPOINT_DAYS) -> float | None:
-    """Total endpoint invocations over the lookback window.
+def _variant_invocations_sum(
+    cw: Any,
+    endpoint_name: str,
+    variants: list[dict[str, Any]],
+    days: int = IDLE_ENDPOINT_DAYS,
+) -> float | None:
+    """Total invocations across the endpoint's variants over the window.
 
-    Uses Period=86400 (the CW maximum); aggregates per-day Sum datapoints.
-    Larger Period values silently fail at the GetMetricStatistics API.
+    SageMaker publishes ``Invocations`` only with the (EndpointName,
+    VariantName) dimension set (plus richer supersets) — never EndpointName
+    alone — and GetMetricStatistics matches the EXACT set, so the old
+    single-dimension read returned empty on every real endpoint and the idle
+    lever never fired (sweep SM-1). Semantics: any read exception -> None
+    (abstain); a successful read with no datapoints contributes 0.0 — the
+    metric publishes only on invocations, so absence over the window IS the
+    idle signal (the caller additionally guards endpoints younger than the
+    window, C8). Uses Period=86400 (the CW maximum).
     """
+    if not variants:
+        return None
     now = datetime.now(timezone.utc)
     start = now - timedelta(days=days)
-    try:
-        resp = cw.get_metric_statistics(
-            Namespace="AWS/SageMaker",
-            MetricName="Invocations",
-            Dimensions=[{"Name": "EndpointName", "Value": endpoint_name}],
-            StartTime=start,
-            EndTime=now,
-            Period=_CW_PERIOD_1D,
-            Statistics=["Sum"],
-        )
-        dps = resp.get("Datapoints", [])
-        if dps:
-            return sum(d["Sum"] for d in dps)
-    except Exception:
-        pass
-    return None
+    total = 0.0
+    for variant in variants:
+        vname = str(variant.get("VariantName") or "")
+        if not vname:
+            return None  # cannot dimension the read — abstain
+        try:
+            resp = cw.get_metric_statistics(
+                Namespace="AWS/SageMaker",
+                MetricName="Invocations",
+                Dimensions=[
+                    {"Name": "EndpointName", "Value": endpoint_name},
+                    {"Name": "VariantName", "Value": vname},
+                ],
+                StartTime=start,
+                EndTime=now,
+                Period=_CW_PERIOD_1D,
+                Statistics=["Sum"],
+            )
+        except Exception:
+            return None
+        total += sum(d["Sum"] for d in resp.get("Datapoints", []))
+    return total
 
 
 def _list_endpoints(sm: Any, ctx: Any = None) -> list[dict[str, Any]]:
@@ -150,33 +170,55 @@ def _check_idle_endpoints(
             if fast_mode:
                 continue
 
-            invocations = _get_cloudwatch_invocations_sum(cw, name)
+            detail = _describe_endpoint(sm, name) or {}
+            config_name = detail.get("EndpointConfigName", "")
+            config = _describe_endpoint_config(sm, config_name) if config_name else None
+            cfg_variants = (config or {}).get("ProductionVariants", []) or []
+            if not cfg_variants:
+                # Cannot dimension the metric read or price the fleet — abstain.
+                continue
+
+            invocations = _variant_invocations_sum(cw, name, cfg_variants)
             if invocations is None or invocations > 0:
                 continue
 
-            detail = _describe_endpoint(sm, name)
-            config_name = ""
-            instance_type = "unknown"
-            if detail:
-                config_name = detail.get("EndpointConfigName", "")
-            if config_name:
-                config = _describe_endpoint_config(sm, config_name)
-                if config:
-                    variants = config.get("ProductionVariants", [])
-                    if variants:
-                        instance_type = variants[0].get("InstanceType", "unknown")
+            # C8 guard — an endpoint younger than the lookback window has an
+            # empty metric series for benign reasons; never a delete rec.
+            created = ep.get("CreationTime")
+            if created is not None:
+                try:
+                    if (datetime.now(timezone.utc) - created).days < IDLE_ENDPOINT_DAYS:
+                        continue
+                except TypeError:
+                    continue  # unreadable creation time — abstain
 
             # PricingEngine returns region-correct prices already; do not
             # re-multiply by pricing_multiplier (would double-count).
             _ = pricing_multiplier
-            instance_monthly = _get_instance_monthly(ctx, instance_type)
+            # SM-3 — the recoverable cost is the whole fleet: every variant's
+            # instance price x its instance count (live CurrentInstanceCount
+            # when present, else the config's initial count). Any unpriceable
+            # variant abstains the whole rec (sagemaker C2 — no partial-fleet
+            # placeholder dollar).
+            desc_counts = {
+                str(v.get("VariantName") or ""): v.get("CurrentInstanceCount")
+                for v in detail.get("ProductionVariants", []) or []
+            }
+            instance_monthly = 0.0
+            variant_summary: list[str] = []
+            for variant in cfg_variants:
+                vtype = str(variant.get("InstanceType") or "")
+                vname = str(variant.get("VariantName") or "")
+                count = int(desc_counts.get(vname) or variant.get("InitialInstanceCount") or 1)
+                per_instance = _get_instance_monthly(ctx, vtype)
+                if per_instance <= 0:
+                    instance_monthly = 0.0
+                    break
+                instance_monthly += per_instance * count
+                variant_summary.append(f"{vname or vtype}: {count}x {vtype}")
             if instance_monthly <= 0:
-                # No region-correct price (Pricing API unavailable or unknown
-                # instance type) — abstain instead of emitting a $0 "Delete
-                # endpoint" placeholder that would inflate the rec count and
-                # dollar total (sagemaker C2). Mirrors the skip the spot and
-                # consolidation checks already apply.
                 continue
+            instance_type = str(cfg_variants[0].get("InstanceType") or "unknown")
 
             recs.append(
                 {
@@ -195,8 +237,12 @@ def _check_idle_endpoints(
                         "PricingEngine (e.g. ml.m5.xlarge us-east-1 = $0.23/hr -> $167.90/mo; "
                         "live-validated 2026-06-27)",
                         "region": getattr(ctx, "region", "unknown"),
-                        "metric_window": f"{IDLE_ENDPOINT_DAYS}d AWS/SageMaker Invocations Sum == 0",
-                        "formula": "full endpoint instance monthly = instance_monthly_price (delete idle endpoint)",
+                        "metric_window": (
+                            f"{IDLE_ENDPOINT_DAYS}d AWS/SageMaker Invocations Sum == 0, read per "
+                            "(EndpointName, VariantName) — the only dimension set AWS publishes"
+                        ),
+                        "formula": "sum(variant instance_monthly x instance_count) (delete idle endpoint)",
+                        "variants": variant_summary,
                         "instance_monthly": round(instance_monthly, 2),
                     },
                 }
@@ -435,7 +481,14 @@ def _check_multi_model_consolidation(
         endpoint_names = [g["name"] for g in group]
         # PricingEngine returns region-correct value; do not re-multiply.
         _ = pricing_multiplier
-        savings = (len(group) - 1) * instance_monthly * CONSOLIDATION_SAVINGS_RATE
+        # SM-2 — the flat 30% factor is a C9 shape (a percentage against a
+        # price, not two live prices) and the grouping tests NO consolidation
+        # feasibility: no invocation-load headroom, no model-memory fit, no
+        # container/framework compatibility (MME requires a shared framework).
+        # The figure is indicative only -> $0 Counted=False advisory carrying
+        # it in PotentialMonthlySavings (C10: a rec you would have to revert
+        # is not a saving).
+        potential = (len(group) - 1) * instance_monthly * CONSOLIDATION_SAVINGS_RATE
 
         recs.append(
             {
@@ -443,17 +496,28 @@ def _check_multi_model_consolidation(
                 "endpoint_count": len(group),
                 "endpoints": ", ".join(endpoint_names[:5]),
                 "check_category": "Consolidation",
-                "Counted": True,
+                "Counted": False,
                 "current_value": f"{len(group)} endpoints using {instance_type}",
                 "recommended_value": "Consolidate into fewer multi-model endpoints",
-                "EstimatedMonthlySavings": round(savings, 2),
-                "EstimatedSavings": f"${savings:,.2f}/month",
+                "EstimatedMonthlySavings": 0.0,
+                "PotentialMonthlySavings": round(potential, 2),
+                "EstimatedSavings": (
+                    f"$0.00/month — advisory: consolidation could recover roughly "
+                    f"${potential:,.2f}/mo (~{CONSOLIDATION_SAVINGS_RATE:.0%} indicative), but "
+                    "invocation-load, model-memory, and framework-compatibility feasibility "
+                    "are unmeasured"
+                ),
                 "reason": f"{len(group)} active (non-idle) SageMaker endpoints use {instance_type}; "
-                f"consolidating onto multi-model endpoints could save ~{CONSOLIDATION_SAVINGS_RATE:.0%}",
+                "multi-model consolidation is only executable when the models share a framework "
+                "and fit one endpoint's load/memory — evidence this scan does not read",
                 "AuditBasis": {
                     "rate": "AmazonSageMaker Hosting on-demand instance-hour, region-correct via PricingEngine",
                     "region": getattr(ctx, "region", "unknown"),
                     "factor": CONSOLIDATION_SAVINGS_RATE,
+                    "advisory_reason": (
+                        "flat factor with no feasibility gate (C9/C10) — indicative figure kept in "
+                        "PotentialMonthlySavings, never counted"
+                    ),
                     "formula": "(endpoint_count - 1) * instance_monthly * CONSOLIDATION_SAVINGS_RATE; "
                     "idle endpoints excluded from the group so idle compute is not double-counted (sagemaker H2)",
                     "instance_monthly": round(instance_monthly, 2),
