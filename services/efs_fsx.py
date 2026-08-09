@@ -334,8 +334,24 @@ def get_efs_findings(
                 has_archive_policy = any(p.get("TransitionToArchive") for p in lifecycle)
 
                 # 1) Idle delete — no mount targets => 100% of storage cost.
+                # FS-1 (C2): bytes already tiered to IA/Archive bill at those
+                # classes' far cheaper rates ($0.025 / $0.008 vs $0.30), and
+                # DescribeFileSystems already reports the split. Pricing every
+                # byte at the Standard rate overstated a 90%-tiered 5 TB file
+                # system by ~$1,267/mo — and a lifecycle-enabled, mount-target-
+                # less file system is exactly this lever's target population.
                 if mount_targets == 0 and total_gb > 0:
-                    savings = efs_idle_savings(total_gb, std_rate)
+                    ia_gb = (size.get("ValueInIA", 0) or 0) / (1024**3)
+                    archive_gb = (size.get("ValueInArchive", 0) or 0) / (1024**3)
+                    # Anything the API did not attribute stays at the Standard
+                    # rate (conservative: never cheaper than reality).
+                    residual_std_gb = max(total_gb - ia_gb - archive_gb, 0.0)
+                    archive_rate = _efs_rate(ctx, "Archive", pricing_multiplier)
+                    savings = (
+                        efs_idle_savings(residual_std_gb, std_rate)
+                        + efs_idle_savings(ia_gb, ia_rate)
+                        + efs_idle_savings(archive_gb, archive_rate)
+                    )
                     counted.append(
                         {
                             "FileSystemId": fs_id, "Name": name, "SizeGB": round(total_gb, 2),
@@ -343,9 +359,19 @@ def get_efs_findings(
                             "Recommendation": "Delete idle file system (no mount targets)",
                             "EstimatedSavings": f"${savings:.2f}/month", "_savings": savings, "Counted": True,
                             "AuditBasis": {
-                                "metric": "100% of measured storage cost", "region": region,
-                                "size_gb": round(total_gb, 2), "rate_per_gb_month": round(std_rate, 6),
-                                "basis": "total_gb x EFS $/GB-mo",
+                                "metric": "100% of measured storage cost, priced per storage class",
+                                "region": region,
+                                "size_gb": round(total_gb, 2),
+                                "standard_gb": round(residual_std_gb, 2),
+                                "ia_gb": round(ia_gb, 2),
+                                "archive_gb": round(archive_gb, 2),
+                                "rate_per_gb_month": round(std_rate, 6),
+                                "ia_rate_per_gb_month": round(ia_rate, 6),
+                                "archive_rate_per_gb_month": round(archive_rate, 6),
+                                "basis": (
+                                    "standard_gb x std_rate + ia_gb x ia_rate + "
+                                    "archive_gb x archive_rate (SizeInBytes class split)"
+                                ),
                             },
                         }
                     )
@@ -530,17 +556,42 @@ def get_fsx_findings(ctx: ScanContext, pricing_multiplier: float) -> dict[str, l
                 hdd_rate = _fsx_rate(ctx, fs_type, "HDD", deployment, pricing_multiplier)
                 savings = fsx_ssd_to_hdd_savings(capacity, ssd_rate, hdd_rate)
                 if savings > 0:
-                    counted.append(
+                    # FS-6 — this is NOT an in-place change: AWS documents "You
+                    # can't switch from SSD storage type to HDD storage type"
+                    # (FSx Windows updating-storage-type), so realizing it means
+                    # building a new file system and migrating. It is also gated
+                    # on capacity alone, with no throughput evidence, while HDD
+                    # delivers 12 MBps/TiB + 12 IOPS/TiB against SSD's 750
+                    # MBps/TiB + 3,000 IOPS/TiB — a 62x cut (C10: a rec you
+                    # would have to revert is not a saving). Advisory: the
+                    # delta stays visible in PotentialMonthlySavings.
+                    advisory.append(
                         {
                             "FileSystemId": fs_id, "FileSystemType": fs_type, "StorageCapacity": capacity,
                             "StorageType": storage_type, "CheckCategory": "FSx Storage Type Optimization",
-                            "Recommendation": f"Switch {fs_type} storage from SSD to HDD ({capacity} GB)",
-                            "EstimatedSavings": f"${savings:.2f}/month", "_savings": savings, "Counted": True,
+                            "Recommendation": (
+                                f"Evaluate HDD storage for {fs_type} ({capacity} GB) — requires "
+                                "creating a new file system and migrating; verify throughput needs first"
+                            ),
+                            "EstimatedSavings": (
+                                f"$0.00/month — advisory: ~${savings:.2f}/mo of storage-rate delta, but "
+                                "SSD->HDD cannot be changed in place and HDD delivers ~12 MBps/TiB vs "
+                                "SSD's 750 MBps/TiB (throughput need unmeasured)"
+                            ),
+                            "PotentialMonthlySavings": round(savings, 2),
+                            "_savings": 0.0, "Counted": False,
                             "AuditBasis": {
-                                "metric": "SSD->HDD $/GB-mo delta", "region": region, "capacity_gb": capacity,
-                                "ssd_rate_per_gb_month": round(ssd_rate, 6), "hdd_rate_per_gb_month": round(hdd_rate, 6),
+                                "metric": "SSD->HDD $/GB-mo delta (indicative)", "region": region,
+                                "capacity_gb": capacity,
+                                "ssd_rate_per_gb_month": round(ssd_rate, 6),
+                                "hdd_rate_per_gb_month": round(hdd_rate, 6),
                                 "deployment": deployment,
-                                "basis": "capacity x (SSD - HDD) rate; HDD trades throughput/latency for cost",
+                                "unmeasured_inputs": ["throughput_utilization", "iops_utilization"],
+                                "basis": (
+                                    "capacity x (SSD - HDD) rate; advisory because the switch is not "
+                                    "in-place (new file system + migration) and no throughput evidence "
+                                    "gates the 62x performance reduction"
+                                ),
                             },
                         }
                     )
