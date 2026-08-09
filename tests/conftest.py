@@ -163,7 +163,11 @@ _STUBBER_SERVICES: Dict[str, Dict[str, Any]] = {
                 "recommendationId": "stub-id",
                 "currentResourceType": "Ec2Instance",
                 "recommendedResourceType": "Ec2Instance",
-                "estimatedMonthlySavings": {"currency": "USD", "value": 0.0},
+                # Double per the botocore cost-optimization-hub model — NOT a
+                # {"currency", "value"} dict (that shape cannot occur, and the
+                # readers all call float() on this).
+                "estimatedMonthlySavings": 0.0,
+                "currencyCode": "USD",
             },
         },
     },

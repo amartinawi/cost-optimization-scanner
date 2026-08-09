@@ -395,6 +395,9 @@ _COH_RI_MATCH = {
     "ElastiCache": ("ElastiCacheReservedInstances",),
     "Redshift": ("RedshiftReservedInstances",),
     "OpenSearch": ("OpenSearchReservedInstances", "EsReservedInstances"),
+    # RI_SERVICES builds a DynamoDB card, so without this the CoH rec for the
+    # same purchase rendered as a SECOND standalone card.
+    "DynamoDB": ("DynamoDbReservedCapacity",),
 }
 
 # Which CoH savings-plan resource-type substrings concur with which SP card type.

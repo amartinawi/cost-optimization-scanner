@@ -1,9 +1,18 @@
 {
+  "_shape_note": "Corrected 2026-08-09 (tranche 4). The previous stub modelled estimatedMonthlySavings as {\"currency\", \"value\"} \u2014 the botocore cost-optimization-hub model types it as a plain Double, which is what core/scan_orchestrator.py and services/commitment_scenarios.py read (float(rec.get(\"estimatedMonthlySavings\") or 0)). The dict form could never occur, so a test resting on this fixture verified nothing. Also adds resourceId / resourceArn / actionType / region / source: every bucketing and de-duplication path keys off those, and their absence made the fixture unusable for exercising the type_map. Keys prefixed with _ are stripped by tests/aws_stubs/stub_responses.load_stub_response.",
   "recommendationId": "stub-id",
+  "resourceId": "i-0123456789abcdef0",
+  "resourceArn": "arn:aws:ec2:us-east-1:123456789012:instance/i-0123456789abcdef0",
+  "accountId": "123456789012",
+  "region": "us-east-1",
   "currentResourceType": "Ec2Instance",
   "recommendedResourceType": "Ec2Instance",
-  "estimatedMonthlySavings": {
-    "currency": "USD",
-    "value": 0.0
-  }
+  "actionType": "Rightsize",
+  "source": "ComputeOptimizer",
+  "estimatedMonthlySavings": 0.0,
+  "estimatedMonthlyCost": 0.0,
+  "currencyCode": "USD",
+  "implementationEffort": "Medium",
+  "restartNeeded": true,
+  "rollbackPossible": true
 }

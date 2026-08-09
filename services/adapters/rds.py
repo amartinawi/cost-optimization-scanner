@@ -7,6 +7,7 @@ from typing import Any
 
 from core.contracts import ServiceFindings, SourceBlock
 from services._base import BaseServiceModule
+from services._coh_dedup import is_storage_coh_rec
 from services.advisor import get_rds_backup_actuals
 from services.rds import (
     RDS_OPTIMIZATION_DESCRIPTIONS,
@@ -180,6 +181,12 @@ class RdsModule(BaseServiceModule):
         # Single owner: RDS (authority CoH > CO) outranks the Aurora heuristic.
         covered_ids: set[str] = set()
         for r in coh_kept + co_kept:
+            # A storage rec is a different remediation from Aurora's serverless
+            # / IO levers, so publishing its id here would suppress them — the
+            # same over-suppression the aurora adapter's own guard prevents.
+            # Both paths must skip it or the guard is defeated via this set.
+            if is_storage_coh_rec(r):
+                continue
             nid = normalize_rds_arn(r.get("resourceArn") or r.get("resourceId") or "")
             if nid:
                 covered_ids.add(nid)

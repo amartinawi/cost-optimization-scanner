@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from services._coh_dedup import is_storage_coh_rec
 from services._savings import compute_optimizer_savings, parse_dollar_savings
 
 # Enhanced-check categories shown for context but whose dollar value is NOT
@@ -285,7 +286,10 @@ def resolve_rds_findings(
         ``(kept_coh, kept_co, kept_enhanced, total_savings, total_recommendations)``.
     """
     coh_recs = coh_recs or []
-    coh_keys = {coh_rds_key(r) for r in coh_recs} - {""}
+    # Storage-type CoH recs are counted and rendered, but they recommend a
+    # DIFFERENT remediation than rightsizing/Multi-AZ/scheduling, so they must
+    # not suppress this DB's other findings (see is_storage_coh_rec).
+    coh_keys = {coh_rds_key(r) for r in coh_recs if not is_storage_coh_rec(r)} - {""}
 
     concrete, snaps, advisory = partition_enhanced(enhanced_recs)
     # Cap snapshot upper-bound savings at the flagged share of actual billed

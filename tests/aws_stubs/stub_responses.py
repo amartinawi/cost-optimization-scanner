@@ -23,12 +23,17 @@ def load_stub_response(service: str, api_call: str) -> Dict[str, Any]:
         service: AWS service name (e.g. 'cost-optimization-hub')
         api_call: API call name (e.g. 'list_recommendations')
 
+    Keys prefixed with ``_`` are documentation notes recording how the fixture
+    was verified against the real API shape (``_shape_note``); they are stripped
+    so a botocore ``Stubber`` never sees a member the service model lacks.
+
     Returns:
         Parsed JSON response dict.
     """
     path = RECORDED_DIR / service / f"{api_call}.json"
     with open(path) as f:
-        return json.load(f)
+        payload = json.load(f)
+    return {k: v for k, v in payload.items() if not k.startswith("_")}
 
 
 STUB_RESPONSES: Dict[str, Dict[str, Dict[str, Any]]] = {
