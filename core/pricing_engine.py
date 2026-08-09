@@ -656,6 +656,7 @@ class PricingEngine:
         *,
         multi_az: bool = False,
         license_model: str | None = None,
+        allow_fallback: bool = True,
         aurora_io_optimized: bool = False,
     ) -> float:
         """$/month for an RDS DB instance, engine/edition/license/deployment-aware.
@@ -675,7 +676,9 @@ class PricingEngine:
 
         Returns:
             Monthly on-demand price in USD (730 hours). Returns 0.0 when both the
-            Pricing API and the fallback constant are unavailable for the given key.
+            Pricing API and the fallback constant are unavailable for the given
+            key, or immediately when ``allow_fallback`` is False and the live SKU
+            is missing (mirrors ``get_dms_instance_monthly_price``).
 
         Notes:
             RDS pricing requires ``databaseEngine``, ``deploymentOption``,
@@ -703,6 +706,13 @@ class PricingEngine:
             aurora_io_optimized=aurora_io_optimized,
         )
         if price is None:
+            if not allow_fallback:
+                # A class that does not exist for a family (db.r7g when only
+                # db.r6g is offered) would otherwise price to the flat RDS
+                # fallback constant, and a delta computed against that constant
+                # is pure fabrication. Return 0.0 so the caller abstains. Not
+                # cached: a later fallback-permitting call must still get one.
+                return 0.0
             fallback = FALLBACK_RDS_INSTANCE_MONTHLY * (FALLBACK_RDS_MULTI_AZ_FACTOR if multi_az else 1.0)
             price = self._use_fallback(
                 fallback * self._fallback_multiplier,

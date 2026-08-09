@@ -320,15 +320,20 @@ def _check_provisioned_instances(
             if grav_family:
                 grav_class = f"{grav_family}.{rightsized_size}"
                 try:
+                    # AUR-C — allow_fallback=False on BOTH legs. A Graviton class
+                    # the engine/region does not offer would otherwise price to
+                    # the flat RDS fallback constant, and the delta against a
+                    # live base price would be pure fabrication (the same defect
+                    # DMS's _downsize_delta already guards against).
                     base_price = pe.get_rds_instance_monthly_price(
-                        engine, rightsized_class, aurora_io_optimized=aurora_io_opt
+                        engine, rightsized_class, aurora_io_optimized=aurora_io_opt, allow_fallback=False
                     )
                     grav_price = pe.get_rds_instance_monthly_price(
-                        engine, grav_class, aurora_io_optimized=aurora_io_opt
+                        engine, grav_class, aurora_io_optimized=aurora_io_opt, allow_fallback=False
                     )
                 except Exception:
                     base_price = grav_price = 0.0
-                if grav_price and 0 < grav_price < base_price:
+                if base_price > 0 and 0 < grav_price < base_price:
                     # The Graviton $ delta is priced on the (possibly rightsized)
                     # class so it never overlaps the separate rightsizing rec. But
                     # the CARD must show the ACTUAL deployed class — labeling the
