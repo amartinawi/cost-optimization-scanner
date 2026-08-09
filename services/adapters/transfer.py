@@ -95,6 +95,52 @@ class TransferModule(BaseServiceModule):
                 priced_recs.append(new_rec)
                 continue
 
+            # --- TR-1: idle ONLINE server (counted) -------------------------- #
+            # An ONLINE server bills every enabled protocol at $0.30/hr whether
+            # or not anyone connects. The shim only sets IdleEvidence when the
+            # CloudWatch read SUCCEEDED and returned NO datapoints at all —
+            # which, per the AWS reporting criteria ("emitted every 5 minutes
+            # while a connection is established"), means no client established a
+            # connection in the whole window. A failed/skipped read never sets
+            # the flag, so a denied CloudWatch call cannot mint this dollar.
+            if category == "Idle Transfer Servers":
+                protocol_count = int(new_rec.get("ProtocolCount") or 0)
+                idle_monthly = round(
+                    protocol_count * TRANSFER_PER_PROTOCOL_HOUR * HOURS_PER_MONTH, 2
+                )
+                if new_rec.get("IdleEvidence") is not True or idle_monthly <= 0:
+                    new_rec["Counted"] = False
+                    new_rec["EstimatedMonthlySavings"] = 0.0
+                    new_rec["EstimatedSavings"] = (
+                        "$0.00/month — advisory: idleness or the enabled-protocol "
+                        "count could not be established"
+                    )
+                    priced_recs.append(new_rec)
+                    continue
+                new_rec["Counted"] = True
+                new_rec["EstimatedMonthlySavings"] = idle_monthly
+                new_rec["EstimatedSavings"] = f"${idle_monthly:.2f}/month if stopped"
+                new_rec["AuditBasis"] = {
+                    "rate_source": "AWS Transfer Family ProtocolHours (region-flat, "
+                    "live-validated $0.30/protocol-hr us-east-1 2026-06-27)",
+                    "rate_per_protocol_hour": TRANSFER_PER_PROTOCOL_HOUR,
+                    "hours_per_month": HOURS_PER_MONTH,
+                    "protocol_count": protocol_count,
+                    "metric": "AWS/Transfer BytesIn + BytesOut (dimension ServerId)",
+                    "metric_window_days": new_rec.get("MetricWindowDays"),
+                    "evidence": (
+                        "zero datapoints across the window. AWS emits these metrics every "
+                        "5 minutes WHILE A CONNECTION IS ESTABLISHED (emitting 0 when a "
+                        "connection transfers nothing), so an EMPTY series means no client "
+                        "connected at all - distinct from a series of zeros, which would "
+                        "mean the server is in use"
+                    ),
+                    "formula": "enabled protocols × $0.30/hr × 730",
+                }
+                savings += idle_monthly
+                priced_recs.append(new_rec)
+                continue
+
             # --- H2: protocol_optimization (gate on per-protocol evidence) -- #
             # Count ONLY when the shim proves specific protocols are unused via
             # per-protocol usage evidence (PerProtocolUsageEvidence=True and an
