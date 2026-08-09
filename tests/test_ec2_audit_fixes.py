@@ -461,7 +461,14 @@ def test_dynamodb_consumes_cost_hub_recs(monkeypatch):
 
 
 def test_dynamodb_cost_hub_dedupes_against_own_checks(monkeypatch):
-    """A table covered by the per-table analysis is not double-counted from CoH."""
+    """A table covered by both sources is counted ONCE — from CoH, the authority.
+
+    DDB-A: this previously asserted the CoH rec was dropped. Since
+    table_analysis emits a row for every active table (and those rows are
+    forced to $0 advisories), that rule discarded AWS's computed dollar
+    entirely. The dedup now runs the other way: CoH counts, the local lever
+    demotes.
+    """
     import services.adapters.dynamodb as ddb_adapter
 
     monkeypatch.setattr(
@@ -478,8 +485,12 @@ def test_dynamodb_cost_hub_dedupes_against_own_checks(monkeypatch):
     ctx = SimpleNamespace(cost_hub_splits={"dynamodb": coh}, pricing_multiplier=1.0)
     findings = ddb_adapter.DynamoDbModule().scan(ctx)
 
-    # Orders already covered by table_analysis -> CoH rec dropped, not double counted.
-    assert findings.sources["cost_optimization_hub"].count == 0
+    # CoH is authoritative: its rec is kept and counted exactly once, while the
+    # local table_analysis row for Orders stays a $0 advisory.
+    assert findings.sources["cost_optimization_hub"].count == 1
+    assert findings.total_monthly_savings == 42.0
+    local = findings.sources["dynamodb_table_analysis"].recommendations[0]
+    assert local["Counted"] is False and local["EstimatedMonthlySavings"] == 0.0
 
 
 # --------------------------------------------------------------------------- #
