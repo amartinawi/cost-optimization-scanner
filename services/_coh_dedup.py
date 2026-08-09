@@ -40,6 +40,22 @@ def normalize_resource_id(raw: str) -> str:
     return text
 
 
+# CoH resource types that recommend a STORAGE remediation rather than an
+# instance/cluster one (verified against the botocore cost-optimization-hub
+# ResourceType enum, 2026-08-09). They route to the "rds" bucket so their
+# AWS-computed dollar is rendered and counted, but they must NOT enter the
+# authority-suppression key set: "shrink this DB's gp2 volume" and "disable
+# this DB's Multi-AZ" are different remediations on the same resource, so
+# letting a storage rec suppress the instance-level levers silently drops
+# real savings.
+COH_STORAGE_TYPES: frozenset[str] = frozenset({"RdsDbInstanceStorage", "AuroraDbClusterStorage"})
+
+
+def is_storage_coh_rec(rec: dict[str, Any]) -> bool:
+    """True when a CoH rec recommends a storage (not instance) remediation."""
+    return str(rec.get("currentResourceType") or "") in COH_STORAGE_TYPES
+
+
 def is_renderable_coh_rec(rec: dict[str, Any]) -> bool:
     """Filter CoH recs down to ones this service tab should render and count.
 

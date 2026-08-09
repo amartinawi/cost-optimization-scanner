@@ -153,16 +153,26 @@ def test_coh_type_map_keys_are_real_resource_types():
     block = src.split("type_map = {", 1)[1].split("}", 1)[0]
     keys = set(re.findall(r'"([A-Za-z0-9]+)":', block))
 
-    # Case-insensitive: real payloads spell some types with a lowercase c2
-    # (Ec2ReservedInstances), and the map deliberately carries both spellings.
-    lowered = {e.lower() for e in enum}
-    # Deliberate defensive alias: the pre-rename Elasticsearch spelling of
-    # OpenSearchReservedInstances (paired in services/commitment_scenarios.py).
-    # It routes to the SAME tab as the real key, so an unmatched alias costs
-    # nothing — unlike a key that feeds an adapter's only counted bucket.
-    known_aliases = {"EsReservedInstances"}
-    unknown = {k for k in keys if k.lower() not in lowered} - known_aliases
+    # CASE-SENSITIVE: type_map.get(rec_type) is an exact-match lookup, so a
+    # key that differs only in case is dead weight that can never fire. The
+    # earlier case-insensitive form passed on exactly those keys, which is how
+    # the dead uppercase spellings below survived unnoticed. Every deliberate
+    # alias must be listed here with a reason.
+    known_aliases = {
+        # Uppercase-EC2 spellings retained defensively. Real payloads use the
+        # enum's Ec2* spelling (live-verified 2026-08-09), so these never fire
+        # today; they route to the SAME tab as the real key, so an unmatched
+        # alias costs nothing — unlike a key feeding an adapter's only counted
+        # bucket.
+        "EC2ReservedInstances",
+        "EC2InstanceSavingsPlans",
+    }
+    unknown = {k for k in keys if k not in enum} - known_aliases
     assert unknown == set(), f"type_map keys absent from AWS ResourceType enum: {sorted(unknown)}"
+    # Every alias must be a case-variant of a real type, not an invention.
+    lowered = {e.lower() for e in enum}
+    stale = {a for a in known_aliases if a.lower() not in lowered}
+    assert stale == set(), f"alias allowlist entries match no real type: {sorted(stale)}"
 
 
 def test_coh_type_map_has_no_dead_cluster_keys():
@@ -172,3 +182,36 @@ def test_coh_type_map_has_no_dead_cluster_keys():
     for dead in ("RedshiftCluster", "OpenSearchDomain", "EksCluster", "RdsDbCluster",
                  "EcsTask", "EcsCluster"):
         assert f'"{dead}":' not in block, f"{dead} is not a CoH ResourceType"
+
+
+def _type_map_block() -> str:
+    from pathlib import Path
+
+    return Path("core/scan_orchestrator.py").read_text().split("type_map = {", 1)[1].split("}", 1)[0]
+
+
+def test_coh_storage_types_route_to_rds():
+    """RdsDbInstanceStorage / AuroraDbClusterStorage are real enum types whose
+    AWS-computed dollars were dropped for want of a bucket."""
+    block = _type_map_block()
+    assert '"RdsDbInstanceStorage": "rds"' in block
+    assert '"AuroraDbClusterStorage": "rds"' in block
+
+
+def test_coh_reserved_capacity_types_route_to_commitment_analysis():
+    block = _type_map_block()
+    assert '"DynamoDbReservedCapacity": "commitment_analysis"' in block
+    assert '"MemoryDbReservedInstances": "commitment_analysis"' in block
+
+
+def test_every_routed_bucket_exists_in_hub_services():
+    """A route to a bucket _HUB_SERVICES never creates is silently dropped by
+    the `bucket in splits` gate — the failure mode is invisible at runtime."""
+    import re
+    from pathlib import Path
+
+    src = Path("core/scan_orchestrator.py").read_text()
+    hub_block = src.split("_HUB_SERVICES = {", 1)[1].split("}", 1)[0]
+    buckets = set(re.findall(r'"([a-z_]+)"', hub_block))
+    routed = set(re.findall(r'"[A-Za-z0-9]+": "([a-z_]+)"', _type_map_block()))
+    assert routed - buckets == set(), f"routed to nonexistent buckets: {sorted(routed - buckets)}"

@@ -132,13 +132,19 @@ class ScanOrchestrator:
             # empty — which is why the redshift tab, whose only counted source
             # is its CoH bucket, is structurally $0 (sweep RS-A).
             #
-            # Real enum types with NO bucket here (AWS-computed dollars we
-            # currently drop): AuroraDbClusterStorage, RdsDbInstanceStorage,
-            # MemoryDBCluster, DocumentDBCluster, SageMakerEndpoint,
-            # WorkSpaces, DynamoDbReservedCapacity, MemoryDbReservedInstances.
-            # Wiring consumers for those is a feature change, tracked in
-            # docs/audits/SWEEP-FALSE-NEGATIVES-2026-08-09.md (rank 7) — an
-            # unbucketed type surfaces the honest "dropped type" warning today.
+            # Storage remediations for RDS/Aurora. They render and count in the
+            # RDS tab, but both rds_logic and the aurora adapter exclude them
+            # from their authority-suppression key sets (is_storage_coh_rec) —
+            # "shrink this volume" does not replace "disable this Multi-AZ".
+            "RdsDbInstanceStorage": "rds",
+            "AuroraDbClusterStorage": "rds",
+            # Real enum types STILL with no bucket (AWS-computed dollars we drop
+            # today): MemoryDBCluster, DocumentDBCluster, SageMakerEndpoint,
+            # WorkSpaces. Each needs a consuming adapter that can de-duplicate
+            # the rec against that tab's local levers, which is a feature
+            # change tracked in docs/audits/SWEEP-FALSE-NEGATIVES-2026-08-09.md
+            # (rank 7) — an unbucketed type surfaces the honest "dropped type"
+            # warning today rather than being silently routed nowhere.
             # Reservation / Savings Plans recommendations all live under
             # the commitment_analysis tab from now on.
             "EC2ReservedInstances": "commitment_analysis",
@@ -150,10 +156,23 @@ class ScanOrchestrator:
             "ElastiCacheReservedInstances": "commitment_analysis",
             "OpenSearchReservedInstances": "commitment_analysis",
             "RedshiftReservedInstances": "commitment_analysis",
-            "EsReservedInstances": "commitment_analysis",
+            # "EsReservedInstances" removed 2026-08-09: unlike the uppercase-EC2
+            # spellings it is not a case variant of any enum value — the enum
+            # only ever carried OpenSearchReservedInstances — so it could never
+            # match a payload (same reasoning as the dead cluster keys above).
+            # services/commitment_scenarios.py still lists it as an accepted
+            # substring, which is harmless there.
             "ComputeSavingsPlans": "commitment_analysis",
             "EC2InstanceSavingsPlans": "commitment_analysis",
             "SageMakerSavingsPlans": "commitment_analysis",
+            # Reserved-capacity types AWS publishes that had no route. Both
+            # land in the commitment_analysis tab's advisory CoH source
+            # (purchase levers are Counted=False there, so this adds no counted
+            # dollar); DynamoDbReservedCapacity additionally merges into the
+            # CE-built DynamoDB RI card via _COH_RI_MATCH instead of rendering
+            # a second card for the same purchase.
+            "DynamoDbReservedCapacity": "commitment_analysis",
+            "MemoryDbReservedInstances": "commitment_analysis",
         }
         # A full scan selects every module; a focused --scan-only run selects a
         # subset. Cost Optimization Hub returns recommendations for the whole

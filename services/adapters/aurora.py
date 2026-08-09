@@ -14,6 +14,7 @@ from typing import Any
 from core.contracts import GroupingSpec, ServiceFindings, SourceBlock, StatCardSpec
 from services._aws_errors import record_aws_error
 from services._base import BaseServiceModule
+from services._coh_dedup import is_storage_coh_rec
 from services.commitment_coverage import demote_covered_in_place
 from services.rds_logic import normalize_rds_arn
 
@@ -670,6 +671,10 @@ class AuroraModule(BaseServiceModule):
         #     RdsModule.scan via ctx.rds_covered_instance_ids (RDS runs first).
         covered: set[str] = set()
         for r in getattr(ctx, "cost_hub_splits", {}).get("rds", []):
+            # A storage rec on this cluster is a different remediation from the
+            # serverless/IO levers below, so it must not suppress them.
+            if is_storage_coh_rec(r):
+                continue
             nid = normalize_rds_arn(r.get("resourceArn") or r.get("resourceId") or "")
             if nid:
                 covered.add(nid)
