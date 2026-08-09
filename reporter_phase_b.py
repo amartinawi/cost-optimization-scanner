@@ -2038,25 +2038,21 @@ def _render_ec2_advanced_checks(recommendations: List[Rec], source_name: str, se
         content += f"<h4>{category} ({len(recs)} {label})</h4>"
         content += f"<p><strong>Recommendation:</strong> {recs[0].get('Recommendation', 'Optimize resource')}</p>"
 
-        total_savings = 0.0
-        has_numeric = False
-        for rec in recs:
-            savings_str = rec.get("EstimatedSavings", "")
-            if isinstance(savings_str, (int, float)):
-                total_savings += float(savings_str)
-                has_numeric = True
-            elif isinstance(savings_str, str) and "$" in savings_str:
-                try:
-                    clean = savings_str.replace("$", "").replace("/month", "").split("(")[0].strip()
-                    total_savings += float(clean)
-                    has_numeric = True
-                except (ValueError, AttributeError):
-                    pass
-
-        if has_numeric and total_savings > 0:
-            content += f'<p class="savings"><strong>Estimated Savings:</strong> ${total_savings:.2f}/month</p>'
+        # This block previously summed EVERY rec's EstimatedSavings string
+        # regardless of Counted, so a commitment-demoted advanced rec (which
+        # keeps its original "$140.16/month" string by design — the sanctioned
+        # B1-iii shape) rendered its full dollar with no advisory marker while
+        # the tab headline correctly excluded it. Reuse the shared helper that
+        # skips Counted=False recs and emits the advisory line, as the EKS
+        # renderer already does.
+        savings_line = _grouped_text_savings_line(recs)
+        if savings_line:
+            content += savings_line
         else:
-            content += f'<p class="savings"><strong>Estimated Savings:</strong> {recs[0].get("EstimatedSavings", "Cost optimization")}</p>'
+            content += (
+                '<p class="savings"><strong>Estimated Savings:</strong> '
+                f'{recs[0].get("EstimatedSavings", "Cost optimization")}</p>'
+            )
 
         content += "<p><strong>Affected Resources:</strong></p><ul>"
         for rec in recs:
