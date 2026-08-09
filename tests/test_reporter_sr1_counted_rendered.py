@@ -95,3 +95,71 @@ def test_glue_hardcoded_dollar_string_replaced_by_counted() -> None:
     html = _render("glue", recs)
     assert "$219.00/month" in html
     assert "$316" not in html
+
+
+# --------------------------------------------------------------------------- #
+# Tranche 5 — the new counted levers must be RENDERABLE, not just counted.
+# A counted dollar whose card says "Unknown" is the LAM-2 failure mode: the
+# headline moves and the reader cannot act on it.
+# --------------------------------------------------------------------------- #
+def test_cloudfront_dedicated_ip_card_names_the_certificate() -> None:
+    """CF-4 is keyed by certificate, not distribution — the extractor's
+    DistributionId lookup would have rendered every card as "Unknown"."""
+    recs = [
+        {
+            "CheckCategory": "CloudFront Dedicated IP SSL",
+            "CertificateId": "arn:aws:acm:us-east-1:1:certificate/abc",
+            "DistributionIds": ["E1", "E2"],
+            "DistributionCount": 2,
+            "EstimatedMonthlySavings": 600.0,
+            "EstimatedSavings": "$600.00/month",
+        }
+    ]
+    html = _render("cloudfront", recs)
+    assert "certificate/abc" in html
+    assert "Unknown" not in html
+    assert "E1" in html and "E2" in html
+    assert "$600.00/month" in html
+
+
+def test_api_gateway_stage_cache_card_names_the_stage() -> None:
+    """AG-3 is per stage: two stages of one API must not render identically."""
+    recs = [
+        {
+            "CheckCategory": "API Gateway Stage Cache",
+            "ApiId": "api1",
+            "StageName": "prod",
+            "CacheClusterSize": "6.1",
+            "EstimatedMonthlySavings": 146.0,
+            "EstimatedSavings": "$146.00/month",
+        },
+        {
+            "CheckCategory": "API Gateway Stage Cache",
+            "ApiId": "api1",
+            "StageName": "staging",
+            "CacheClusterSize": "0.5",
+            "EstimatedMonthlySavings": 14.6,
+            "EstimatedSavings": "$14.60/month",
+        },
+    ]
+    html = _render("api_gateway", recs)
+    assert "stage: prod" in html and "stage: staging" in html
+    assert "$160.60/month" in html  # the group's counted sum
+
+
+def test_advisory_stage_cache_does_not_reach_the_card_total() -> None:
+    recs = [
+        {
+            "CheckCategory": "API Gateway Stage Cache",
+            "ApiId": "api1",
+            "StageName": "prod",
+            "CacheClusterSize": "237",
+            "EstimatedMonthlySavings": 0.0,
+            "PotentialMonthlySavings": 2774.0,
+            "Counted": False,
+            "EstimatedSavings": "$0.00/month - advisory: stage served 9,000,000 requests",
+        }
+    ]
+    html = _render("api_gateway", recs)
+    assert "$0.00/month — advisory" in html
+    assert "2,774" not in html and "2774" not in html
