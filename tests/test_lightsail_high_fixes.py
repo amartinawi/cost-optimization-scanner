@@ -256,7 +256,11 @@ def test_scan_h4_static_ip_counted(monkeypatch: pytest.MonkeyPatch) -> None:
     assert emitted["AuditBasis"]["rate"] == 0.005
 
 
-def test_scan_h4_static_ip_region_scaled(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_scan_h4_static_ip_is_flat_not_region_scaled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """LS-1 (C1): Lightsail prices are globally FLAT — live SKUs are identical
+    across USE1/EUC1/APS3/SAE1/APN1/APE1. Multiplying by pricing_multiplier
+    fabricated a region-specific rate for a flat charge (+8..25% phantom on
+    the whole tab; live-reproduced +$0.29 on ap-south-1)."""
     rec = _static_ip()
     monkeypatch.setattr(
         adapter_mod, "get_enhanced_lightsail_checks",
@@ -264,23 +268,22 @@ def test_scan_h4_static_ip_region_scaled(monkeypatch: pytest.MonkeyPatch) -> Non
     )
     findings = LightsailModule().scan(_ctx(pricing_multiplier=1.2))
 
-    # 3.65 × 1.2 = 4.38; the card string and the counted number both scale.
-    assert findings.total_monthly_savings == pytest.approx(4.38)
+    assert findings.total_monthly_savings == pytest.approx(3.65)
     emitted = findings.sources["unused_static_ips"].recommendations[0]
-    assert emitted["EstimatedSavings"] == "$4.38/month"
+    assert emitted["EstimatedSavings"] == "$3.65/month"
 
 
 # --------------------------------------------------------------------------- #
-# Scan path — region multiplier applied once to bundle dollars
+# Scan path — bundle dollars are flat too (LS-1)
 # --------------------------------------------------------------------------- #
-def test_scan_bundle_multiplier_applied_once(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_scan_bundle_price_is_flat_not_region_scaled(monkeypatch: pytest.MonkeyPatch) -> None:
     rec = _idle("medium_2_0")
     monkeypatch.setattr(
         adapter_mod, "get_enhanced_lightsail_checks",
         lambda c: _result({"idle_instances": [rec]}),
     )
     findings = LightsailModule().scan(_ctx(pricing_multiplier=1.5))
-    assert findings.total_monthly_savings == pytest.approx(24.00 * 1.5)
+    assert findings.total_monthly_savings == pytest.approx(24.00)
 
 
 # --------------------------------------------------------------------------- #

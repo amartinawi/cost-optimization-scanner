@@ -55,7 +55,7 @@ class LightsailModule(BaseServiceModule):
         #     (lightsail H4 — previously displayed-but-uncounted).
         #   - Instance Rightsizing (name-based oversized, no utilization metric)
         #     → $0 advisory (lightsail C1 / Cluster F desync).
-        multiplier = getattr(ctx, "pricing_multiplier", 1.0)
+        # No pricing_multiplier here — Lightsail prices are globally flat (LS-1).
         region = getattr(ctx, "region", None)
         savings = 0.0
         for rec in recs:
@@ -82,19 +82,21 @@ class LightsailModule(BaseServiceModule):
 
             if category == "Unused Resource Cleanup":
                 # H4: unattached static IP billed at $0.005/hr after the first
-                # free hour. Region-scaled so counted == displayed.
-                monthly = round(
-                    LIGHTSAIL_UNUSED_STATIC_IP_HOURLY * HOURS_PER_MONTH * multiplier, 2
-                )
+                # free hour. LS-1 (C1): Lightsail prices are globally FLAT —
+                # the UnusedStaticIP SKU is identical in every published
+                # region — so the region multiplier must NOT be applied
+                # (doing so fabricated a region-specific rate for a flat
+                # charge, +8..25% by region).
+                monthly = round(LIGHTSAIL_UNUSED_STATIC_IP_HOURLY * HOURS_PER_MONTH, 2)
                 rec["EstimatedMonthlySavings"] = monthly
                 rec["EstimatedSavings"] = f"${monthly:.2f}/month"
                 rec["AuditBasis"] = {
                     "rate": LIGHTSAIL_UNUSED_STATIC_IP_HOURLY,
                     "metric_window": "flat hourly charge while unattached",
                     "region": region,
-                    "multiplier": multiplier,
-                    "formula": "$0.005/hr × 730 hr × region multiplier",
-                    "source": "AmazonLightsail Pricing API usagetype USE1-UnusedStaticIP",
+                    "formula": "$0.005/hr × 730 hr (flat-global rate; no region multiplier)",
+                    "source": "AmazonLightsail Pricing API usagetype *-UnusedStaticIP "
+                    "(identical across regions, verified 2026-08-09)",
                 }
                 savings += monthly
                 continue
@@ -124,7 +126,9 @@ class LightsailModule(BaseServiceModule):
                 }
                 continue
 
-            monthly = round(monthly_base * multiplier, 2)
+            # LS-1 (C1): bundle prices are globally FLAT (BundleUsage SKUs are
+            # identical across every published region) — no region multiplier.
+            monthly = round(monthly_base, 2)
             rec["EstimatedMonthlySavings"] = monthly
             rec["EstimatedSavings"] = f"${monthly:.2f}/month"
             rec["AuditBasis"] = {
@@ -132,9 +136,9 @@ class LightsailModule(BaseServiceModule):
                 "bundle_id": bundle_name,
                 "operating_system": rec.get("OperatingSystem", "Linux"),
                 "region": region,
-                "multiplier": multiplier,
-                "formula": "AWS Lightsail published monthly bundle price × region multiplier",
-                "source": "AmazonLightsail Pricing API usagetype USE1-BundleUsage:<mem>[_win]",
+                "formula": "AWS Lightsail published monthly bundle price (flat-global; no region multiplier)",
+                "source": "AmazonLightsail Pricing API usagetype *-BundleUsage:<mem>[_win] "
+                "(identical across regions, verified 2026-08-09)",
             }
             savings += monthly
 
