@@ -220,6 +220,69 @@ def test_storage_delta_is_region_scaled(monkeypatch: pytest.MonkeyPatch) -> None
     assert rec["EstimatedMonthlySavings"] == pytest.approx(1000 * 0.013 * 1.25)  # 16.25
 
 
+def test_storage_delta_multiplies_data_node_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    """OS-2: EBSOptions.VolumeSize is PER DATA NODE (AWS EBSOptions docs); a
+    6-node domain bills 6x the per-node volume. Pricing one volume under-counted
+    the gp2->gp3 delta by the node count."""
+    recs = [
+        {
+            "DomainName": "d",
+            "StorageType": "gp2",
+            "EBSVolumeSize": 500,
+            "InstanceCount": 6,
+            "CheckCategory": "Storage Optimization",
+        }
+    ]
+    findings = _scan_with(recs, monkeypatch)
+    rec = _by_category(findings)["Storage Optimization"]
+    assert rec["EstimatedMonthlySavings"] == pytest.approx(500 * 6 * 0.013)  # 39.00
+    assert rec["AuditBasis"]["instance_count"] == 6
+
+
+def test_idle_domain_storage_leg_multiplies_data_node_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    """OS-2 (idle branch): the instance leg already multiplies count; the
+    storage leg must too — the recoverable EBS on delete is per-node volume x
+    node count."""
+    recs = [
+        {
+            "DomainName": "idle",
+            "InstanceType": "r5.large.search",
+            "InstanceCount": 6,
+            "EBSVolumeSize": 500,
+            "IdleCorroborated": True,
+            "CheckCategory": "Idle Domain",
+        }
+    ]
+    pricing = _FakePricing({"r5.large.search": 100.0})
+    findings = _scan_with(recs, monkeypatch, pricing_engine=pricing)
+    rec = _by_category(findings)["Idle Domain"]
+    expected = 100.0 * 6 + 500 * 6 * GP3_PRICE_PER_GB_MONTH  # 600 + 366 = 966
+    assert rec["EstimatedMonthlySavings"] == pytest.approx(expected)
+
+
+def test_extended_support_ce_read_is_region_scoped():
+    """OS-1: the ce client is account-global; without a REGION dimension the
+    account-wide surcharge is re-counted in EVERY scanned region, including
+    regions with zero domains. Assert on the REQUEST kwargs, not the mocked
+    response (the C8-corollary trap: a wrong filter returns plausible data)."""
+    from types import SimpleNamespace
+
+    from services.adapters.opensearch import _extended_support_breakdown
+
+    ce = _ce_with(
+        [("EUW1-OpenSearchExtendedSupport", 10.0)],
+        resource_error=RuntimeError("resource granularity disabled"),
+    )
+    ctx = SimpleNamespace(client=lambda _n: ce, warn=lambda *a, **k: None, region="eu-west-1")
+    _extended_support_breakdown(ctx)
+
+    f = ce.get_cost_and_usage.call_args.kwargs["Filter"]
+    clauses = f.get("And", [f])
+    region_clauses = [c for c in clauses if c.get("Dimensions", {}).get("Key") == "REGION"]
+    assert region_clauses, f"CE read must be region-scoped; Filter was {f}"
+    assert region_clauses[0]["Dimensions"]["Values"] == ["eu-west-1"]
+
+
 # --------------------------------------------------------------------------- #
 # C3 — Underutilized Domain: concrete downsize delta OR explicit $0 advisory
 # --------------------------------------------------------------------------- #
@@ -389,11 +452,12 @@ def test_shim_to_adapter_end_to_end_prices_every_lever(monkeypatch: pytest.Monke
     # Graviton node delta: (400 - 380) * 4 = 80 -> superseded by the downsize lever.
     assert cats["Graviton Migration"]["Counted"] is False
     assert cats["Graviton Migration"]["EstimatedSavings"].startswith("$0.00/month")
-    # Storage delta is a separate axis: 1000 * 0.013 = 13.00, counted.
-    assert cats["Storage Optimization"]["EstimatedMonthlySavings"] == pytest.approx(13.0)
+    # Storage delta is a separate axis, PER DATA NODE (OS-2): VolumeSize=1000
+    # is per node, so 4 nodes bill 4,000 GB -> 1000 * 4 * 0.013 = 52.00, counted.
+    assert cats["Storage Optimization"]["EstimatedMonthlySavings"] == pytest.approx(52.0)
     assert cats["Storage Optimization"]["Counted"] is True
-    # Total = downsize 800 + storage 13 = 813.00.
-    assert findings.total_monthly_savings == pytest.approx(813.0)
+    # Total = downsize 800 + storage 52 = 852.00.
+    assert findings.total_monthly_savings == pytest.approx(852.0)
 
 
 # --------------------------------------------------------------------------- #

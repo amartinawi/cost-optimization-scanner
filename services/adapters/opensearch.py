@@ -211,13 +211,27 @@ def _extended_support_breakdown(ctx: Any) -> tuple[float, dict[str, float]]:
     period = {"Start": start.isoformat(), "End": end.isoformat()}
     scale = 30.0 / _SURCHARGE_WINDOW_DAYS
 
+    # OS-1 — the ce client is account-global and the usage-type matcher strips
+    # region prefixes, so a SERVICE-only filter returns the ACCOUNT-WIDE
+    # surcharge and re-counts it in every scanned region (including regions
+    # with zero domains). Scope by REGION, mirroring the headroom read in
+    # services/commitment_coverage.py.
+    service_clause: dict[str, Any] = {
+        "Dimensions": {"Key": "SERVICE", "Values": [_CE_OPENSEARCH_SERVICE]}
+    }
+    region = str(getattr(ctx, "region", "") or "")
+    ce_filter: dict[str, Any] = (
+        {"And": [service_clause, {"Dimensions": {"Key": "REGION", "Values": [region]}}]}
+        if region
+        else service_clause
+    )
     try:
         resp = ce.get_cost_and_usage(
             TimePeriod=period,
             Granularity="MONTHLY",
             Metrics=["UnblendedCost"],
             GroupBy=[{"Type": "DIMENSION", "Key": "USAGE_TYPE"}],
-            Filter={"Dimensions": {"Key": "SERVICE", "Values": [_CE_OPENSEARCH_SERVICE]}},
+            Filter=ce_filter,
         )
     except Exception as e:  # noqa: BLE001 — fail closed
         ctx.warn(f"Could not read OpenSearch Extended Support spend: {e}", "opensearch")
@@ -362,15 +376,20 @@ class OpensearchModule(BaseServiceModule):
                 if ctx.pricing_engine is not None and instance_type:
                     instance_monthly = ctx.pricing_engine.get_instance_monthly_price("AmazonES", instance_type)
                 ebs = rec.get("EBSVolumeSize", 0) or 0
-                storage_monthly = ebs * GP3_PRICE_PER_GB_MONTH * ctx.pricing_multiplier
+                # OS-2 — EBSOptions.VolumeSize is PER DATA NODE; the recoverable
+                # storage on delete is volume x node count, like the instance leg.
+                storage_monthly = ebs * instance_count * GP3_PRICE_PER_GB_MONTH * ctx.pricing_multiplier
                 value = (instance_monthly * instance_count) + storage_monthly
                 audit_basis = {
                     "instance_rate_monthly": round(instance_monthly, 4),
                     "instance_count": instance_count,
-                    "storage_gb": ebs,
+                    "storage_gb_per_node": ebs,
                     "gp3_rate_per_gb_month": GP3_PRICE_PER_GB_MONTH,
                     "region_multiplier": round(ctx.pricing_multiplier, 4),
-                    "formula": "instance_rate x count + storage_gb x gp3_rate x region_multiplier",
+                    "formula": (
+                        "instance_rate x count + storage_gb_per_node x count x gp3_rate "
+                        "x region_multiplier"
+                    ),
                 }
             elif "storage" in category.lower():
                 # gp2 -> gp3 migration delta (OpenSearch H3): the realizable
@@ -379,14 +398,18 @@ class OpensearchModule(BaseServiceModule):
                 # scaled once.
                 ebs = rec.get("EBSVolumeSize", 0) or 0
                 delta_rate = GP2_PRICE_PER_GB_MONTH - GP3_PRICE_PER_GB_MONTH
-                value = ebs * delta_rate * ctx.pricing_multiplier
+                # OS-2 — per-node volume x data-node count (see idle branch).
+                value = ebs * instance_count * delta_rate * ctx.pricing_multiplier
                 audit_basis = {
-                    "storage_gb": ebs,
+                    "storage_gb_per_node": ebs,
+                    "instance_count": instance_count,
                     "gp2_rate_per_gb_month": GP2_PRICE_PER_GB_MONTH,
                     "gp3_rate_per_gb_month": GP3_PRICE_PER_GB_MONTH,
                     "delta_rate_per_gb_month": round(delta_rate, 4),
                     "region_multiplier": round(ctx.pricing_multiplier, 4),
-                    "formula": "storage_gb x (gp2_rate - gp3_rate) x region_multiplier",
+                    "formula": (
+                        "storage_gb_per_node x count x (gp2_rate - gp3_rate) x region_multiplier"
+                    ),
                 }
             elif category == "Underutilized Domain":
                 # Concrete current -> one-size-down node-price delta (OpenSearch
