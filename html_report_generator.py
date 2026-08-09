@@ -2246,7 +2246,11 @@ class HTMLReportGenerator:
                forces the engine to push/clip whole panels — the "mostly
                blank pages" PDF bug (M360). Panels break BETWEEN each other;
                only small units (cards, single tables) avoid internal breaks. */
-            .tab-content { display: block !important; overflow-x: visible; }
+            /* overflow must reset on BOTH axes: overflow-x:auto computes
+               overflow-y:auto too, and Chrome CLIPS scroll containers in
+               print instead of paginating them — 67 of 72 pages printed
+               blank (af-south-1 live repro, headless print-to-pdf). */
+            .tab-content { display: block !important; overflow: visible !important; animation: none !important; }
             .tab-content:not(:first-of-type) { page-break-before: always; }
             .rec-item { page-break-inside: avoid; }
             canvas { max-width: 100%; page-break-inside: avoid; }
