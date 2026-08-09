@@ -64,7 +64,13 @@ class ApiGatewayModule(BaseServiceModule):
         # broke counted==rendered (headline was scaled, the rendered cards were
         # not). The us-east-1 constants stand as a conservative floor that never
         # exceeds the real regional saving (api_gateway region fix).
-        savings = sum(rec.get("EstimatedMonthlySavings", 0.0) for rec in recs)
+        # Sum only counted recs. Every advisory is $0 today, but the AG-3
+        # stage-cache advisory carries its real figure in
+        # PotentialMonthlySavings, and a future advisory that also filled
+        # EstimatedMonthlySavings would silently leak into the headline.
+        savings = sum(
+            rec.get("EstimatedMonthlySavings", 0.0) for rec in recs if rec.get("Counted", True)
+        )
 
         return ServiceFindings(
             service_name="API Gateway",

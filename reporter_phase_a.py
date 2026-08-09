@@ -130,6 +130,15 @@ def _extract_lambda_details(rec: Rec) -> Tuple[str, str]:
 
 def _extract_cloudfront_details(rec: Rec) -> Tuple[str, str]:
     """Extract CloudFront distribution ID and metadata. Called by: render_grouped_by_category."""
+    # CF-4 is keyed by CERTIFICATE, not distribution (AWS bills the dedicated-IP
+    # fee per certificate), so its rec carries CertificateId + a DistributionIds
+    # list. Without this branch every dedicated-IP card rendered "Unknown" — a
+    # counted dollar with no identifiable resource.
+    if rec.get("CertificateId"):
+        dist_ids = rec.get("DistributionIds") or []
+        detail = f" ({len(dist_ids)} distribution(s): {', '.join(map(str, dist_ids))})" if dist_ids else ""
+        return str(rec["CertificateId"]), detail
+
     dist_id = rec.get("DistributionId", "Unknown")
     domain_name = rec.get("DomainName", "")
     status = rec.get("Status", "")
@@ -216,6 +225,13 @@ def _extract_glue_details(rec: Rec) -> Tuple[str, str]:
 def _extract_api_gateway_details(rec: Rec) -> Tuple[str, str]:
     """Extract API Gateway resource identifier. Called by: render_grouped_by_category."""
     resource_id = rec.get("ApiId", rec.get("RestApiId", rec.get("ApiName", "Unknown")))
+    # AG-3 is per STAGE: two cache recs on different stages of one API would
+    # otherwise render as two identical rows with no way to tell them apart.
+    stage = rec.get("StageName")
+    if stage:
+        size = rec.get("CacheClusterSize")
+        suffix = f", {size}GB cache" if size else ""
+        return resource_id, f" (stage: {stage}{suffix})"
     return resource_id, ""
 
 

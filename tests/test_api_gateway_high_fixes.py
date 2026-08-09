@@ -82,11 +82,18 @@ class _FakeApiGateway:
         apis: list[dict[str, Any]],
         resource_counts: dict[str, int],
         resources_error: set[str] | None = None,
+        stages: dict[str, list[dict[str, Any]]] | None = None,
     ) -> None:
         self._apis = apis
         self._resource_counts = resource_counts
         self._resources_error = resources_error or set()
+        # AG-3 reads stages to price provisioned caches. Default: no stages, so
+        # these tests exercise only the REST->HTTP lever they were written for.
+        self._stages = stages or {}
         self.paginators_requested: list[str] = []
+
+    def get_stages(self, restApiId: str) -> dict[str, Any]:  # noqa: N803 - boto3 shape
+        return {"item": self._stages.get(restApiId, [])}
 
     def get_paginator(self, name: str) -> _FakePaginator:
         self.paginators_requested.append(name)

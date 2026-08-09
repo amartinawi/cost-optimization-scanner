@@ -34,6 +34,9 @@ def _no_registered_targets(elbv2: Any, lb_arn: str) -> bool | None:
     * ``None``  — unknown: an enumeration failed, or the LB has no target
       groups at all (it may be wired another way). The caller must abstain;
       an ambiguous read must never produce a counted delete recommendation.
+
+    Costs ``1 + N`` describe calls per LB, so the caller skips it in fast mode
+    (a fast scan under-counts rather than guesses).
     """
     try:
         groups: list[dict[str, Any]] = []
@@ -58,6 +61,53 @@ def _no_registered_targets(elbv2: Any, lb_arn: str) -> bool | None:
         return True
     except Exception:
         return None
+
+
+# An LB younger than this may simply be mid-provisioning: its targets or
+# listeners have not been attached yet. The charge is real from hour one, but
+# "delete it" is the wrong call for something still being built, so a young LB
+# renders as a $0 advisory carrying the figure instead of a counted dollar.
+_MIN_IDLE_AGE_DAYS = 7
+
+
+def _idle_age_days(created: Any) -> int | None:
+    """Whole days since ``created``, or ``None`` when it cannot be read.
+
+    A payload with no usable CreatedTime is unknown, not old — the caller
+    demotes rather than counting.
+    """
+    if not isinstance(created, datetime):
+        return None
+    try:
+        return (datetime.now(created.tzinfo) - created).days
+    except Exception:
+        return None
+
+
+def _apply_idle_age_gate(rec: dict[str, Any], created: Any, monthly: float) -> dict[str, Any]:
+    """Count an idle-LB rec only when the LB is demonstrably not brand new.
+
+    Returns a NEW dict. Old enough -> counted, unchanged. Young or unknown age
+    -> $0 advisory that keeps the figure in ``PotentialMonthlySavings`` (B1),
+    so the evidence survives without the headline claiming it.
+    """
+    age = _idle_age_days(created)
+    if age is not None and age >= _MIN_IDLE_AGE_DAYS:
+        return dict(rec, AgeDays=age)
+    reason = (
+        f"only {age} day(s) old" if age is not None else "creation time unreadable"
+    )
+    return dict(
+        rec,
+        EstimatedSavings=(
+            f"$0.00/month — advisory: {reason}; a load balancer under "
+            f"{_MIN_IDLE_AGE_DAYS} days old may still be mid-provisioning"
+        ),
+        EstimatedMonthlySavings=0.0,
+        PotentialMonthlySavings=round(monthly, 2),
+        Counted=False,
+        AgeDays=age,
+    )
 
 
 def _is_kubernetes_managed_alb(ctx: ScanContext, elbv2: Any, lb_name: str, lb_arn: str) -> bool:
@@ -193,17 +243,21 @@ def get_load_balancer_checks(ctx: ScanContext) -> dict[str, Any]:
                     # tripped the counted-but-$0 check.
                     lb_monthly = lb_rate_by_type.get(lb_type, alb_monthly)
                     checks["idle_listeners"].append(
-                        {
-                            "LoadBalancerName": lb_name,
-                            "Type": lb_type,
-                            "Recommendation": "Load balancer has no listeners configured - verify configuration or delete if unused",
-                            "EstimatedSavings": f"${lb_monthly:.2f}/month if deleted",
-                            "EstimatedMonthlySavings": round(lb_monthly, 2),
-                            "Action": "1. Check if listeners were accidentally deleted\n2. Verify if LB is still needed\n3. Configure listeners or delete LB",
-                            "CheckCategory": "Load Balancer Configuration Issue",
-                        }
+                        _apply_idle_age_gate(
+                            {
+                                "LoadBalancerName": lb_name,
+                                "Type": lb_type,
+                                "Recommendation": "Load balancer has no listeners configured - verify configuration or delete if unused",
+                                "EstimatedSavings": f"${lb_monthly:.2f}/month if deleted",
+                                "EstimatedMonthlySavings": round(lb_monthly, 2),
+                                "Action": "1. Check if listeners were accidentally deleted\n2. Verify if LB is still needed\n3. Configure listeners or delete LB",
+                                "CheckCategory": "Load Balancer Configuration Issue",
+                            },
+                            lb.get("CreatedTime"),
+                            lb_monthly,
+                        )
                     )
-                elif lb_arn:
+                elif lb_arn and not getattr(ctx, "fast_mode", False):
                     # NET-E: an ALB/NLB whose target groups have NO registered
                     # targets cannot be serving traffic — definitive idleness
                     # from describe APIs alone (no CloudWatch, no new
@@ -211,28 +265,34 @@ def get_load_balancer_checks(ctx: ScanContext) -> dict[str, Any]:
                     # whole base charge is recoverable on delete. Fails CLOSED:
                     # any enumeration error, or zero target groups (which can
                     # mean the LB is wired some other way), abstains entirely.
+                    # Skipped under --fast: it costs 1+N describe calls per LB,
+                    # and a fast scan should under-count rather than guess.
                     idle_state = _no_registered_targets(elbv2, lb_arn)
                     if idle_state is True:
                         lb_monthly = lb_rate_by_type.get(lb_type, alb_monthly)
                         checks["idle_listeners"].append(
-                            {
-                                "LoadBalancerName": lb_name,
-                                "Type": lb_type,
-                                "Recommendation": (
-                                    "Load balancer has listeners but NO registered targets in any "
-                                    "target group - delete if no longer needed"
-                                ),
-                                "EstimatedSavings": f"${lb_monthly:.2f}/month if deleted",
-                                "EstimatedMonthlySavings": round(lb_monthly, 2),
-                                "AuditBasis": {
-                                    "metric": "0 registered targets across all attached target groups",
-                                    "evidence": "elbv2:DescribeTargetGroups + DescribeTargetHealth",
-                                    "rate_monthly": round(lb_monthly, 2),
-                                    "formula": "full LB base charge (billed regardless of traffic)",
+                            _apply_idle_age_gate(
+                                {
+                                    "LoadBalancerName": lb_name,
+                                    "Type": lb_type,
+                                    "Recommendation": (
+                                        "Load balancer has listeners but NO registered targets in any "
+                                        "target group - delete if no longer needed"
+                                    ),
+                                    "EstimatedSavings": f"${lb_monthly:.2f}/month if deleted",
+                                    "EstimatedMonthlySavings": round(lb_monthly, 2),
+                                    "AuditBasis": {
+                                        "metric": "0 registered targets across all attached target groups",
+                                        "evidence": "elbv2:DescribeTargetGroups + DescribeTargetHealth",
+                                        "rate_monthly": round(lb_monthly, 2),
+                                        "formula": "full LB base charge (billed regardless of traffic)",
+                                    },
+                                    "Action": "1. Confirm no service is being migrated onto it\n2. Delete the load balancer",
+                                    "CheckCategory": "Idle Load Balancer",
                                 },
-                                "Action": "1. Confirm no service is being migrated onto it\n2. Delete the load balancer",
-                                "CheckCategory": "Idle Load Balancer",
-                            }
+                                lb.get("CreatedTime"),
+                                lb_monthly,
+                            )
                         )
 
                 if lb_type == "application" and len(listeners) == 1 and not is_k8s_managed:
@@ -360,22 +420,26 @@ def get_load_balancer_checks(ctx: ScanContext) -> dict[str, Any]:
                 if clb_monthly <= 0:
                     continue
                 checks["idle_listeners"].append(
-                    {
-                        "LoadBalancerName": elb_name,
-                        "Type": "classic",
-                        "Recommendation": (
-                            "Classic Load Balancer has no registered instances - delete if unused"
-                        ),
-                        "EstimatedSavings": f"${clb_monthly:.2f}/month if deleted",
-                        "EstimatedMonthlySavings": round(clb_monthly, 2),
-                        "AuditBasis": {
-                            "metric": "0 registered instances (elb:DescribeLoadBalancers)",
-                            "rate_monthly": round(clb_monthly, 2),
-                            "formula": "full Classic LB base charge (billed regardless of traffic)",
+                    _apply_idle_age_gate(
+                        {
+                            "LoadBalancerName": elb_name,
+                            "Type": "classic",
+                            "Recommendation": (
+                                "Classic Load Balancer has no registered instances - delete if unused"
+                            ),
+                            "EstimatedSavings": f"${clb_monthly:.2f}/month if deleted",
+                            "EstimatedMonthlySavings": round(clb_monthly, 2),
+                            "AuditBasis": {
+                                "metric": "0 registered instances (elb:DescribeLoadBalancers)",
+                                "rate_monthly": round(clb_monthly, 2),
+                                "formula": "full Classic LB base charge (billed regardless of traffic)",
+                            },
+                            "Action": "1. Confirm no instances are being registered\n2. Delete the load balancer",
+                            "CheckCategory": "Idle Load Balancer",
                         },
-                        "Action": "1. Confirm no instances are being registered\n2. Delete the load balancer",
-                        "CheckCategory": "Idle Load Balancer",
-                    }
+                        created_time,
+                        clb_monthly,
+                    )
                 )
 
             if created_time:

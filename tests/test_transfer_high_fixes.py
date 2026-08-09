@@ -78,6 +78,18 @@ class _FakeTransferClient:
     def __init__(self, servers: list[dict[str, Any]]) -> None:
         self._servers = servers
 
+    def describe_server(self, ServerId: str) -> dict:  # noqa: N803 - boto3 shape
+        """TR-3: ListedServer carries no Protocols; only DescribeServer does.
+
+        The fakes used to seed Protocols straight onto the list_servers payload,
+        which is a shape AWS never returns - so the protocol lever passed its
+        tests while being dead against a real account.
+        """
+        for server in self._servers:
+            if server.get("ServerId") == ServerId:
+                return {"Server": {"ServerId": ServerId, "Protocols": server.get("Protocols", [])}}
+        return {"Server": {"ServerId": ServerId, "Protocols": []}}
+
     def get_paginator(self, _name: str) -> _FakePaginator:
         return _FakePaginator([{"Servers": self._servers}])
 
@@ -345,8 +357,9 @@ def test_data_transfer_note_uses_real_metric_names() -> None:
     cw.get_metric_statistics.side_effect = _metrics
     transfer = MagicMock()
     transfer.get_paginator.return_value.paginate.return_value = iter(
-        [{"Servers": [{"ServerId": "s-1", "State": "ONLINE", "Protocols": ["SFTP", "FTPS"]}]}]
+        [{"Servers": [{"ServerId": "s-1", "State": "ONLINE"}]}]
     )
+    transfer.describe_server.return_value = {"Server": {"Protocols": ["SFTP", "FTPS"]}}
     ctx = SimpleNamespace(
         region="us-east-1", fast_mode=False,
         client=lambda name, region=None: {"transfer": transfer, "cloudwatch": cw}.get(name),
@@ -374,8 +387,9 @@ def test_cw_failure_is_classified_not_swallowed() -> None:
     cw.get_metric_statistics.side_effect = Exception("AccessDeniedException: denied")
     transfer = MagicMock()
     transfer.get_paginator.return_value.paginate.return_value = iter(
-        [{"Servers": [{"ServerId": "s-2", "State": "ONLINE", "Protocols": ["SFTP", "FTPS"]}]}]
+        [{"Servers": [{"ServerId": "s-2", "State": "ONLINE"}]}]
     )
+    transfer.describe_server.return_value = {"Server": {"Protocols": ["SFTP", "FTPS"]}}
     perms: list = []
     warns: list = []
     ctx = SimpleNamespace(

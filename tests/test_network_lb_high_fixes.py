@@ -19,6 +19,7 @@ to prove the fix is surgical.
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
 
@@ -107,11 +108,12 @@ def _ctx(
     *,
     pricing_engine: Any = None,
     pricing_multiplier: float = 1.0,
+    fast_mode: bool = False,
 ) -> SimpleNamespace:
     ctx = SimpleNamespace(
         pricing_engine=pricing_engine,
         pricing_multiplier=pricing_multiplier,
-        fast_mode=False,
+        fast_mode=fast_mode,
         warnings=[],
         permissions=[],
     )
@@ -144,11 +146,16 @@ def _pe(
     )
 
 
-def _alb(name: str) -> dict[str, Any]:
+# Old enough to clear _MIN_IDLE_AGE_DAYS; individual tests override it.
+_AGED = datetime(2020, 1, 1, tzinfo=timezone.utc)
+
+
+def _alb(name: str, created: datetime | None = _AGED) -> dict[str, Any]:
     arn = f"arn:aws:elasticloadbalancing:us-east-1:111122223333:loadbalancer/app/{name}/abc123"
     return {
         "LoadBalancerArn": arn,
         "LoadBalancerName": name,
+        **({"CreatedTime": created} if created is not None else {}),
         "Type": "application",
         "Scheme": "internet-facing",
     }
@@ -158,12 +165,14 @@ def _listener(arn_suffix: str) -> dict[str, Any]:
     return {"ListenerArn": f"listener/{arn_suffix}"}
 
 
-def _build(names_with_listener_counts: dict[str, int]) -> tuple[list[dict], dict[str, list]]:
+def _build(
+    names_with_listener_counts: dict[str, int], created: datetime | None = _AGED
+) -> tuple[list[dict], dict[str, list]]:
     """Build (load_balancers, listeners_by_arn) for the given {name: listener_count}."""
     lbs: list[dict[str, Any]] = []
     listeners_by_arn: dict[str, list[dict[str, Any]]] = {}
     for name, n in names_with_listener_counts.items():
-        lb = _alb(name)
+        lb = _alb(name, created)
         lbs.append(lb)
         listeners_by_arn[lb["LoadBalancerArn"]] = [_listener(f"{name}-{i}") for i in range(n)]
     return lbs, listeners_by_arn
@@ -348,8 +357,6 @@ def test_lb_target_enumeration_failure_abstains() -> None:
 
 
 def test_classic_lb_with_no_instances_is_counted_idle() -> None:
-    from datetime import datetime, timezone
-
     clb = {
         "LoadBalancerName": "clb-idle",
         "CreatedTime": datetime(2020, 1, 1, tzinfo=timezone.utc),
@@ -365,8 +372,6 @@ def test_classic_lb_with_no_instances_is_counted_idle() -> None:
 
 
 def test_classic_lb_with_instances_is_not_flagged() -> None:
-    from datetime import datetime, timezone
-
     clb = {
         "LoadBalancerName": "clb-busy",
         "CreatedTime": datetime(2020, 1, 1, tzinfo=timezone.utc),
@@ -381,11 +386,103 @@ def test_classic_lb_with_instances_is_not_flagged() -> None:
 
 def test_classic_lb_without_instances_key_abstains() -> None:
     """A payload missing Instances entirely is unknown, not empty."""
-    from datetime import datetime, timezone
-
     clb = {"LoadBalancerName": "clb-unknown", "CreatedTime": datetime(2020, 1, 1, tzinfo=timezone.utc)}
     lbs, listeners = _build({"app-1": 1})
     out = get_load_balancer_checks(
         _ctx(_FakeElbv2(lbs, listeners), _FakeElb([clb]), pricing_engine=_pe())
     )
     assert [r for r in _category(out, "idle_listeners") if r["CheckCategory"] == "Idle Load Balancer"] == []
+
+
+# --------------------------------------------------------------------------- #
+# T5-1 — the two conservatism gaps carried out of the tranche-4 review.
+#
+# (a) A load balancer younger than _MIN_IDLE_AGE_DAYS may simply be
+#     mid-provisioning. The charge is real, but "delete it" is the wrong call,
+#     so the rec demotes to a $0 advisory that keeps the figure rather than
+#     disappearing. Applies to BOTH idle branches — gating one and not its
+#     sibling (which makes the same delete recommendation) would be incoherent.
+# (b) The zero-target lever costs 1+N describe calls per LB, so --fast skips it
+#     entirely: a fast scan under-counts rather than guesses.
+# --------------------------------------------------------------------------- #
+_YOUNG = datetime.now(timezone.utc) - timedelta(days=2)
+
+
+def _idle_rec(out: dict[str, Any], category: str) -> dict[str, Any] | None:
+    recs = [r for r in _category(out, "idle_listeners") if r["CheckCategory"] == category]
+    assert len(recs) <= 1
+    return recs[0] if recs else None
+
+
+def _zero_listener_case(created: datetime | None) -> dict[str, Any]:
+    lbs, listeners = _build({"app-1": 0}, created)
+    return get_load_balancer_checks(_ctx(_FakeElbv2(lbs, listeners), pricing_engine=_pe()))
+
+
+def _zero_target_case(created: datetime | None, *, fast: bool = False) -> dict[str, Any]:
+    lbs, listeners = _build({"app-1": 1}, created)
+    arn = lbs[0]["LoadBalancerArn"]
+    elbv2 = _FakeElbv2(lbs, listeners, tgs_by_lb={arn: ["tg-1"]}, targets_by_tg={"tg-1": []})
+    return get_load_balancer_checks(_ctx(elbv2, pricing_engine=_pe(), fast_mode=fast))
+
+
+def test_young_lb_with_no_listeners_is_advisory_not_counted() -> None:
+    rec = _idle_rec(_zero_listener_case(_YOUNG), "Load Balancer Configuration Issue")
+    assert rec is not None, "the finding must stay visible, just uncounted"
+    assert rec["Counted"] is False
+    assert rec["EstimatedMonthlySavings"] == 0.0
+    assert rec["PotentialMonthlySavings"] == pytest.approx(_ALB_MONTHLY, abs=0.01)
+    assert "mid-provisioning" in rec["EstimatedSavings"]
+
+
+def test_young_lb_with_no_targets_is_advisory_not_counted() -> None:
+    """Same gate on the sibling branch — both make the same delete call."""
+    rec = _idle_rec(_zero_target_case(_YOUNG), "Idle Load Balancer")
+    assert rec is not None
+    assert rec["Counted"] is False
+    assert rec["PotentialMonthlySavings"] == pytest.approx(_ALB_MONTHLY, abs=0.01)
+
+
+def test_lb_with_unreadable_creation_time_is_advisory() -> None:
+    """Unknown age is not old age — demote rather than count."""
+    for out, category in (
+        (_zero_listener_case(None), "Load Balancer Configuration Issue"),
+        (_zero_target_case(None), "Idle Load Balancer"),
+    ):
+        rec = _idle_rec(out, category)
+        assert rec is not None and rec["Counted"] is False
+        assert "creation time unreadable" in rec["EstimatedSavings"]
+
+
+def test_aged_lb_still_counts_and_carries_its_age() -> None:
+    for out, category in (
+        (_zero_listener_case(_AGED), "Load Balancer Configuration Issue"),
+        (_zero_target_case(_AGED), "Idle Load Balancer"),
+    ):
+        rec = _idle_rec(out, category)
+        assert rec is not None
+        assert rec.get("Counted") is not False
+        assert rec["EstimatedMonthlySavings"] == pytest.approx(_ALB_MONTHLY, abs=0.01)
+        assert rec["AgeDays"] > 365
+
+
+def test_fast_mode_skips_the_zero_target_lever() -> None:
+    assert _idle_rec(_zero_target_case(_AGED, fast=True), "Idle Load Balancer") is None
+    # ...but the branch that needs no extra API call still fires.
+    assert _idle_rec(_zero_listener_case(_AGED), "Load Balancer Configuration Issue") is not None
+
+
+def test_fast_mode_makes_no_target_group_calls() -> None:
+    """Not just "emits nothing" — the calls must not happen at all."""
+    lbs, listeners = _build({"app-1": 1})
+    arn = lbs[0]["LoadBalancerArn"]
+    elbv2 = _FakeElbv2(lbs, listeners, tgs_by_lb={arn: ["tg-1"]}, targets_by_tg={"tg-1": []})
+    calls: list[str] = []
+    original = elbv2.describe_target_groups
+    elbv2.describe_target_groups = lambda **kw: (calls.append("tg"), original(**kw))[1]  # type: ignore[method-assign]
+    get_load_balancer_checks(_ctx(elbv2, pricing_engine=_pe(), fast_mode=True))
+    assert calls == []
+
+
+def test_network_module_declares_it_reads_fast_mode() -> None:
+    assert NetworkModule.reads_fast_mode is True

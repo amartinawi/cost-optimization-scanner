@@ -22,7 +22,7 @@ saving can be emitted. The single REST lever is the REST→HTTP migration candid
 
 from __future__ import annotations
 
-from datetime import timedelta, timezone
+from datetime import UTC, timedelta
 from typing import Any
 
 from core.scan_context import ScanContext
@@ -45,7 +45,151 @@ API_GATEWAY_OPTIMIZATION_DESCRIPTIONS: dict[str, dict[str, str]] = {
         "description": "REST APIs with ≤10 resources can migrate to cheaper HTTP APIs for 10-30% cost reduction.",
         "action": "Review simple REST APIs and migrate to HTTP API where feature compatibility allows",
     },
+    "stage_caches": {
+        "title": "Remove Unused REST Stage Caches",
+        "description": (
+            "A provisioned stage cache bills 24/7 by size ($14.60-$2,774/month) whether "
+            "or not any request hits it."
+        ),
+        "action": "Disable the cache on stages that serve no traffic",
+    },
 }
+
+
+# apigateway CacheClusterStatus values in which the cache is provisioned and
+# therefore billing. CREATE_IN_PROGRESS is excluded deliberately: it is a
+# transient state, and recommending deletion of something mid-creation would be
+# noise. DELETE_IN_PROGRESS / NOT_AVAILABLE are already on their way out.
+_BILLING_CACHE_STATUSES = frozenset({"AVAILABLE", "FLUSH_IN_PROGRESS"})
+
+_CACHE_METRIC_WINDOW_DAYS = 30
+
+
+def _stage_request_count(ctx: ScanContext, api_name: str, stage_name: str) -> float | None:
+    """Requests to one stage over the window, or ``None`` if unreadable.
+
+    ``(ApiName, Stage)`` is a standard AWS/ApiGateway dimension pair — unlike
+    the four-dimension form it does NOT require detailed metrics to be enabled.
+    ``None`` means the read failed or was skipped, which is not evidence of
+    zero traffic (H2).
+    """
+    if ctx.fast_mode:
+        return None
+    try:
+        from datetime import datetime
+
+        cw = ctx.client("cloudwatch")
+        end = datetime.now(UTC)
+        start = end - timedelta(days=_CACHE_METRIC_WINDOW_DAYS)
+        resp = cw.get_metric_statistics(
+            Namespace="AWS/ApiGateway",
+            MetricName="Count",
+            Dimensions=[
+                {"Name": "ApiName", "Value": api_name},
+                {"Name": "Stage", "Value": stage_name},
+            ],
+            StartTime=start,
+            EndTime=end,
+            Period=_CACHE_METRIC_WINDOW_DAYS * 86400,
+            Statistics=["Sum"],
+        )
+        return float(sum(dp["Sum"] for dp in resp.get("Datapoints", [])))
+    except Exception as exc:
+        record_aws_error(
+            ctx,
+            exc,
+            service="api_gateway",
+            context=f"CloudWatch Count read failed for stage '{api_name}/{stage_name}'",
+        )
+        return None
+
+
+def _stage_cache_recs(
+    ctx: ScanContext, apigateway: Any, api_id: str, api_name: str
+) -> list[dict[str, Any]]:
+    """One rec per provisioned REST stage cache (AG-3).
+
+    Counted only when the stage demonstrably served zero requests over the
+    window: a cache fronting live traffic may be load-bearing, and this scanner
+    cannot measure the backend cost it offsets. Everything else — traffic
+    present, metric unreadable, fast mode — renders the exact figure as a $0
+    advisory instead.
+    """
+    try:
+        stages = apigateway.get_stages(restApiId=api_id).get("item", [])
+    except Exception as exc:
+        record_aws_error(
+            ctx,
+            exc,
+            service="api_gateway",
+            context=f"apigateway:GetStages failed for API '{api_name}'",
+        )
+        return []
+
+    recs: list[dict[str, Any]] = []
+    for stage in stages:
+        if not stage.get("cacheClusterEnabled"):
+            continue
+        if stage.get("cacheClusterStatus") not in _BILLING_CACHE_STATUSES:
+            continue
+        size = str(stage.get("cacheClusterSize") or "")
+        pe = ctx.pricing_engine
+        monthly = pe.get_apigateway_cache_monthly_price(size) if pe is not None else 0.0
+        if monthly <= 0:
+            # Unknown size or no rate — abstain rather than invent a dollar.
+            ctx.warn(
+                f"API Gateway stage {api_name}/{stage.get('stageName')} has a cache of "
+                f"unpriceable size {size!r}; skipped",
+                "api_gateway",
+            )
+            continue
+
+        stage_name = str(stage.get("stageName") or "")
+        requests = _stage_request_count(ctx, api_name, stage_name)
+        idle = requests == 0.0
+        rec: dict[str, Any] = {
+            "ApiId": api_id,
+            "ApiName": api_name,
+            "StageName": stage_name,
+            "CacheClusterSize": size,
+            "MonthlyRequests": requests,
+            "Recommendation": (
+                f"Stage cache ({size}GB) is provisioned 24/7 and the stage served no "
+                "requests in the last 30 days - disable the cache"
+                if idle
+                else f"Stage cache ({size}GB) is provisioned 24/7 - confirm it earns its cost"
+            ),
+            "CheckCategory": "API Gateway Stage Cache",
+            "AuditBasis": {
+                "metric": "AWS/ApiGateway Count (Sum), dimensions ApiName+Stage",
+                "metric_window_days": _CACHE_METRIC_WINDOW_DAYS,
+                "monthly_requests": requests,
+                "cache_size_gb": size,
+                "rate_monthly": round(monthly, 2),
+                "rate_source": (
+                    "AmazonApiGateway productFamily 'Amazon API Gateway Cache' "
+                    "(AWS Pricing API, validated 2026-08-09)"
+                ),
+                "formula": "cache hourly rate x 730 (billed whether or not the cache is hit)",
+            },
+        }
+        if idle:
+            rec["EstimatedSavings"] = f"${monthly:.2f}/month"
+            rec["EstimatedMonthlySavings"] = round(monthly, 2)
+        else:
+            reason = (
+                f"stage served {requests:,.0f} requests in the last "
+                f"{_CACHE_METRIC_WINDOW_DAYS} days; the cache may be load-bearing and "
+                "the backend cost it offsets is not measured here"
+                if requests is not None
+                else "request metric unavailable, so idleness is unproven"
+            )
+            rec["EstimatedSavings"] = f"$0.00/month - advisory: {reason}"
+            rec["EstimatedMonthlySavings"] = 0.0
+            rec["PotentialMonthlySavings"] = round(monthly, 2)
+            rec["Counted"] = False
+        recs.append(rec)
+    return recs
 
 
 def get_enhanced_api_gateway_checks(ctx: ScanContext) -> dict[str, Any]:
@@ -68,6 +212,7 @@ def get_enhanced_api_gateway_checks(ctx: ScanContext) -> dict[str, Any]:
     """
     checks: dict[str, list[dict[str, Any]]] = {
         "rest_vs_http": [],
+        "stage_caches": [],
     }
 
     try:
@@ -93,7 +238,7 @@ def get_enhanced_api_gateway_checks(ctx: ScanContext) -> dict[str, Any]:
                                 from datetime import datetime
 
                                 cw = ctx.client("cloudwatch")
-                                end = datetime.now(timezone.utc)
+                                end = datetime.now(UTC)
                                 start = end - timedelta(days=30)
                                 resp = cw.get_metric_statistics(
                                     Namespace="AWS/ApiGateway",
@@ -159,11 +304,15 @@ def get_enhanced_api_gateway_checks(ctx: ScanContext) -> dict[str, Any]:
                         context=f"apigateway:GetResources failed for API '{api_name}'",
                     )
 
-                # API Gateway Caching finding removed: "Reduced backend costs" with no
-                # quantification — caching actually adds API Gateway cost ($0.020-$3.80/hr
-                # by cache size); whether net savings exist depends on backend pricing
-                # not measured here.
-                _ = api_id
+                # AG-3 — the previous note here ("caching actually adds API
+                # Gateway cost $0.020-$3.80/hr by cache size") found the rate and
+                # then deleted the lever instead of inverting it. A PROVISIONED
+                # stage cache bills 24/7 whether or not anything hits it, so a
+                # cache on a stage with zero requests is pure waste at a known,
+                # exact rate. That is the lever; the old framing (does caching
+                # pay for itself in reduced backend cost?) needed backend
+                # pricing this scanner does not measure, but this one does not.
+                checks["stage_caches"].extend(_stage_cache_recs(ctx, apigateway, api_id, api_name))
 
     except Exception as e:
         # H1 — classify the outer failure (account-wide AccessDenied on

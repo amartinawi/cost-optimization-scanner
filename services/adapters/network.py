@@ -160,6 +160,10 @@ class NetworkModule(BaseServiceModule):
     key: str = "network"
     cli_aliases: tuple[str, ...] = ("network",)
     display_name: str = "Network & Infrastructure"
+    # The ASG sub-shim (services/ec2.get_auto_scaling_checks) has always read
+    # ctx.fast_mode, and the NET-E idle-LB lever now skips its 1+N describe
+    # calls under --fast. The declaration was missing for the ASG case too.
+    reads_fast_mode: bool = True
 
     def required_clients(self) -> tuple[str, ...]:
         """Returns boto3 client names required for network infrastructure scanning."""

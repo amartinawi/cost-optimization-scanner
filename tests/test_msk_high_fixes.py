@@ -79,15 +79,25 @@ def _ctx(
     *,
     pricing_multiplier: float = 1.0,
     region: str = "us-east-1",
+    cloudwatch: Any = None,
+    fast_mode: bool = True,
 ) -> SimpleNamespace:
     warnings: list[tuple[Any, str]] = []
+    permissions: list[str] = []
+    clients = {"kafka": kafka_client, "cloudwatch": cloudwatch}
+    # MSK-1 reads AWS/Kafka ConnectionCount. These tests predate that lever and
+    # target the pricing legs, so they default to fast_mode (no CloudWatch read)
+    # rather than pretending a metric result.
     return SimpleNamespace(
         pricing_engine=pricing_engine,
         pricing_multiplier=pricing_multiplier,
         region=region,
+        fast_mode=fast_mode,
         warnings=warnings,
-        client=lambda name, region=None: kafka_client if name == "kafka" else None,
+        permissions=permissions,
+        client=lambda name, region=None: clients.get(name),
         warn=lambda msg, service=None: warnings.append((service, msg)),
+        permission_issue=lambda msg, service=None, action=None: permissions.append(msg),
     )
 
 

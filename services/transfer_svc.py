@@ -6,13 +6,21 @@ This module will later become TransferModule (T-XXX) implementing ServiceModule.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from core.scan_context import ScanContext
 from services._aws_errors import record_aws_error
 
 TRANSFER_OPTIMIZATION_DESCRIPTIONS: dict[str, dict[str, str]] = {
+    "idle_servers": {
+        "title": "Stop Idle Transfer Family Servers",
+        "description": (
+            "An ONLINE server bills every enabled protocol at $0.30/hour ($219/month each)"
+            " whether or not any client connects."
+        ),
+        "action": "Stop servers with no client connections (reversible - the server can be started again)",
+    },
     "protocol_optimization": {
         "title": "Optimize Transfer Family Protocols",
         "description": "Protocol costs vary by region and endpoint type. Review if all protocols are needed.",
@@ -21,11 +29,41 @@ TRANSFER_OPTIMIZATION_DESCRIPTIONS: dict[str, dict[str, str]] = {
 }
 
 
+# A server nobody has connected to in this many days is idle. The window doubles
+# as the data-transfer note's window so only one CloudWatch read is made.
+_IDLE_WINDOW_DAYS = 30
+
+
+def _server_protocols(ctx: ScanContext, server_id: str | None) -> list[str]:
+    """Protocols enabled on a server, or ``[]`` when unreadable.
+
+    ``ListServers`` returns ``ListedServer``, which has no ``Protocols`` member;
+    only ``DescribeServer`` carries it. Returning ``[]`` on failure means the
+    caller emits no priced rec, which is the safe direction: the per-protocol
+    hourly charge cannot be computed without the protocol count.
+    """
+    if not server_id:
+        return []
+    try:
+        described = ctx.client("transfer").describe_server(ServerId=server_id)
+        protocols = (described.get("Server") or {}).get("Protocols") or []
+        return [str(p) for p in protocols]
+    except Exception as exc:
+        record_aws_error(
+            ctx,
+            exc,
+            service="transfer",
+            context=f"transfer:DescribeServer failed for {server_id}",
+        )
+        return []
+
+
 def get_enhanced_transfer_checks(ctx: ScanContext) -> dict[str, Any]:
     """Get enhanced Transfer Family cost optimization checks."""
     checks: dict[str, list[dict[str, Any]]] = {
         "unused_servers": [],
         "protocol_optimization": [],
+        "idle_servers": [],
     }
 
     try:
@@ -37,7 +75,14 @@ def get_enhanced_transfer_checks(ctx: ScanContext) -> dict[str, Any]:
             for server in servers:
                 server_id = server.get("ServerId")
                 state = server.get("State")
-                protocols = server.get("Protocols", [])
+                # TR-3 — ListedServer has NO Protocols member (verified against
+                # the botocore transfer model): every rec here read `[]`, so the
+                # `len(protocols) > 1` protocol lever below could never fire on
+                # a real payload, and the data-transfer note it carried never
+                # rendered either. Protocols live on DescribedServer. Only an
+                # ONLINE server is billing protocol hours, so the extra describe
+                # is spent only where a dollar can follow from it.
+                protocols = _server_protocols(ctx, server_id) if state == "ONLINE" else []
 
                 rec: dict[str, Any] = {
                     "ServerId": server_id,
@@ -69,9 +114,18 @@ def get_enhanced_transfer_checks(ctx: ScanContext) -> dict[str, Any]:
                 if not ctx.fast_mode:
                     try:
                         cw = ctx.client("cloudwatch")
-                        end = datetime.now(timezone.utc)
-                        start = end - timedelta(days=14)
+                        end = datetime.now(UTC)
+                        start = end - timedelta(days=_IDLE_WINDOW_DAYS)
                         uploaded = downloaded = 0.0
+                        # TR-1 — the SUM is not the idle signal; the PRESENCE of
+                        # datapoints is. AWS documents these metrics as "emitted
+                        # every 5 minutes WHILE A CONNECTION IS ESTABLISHED... if
+                        # no files or bytes are transferred in the period, '0' is
+                        # emitted". So a series of zeros means somebody connected
+                        # and moved nothing, while an EMPTY series means nobody
+                        # connected at all. A naive `sum == 0` conflates the two
+                        # and would flag an actively-used server as idle.
+                        datapoints = 0
                         # TR-2 — AWS/Transfer publishes BytesIn / BytesOut
                         # (dimension ServerId), NOT BytesUploaded /
                         # BytesDownloaded: those names match no metric, so
@@ -89,14 +143,34 @@ def get_enhanced_transfer_checks(ctx: ScanContext) -> dict[str, Any]:
                                 Dimensions=[{"Name": "ServerId", "Value": server_id}],
                                 StartTime=start,
                                 EndTime=end,
-                                Period=86400 * 14,
+                                Period=86400 * _IDLE_WINDOW_DAYS,
                                 Statistics=["Sum"],
                             )
                             for dp in pts.get("Datapoints", []):
+                                datapoints += 1
                                 if metric_name == "BytesIn":
                                     uploaded += dp.get("Sum", 0)
                                 else:
                                     downloaded += dp.get("Sum", 0)
+                        if state == "ONLINE" and datapoints == 0 and protocols:
+                            checks["idle_servers"].append(
+                                {
+                                    "ServerId": server_id,
+                                    "State": state,
+                                    "Protocols": list(protocols),
+                                    "ProtocolCount": len(protocols),
+                                    "MetricWindowDays": _IDLE_WINDOW_DAYS,
+                                    "ConnectionDatapoints": 0,
+                                    "IdleEvidence": True,
+                                    "Recommendation": (
+                                        "No client connected in the last "
+                                        f"{_IDLE_WINDOW_DAYS} days - stop the server "
+                                        "(reversible) to end its per-protocol hourly charge"
+                                    ),
+                                    "CheckCategory": "Idle Transfer Servers",
+                                }
+                            )
+
                         upload_gb = uploaded / (1024**3)
                         download_gb = downloaded / (1024**3)
                         total_gb = upload_gb + download_gb
@@ -104,7 +178,7 @@ def get_enhanced_transfer_checks(ctx: ScanContext) -> dict[str, Any]:
                             rec["DataTransferCostGB"] = round(total_gb, 2)
                             rec["DataTransferCostNote"] = (
                                 f"~${upload_gb * 0.04:.2f} upload + ${download_gb * 0.04:.2f} download"
-                                " (14-day; Transfer Family $0.04/GB each way)"
+                                f" ({_IDLE_WINDOW_DAYS}-day; Transfer Family $0.04/GB each way)"
                             )
                     except Exception as cw_err:
                         # Classify: an AccessDenied/throttle on the CW read is a
