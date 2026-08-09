@@ -41,7 +41,6 @@ CW_CUSTOM_METRIC_TIER_3_LIMIT: int = 1_000_000
 # A custom metric that published NO datapoints over this trailing window is
 # treated as stale (removable). Drives the H3 removable quantity from a
 # measured staleness signal instead of a fabricated count//2.
-CUSTOM_METRIC_STALE_LOOKBACK_DAYS: int = 30
 
 # GetMetricData accepts at most 500 MetricDataQueries per call.
 _GET_METRIC_DATA_BATCH: int = 500
@@ -66,115 +65,6 @@ def _cw_custom_metrics_monthly_cost(count: int) -> float:
     tier_4 = max(0, count - CW_CUSTOM_METRIC_TIER_3_LIMIT) * CW_CUSTOM_METRIC_TIER_4
     return tier_1 + tier_2 + tier_3 + tier_4
 
-
-def _stale_custom_metric_counts(
-    cloudwatch: Any,
-    metrics: list[dict[str, Any]],
-    lookback_days: int,
-) -> dict[str, int]:
-    """Return per-namespace count of STALE custom metrics.
-
-    A metric is stale when GetMetricData returns no datapoints (empty
-    ``Values``) for it over the trailing ``lookback_days`` window — i.e. it
-    published nothing and is genuinely removable. Each unique
-    ``(Namespace, MetricName, Dimensions)`` is one billable metric stream.
-    Queries are batched 500-per-call (the GetMetricData limit) and
-    ``NextToken``-paginated.
-
-    Raises on API error so the caller can classify the failure and fall back
-    to a $0 advisory rather than fabricate a removable quantity (H3).
-    """
-    end = datetime.now(UTC)
-    start = end - timedelta(days=lookback_days)
-    period = max(60, lookback_days * 86400)  # one bucket spanning the window
-    stale_by_ns: dict[str, int] = {}
-
-    for offset in range(0, len(metrics), _GET_METRIC_DATA_BATCH):
-        batch = metrics[offset : offset + _GET_METRIC_DATA_BATCH]
-        id_to_metric: dict[str, dict[str, Any]] = {}
-        queries: list[dict[str, Any]] = []
-        for i, metric in enumerate(batch):
-            qid = f"m{i}"
-            id_to_metric[qid] = metric
-            queries.append(
-                {
-                    "Id": qid,
-                    "MetricStat": {
-                        "Metric": {
-                            "Namespace": metric.get("Namespace", ""),
-                            "MetricName": metric.get("MetricName", ""),
-                            "Dimensions": metric.get("Dimensions", []),
-                        },
-                        "Period": period,
-                        "Stat": "SampleCount",
-                    },
-                    "ReturnData": True,
-                }
-            )
-
-        active_ids: set[str] = set()
-        next_token = None
-        while True:
-            kwargs: dict[str, Any] = {
-                "MetricDataQueries": queries,
-                "StartTime": start,
-                "EndTime": end,
-            }
-            if next_token:
-                kwargs["NextToken"] = next_token
-            response = cloudwatch.get_metric_data(**kwargs)
-            for result in response.get("MetricDataResults", []):
-                if result.get("Values"):
-                    active_ids.add(result.get("Id"))
-            next_token = response.get("NextToken")
-            if not next_token:
-                break
-
-        for qid, metric in id_to_metric.items():
-            if qid not in active_ids:
-                namespace = metric.get("Namespace", "")
-                stale_by_ns[namespace] = stale_by_ns.get(namespace, 0) + 1
-
-    return stale_by_ns
-
-
-MONITORING_OPTIMIZATION_DESCRIPTIONS: dict[str, dict[str, str]] = {
-    "never_expiring_logs": {
-        "title": "Set Log Retention Policies",
-        "description": "Log groups without retention policies grow indefinitely, increasing storage costs.",
-        "action": "Set retention policy (e.g., 30 days) on all log groups",
-    },
-    "excessive_logging": {
-        "title": "Reduce Excessive Log Storage",
-        "description": "Large log groups may indicate excessive logging or missing log level controls.",
-        "action": "Review log levels and reduce retention for non-essential logs",
-    },
-    "unused_custom_metrics": {
-        "title": "Optimize Custom Metrics",
-        "description": "High volumes of custom metrics incur significant monthly charges.",
-        "action": "Review and reduce unnecessary custom metrics",
-    },
-    "unused_alarms": {
-        "title": "Clean Up Stale Alarms",
-        "description": "Alarms with persistent insufficient data may be monitoring unavailable metrics.",
-        "action": "Delete or reconfigure alarms with prolonged insufficient data",
-    },
-    "multi_region_trails": {
-        "title": "Optimize Multi-Region Trails",
-        "description": "Multi-region CloudTrail trails replicate events to all regions, increasing costs.",
-        "action": "Use single-region trails where multi-region is not required",
-    },
-    "data_events_all_s3": {
-        "title": "Scope S3 Data Events",
-        "description": "Data events for all S3 objects generate very high volume and cost.",
-        "action": "Limit data events to specific buckets",
-    },
-    "data_events_all_lambda": {
-        "title": "Scope Lambda Data Events",
-        "description": "Data events for all Lambda functions increase CloudTrail costs.",
-        "action": "Limit data events to specific functions",
-    },
-}
 
 
 def get_cloudwatch_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> dict[str, Any]:
@@ -297,128 +187,62 @@ def get_cloudwatch_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> 
 
             high_volume = {ns for ns, c in namespace_counts.items() if c > 100}
 
-            # H3 — the removable quantity must come from a STALENESS signal, not
-            # a fabricated count//2. A custom metric that published no datapoints
-            # over the lookback window is genuinely removable; one still emitting
-            # data is not. Probe only high-volume namespaces (bounded) and gate
-            # on fast mode. No evidence (fast mode / GetMetricData failure) → $0
-            # advisory, never a fabricated count.
-            stale_by_ns = None
-            if high_volume and not fast_mode:
-                probe = [m for m in custom_metrics if m.get("Namespace", "") in high_volume]
-                try:
-                    stale_by_ns = _stale_custom_metric_counts(
-                        cloudwatch, probe, CUSTOM_METRIC_STALE_LOOKBACK_DAYS
-                    )
-                except Exception as e:
-                    # A GetMetricData permission/throttle gap must surface AND
-                    # leave the saving unfabricated (fall through to advisory).
-                    record_aws_error(
-                        ctx, e, service="monitoring", context="cloudwatch:GetMetricData failed"
-                    )
-                    stale_by_ns = None
-
-            # AWS custom-metric tiering is account-wide per region ($0.30 first 10k,
-            # then $0.10, then $0.05), so the removable (stale) metrics come off the
-            # TOP of the account's metric stack. Anchor the marginal-rate computation
-            # on the total custom-metric count and walk it down as each namespace's
-            # stale metrics are attributed — pricing per-namespace from 0 overstated
-            # the saving once the account exceeds the 10k tier-1 limit.
+            # MON-1/MON-2 — the previous lever counted "stale" custom metrics
+            # as a removable dollar. That was inverted twice over: CloudWatch
+            # bills per PutMetricData-ACTIVE metric-month, so a metric that
+            # stopped publishing is ALREADY FREE (and there is no DeleteMetric
+            # API — metrics age out on their own); and ListMetrics only returns
+            # metrics with datapoints in ~2 weeks, so every metric enumerated
+            # here is inside any 30d window — the stale set was empty on
+            # healthy accounts and non-empty exactly when the GetMetricData
+            # probe broke (its StatusCode was never checked): dead code when
+            # healthy, phantom when it fired. Replaced with a MEASURED-SPEND
+            # advisory: what the namespace's active metrics bill at the
+            # account-wide marginal tier ($0 counted — the only way to save is
+            # to stop publishing, which this scan cannot verify anyone wants).
             running_account_count = len(custom_metrics)
-
             for namespace in sorted(high_volume):
                 count = namespace_counts[namespace]
-
-                if stale_by_ns is None:
-                    # No staleness evidence → advisory $0 (never count//2).
-                    checks["unused_custom_metrics"].append(
-                        {
-                            "Namespace": namespace,
-                            "MetricCount": count,
-                            "StaleMetricCount": None,
-                            "Recommendation": (
-                                f"High number of custom metrics ({count}) - review necessity"
-                            ),
-                            "EstimatedSavings": (
-                                "$0.00/month — advisory: removable metrics require per-metric "
-                                f"staleness (no datapoints over {CUSTOM_METRIC_STALE_LOOKBACK_DAYS}d); "
-                                "run without --fast / grant cloudwatch:GetMetricData"
-                            ),
-                            "EstimatedMonthlySavings": 0.0,
-                            "Counted": False,
-                            "CheckCategory": "Excessive Custom Metrics",
-                            "AuditBasis": {
-                                "metric_count": count,
-                                "reason": "no GetMetricData staleness evidence (fast mode or read failure)",
-                                "formula": "advisory $0",
-                            },
-                        }
-                    )
-                    continue
-
-                stale = stale_by_ns.get(namespace, 0)
-                if stale <= 0:
-                    # Measured: every custom metric still publishing → nothing removable.
-                    checks["unused_custom_metrics"].append(
-                        {
-                            "Namespace": namespace,
-                            "MetricCount": count,
-                            "StaleMetricCount": 0,
-                            "Recommendation": (
-                                f"All {count} custom metrics published data in the last "
-                                f"{CUSTOM_METRIC_STALE_LOOKBACK_DAYS}d - none stale"
-                            ),
-                            "EstimatedSavings": "$0.00/month — advisory: no stale metrics measured",
-                            "EstimatedMonthlySavings": 0.0,
-                            "Counted": False,
-                            "CheckCategory": "Excessive Custom Metrics",
-                            "AuditBasis": {
-                                "metric_count": count,
-                                "stale_metric_count": 0,
-                                "metric_window": (
-                                    f"{CUSTOM_METRIC_STALE_LOOKBACK_DAYS}d GetMetricData SampleCount"
-                                ),
-                                "formula": "advisory $0 (no stale metrics)",
-                            },
-                        }
-                    )
-                    continue
-
-                # Counted: removable = measured stale metrics, priced at the
-                # account-wide MARGINAL tier (top of the stack), region-scaled.
-                current_cost = _cw_custom_metrics_monthly_cost(running_account_count)
-                reduced_cost = _cw_custom_metrics_monthly_cost(running_account_count - stale)
-                monthly_savings = (current_cost - reduced_cost) * pricing_multiplier
-                running_account_count -= stale
+                spend = (
+                    _cw_custom_metrics_monthly_cost(running_account_count)
+                    - _cw_custom_metrics_monthly_cost(running_account_count - count)
+                ) * pricing_multiplier
+                running_account_count -= count
                 checks["unused_custom_metrics"].append(
                     {
                         "Namespace": namespace,
                         "MetricCount": count,
-                        "StaleMetricCount": stale,
                         "Recommendation": (
-                            f"{stale} of {count} custom metrics published no data in "
-                            f"{CUSTOM_METRIC_STALE_LOOKBACK_DAYS}d - delete to stop per-metric charges"
+                            f"{count} active custom metrics bill ~${spend:.2f}/mo — review "
+                            "whether each publisher is still needed (stopping PutMetricData "
+                            "stops the charge; idle metrics are already free)"
                         ),
-                        "EstimatedSavings": f"${monthly_savings:.2f}/month if {stale} stale metrics removed",
-                        "EstimatedMonthlySavings": round(monthly_savings, 2),
+                        "EstimatedSavings": (
+                            f"$0.00/month — advisory: ~${spend:.2f}/mo billed for {count} "
+                            "active custom metrics in this namespace; a saving requires "
+                            "stopping unneeded publishers, which this scan cannot verify"
+                        ),
+                        "EstimatedMonthlySavings": 0.0,
+                        "Counted": False,
                         "CheckCategory": "Excessive Custom Metrics",
                         "AuditBasis": {
                             "metric_count": count,
-                            "stale_metric_count": stale,
+                            "billed_monthly_estimate": round(spend, 2),
                             "tier_rates_per_metric_month": [
                                 CW_CUSTOM_METRIC_TIER_1,
                                 CW_CUSTOM_METRIC_TIER_2,
                                 CW_CUSTOM_METRIC_TIER_3,
+                                CW_CUSTOM_METRIC_TIER_4,
                             ],
-                            "metric_window": (
-                                f"{CUSTOM_METRIC_STALE_LOOKBACK_DAYS}d GetMetricData SampleCount "
-                                "(no datapoints = stale)"
-                            ),
                             "region_multiplier": round(pricing_multiplier, 4),
-                            "account_marginal_anchor": running_account_count + stale,
+                            "account_marginal_anchor": running_account_count + count,
                             "formula": (
-                                "(tiered_cost(account_anchor) - tiered_cost(account_anchor - stale)) "
-                                "x region_multiplier  [account-wide marginal tier]"
+                                "(tiered_cost(anchor) - tiered_cost(anchor - count)) x "
+                                "region_multiplier — MEASURED SPEND, not a saving"
+                            ),
+                            "reason": (
+                                "idle custom metrics are not billed and cannot be deleted; "
+                                "only active publishers cost money (MON-1)"
                             ),
                         },
                     }

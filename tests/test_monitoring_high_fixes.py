@@ -39,7 +39,6 @@ import services.adapters.monitoring as monitoring_adapter
 from services.monitoring import (
     CW_CUSTOM_METRIC_TIER_1,
     _cw_custom_metrics_monthly_cost,
-    _stale_custom_metric_counts,
     get_cloudtrail_checks,
     get_cloudwatch_checks,
 )
@@ -221,73 +220,57 @@ def test_custom_metric_cost_applies_fourth_tier_above_1m() -> None:
     assert _cw_custom_metrics_monthly_cost(2_000_000) < old_flat_tier3
 
 
-def test_unused_custom_metrics_counts_only_stale_metrics() -> None:
+def test_custom_metrics_advisory_reports_measured_spend_never_counts() -> None:
+    """MON-1: CloudWatch bills per PutMetricData-ACTIVE metric-month — an idle
+    metric is already free and there is no DeleteMetric API, so a counted
+    "stale metrics removable" dollar was a phantom (and ListMetrics' ~2-week
+    horizon meant the stale set was empty on healthy accounts, non-empty
+    exactly when the GetMetricData probe broke — MON-2). The lever is now a
+    measured-SPEND advisory: $0 counted, the billed figure in AuditBasis."""
     metrics = _custom_metrics("MyApp", 120)
-    # 40 active (m0..m39) → 80 stale.
-    active = {f"m{i}" for i in range(40)}
-    cw = _FakeCloudWatchClient(metrics=metrics, metric_data_fn=_metric_data_fn(active))
+    cw = _FakeCloudWatchClient(metrics=metrics)
     ctx = _shim_ctx({"logs": _FakeLogsClient([]), "cloudwatch": cw})
 
     result = get_cloudwatch_checks(ctx, pricing_multiplier=1.0)
     recs = result["unused_custom_metrics"]
     assert len(recs) == 1
     rec = recs[0]
-    assert rec["StaleMetricCount"] == 80
-    # cost(120)-cost(40) = (120-40)*$0.30 = $24.00 (NOT count//2 → $18.00).
-    expected = (_cw_custom_metrics_monthly_cost(120) - _cw_custom_metrics_monthly_cost(40))
-    assert expected == pytest.approx(24.0)
-    assert rec["EstimatedMonthlySavings"] == pytest.approx(24.0)
-    old_count_half = _cw_custom_metrics_monthly_cost(120) - _cw_custom_metrics_monthly_cost(60)
-    assert rec["EstimatedMonthlySavings"] != pytest.approx(old_count_half)  # not $18.00
-    assert rec.get("Counted", True) is True
-    assert _counted_sum(result["recommendations"]) == pytest.approx(24.0)
+    assert rec["Counted"] is False
+    assert rec["EstimatedMonthlySavings"] == 0.0
+    assert rec["EstimatedSavings"].startswith("$0.00/month")
+    # Measured spend (120 x $0.30 = $36.00) surfaces as billed estimate.
+    assert rec["AuditBasis"]["billed_monthly_estimate"] == pytest.approx(36.0)
+    assert _counted_sum(result["recommendations"]) == 0.0
+    # MON-2: the fragile GetMetricData staleness probe is gone entirely.
+    assert cw.get_metric_data_calls == 0
 
 
-def test_custom_metrics_priced_at_account_wide_marginal_tier() -> None:
+def test_custom_metrics_spend_uses_account_wide_marginal_tier() -> None:
     # AWS tiers custom metrics account-wide per region ($0.30 first 10k, then
-    # $0.10). Two high-volume namespaces (8000 + 4000 = 12000 metrics, all stale)
-    # must be priced at the marginal tier, not as if each started at $0.30.
+    # $0.10). Two high-volume namespaces (8000 + 4000 = 12000 metrics) must
+    # attribute spend at the marginal tier, not as if each started at $0.30.
     metrics = _custom_metrics("nsA", 8000) + _custom_metrics("nsB", 4000)
-    cw = _FakeCloudWatchClient(metrics=metrics, metric_data_fn=_metric_data_fn(active_names=set()))
+    cw = _FakeCloudWatchClient(metrics=metrics)
     ctx = _shim_ctx({"logs": _FakeLogsClient([]), "cloudwatch": cw})
 
     result = get_cloudwatch_checks(ctx, pricing_multiplier=1.0)
-    total = _counted_sum(result["recommendations"])
-
-    # Account-wide marginal: cost(12000) - cost(0) = 10000*0.30 + 2000*0.10 = $3200.
-    expected = _cw_custom_metrics_monthly_cost(12000) - _cw_custom_metrics_monthly_cost(0)
-    assert expected == pytest.approx(3200.0)
-    assert total == pytest.approx(3200.0)
-    # The old per-namespace pricing (each starting at tier-1 $0.30) overstated by
-    # $400: 8000*0.30 + 4000*0.30 = $3600.
-    old_per_namespace = 8000 * 0.30 + 4000 * 0.30
-    assert old_per_namespace == pytest.approx(3600.0)
-    assert total != pytest.approx(old_per_namespace)
+    recs = result["unused_custom_metrics"]
+    total_billed = sum(r["AuditBasis"]["billed_monthly_estimate"] for r in recs)
+    # cost(12000) = 10000*0.30 + 2000*0.10 = $3200 — not 12000*0.30 = $3600.
+    assert total_billed == pytest.approx(3200.0)
+    # Nothing counted, ever.
+    assert _counted_sum(result["recommendations"]) == 0.0
 
 
-def test_unused_custom_metrics_region_scaled() -> None:
+def test_custom_metrics_spend_estimate_region_scaled() -> None:
     metrics = _custom_metrics("MyApp", 120)
-    active = {f"m{i}" for i in range(40)}  # 80 stale
-    cw = _FakeCloudWatchClient(metrics=metrics, metric_data_fn=_metric_data_fn(active))
+    cw = _FakeCloudWatchClient(metrics=metrics)
     ctx = _shim_ctx({"logs": _FakeLogsClient([]), "cloudwatch": cw})
 
     result = get_cloudwatch_checks(ctx, pricing_multiplier=1.25)
     rec = result["unused_custom_metrics"][0]
-    assert rec["EstimatedMonthlySavings"] == pytest.approx(24.0 * 1.25)  # $30.00
-
-
-def test_unused_custom_metrics_no_stale_is_advisory() -> None:
-    metrics = _custom_metrics("MyApp", 150)
-    active = {f"m{i}" for i in range(150)}  # all active → 0 stale
-    cw = _FakeCloudWatchClient(metrics=metrics, metric_data_fn=_metric_data_fn(active))
-    ctx = _shim_ctx({"logs": _FakeLogsClient([]), "cloudwatch": cw})
-
-    result = get_cloudwatch_checks(ctx, pricing_multiplier=1.0)
-    rec = result["unused_custom_metrics"][0]
-    assert rec["StaleMetricCount"] == 0
+    assert rec["AuditBasis"]["billed_monthly_estimate"] == pytest.approx(36.0 * 1.25)
     assert rec["EstimatedMonthlySavings"] == 0.0
-    assert rec["Counted"] is False
-    assert _counted_sum(result["recommendations"]) == 0.0
 
 
 def test_fast_mode_skips_cloudwatch_describe_paginators() -> None:
@@ -308,248 +291,18 @@ def test_fast_mode_skips_cloudwatch_describe_paginators() -> None:
     assert cw.describe_alarms_paginate_calls == 0
 
 
-def test_unused_custom_metrics_get_metric_data_denied_is_permission_and_advisory() -> None:
+def test_no_get_metric_data_probe_remains() -> None:
+    """MON-2: the staleness probe (whose broken reads manufactured the stale
+    set) is deleted — the custom-metric block must not call GetMetricData."""
     metrics = _custom_metrics("MyApp", 200)
 
-    def denied(**_kwargs: Any) -> dict[str, Any]:
-        raise ClientError(
-            {"Error": {"Code": "AccessDenied", "Message": "no GetMetricData"}}, "GetMetricData"
-        )
+    def boom(**_kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("GetMetricData must not be called")
 
-    cw = _FakeCloudWatchClient(metrics=metrics, metric_data_fn=denied)
+    cw = _FakeCloudWatchClient(metrics=metrics, metric_data_fn=boom)
     ctx = _shim_ctx({"logs": _FakeLogsClient([]), "cloudwatch": cw})
 
     result = get_cloudwatch_checks(ctx, pricing_multiplier=1.0)
     rec = result["unused_custom_metrics"][0]
-    assert rec["EstimatedMonthlySavings"] == 0.0
     assert rec["Counted"] is False
-    # Permission gap classified, not swallowed.
-    assert any("GetMetricData" in msg for _svc, _action, msg in ctx.permissions)
-    assert ctx.warnings == []
-
-
-def test_low_volume_namespace_not_probed() -> None:
-    # 50 custom metrics (<=100) → no rec, no GetMetricData probe.
-    metrics = _custom_metrics("Small", 50)
-    cw = _FakeCloudWatchClient(metrics=metrics, metric_data_fn=_metric_data_fn(set()))
-    ctx = _shim_ctx({"logs": _FakeLogsClient([]), "cloudwatch": cw})
-
-    result = get_cloudwatch_checks(ctx, pricing_multiplier=1.0)
-    assert result["unused_custom_metrics"] == []
     assert cw.get_metric_data_calls == 0
-    # Outside fast mode the list_metrics paginator DOES run (contrast with L3).
-    assert cw.list_metrics_paginate_calls == 1
-
-
-def test_aws_namespace_metrics_excluded() -> None:
-    # 200 AWS/ metrics must not be treated as billable custom metrics.
-    metrics = [
-        {"Namespace": "AWS/EC2", "MetricName": f"m{i}", "Dimensions": []} for i in range(200)
-    ]
-    cw = _FakeCloudWatchClient(metrics=metrics, metric_data_fn=_metric_data_fn(set()))
-    ctx = _shim_ctx({"logs": _FakeLogsClient([]), "cloudwatch": cw})
-
-    result = get_cloudwatch_checks(ctx, pricing_multiplier=1.0)
-    assert result["unused_custom_metrics"] == []
-    assert cw.get_metric_data_calls == 0
-
-
-# --------------------------------------------------------------------------- #
-# monitoring H3 — staleness helper: batching + empty-Values detection
-# --------------------------------------------------------------------------- #
-def test_stale_helper_detects_empty_values_per_namespace() -> None:
-    metrics = (
-        _custom_metrics("nsA", 3)  # names m0,m1,m2
-        + [{"Namespace": "nsB", "MetricName": f"b{i}", "Dimensions": []} for i in range(2)]
-    )
-    # Active: m0 (nsA) and b0 (nsB). Stale: m1, m2 (nsA) and b1 (nsB).
-    cw = _FakeCloudWatchClient(metric_data_fn=_metric_data_fn({"m0", "b0"}))
-    stale = _stale_custom_metric_counts(cw, metrics, lookback_days=30)
-    assert stale == {"nsA": 2, "nsB": 1}
-
-
-def test_stale_helper_batches_in_chunks_of_500() -> None:
-    metrics = _custom_metrics("Big", 1001)  # 1001 → 3 GetMetricData calls
-    cw = _FakeCloudWatchClient(metric_data_fn=_metric_data_fn(set()))  # all stale
-    stale = _stale_custom_metric_counts(cw, metrics, lookback_days=30)
-    assert stale == {"Big": 1001}
-    assert cw.get_metric_data_calls == 3
-
-
-def test_stale_helper_handles_get_metric_data_pagination() -> None:
-    metrics = _custom_metrics("Pag", 2)
-
-    state = {"calls": 0}
-
-    def paged(MetricDataQueries: list[dict[str, Any]], NextToken: str | None = None, **_kw: Any):  # noqa: N803
-        state["calls"] += 1
-        if NextToken is None:
-            # First page returns only m0 active; signal more via NextToken.
-            return {
-                "MetricDataResults": [{"Id": MetricDataQueries[0]["Id"], "Values": [1.0]}],
-                "NextToken": "more",
-            }
-        # Second page returns m1 with no datapoints (stale).
-        return {"MetricDataResults": [{"Id": MetricDataQueries[1]["Id"], "Values": []}]}
-
-    cw = _FakeCloudWatchClient(metric_data_fn=paged)
-    stale = _stale_custom_metric_counts(cw, metrics, lookback_days=30)
-    assert stale == {"Pag": 1}  # m1 stale, m0 active
-    assert state["calls"] == 2
-
-
-# --------------------------------------------------------------------------- #
-# monitoring H4 — Route 53 zone counted once across the two checks
-# --------------------------------------------------------------------------- #
-def _zone(zid: str, name: str, *, private: bool, records: int) -> dict[str, Any]:
-    return {
-        "Id": f"/hostedzone/{zid}",
-        "Name": name,
-        "Config": {"PrivateZone": private},
-        "ResourceRecordSetCount": records,
-    }
-
-
-def test_route53_normalize_zone_id() -> None:
-    assert _normalize_zone_id("/hostedzone/Z123") == "Z123"
-    assert _normalize_zone_id("Z123") == "Z123"
-    assert _normalize_zone_id("") == ""
-
-
-def test_route53_low_record_duplicate_counted_once() -> None:
-    # Two same-name private zones, BOTH nearly empty → both flagged unused.
-    # The duplicate check must add $0 (every removable zone already counted).
-    zones = [
-        _zone("Z1", "dup.internal.", private=True, records=2),
-        _zone("Z2", "dup.internal.", private=True, records=2),
-    ]
-    ctx = _shim_ctx({"route53": _FakeRoute53Client(zones)})
-    result = get_route53_checks(ctx, pricing_multiplier=1.0)
-
-    unused = result["unused_hosted_zones"]
-    dup = result["duplicate_private_zones"]
-    assert len(unused) == 2  # both zones, $0.50 each
-    assert len(dup) == 1
-    assert dup[0]["EstimatedMonthlySavings"] == 0.0
-    assert dup[0]["Counted"] is False
-    assert dup[0]["AuditBasis"]["already_counted_as_unused"] == 2
-    assert dup[0]["AuditBasis"]["removable_zones"] == 0
-    # Old code: 2*$0.50 (unused) + $0.50 (dup) = $1.50 (Z2 double-counted).
-    # Deduped: only the two unused zones → $1.00.
-    assert _counted_sum(result["recommendations"]) == pytest.approx(1.0)
-
-
-def test_route53_high_record_duplicates_counted_in_duplicate_check() -> None:
-    # Three same-name private zones, none nearly-empty → duplicate check owns
-    # the (N-1)=2 removable zones; no overlap with unused.
-    zones = [
-        _zone("Z3", "dup2.internal.", private=True, records=10),
-        _zone("Z4", "dup2.internal.", private=True, records=10),
-        _zone("Z5", "dup2.internal.", private=True, records=10),
-    ]
-    ctx = _shim_ctx({"route53": _FakeRoute53Client(zones)})
-    result = get_route53_checks(ctx, pricing_multiplier=1.0)
-
-    assert result["unused_hosted_zones"] == []
-    dup = result["duplicate_private_zones"]
-    assert len(dup) == 1
-    # 2 removable zones × $0.50 (base 3 zones < 25) = $1.00.
-    assert dup[0]["EstimatedMonthlySavings"] == pytest.approx(1.0)
-    assert dup[0]["AuditBasis"]["removable_zones"] == 2
-    assert _counted_sum(result["recommendations"]) == pytest.approx(1.0)
-
-
-def test_route53_partial_overlap_no_double_count() -> None:
-    # Three same-name private zones; ONE is nearly empty (counted unused).
-    # Consolidation removes 2 zones total; the unused one is one of them, so
-    # the duplicate check may only add the remaining 1.
-    zones = [
-        _zone("Z6", "dup3.internal.", private=True, records=2),   # unused
-        _zone("Z7", "dup3.internal.", private=True, records=10),
-        _zone("Z8", "dup3.internal.", private=True, records=10),
-    ]
-    ctx = _shim_ctx({"route53": _FakeRoute53Client(zones)})
-    result = get_route53_checks(ctx, pricing_multiplier=1.0)
-
-    unused = result["unused_hosted_zones"]
-    dup = result["duplicate_private_zones"]
-    assert len(unused) == 1
-    assert unused[0]["EstimatedMonthlySavings"] == pytest.approx(0.5)
-    assert dup[0]["AuditBasis"]["already_counted_as_unused"] == 1
-    assert dup[0]["AuditBasis"]["removable_zones"] == 1
-    assert dup[0]["EstimatedMonthlySavings"] == pytest.approx(0.5)
-    # Total: $0.50 (unused) + $0.50 (dup) = $1.00 — NOT $1.50 (old double count).
-    assert _counted_sum(result["recommendations"]) == pytest.approx(1.0)
-
-
-# --------------------------------------------------------------------------- #
-# scan() path — adapter sums only counted recs (advisory $0 excluded)
-# --------------------------------------------------------------------------- #
-def test_scan_excludes_advisory_dollars_from_counted_total(monkeypatch: pytest.MonkeyPatch) -> None:
-    cw_recs = [
-        {"EstimatedMonthlySavings": 24.0, "CheckCategory": "Excessive Custom Metrics"},  # counted
-        {
-            "EstimatedMonthlySavings": 0.0,
-            "Counted": False,
-            "CheckCategory": "Never-Expiring Log Groups",
-        },  # H2 advisory
-    ]
-    r53_recs = [
-        {"EstimatedMonthlySavings": 1.0, "CheckCategory": "Unused Hosted Zones"},  # counted
-        {
-            "EstimatedMonthlySavings": 0.0,
-            "Counted": False,
-            "CheckCategory": "Duplicate Private Zones",
-        },  # H4 deduped advisory
-    ]
-    monkeypatch.setattr(
-        monitoring_adapter,
-        "get_cloudwatch_checks",
-        lambda ctx, mult: {"recommendations": [dict(r) for r in cw_recs]},
-    )
-    monkeypatch.setattr(
-        monitoring_adapter, "get_cloudtrail_checks", lambda ctx: {"recommendations": []}
-    )
-    monkeypatch.setattr(
-        monitoring_adapter, "get_backup_checks", lambda ctx: {"recommendations": []}
-    )
-    monkeypatch.setattr(
-        monitoring_adapter,
-        "get_route53_checks",
-        lambda ctx, mult: {"recommendations": [dict(r) for r in r53_recs]},
-    )
-
-    findings = monitoring_adapter.MonitoringModule().scan(SimpleNamespace(pricing_multiplier=1.0))
-    # Only the two counted recs: $24.00 + $1.00 = $25.00; advisory $0 excluded.
-    assert findings.total_monthly_savings == pytest.approx(25.0)
-
-
-def test_tier_constant_matches_live_pricing() -> None:
-    # Live AWS Pricing API (2026-06-27) tier-1 custom metric rate = $0.30.
-    assert CW_CUSTOM_METRIC_TIER_1 == 0.30
-
-
-# --------------------------------------------------------------------------- #
-# monitoring L1 — CloudTrail dead-cost walk removed (zero recs, zero API calls)
-# --------------------------------------------------------------------------- #
-def test_cloudtrail_checks_makes_no_api_calls_and_emits_nothing() -> None:
-    # The walk (describe_trails + per-trail get_event_selectors) spent API quota
-    # to emit zero recommendations; it is removed. The empty source structure is
-    # retained for a stable report shape.
-    ct = _FakeCloudTrailClient()
-    ctx = _shim_ctx({"cloudtrail": ct})
-
-    result = get_cloudtrail_checks(ctx)
-
-    assert result["recommendations"] == []
-    assert ct.describe_trails_calls == 0
-    assert ct.get_event_selectors_calls == 0
-    for key in (
-        "multi_region_trails",
-        "data_events_all_s3",
-        "data_events_all_lambda",
-        "duplicate_trails",
-        "expensive_storage_trails",
-        "unused_insights",
-    ):
-        assert result[key] == []
