@@ -197,6 +197,10 @@ def test_adapter_no_fargate_returns_empty():
 # Reporter
 # --------------------------------------------------------------------------- #
 def test_ri_utilization_uses_subscription_id_groupby():
+    """H5: the old fixture used TotalAmortizedCost, which is NOT a
+    ReservationAggregates member — the code read it, always got 0.0, and the
+    green test hid that real RI waste never surfaced. Documented members are
+    TotalAmortizedFee and RICostForUnusedHours (preferred: measured)."""
     ce = MagicMock()
     captured = {}
 
@@ -204,7 +208,11 @@ def test_ri_utilization_uses_subscription_id_groupby():
         captured.update(kw)
         return {"UtilizationsByTime": [{"Groups": [
             {"Attributes": {"subscriptionId": "ri-abc"},
-             "Utilization": {"UtilizationPercentage": "40", "TotalAmortizedCost": "100"}},
+             "Utilization": {
+                 "UtilizationPercentage": "40",
+                 "TotalAmortizedFee": "100",
+                 "RICostForUnusedHours": "60",
+             }},
         ]}], "Total": {"UtilizationPercentage": "40", "PurchasedHours": "730"}}
 
     ce.get_reservation_utilization.side_effect = util
@@ -212,8 +220,32 @@ def test_ri_utilization_uses_subscription_id_groupby():
     ctx.warn = MagicMock(); ctx.permission_issue = MagicMock()
     recs, rate = CommitmentAnalysisModule()._check_ri_utilization(ctx, ce, {"Start": "x", "End": "y"})
     assert captured["GroupBy"] == [{"Type": "DIMENSION", "Key": "SUBSCRIPTION_ID"}]
-    assert recs[0]["resource_id"] == "ri-abc" and recs[0]["monthly_savings"] == 60.0  # 100 * (1-0.4)
+    # Measured unused-hours cost wins over the derived fee x (1 - rate).
+    assert recs[0]["resource_id"] == "ri-abc" and recs[0]["monthly_savings"] == 60.0
     assert rate == 0.40
+
+
+def test_ri_waste_falls_back_to_amortized_fee_when_unused_cost_absent():
+    ce = MagicMock()
+    ce.get_reservation_utilization.return_value = {"UtilizationsByTime": [{"Groups": [
+        {"Attributes": {"subscriptionId": "ri-x"},
+         "Utilization": {"UtilizationPercentage": "40", "TotalAmortizedFee": "100"}},
+    ]}], "Total": {"UtilizationPercentage": "40", "PurchasedHours": "730"}}
+    ctx = SimpleNamespace(warn=MagicMock(), permission_issue=MagicMock())
+    recs, _ = CommitmentAnalysisModule()._check_ri_utilization(ctx, ce, {"Start": "x", "End": "y"})
+    assert recs[0]["monthly_savings"] == pytest.approx(60.0)  # 100 * (1 - 0.40)
+
+
+def test_ri_underutilized_with_no_cost_fields_emits_no_counted_zero_row():
+    """H4/D4: the old code emitted a $0 rec for every under-utilized RI
+    because TotalAmortizedCost never existed. No dollar -> no row."""
+    ce = MagicMock()
+    ce.get_reservation_utilization.return_value = {"UtilizationsByTime": [{"Groups": [
+        {"Attributes": {"subscriptionId": "ri-y"}, "Utilization": {"UtilizationPercentage": "40"}},
+    ]}], "Total": {"UtilizationPercentage": "40", "PurchasedHours": "730"}}
+    ctx = SimpleNamespace(warn=MagicMock(), permission_issue=MagicMock())
+    recs, _ = CommitmentAnalysisModule()._check_ri_utilization(ctx, ce, {"Start": "x", "End": "y"})
+    assert recs == []
 
 
 def test_ri_coverage_no_groupby_returns_overall_rate():
