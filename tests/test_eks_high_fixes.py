@@ -494,3 +494,58 @@ def test_h2_cluster_with_managed_nodegroup_skips_corroboration_and_is_not_idle()
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+def test_eks1_capacity_found_via_aws_cluster_name_tag_demotes_idle():
+    """EKS-1: the legacy kubernetes.io/cluster/<name>=owned tag is tool-applied
+    and absent on Karpenter-with-custom-tags / custom-launch-template / Auto
+    Mode capacity; AWS's own cost-allocation tag aws:eks:cluster-name is on
+    EVERY participating instance. Capacity found under ANY tag variant must
+    demote the idle delete — previously such a cluster was counted idle and
+    handed a HIGH 'delete the cluster' rec against live prod."""
+
+    class _TagAwareEc2:
+        def get_paginator(self, op):
+            assert op == "describe_instances"
+
+            class _P:
+                def paginate(self, Filters=None, **_kw):  # noqa: N803 - boto3 shape
+                    names = {f["Name"] for f in (Filters or [])}
+                    if "tag:aws:eks:cluster-name" in names:
+                        return iter(
+                            [{"Reservations": [{"Instances": [{"InstanceId": "i-karpenter"}]}]}]
+                        )
+                    return iter([{"Reservations": []}])  # legacy tag absent
+
+            return _P()
+
+    eks = _FakeEks({"karpenter": _empty_cluster()})
+    findings = EksCostModule().scan(_ctx(eks, _TagAwareEc2()))
+
+    idle = [r for r in _recs(findings, "cluster_costs") if r["check_type"] == "idle_cluster"]
+    assert len(idle) == 1
+    assert idle[0]["Counted"] is False
+    assert findings.total_monthly_savings == 0.0
+
+
+def test_eks2_failed_nodegroup_enumeration_never_counts_idle():
+    """EKS-2 (C8): a failed eks:ListNodegroups is NOT 'zero node groups' — the
+    cluster must not become candidate-idle at all (previously the exception
+    path returned a count of 0, indistinguishable from measured-empty)."""
+
+    class _BoomNgEks(_FakeEks):
+        def get_paginator(self, op):
+            if op == "list_nodegroups":
+                class _P:
+                    def paginate(self, **_kw):
+                        raise Exception("AccessDeniedException: ListNodegroups denied")
+
+                return _P()
+            return super().get_paginator(op)
+
+    eks = _BoomNgEks({"prod": _empty_cluster()})
+    findings = EksCostModule().scan(_ctx(eks, _FakeEc2(owned=0)))
+
+    idle = [r for r in _recs(findings, "cluster_costs") if r["check_type"] == "idle_cluster"]
+    assert idle == []  # ambiguous capacity: no idle assertion of any kind
+    assert findings.total_monthly_savings == 0.0

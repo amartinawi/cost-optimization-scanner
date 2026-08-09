@@ -145,11 +145,11 @@ class EksCostModule(BaseServiceModule):
 
             ngs, ng_count = self._analyze_node_groups(ctx, eks, name)
             node_group_recs.extend(ngs)
-            node_group_count += ng_count
+            node_group_count += ng_count or 0
 
             fgs, fp_count = self._analyze_fargate(ctx, eks, name)
             fargate_recs.extend(fgs)
-            fargate_profile_count += fp_count
+            fargate_profile_count += fp_count or 0
 
             # H2 fail-safe: a cluster with 0 managed node groups and 0 Fargate
             # profiles may still run self-managed / Karpenter-provisioned EC2
@@ -158,6 +158,7 @@ class EksCostModule(BaseServiceModule):
             # zero capacity from EC2 instances tagged
             # kubernetes.io/cluster/<name>=owned. owned_node_count is None when
             # the evidence read is unavailable/ambiguous -> abstain (advisory).
+            # None (enumeration failed) is ambiguous, never candidate-idle.
             is_candidate_idle = ng_count == 0 and fp_count == 0
             owned_node_count = (
                 self._count_owned_ec2_nodes(ctx, name) if is_candidate_idle else 0
@@ -495,17 +496,33 @@ class EksCostModule(BaseServiceModule):
         ec2 = ctx.client("ec2")
         if not ec2:
             return None
+        # EKS-1 — the legacy kubernetes.io/cluster/<name>=owned tag is
+        # tool-applied and absent on Karpenter-with-custom-tags, direct
+        # custom-launch-template, and Auto Mode capacity. AWS's own
+        # cost-allocation tag aws:eks:cluster-name is applied to EVERY EC2
+        # instance participating in a cluster "regardless of whether the
+        # instances are provisioned using managed node groups, Karpenter, or
+        # directly with EC2" (EKS user guide, eks-using-tags). Query each tag
+        # variant; ANY match proves capacity (short-circuit).
+        tag_filters = (
+            {"Name": "tag:aws:eks:cluster-name", "Values": [cluster_name]},
+            {"Name": "tag:eks:cluster-name", "Values": [cluster_name]},
+            {"Name": f"tag:kubernetes.io/cluster/{cluster_name}", "Values": ["owned"]},
+        )
         try:
             count = 0
             paginator = ec2.get_paginator("describe_instances")
-            for page in paginator.paginate(
-                Filters=[
-                    {"Name": f"tag:kubernetes.io/cluster/{cluster_name}", "Values": ["owned"]},
-                    {"Name": "instance-state-name", "Values": ["running", "pending"]},
-                ]
-            ):
-                for reservation in page.get("Reservations", []):
-                    count += len(reservation.get("Instances", []))
+            for tag_filter in tag_filters:
+                for page in paginator.paginate(
+                    Filters=[
+                        tag_filter,
+                        {"Name": "instance-state-name", "Values": ["running", "pending"]},
+                    ]
+                ):
+                    for reservation in page.get("Reservations", []):
+                        count += len(reservation.get("Instances", []))
+                if count:
+                    return count
             return count
         except Exception as e:
             record_aws_error(
@@ -523,7 +540,7 @@ class EksCostModule(BaseServiceModule):
         ctx: Any,
         eks: Any,
         cluster_name: str,
-    ) -> tuple[list[dict[str, Any]], int]:
+    ) -> tuple[list[dict[str, Any]], int | None]:
         """Surface node-group optimization opportunities as ADVISORY only.
 
         Node-group instances are EC2 resources covered by the EC2 adapter
@@ -548,7 +565,10 @@ class EksCostModule(BaseServiceModule):
                 )
             else:
                 ctx.warn(f"EKS list_nodegroups({cluster_name}) failed: {e}", "eks_cost")
-            return recs, 0
+            # EKS-2 (C8): a FAILED enumeration is not "zero node groups" — a
+            # counted delete rec on that basis would rise exactly when a
+            # permission is missing. None = ambiguous; the caller abstains.
+            return recs, None
 
         for ng_name in ng_names:
             try:
@@ -667,7 +687,7 @@ class EksCostModule(BaseServiceModule):
         ctx: Any,
         eks: Any,
         cluster_name: str,
-    ) -> tuple[list[dict[str, Any]], int]:
+    ) -> tuple[list[dict[str, Any]], int | None]:
         """Surface Fargate-profile presence as ADVISORY (no fabricated savings).
 
         Quantifying Fargate pod cost requires real pod count and per-pod
@@ -694,7 +714,11 @@ class EksCostModule(BaseServiceModule):
                 )
             else:
                 ctx.warn(f"EKS list_fargate_profiles({cluster_name}) failed: {e}", "eks_cost")
-            return recs, 0
+            # EKS-2 (C8): failed enumeration != zero profiles — a Fargate-only
+            # cluster under a denied eks:ListFargateProfiles must never be
+            # counted idle (its pods are not EC2 instances, so the owned-node
+            # fallback cannot save it). None = ambiguous; the caller abstains.
+            return recs, None
 
         if profile_names:
             note = (
