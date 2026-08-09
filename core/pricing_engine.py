@@ -329,6 +329,21 @@ FALLBACK_CLB_MONTH: float = 18.25  # $0.025/hr × 730 = $18.25/mo (Classic Load 
 # against the live Pricing API 2026-08-09). Global: the SKU carries
 # location "Any" and no regionCode, so it is NOT region-scaled.
 FALLBACK_CF_DEDICATED_IP_SSL_MONTH: float = 600.00
+# API Gateway REST stage cache, $/hour by cacheClusterSize. Validated against
+# the live Pricing API 2026-08-09 (AmazonApiGateway, us-east-1, productFamily
+# "Amazon API Gateway Cache", attribute cacheMemorySizeGb). The keys are the
+# apigateway CacheClusterSize enum verbatim. Region-scaled via
+# pricing_multiplier on the fallback path only.
+FALLBACK_APIGW_CACHE_HOURLY: dict[str, float] = {
+    "0.5": 0.020,
+    "1.6": 0.038,
+    "6.1": 0.200,
+    "13.5": 0.250,
+    "28.4": 0.500,
+    "58.2": 1.000,
+    "118": 1.900,
+    "237": 3.800,
+}
 FALLBACK_AURORA_ACU_HOURLY: float = 0.12  # us-east-1 Aurora Serverless v2 ACU-Hr list rate
 SAGEMAKER_OVER_EC2: float = 1.15
 # MSK broker $/hr expressed as a multiple of the equivalent EC2 on-demand rate.
@@ -1003,6 +1018,30 @@ class PricingEngine:
                 FALLBACK_CF_DEDICATED_IP_SSL_MONTH,
                 "Pricing API unavailable for the CloudFront dedicated-IP custom SSL fee; using fallback",
             )
+        self._cache.set(key, price)
+        return price
+
+    def get_apigateway_cache_monthly_price(self, cache_size: str) -> float:
+        """$/month for a provisioned API Gateway REST stage cache.
+
+        ``cache_size`` is the stage's ``cacheClusterSize`` (the apigateway
+        CacheClusterSize enum: "0.5" … "237"). Returns 0.0 for an unknown size
+        rather than guessing — the caller must abstain, since a fabricated rate
+        on an unrecognized size would invent a counted dollar.
+        """
+        if cache_size not in FALLBACK_APIGW_CACHE_HOURLY:
+            return 0.0
+        key = ("apigw_cache_month", cache_size)
+        if (cached := self._get_cached(key)) is not None:
+            return cached
+        hourly = self._fetch_apigateway_cache_hourly(cache_size)
+        if hourly is None:
+            hourly = self._use_fallback(
+                FALLBACK_APIGW_CACHE_HOURLY[cache_size] * self._fallback_multiplier,
+                f"Pricing API unavailable for the API Gateway {cache_size}GB cache "
+                f"in {self._region}; using fallback",
+            )
+        price = hourly * 730
         self._cache.set(key, price)
         return price
 
@@ -1864,6 +1903,31 @@ class PricingEngine:
         # only by coincidence today since both rates are $0.01) (network NET-07).
         hourly = self._call_pricing_api_hourly("AmazonVPC", filters)
         return hourly * 730 if hourly is not None else None
+
+    def _fetch_apigateway_cache_hourly(self, cache_size: str) -> float | None:
+        """Live $/hr for one API Gateway cache size in this region, or None."""
+        filters = [
+            {"Type": "TERM_MATCH", "Field": "location", "Value": self._display_name},
+            {"Type": "TERM_MATCH", "Field": "productFamily", "Value": "Amazon API Gateway Cache"},
+            {"Type": "TERM_MATCH", "Field": "cacheMemorySizeGb", "Value": cache_size},
+        ]
+        try:
+            resp = self._pricing.get_products(
+                ServiceCode="AmazonApiGateway", Filters=filters, MaxResults=100
+            )
+            self._stats["api_calls"] += 1
+            for raw in resp.get("PriceList", []):
+                price, unit = _extract_usd_with_unit(json.loads(raw))
+                if unit == "Hrs" and price is not None:
+                    logger.debug(
+                        "pricing:GetProducts  AmazonApiGateway  cache %sGB → $%.6f/hr", cache_size, price
+                    )
+                    return price
+            logger.debug("pricing:GetProducts  AmazonApiGateway  cache %sGB → no Hrs row", cache_size)
+            return None
+        except Exception as exc:
+            logger.debug("pricing:GetProducts  AmazonApiGateway  cache %sGB failed: %s", cache_size, exc)
+            return None
 
     def _fetch_cloudfront_dedicated_ip_ssl_monthly(self) -> float | None:
         """Live $/Mo for the CloudFront dedicated-IP custom SSL fee, or None.

@@ -119,7 +119,7 @@ Savings derived from a measured CloudWatch volume × a published unit rate.
 
 | Adapter | Method |
 |---------|--------|
-| `api_gateway.py` | CloudWatch `Count` metric → `(REST $3.50/M − HTTP $1.00/M) × monthly_requests`; a rec with no measured volume (`$0`, fast mode / throttled CW) is `Counted=False` advisory (the prior flat $50 fabrication is gone). REST APIs only. |
+| `api_gateway.py` | CloudWatch `Count` metric → `(REST $3.50/M − HTTP $1.00/M) × monthly_requests`; a rec with no measured volume (`$0`, fast mode / throttled CW) is `Counted=False` advisory (the prior flat $50 fabrication is gone). **AG-3 stage caches:** a provisioned REST stage cache bills 24/7 by size ($14.60–$2,774/mo via `get_apigateway_cache_monthly_price()`, live SKUs), counted **only** when the `(ApiName, Stage)` `Count` read proves zero requests over 30 days — traffic present, unreadable metric, or `--fast` renders the exact figure as a `$0` advisory in `PotentialMonthlySavings`. Unknown `cacheClusterSize` or no pricing engine abstains rather than inventing a rate; only `AVAILABLE`/`FLUSH_IN_PROGRESS` count as billing. REST APIs only. |
 | `athena.py` | CloudWatch `ProcessedBytes` → `$5/TB` scanned for workgroups that would benefit from partitioning/compression; advisory when unmeasured. |
 
 ### Field-extraction / composite (2 adapters)
