@@ -288,3 +288,39 @@ def test_asg_enumeration_failure_demotes_heuristics(monkeypatch) -> None:
     ]
     assert rendered and rendered[0]["Counted"] is False
     assert rendered[0]["AdvisoryEstimate"] == pytest.approx(140.16)
+
+
+# --------------------------------------------------------------------------- #
+# Reporter — the advanced-checks block must honor Counted (tranche-2 review)
+# --------------------------------------------------------------------------- #
+def test_advanced_checks_renderer_excludes_demoted_recs() -> None:
+    """A commitment-demoted advanced rec keeps its original dollar string (the
+    sanctioned B1-iii shape), so a renderer that sums strings regardless of
+    Counted printed the full dollar with no advisory marker while the tab
+    headline excluded it — reachable on any account holding an EC2 SP/RI."""
+    from reporter_phase_b import _render_ec2_advanced_checks
+
+    recs = [
+        {"InstanceId": "i-demoted", "CheckCategory": "Cron Job Instances",
+         "EstimatedSavings": "$140.16/month", "EstimatedMonthlySavings": 140.16,
+         "Counted": False, "AdvisoryEstimate": 140.16,
+         "CommitmentCoverageNote": "Covered by an active Savings Plan"},
+    ]
+    html = _render_ec2_advanced_checks(recs, "advanced_ec2_checks", {})
+    assert "$140.16/month" not in html
+    assert "advisory" in html
+
+
+def test_advanced_checks_renderer_sums_only_counted_recs() -> None:
+    from reporter_phase_b import _render_ec2_advanced_checks
+
+    recs = [
+        {"InstanceId": "i-counted", "CheckCategory": "Batch Job Instances",
+         "EstimatedSavings": "$25.00/month", "EstimatedMonthlySavings": 25.0},
+        {"InstanceId": "i-demoted", "CheckCategory": "Batch Job Instances",
+         "EstimatedSavings": "$100.00/month", "EstimatedMonthlySavings": 100.0,
+         "Counted": False},
+    ]
+    html = _render_ec2_advanced_checks(recs, "advanced_ec2_checks", {})
+    assert "$25.00/month" in html
+    assert "$125.00" not in html  # the demoted rec must not join the sum

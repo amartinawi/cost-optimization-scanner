@@ -126,3 +126,40 @@ def test_ri_coverage_none_when_no_hours():
     mod, ctx = _mod_and_ctx()
     recs, rate = mod._check_ri_coverage(ctx, _NoHours(), {"Start": "2026-07-10", "End": "2026-08-09"})
     assert rate is None
+
+
+# --------------------------------------------------------------------------- #
+# H3 — expiring Savings Plans come from savingsplans:DescribeSavingsPlans
+# --------------------------------------------------------------------------- #
+def test_expiring_sp_emitted_from_describe_savings_plans():
+    """The old implementation read a MISSPELLED CE key
+    (SavingsPlansUtilizationsDetails) and an EndDateTime field that
+    SavingsPlansUtilizationDetail does not have, so the check could never fire
+    on any account. End dates live on savingsplans:DescribeSavingsPlans."""
+    from datetime import datetime, timedelta, UTC
+
+    soon = (datetime.now(UTC) + timedelta(days=20)).isoformat().replace("+00:00", "Z")
+    later = (datetime.now(UTC) + timedelta(days=200)).isoformat().replace("+00:00", "Z")
+    sp = MagicMock()
+    sp.describe_savings_plans.return_value = {"savingsPlans": [
+        {"savingsPlanId": "sp-expiring", "savingsPlanType": "Compute", "end": soon},
+        {"savingsPlanId": "sp-far", "savingsPlanType": "Compute", "end": later},
+    ]}
+    ctx = SimpleNamespace(
+        region="us-east-1", warn=MagicMock(), permission_issue=MagicMock(),
+        client=lambda name, region=None: sp,
+    )
+    recs = CommitmentAnalysisModule()._check_expiring(ctx, MagicMock(), {"Start": "x", "End": "y"})
+
+    assert [r["resource_id"] for r in recs] == ["sp-expiring"]  # >90d not flagged
+    rec = recs[0]
+    assert rec["severity"] == "HIGH"          # <= 30 days
+    assert rec["Counted"] is False            # an expiry date is not a saving (D4)
+    assert rec["monthly_savings"] == 0.0
+    assert "expires in" in rec["reason"]
+
+
+def test_expiring_sp_no_client_is_silent():
+    ctx = SimpleNamespace(region="us-east-1", warn=MagicMock(), permission_issue=MagicMock())
+    # No .client attribute at all -> abstain, no crash.
+    assert CommitmentAnalysisModule()._check_expiring(ctx, MagicMock(), {"Start": "x", "End": "y"}) == []

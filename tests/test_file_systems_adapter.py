@@ -210,7 +210,7 @@ class _FakeFsx:
 class _PE:
     """Region-correct rate stand-in matching the validated us-east-1 rates."""
 
-    _EFS = {"Standard": 0.30, "IA": 0.025, "One Zone": 0.16, "One Zone-IA": 0.0133}
+    _EFS = {"Standard": 0.30, "IA": 0.025, "One Zone": 0.16, "One Zone-IA": 0.0133, "Archive": 0.008}
     _FSX = {("WINDOWS", "SSD"): 0.130, ("WINDOWS", "HDD"): 0.013, ("LUSTRE", "SSD"): 0.145, ("LUSTRE", "HDD"): 0.025}
 
     def get_efs_monthly_price_per_gb(self, storage_class="Standard"):
@@ -253,11 +253,17 @@ def _ctx(efs=None, fsx=None, cloudwatch=None):
     return ns
 
 
-def _efs_fs(fs_id, total_gb, standard_gb, mount_targets, one_zone=False, throughput="bursting"):
+def _efs_fs(fs_id, total_gb, standard_gb, mount_targets, one_zone=False, throughput="bursting",
+            ia_gb=0.0, archive_gb=0.0):
     d = {
         "FileSystemId": fs_id,
         "Name": fs_id,
-        "SizeInBytes": {"Value": int(total_gb * GB), "ValueInStandard": int(standard_gb * GB)},
+        "SizeInBytes": {
+            "Value": int(total_gb * GB),
+            "ValueInStandard": int(standard_gb * GB),
+            "ValueInIA": int(ia_gb * GB),
+            "ValueInArchive": int(archive_gb * GB),
+        },
         "NumberOfMountTargets": mount_targets,
         "ThroughputMode": throughput,
     }
@@ -366,17 +372,24 @@ class TestEfsFindings:
 
 
 class TestFsxFindings:
-    def test_ssd_to_hdd_counted(self):
+    def test_ssd_to_hdd_is_advisory(self):
+        """FS-6: AWS cannot switch SSD->HDD in place ("You can't switch from SSD
+        storage type to HDD storage type"), and the lever was gated on capacity
+        alone while HDD delivers ~12 MBps/TiB vs SSD's 750 (C10). The delta
+        stays visible in PotentialMonthlySavings but is never counted."""
         fs = {
             "FileSystemId": "fs-w", "FileSystemType": "WINDOWS", "StorageCapacity": 4000,
             "StorageType": "SSD", "Lifecycle": "AVAILABLE",
             "WindowsConfiguration": {"DeploymentType": "SINGLE_AZ_2"},
         }
         out = get_fsx_findings(_ctx(fsx=_FakeFsx([fs])), 1.0)
-        counted = out["counted"]
-        assert len(counted) == 1
-        assert counted[0]["_savings"] == pytest.approx(468.0)  # 4000 × (0.130 − 0.013)
-        assert counted[0]["AuditBasis"]["deployment"] == "Single-AZ"
+        assert out["counted"] == []
+        swap = [a for a in out["advisory"] if a["CheckCategory"] == "FSx Storage Type Optimization"]
+        assert len(swap) == 1
+        assert swap[0]["Counted"] is False
+        assert swap[0]["_savings"] == 0.0
+        assert swap[0]["PotentialMonthlySavings"] == pytest.approx(468.0)  # 4000 x (0.130 - 0.013)
+        assert swap[0]["AuditBasis"]["deployment"] == "Single-AZ"
 
     def test_small_ssd_not_counted(self):
         fs = {
@@ -522,3 +535,36 @@ class TestAdapter:
         # fs-1 counted once at the higher saving.
         assert findings.total_recommendations == 1
         assert findings.total_monthly_savings == pytest.approx(60.0)
+
+
+class TestEfsClassAwareIdlePricing:
+    """FS-1: DescribeFileSystems reports the storage-class split; pricing every
+    byte at the Standard rate overstated a tiered file system massively (a
+    90%-tiered 5 TB EFS: $1,536/mo claimed vs $268.80/mo real)."""
+
+    def test_idle_delete_prices_each_storage_class(self):
+        # 512 GB Standard + 4,608 GB IA (the 5 TB, 90%-tiered case).
+        fs = _efs_fs("fs-tiered", total_gb=5120, standard_gb=512, mount_targets=0, ia_gb=4608)
+        out = get_efs_findings(_ctx(efs=_FakeEfs([fs])), 1.0)
+        counted = out["counted"]
+        assert len(counted) == 1
+        expected = 512 * 0.30 + 4608 * 0.025  # 153.60 + 115.20 = 268.80
+        assert counted[0]["_savings"] == pytest.approx(expected, abs=0.01)
+        # The old all-Standard pricing would have claimed 5120 x 0.30 = $1,536.
+        assert counted[0]["_savings"] < 5120 * 0.30
+        basis = counted[0]["AuditBasis"]
+        assert basis["ia_gb"] == pytest.approx(4608)
+        assert basis["standard_gb"] == pytest.approx(512)
+
+    def test_idle_delete_prices_archive_bytes(self):
+        fs = _efs_fs("fs-arch", total_gb=1000, standard_gb=100, mount_targets=0,
+                     ia_gb=200, archive_gb=700)
+        out = get_efs_findings(_ctx(efs=_FakeEfs([fs])), 1.0)
+        expected = 100 * 0.30 + 200 * 0.025 + 700 * 0.008
+        assert out["counted"][0]["_savings"] == pytest.approx(expected, abs=0.01)
+
+    def test_unattributed_bytes_stay_at_the_standard_rate(self):
+        # API reports no class split -> conservative: everything at Standard.
+        fs = _efs_fs("fs-plain", total_gb=200, standard_gb=200, mount_targets=0)
+        out = get_efs_findings(_ctx(efs=_FakeEfs([fs])), 1.0)
+        assert out["counted"][0]["_savings"] == pytest.approx(60.0)  # 200 x 0.30

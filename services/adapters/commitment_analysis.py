@@ -4,11 +4,12 @@ Analyzes AWS Cost Explorer data to surface under-utilized commitments,
 coverage gaps, expiring commitments, and purchase recommendations.
 
 AWS API cost: Cost Explorer charges $0.01 per API request. This adapter
-makes ~62 calls per scan (~$0.62/scan). The calls are:
+makes ~61 calls per scan (~$0.61/scan). The calls are:
 
 1. ``get_savings_plans_utilization`` — overall SP utilization rate (1 call)
-2. ``get_savings_plans_utilization_details`` — per-SP utilization and the
-   expiry scan (2 calls: one in _check_sp_utilization, one in _check_expiring)
+2. ``get_savings_plans_utilization_details`` — per-SP utilization (1 call).
+   Expiry no longer reads CE at all: end timestamps are not on this shape, so
+   _check_expiring uses savingsplans:DescribeSavingsPlans (free) — H3.
 3. ``get_savings_plans_coverage`` — SP coverage rate by service (1 call)
 4. ``get_reservation_utilization`` — RI utilization rate (1 call)
 5. ``get_reservation_coverage`` — RI coverage rate (1 call)
@@ -83,7 +84,7 @@ class CommitmentAnalysisModule(BaseServiceModule):
     Uses Cost Explorer to detect under-utilized commitments, coverage gaps,
     expiring commitments, and purchase recommendations.
 
-    CE API cost: ~$0.62 per scan (~62 calls at $0.01 each including the full
+    CE API cost: ~$0.61 per scan (~61 calls at $0.01 each including the full
     RI (6 services) and SP (3 types) purchase matrices, each across 2 terms
     x 3 payment options).
     """
@@ -381,10 +382,26 @@ class CommitmentAnalysisModule(BaseServiceModule):
                         util = group.get("Utilization", {})
                         rate = self._parse_pct(util.get("UtilizationPercentage", "0"))
                         attrs = group.get("Attributes", {})
-                        rid = attrs.get("subscriptionId") or next(iter(attrs.values()), "Reserved Instance")
+                        rid = (
+                            attrs.get("subscriptionId")
+                            or group.get("Value")  # the documented identifier slot
+                            or next(iter(attrs.values()), "Reserved Instance")
+                        )
                         if rate < self.UTILIZATION_THRESHOLD:
-                            total_cost = float(util.get("TotalAmortizedCost", "0"))
-                            waste = total_cost * (1.0 - rate)
+                            # H4 — ReservationAggregates has NO TotalAmortizedCost
+                            # member (the old read yielded 0.0 on every account:
+                            # real RI waste never surfaced AND every rec was an
+                            # emitted counted-$0 row). Prefer the MEASURED
+                            # RICostForUnusedHours; fall back to the derived
+                            # TotalAmortizedFee x (1 - rate).
+                            unused_str = util.get("RICostForUnusedHours")
+                            if unused_str is not None:
+                                waste = float(unused_str or 0)
+                            else:
+                                waste = float(util.get("TotalAmortizedFee", "0") or 0) * (1.0 - rate)
+                            if waste <= 1.0:
+                                # Immaterial or fields absent — never a counted-$0 row (D4).
+                                continue
                             recs.append(
                                 {
                                     "resource_id": str(rid),
@@ -448,62 +465,76 @@ class CommitmentAnalysisModule(BaseServiceModule):
 
         return recs, overall_rate
 
-    # Coverage gap (intentional): expiry detection is Savings-Plans-only.
-    # GetSavingsPlansUtilizationDetails exposes per-SP end timestamps; there is
-    # no Reserved Instance equivalent queried here, so RI expirations are not
-    # flagged.
+    # Coverage gap (intentional): expiry detection is Savings-Plans-only —
+    # RI expirations would come from ec2:DescribeReservedInstances `End`,
+    # which is not queried here.
     def _check_expiring(self, ctx: Any, ce: Any, tp: dict[str, str]) -> list[dict[str, Any]]:
-        """Check for expiring Savings Plans using utilization details.
+        """$0 advisories for Savings Plans expiring within 90 days.
 
-        Uses ``get_savings_plans_utilization_details`` which includes
-        start/end timestamps for each Savings Plan.
-
-        Args:
-            ce: Cost Explorer boto3 client.
-            tp: Time period dict with Start/End keys.
-
-        Returns:
-            List of expiry alert recommendation dicts.
+        H3 — the previous implementation read a MISSPELLED response key
+        (``SavingsPlansUtilizationsDetails``) and a field
+        (``EndDateTime``) that ``SavingsPlansUtilizationDetail`` does not
+        have, so it could never emit anything on any account. End dates
+        actually live on ``savingsplans:DescribeSavingsPlans`` (``end``) —
+        the API the coverage prefetch already uses.
         """
+        _ = (ce, tp)  # CE utilization shapes carry no end timestamps.
         recs: list[dict[str, Any]] = []
         now = datetime.now(UTC)
 
         try:
-            params: dict[str, Any] = {"TimePeriod": tp}
+            sp_client = ctx.client("savingsplans")
+        except Exception:
+            return recs
+        if not sp_client:
+            return recs
+
+        try:
+            params: dict[str, Any] = {"states": ["active"]}
             while True:
-                details = ce.get_savings_plans_utilization_details(**params)
-                for detail in details.get("SavingsPlansUtilizationsDetails", []):
-                    sp_arn = detail.get("SavingsPlanArn", "")
-                    end_str = detail.get("EndDateTime", "")
+                resp = sp_client.describe_savings_plans(**params)
+                for sp in resp.get("savingsPlans", []):
+                    sp_id = sp.get("savingsPlanId") or sp.get("savingsPlanArn", "")
+                    end_str = str(sp.get("end") or "")
                     if not end_str:
                         continue
-
                     try:
                         end_dt = datetime.fromisoformat(end_str.replace("Z", "+00:00"))
                     except (ValueError, TypeError):
                         continue
 
                     days_left = (end_dt - now).days
-                    if days_left <= 90:
+                    # states=["active"] should preclude a past end date;
+                    # never render a negative countdown if one slips through.
+                    if 0 <= days_left <= 90:
                         severity = "HIGH" if days_left <= 30 else ("MEDIUM" if days_left <= 60 else "LOW")
                         recs.append(
                             {
-                                "resource_id": sp_arn,
+                                "resource_id": sp_id,
                                 "check_type": "expiry",
                                 "check_category": "Expiring Commitment",
                                 "current_value": f"{days_left} days remaining",
                                 "recommended_value": "Plan renewal or migration",
                                 "monthly_savings": 0.0,
+                                # Born-advisory: an expiry alert is a date, not
+                                # a counted resource saving (D4).
+                                "Counted": False,
                                 "severity": severity,
-                                "reason": f"Savings Plan expires in {days_left} days ({end_dt.strftime('%Y-%m-%d')})",
+                                "reason": (
+                                    f"Savings Plan {sp_id} "
+                                    f"({sp.get('savingsPlanType', 'unknown type')}) expires in "
+                                    f"{days_left} days ({end_dt.strftime('%Y-%m-%d')})"
+                                ),
                             }
                         )
-                next_token = details.get("NextToken")
-                if not next_token:
+                token = resp.get("nextToken")
+                # Only follow a REAL continuation token: a non-str truthy value
+                # (e.g. a test double's auto-attribute) would loop forever.
+                if not isinstance(token, str) or not token:
                     break
-                params["NextToken"] = next_token
+                params["nextToken"] = token
         except Exception as e:
-            _route_ce_error(ctx, "ce:GetSavingsPlansUtilizationDetails", e)
+            _route_ce_error(ctx, "savingsplans:DescribeSavingsPlans", e)
 
         return recs
 

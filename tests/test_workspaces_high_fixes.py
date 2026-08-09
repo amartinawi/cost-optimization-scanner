@@ -470,3 +470,64 @@ def test_scan_end_to_end_counts_autostop_saving(monkeypatch: pytest.MonkeyPatch)
     assert expected > 0  # 48 hrs is below the ~84h break-even, so AutoStop is cheaper
     assert findings.total_monthly_savings == pytest.approx(expected, abs=0.05)
     assert findings.total_recommendations == 1
+
+
+# --------------------------------------------------------------------------- #
+# WS-3 / WS-1 — missing ComputeTypeName abstains; GENERALPURPOSE_4XLARGE priced
+# --------------------------------------------------------------------------- #
+def test_ws3_missing_compute_type_abstains(monkeypatch: pytest.MonkeyPatch) -> None:
+    """ComputeTypeName is documented Required: No — the old silent 'STANDARD'
+    default booked a fabricated $35 counted dollar, highest-risk on ERROR-state
+    WorkSpaces (exactly what the Unused check targets)."""
+    rec = {
+        "WorkspaceId": "ws-noprops",
+        "State": "ERROR",
+        "RunningMode": "ALWAYS_ON",
+        "ComputeType": "",  # shim now carries "" rather than defaulting
+        "CheckCategory": "Unused WorkSpaces",
+    }
+    _patch_shim(monkeypatch, [rec])
+    findings = WorkspacesModule().scan(_recording_ctx())
+
+    assert findings.total_monthly_savings == 0.0
+    emitted = findings.sources["enhanced_checks"].recommendations[0]
+    assert emitted["Counted"] is False
+    assert "no validated price" in emitted["EstimatedSavings"] or emitted["EstimatedMonthlySavings"] == 0.0
+
+
+def test_ws3_shim_does_not_default_missing_compute_type() -> None:
+    """The shim must carry the absent field through as empty, not 'STANDARD'."""
+    from unittest.mock import MagicMock
+
+    import services.workspaces as shim
+
+    ws = {"WorkspaceId": "ws-x", "State": "ERROR", "WorkspaceProperties": {"RunningMode": "ALWAYS_ON"}}
+    client = MagicMock()
+    client.get_paginator.return_value.paginate.return_value = [{"Workspaces": [ws]}]
+    ctx = SimpleNamespace(
+        client=lambda name, region=None: client if name == "workspaces" else None,
+        pricing_multiplier=1.0, fast_mode=True, region="us-east-1",
+        warn=lambda *a, **k: None, permission_issue=lambda *a, **k: None,
+        pricing_engine=None,
+    )
+    result = shim.get_enhanced_workspaces_checks(ctx)
+    recs = result.get("recommendations", [])
+    assert recs, "an ERROR-state WorkSpace should still surface"
+    assert recs[0].get("ComputeType") in ("", None)
+
+
+def test_ws1_general_purpose_4xlarge_is_priced(monkeypatch: pytest.MonkeyPatch) -> None:
+    """WS-1: GENERALPURPOSE_4XLARGE (AlwaysOn $295/mo, live SKU) was unpriced,
+    so a modern fleet produced a $0 WorkSpaces tab."""
+    rec = {
+        "WorkspaceId": "ws-gp4",
+        "State": "STOPPED",
+        "RunningMode": "ALWAYS_ON",
+        "ComputeType": "GENERALPURPOSE_4XLARGE",
+        "CheckCategory": "Unused WorkSpaces",
+    }
+    _patch_shim(monkeypatch, [rec])
+    findings = WorkspacesModule().scan(_recording_ctx())
+
+    assert findings.total_monthly_savings == pytest.approx(295.0)
+    assert WORKSPACE_AUTOSTOP_PRICING["GENERALPURPOSE_4XLARGE"] == (19.0, 2.28)

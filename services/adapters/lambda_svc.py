@@ -191,6 +191,13 @@ class LambdaModule(BaseServiceModule):
                 unused_fraction = max(0.0, 1.0 - float(max_util))
                 pc_savings = allocation * unused_fraction * ctx.pricing_multiplier
                 rec["EstimatedMonthlySavings"] = round(pc_savings, 2)
+                # LAM-2 — the shim leaves a percentage string ("Up to 90% if not
+                # needed") on this rec, and the Phase-B renderer prefers the
+                # string (falling back only to camelCase estimatedMonthlySavings),
+                # so the counted PC dollar was unrenderable: the card showed the
+                # percentage while the headline counted real money. Single-source
+                # the string from the counted number (B2).
+                rec["EstimatedSavings"] = f"${pc_savings:,.2f}/month"
                 rec["AuditBasis"] = {
                     "rate_per_gb_sec": pc_rate,
                     "architecture": arch,
@@ -247,9 +254,39 @@ class LambdaModule(BaseServiceModule):
                     "Covered by an active Compute Savings Plan; the on-demand "
                     f"${gross:,.2f}/mo is not realizable while the commitment bills — not counted."
                 )
-            savings = formula_savings
+            # LAM-1 — Compute Savings Plans cover Lambda **Provisioned
+            # Concurrency and PC Duration**, not just invocation duration
+            # (AWS: "Lambda usage for Duration, Provisioned Concurrency, and
+            # Provisioned Concurrency Duration now applies to Compute Savings
+            # Plans"). The gate previously demoted CoH+CO and then set
+            # `savings = formula_savings` — i.e. it exempted the ONE locally
+            # counted lever, leaving the PC dollars in the headline while the
+            # commitment bills regardless. Gate them too.
+            for rec in enhanced_recs:
+                if rec.get("Counted") is False:
+                    continue
+                gross = float(rec.get("EstimatedMonthlySavings", 0.0) or 0.0)
+                if gross <= 0:
+                    continue
+                rec["Counted"] = False
+                rec["EstimatedMonthlySavings"] = 0.0
+                rec["AdvisoryEstimate"] = round(gross, 2)
+                rec["EstimatedSavings"] = f"$0.00/month — advisory (indicative ${gross:,.2f}/mo)"
+                rec["CommitmentCoverageNote"] = (
+                    "Covered by an active Compute Savings Plan (Compute SPs cover "
+                    "Provisioned Concurrency); the on-demand "
+                    f"${gross:,.2f}/mo is not realizable while the commitment bills — not counted."
+                )
+            savings = 0.0
 
-        total_recs = len(cost_hub_recs) + len(co_recs) + len(enhanced_recs)
+        # D4 count hygiene: advisories render but never inflate the headline
+        # count (under a Compute SP every rec here is demoted, so the tab would
+        # otherwise report N recommendations worth $0.00).
+        total_recs = sum(
+            1
+            for rec in list(cost_hub_recs) + list(co_recs) + list(enhanced_recs)
+            if rec.get("Counted") is not False
+        )
 
         return ServiceFindings(
             service_name="Lambda",

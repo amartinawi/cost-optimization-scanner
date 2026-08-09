@@ -6,6 +6,7 @@ from typing import Any
 
 from core.contracts import ServiceFindings, SourceBlock
 from services._base import BaseServiceModule
+from services._coh_dedup import is_renderable_coh_rec
 from services.commitment_coverage import demote_recs_in_place
 from services.dynamodb import (
     DYNAMODB_ADVISORY_CATEGORIES,
@@ -150,7 +151,7 @@ class DynamoDbModule(BaseServiceModule):
                             "target = ceil(avg_consumed x buffer) per base+GSI when utilization < 20%"
                         ),
                     }
-                    savings += capped
+                    savings += round(capped, 2)  # same basis the demotion subtracts
                 else:
                     rec["EstimatedMonthlySavings"] = 0.0
                     rec["Counted"] = False
@@ -167,28 +168,70 @@ class DynamoDbModule(BaseServiceModule):
             rec["Counted"] = False
 
         # AWS Cost Optimization Hub DynamoDBTable recommendations (e.g. capacity
-        # mode / reserved-capacity savings). De-duplicate by table name against the
-        # per-table checks above so a table covered by both is not counted twice.
-        covered_tables = {r.get("TableName") for r in opt_opps} | {r.get("TableName") for r in enhanced_recs}
-        covered_tables.discard(None)
-        cost_hub_recs = getattr(ctx, "cost_hub_splits", {}).get("dynamodb", [])
+        # mode / reserved-capacity savings). CoH is the AUTHORITY (CoH > CO >
+        # heuristic), so a table covered by both keeps the AWS-computed dollar
+        # and the local lever demotes.
+        #
+        # DDB-A — the previous code did the opposite: it built `covered_tables`
+        # from `opt_opps`, which carries a row for EVERY active table, and
+        # `continue`d the CoH rec. Since those local rows are themselves forced
+        # to $0 advisories (H1 above), AWS's computed dollar was replaced by a
+        # $0 advisory AND dropped from the report entirely — no card, no row.
+        cost_hub_recs = [
+            r for r in getattr(ctx, "cost_hub_splits", {}).get("dynamodb", []) if is_renderable_coh_rec(r)
+        ]
+
+        def _coh_table_name(rec: dict[str, Any]) -> str:
+            """Table segment of a CoH rec's resource identifier.
+
+            Prefers ``resourceArn`` then ``resourceId`` (the order the shared
+            ``coh_key`` helper uses), and handles plain table ARNs
+            (...:table/Name) and index ARNs (...:table/Name/index/GSI) — a naive
+            split("/")[-1] yields the GSI name, so an index rec would not match
+            its own table (DynamoDB L3).
+            """
+            resource_id = str(rec.get("resourceArn") or rec.get("resourceId") or "")
+            if ":table/" in resource_id:
+                return resource_id.split(":table/")[-1].split("/")[0]
+            return resource_id.split("/")[-1]
+
         coh_kept: list[dict[str, Any]] = []
+        coh_tables: set[str] = set()
         for rec in cost_hub_recs:
-            resource_id = str(rec.get("resourceId", "") or "")
-            # Extract the table-name segment for both plain table ARNs
-            # (...:table/Name) and index ARNs (...:table/Name/index/GSI). A naive
-            # split("/")[-1] yields the GSI name for index ARNs, so a CoH rec
-            # targeting an index on an already-covered table would not dedupe and
-            # its savings would be double-counted (DynamoDB L3).
-            table_name = (
-                resource_id.split(":table/")[-1].split("/")[0]
-                if ":table/" in resource_id
-                else resource_id.split("/")[-1]
-            )
-            if table_name and table_name in covered_tables:
-                continue
             coh_kept.append(rec)
+            table_name = _coh_table_name(rec)
+            if not table_name:
+                # Fail CLOSED: with no resolvable table we cannot demote the
+                # matching local lever, so counting this rec too would double
+                # the table's dollar. Surface it as advisory instead.
+                gross = float(rec.get("estimatedMonthlySavings", 0.0) or 0.0)
+                rec["Counted"] = False
+                rec["AdvisoryEstimate"] = round(gross, 2)
+                rec["PricingWarning"] = (
+                    "no resourceArn/resourceId on the Cost Optimization Hub rec — "
+                    "cannot dedupe against local levers, so not counted"
+                )
+                continue
+            coh_tables.add(table_name)
             savings += float(rec.get("estimatedMonthlySavings", 0.0) or 0.0)
+
+        # Demote any LOCAL counted lever on a CoH-covered table so the same
+        # table is never counted twice (the CoH dollar wins).
+        if coh_tables:
+            for rec in list(opt_opps) + list(enhanced_recs):
+                if rec.get("Counted") is False:
+                    continue
+                if str(rec.get("TableName") or "") not in coh_tables:
+                    continue
+                gross = float(rec.get("EstimatedMonthlySavings", 0.0) or 0.0)
+                rec["Counted"] = False
+                rec["EstimatedMonthlySavings"] = 0.0
+                rec["AdvisoryEstimate"] = round(gross, 2)
+                rec["EstimatedSavings"] = (
+                    "$0.00/month — advisory: superseded by the AWS Cost Optimization Hub "
+                    "recommendation for this table (counted there)"
+                )
+                savings -= gross
 
         # Active-commitment demotion: DynamoDB reserved capacity is fixed pre-paid
         # RCU/WCU spend that bills regardless of a provisioned-capacity reduction,

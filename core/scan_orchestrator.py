@@ -53,6 +53,15 @@ class ScanOrchestrator:
         logged and dropped, which is acceptable because the type_map covers
         every CoH resourceType AWS currently returns.
         """
+        # NOTE (2026-08-09): the "opensearch", "redshift" and "eks_cost" buckets
+        # below are retained but can no longer RECEIVE recs — AWS publishes no
+        # OpenSearchDomain / RedshiftCluster / EksCluster ResourceType (verified
+        # against the botocore cost-optimization-hub enum), so the type_map keys
+        # that fed them were removed. Their consumers read with a default and are
+        # unaffected; the buckets stay so a future real type can be routed here
+        # without re-plumbing. Consequence worth knowing: the redshift adapter's
+        # ONLY counted source is its CoH bucket, so that tab is structurally $0
+        # until a local priced lever or a real CoH type exists (sweep RS-A).
         _HUB_SERVICES = {
             "ec2",
             "lambda",
@@ -110,17 +119,26 @@ class ScanOrchestrator:
             "LambdaFunction": "lambda",
             "EbsVolume": "ebs",
             "RdsDbInstance": "rds",
-            "RdsDbCluster": "rds",
             "ElastiCacheCluster": "elasticache",
-            "OpenSearchDomain": "opensearch",
-            "RedshiftCluster": "redshift",
-            "EksCluster": "eks_cost",
             "DynamoDBTable": "dynamodb",
             "NatGateway": "network",
             # ECS / container-level
             "EcsService": "containers",
-            "EcsTask": "containers",
-            "EcsCluster": "containers",
+            # VERIFIED 2026-08-09 against the botocore cost-optimization-hub
+            # model: the ResourceType enum has exactly 25 values, and
+            # RedshiftCluster / OpenSearchDomain / EksCluster / RdsDbCluster /
+            # EcsTask / EcsCluster are NOT among them. Those keys could never
+            # match a real payload, so the buckets they fed were permanently
+            # empty — which is why the redshift tab, whose only counted source
+            # is its CoH bucket, is structurally $0 (sweep RS-A).
+            #
+            # Real enum types with NO bucket here (AWS-computed dollars we
+            # currently drop): AuroraDbClusterStorage, RdsDbInstanceStorage,
+            # MemoryDBCluster, DocumentDBCluster, SageMakerEndpoint,
+            # WorkSpaces, DynamoDbReservedCapacity, MemoryDbReservedInstances.
+            # Wiring consumers for those is a feature change, tracked in
+            # docs/audits/SWEEP-FALSE-NEGATIVES-2026-08-09.md (rank 7) — an
+            # unbucketed type surfaces the honest "dropped type" warning today.
             # Reservation / Savings Plans recommendations all live under
             # the commitment_analysis tab from now on.
             "EC2ReservedInstances": "commitment_analysis",

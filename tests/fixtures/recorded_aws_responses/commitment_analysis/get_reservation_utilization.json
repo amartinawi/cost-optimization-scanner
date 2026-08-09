@@ -1,19 +1,31 @@
 {
+  "_shape_note": "Corrected 2026-08-09 (sweep H5). The previous fixture used TotalAmortizedCost / AmortizedUpfrontCost and grouped by Attributes.service — none of which exist in ReservationAggregates, so any gate built on it passed by construction. Real members include TotalAmortizedFee, RICostForUnusedHours, UnusedHours, PurchasedHours, UtilizationPercentage; a DIMENSION groupBy carries its identifier in Value (the code groups by SUBSCRIPTION_ID).",
   "UtilizationsByTime": [
     {
+      "TimePeriod": {"Start": "2026-07-10", "End": "2026-08-09"},
       "Groups": [
         {
-          "Attributes": {"service": "Amazon EC2"},
+          "Key": "SUBSCRIPTION_ID",
+          "Value": "1234567890",
+          "Attributes": {"subscriptionId": "1234567890"},
           "Utilization": {
             "UtilizationPercentage": "85.0",
-            "TotalAmortizedCost": "200.00",
-            "AmortizedUpfrontCost": "50.00"
+            "PurchasedHours": "730",
+            "UsedHours": "620.5",
+            "UnusedHours": "109.5",
+            "TotalAmortizedFee": "200.00",
+            "RICostForUnusedHours": "30.00"
           }
         }
       ]
     }
   ],
   "Total": {
-    "UtilizationPercentage": "85.0"
+    "UtilizationPercentage": "85.0",
+    "PurchasedHours": "730",
+    "UsedHours": "620.5",
+    "UnusedHours": "109.5",
+    "TotalAmortizedFee": "200.00",
+    "RICostForUnusedHours": "30.00"
   }
 }

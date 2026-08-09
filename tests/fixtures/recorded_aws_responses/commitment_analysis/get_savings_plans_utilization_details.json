@@ -1,20 +1,37 @@
 {
-  "SavingsPlansUtilizationsDetails": [
+  "_shape_note": "Corrected 2026-08-09 (sweep H5). The previous fixture used the misspelled SavingsPlansUtilizationsDetails key, a flat per-detail UtilizationPercentage, a top-level EndDateTime, and AmortizedCommitment.TotalHourlyCommitment — none of which exist. Real shape: SavingsPlansUtilizationDetails[], each with Utilization{TotalCommitment,UsedCommitment,UnusedCommitment,UtilizationPercentage} and AmortizedCommitment{AmortizedRecurringCommitment,AmortizedUpfrontCommitment,TotalAmortizedCommitment}. There is NO end timestamp here — expiry comes from savingsplans:DescribeSavingsPlans (sweep H3).",
+  "SavingsPlansUtilizationDetails": [
     {
       "SavingsPlanArn": "arn:aws:savingsplans::123456789012:savingsplan/sp-abc123",
-      "UtilizationPercentage": "88.0",
-      "AmortizedCommitment": {
-        "TotalHourlyCommitment": "0.50"
+      "Attributes": {"SavingsPlansType": "Compute", "Region": "us-east-1"},
+      "Utilization": {
+        "TotalCommitment": "365.00",
+        "UsedCommitment": "321.20",
+        "UnusedCommitment": "43.80",
+        "UtilizationPercentage": "88.0"
       },
-      "EndDateTime": "2027-04-01T00:00:00Z"
+      "AmortizedCommitment": {
+        "AmortizedRecurringCommitment": "365.00",
+        "AmortizedUpfrontCommitment": "0.00",
+        "TotalAmortizedCommitment": "365.00"
+      },
+      "Savings": {"NetSavings": "72.15", "OnDemandCostEquivalent": "437.15"}
     },
     {
       "SavingsPlanArn": "arn:aws:savingsplans::123456789012:savingsplan/sp-def456",
-      "UtilizationPercentage": "97.0",
-      "AmortizedCommitment": {
-        "TotalHourlyCommitment": "1.00"
+      "Attributes": {"SavingsPlansType": "EC2Instance", "Region": "us-east-1"},
+      "Utilization": {
+        "TotalCommitment": "730.00",
+        "UsedCommitment": "708.10",
+        "UnusedCommitment": "21.90",
+        "UtilizationPercentage": "97.0"
       },
-      "EndDateTime": "2026-06-01T00:00:00Z"
+      "AmortizedCommitment": {
+        "AmortizedRecurringCommitment": "730.00",
+        "AmortizedUpfrontCommitment": "0.00",
+        "TotalAmortizedCommitment": "730.00"
+      },
+      "Savings": {"NetSavings": "155.40", "OnDemandCostEquivalent": "885.40"}
     }
   ]
 }
