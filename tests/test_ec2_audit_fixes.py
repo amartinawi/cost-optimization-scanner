@@ -507,3 +507,34 @@ def test_trend_access_denied_is_recorded():
     result = analyze_spend_trends(_Ctx())
     assert recorded.get("perm") == ("trend_analysis", "ce:GetCostAndUsage")
     assert result.total_spend == 0.0  # empty trend returned, scan continues
+
+
+def test_dedicated_tenancy_is_zero_advisory():
+    """EC2-3 (C9): the flat 30% was applied to the SHARED-tenancy price, but
+    the real Dedicated->Shared instance-hour delta is ~6% (live SKUs:
+    m5.large Shared $0.096 vs Dedicated $0.102/hr) and the $2/hr dedicated
+    region fee is per-REGION — recovered only when the LAST dedicated
+    instance leaves (A3). No per-instance dollar is defensible without
+    tenancy-pinned pricing -> $0 advisory carrying the indicative figure."""
+    ctx = _fake_ctx(
+        [
+            {
+                "InstanceId": "i-ded",
+                "InstanceType": "m5.large",
+                "State": {"Name": "running"},
+                "PlatformDetails": "Linux/UNIX",
+                "Placement": {"Tenancy": "dedicated"},
+                "Tags": [],
+            }
+        ],
+        hourly=0.096,
+    )
+    recs = get_enhanced_ec2_checks(ctx, 1.0, fast_mode=True)["recommendations"]
+    ded = [r for r in recs if r["CheckCategory"] == "Dedicated Hosts"]
+    assert len(ded) == 1
+    rec = ded[0]
+    assert rec["Counted"] is False
+    assert rec.get("EstimatedMonthlySavings", 0.0) == 0.0
+    assert rec["EstimatedSavings"].startswith("$0.00/month")
+    # Indicative figure preserved for the card (old 30% shape: 0.096*730*0.30).
+    assert rec["AdvisoryEstimate"] == pytest.approx(0.096 * 730 * 0.30, abs=0.01)

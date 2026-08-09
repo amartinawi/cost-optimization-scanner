@@ -724,6 +724,15 @@ def get_enhanced_ec2_checks(
                                 ctx, instance_type, "Dedicated Hosts", os_name, license_model
                             )
                             if dedicated_savings > 0:
+                                # EC2-3 (C9): the 30% factor is applied to the
+                                # SHARED-tenancy price; the real Dedicated->Shared
+                                # instance-hour delta is ~6% (m5.large: $0.102 vs
+                                # $0.096/hr, live SKUs), and the $2/hr dedicated
+                                # region fee is per-REGION — recovered only when
+                                # the LAST dedicated instance leaves (A3), so a
+                                # per-instance attribution double-counts it. No
+                                # defensible per-instance dollar without
+                                # tenancy-pinned pricing -> $0 advisory.
                                 checks["dedicated_hosts"].append(
                                     {
                                         "InstanceId": instance_id,
@@ -731,7 +740,14 @@ def get_enhanced_ec2_checks(
                                         "OS": os_name,
                                         "Tenancy": "dedicated",
                                         "Recommendation": ("Review dedicated tenancy necessity"),
-                                        "EstimatedSavings": f"${dedicated_savings:.2f}/month with shared tenancy",
+                                        "EstimatedSavings": (
+                                            "$0.00/month — advisory: real saving is the "
+                                            "Dedicated->Shared price delta plus a per-region "
+                                            "fee recovered only with the last dedicated instance"
+                                        ),
+                                        "EstimatedMonthlySavings": 0.0,
+                                        "Counted": False,
+                                        "AdvisoryEstimate": round(dedicated_savings, 2),
                                         "PricingBasis": dedicated_basis,
                                         "CheckCategory": "Dedicated Hosts",
                                     }
