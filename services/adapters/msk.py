@@ -98,7 +98,14 @@ def _to_advisory_rec(ctx: Any, rec: dict[str, Any]) -> dict[str, Any]:
 
 
 class MskModule(BaseServiceModule):
-    """ServiceModule adapter for MSK. Advisory-only ($0 Counted=False) strategy."""
+    """ServiceModule adapter for MSK.
+
+    Rightsizing / storage / serverless levers are $0 advisories (the realized
+    saving is utilization-dependent and MSK exposes no target-broker-size signal
+    at scan time). The idle-cluster lever (MSK-1) is counted: a cluster nobody
+    has connected to wastes its entire cost, which the AuditBasis already prices
+    from live SKUs.
+    """
 
     key: str = "msk"
     cli_aliases: tuple[str, ...] = ("msk",)
@@ -111,12 +118,15 @@ class MskModule(BaseServiceModule):
     def scan(self, ctx: Any) -> ServiceFindings:
         """Scan MSK clusters for cost optimization opportunities.
 
-        Consults enhanced MSK checks. Every rec is emitted as a $0
-        ``Counted=False`` advisory (the prior blanket 30% flat-rate factor was
-        removed — msk C1): the realized broker-rightsizing / storage saving is
+        Consults enhanced MSK checks. Rightsizing / storage / serverless recs
+        are emitted as $0 ``Counted=False`` advisories (the prior blanket 30%
+        flat-rate factor was removed — msk C1): the realized saving is
         utilization-dependent and needs a target broker size + run-hour signal
         MSK does not expose at scan time. The live current-spend SKUs are still
         priced into each rec's AuditBasis so the advisory is defensible.
+
+        The exception is the idle-cluster lever (MSK-1), which is counted at the
+        full current spend — an unconnected cluster needs no target size.
 
         Args:
             ctx: ScanContext with region, clients, and pricing data.
@@ -134,8 +144,43 @@ class MskModule(BaseServiceModule):
         # size (msk H3) into each rec's AuditBasis so the advisory is defensible.
         result = get_enhanced_msk_checks(ctx)
         source_recs = result.get("recommendations", [])
-        recs = [_to_advisory_rec(ctx, rec) for rec in source_recs]
+        recs: list[dict[str, Any]] = []
         savings = 0.0
+        for rec in source_recs:
+            # MSK-1 is the one counted lever: a cluster nobody has connected to
+            # in 30 days is wasting its ENTIRE cost, so no target-broker-size
+            # signal is needed — the saving is the current spend the AuditBasis
+            # already prices. Everything else stays a $0 advisory.
+            if rec.get("CheckCategory") == "Idle MSK Cluster" and rec.get("IdleEvidence") is True:
+                priced = dict(rec)
+                basis = _current_cost_basis(ctx, rec)
+                monthly = float(basis.get("current_monthly_cost") or 0.0)
+                if monthly > 0:
+                    basis["realizable_monthly_savings"] = round(monthly, 2)
+                    basis["metric"] = "AWS/Kafka ConnectionCount (Maximum), per Cluster Name + Broker ID"
+                    basis["metric_window_days"] = rec.get("MetricWindowDays")
+                    basis["evidence"] = (
+                        "every broker published datapoints and every one was zero. "
+                        "ConnectionCount is a free DEFAULT-level metric published "
+                        "continuously from the moment a cluster is ACTIVE, so an EMPTY "
+                        "series means the read found nothing and abstains - only a "
+                        "present-and-zero series proves idleness"
+                    )
+                    basis["reason"] = (
+                        "An idle cluster wastes its whole broker + storage spend, so the "
+                        "realizable saving is the current cost - no target broker size or "
+                        "utilization signal is required."
+                    )
+                    priced["AuditBasis"] = basis
+                    priced["Counted"] = True
+                    priced["EstimatedMonthlySavings"] = round(monthly, 2)
+                    priced["EstimatedSavings"] = f"${monthly:.2f}/month if deleted"
+                    savings += monthly
+                    recs.append(priced)
+                    continue
+                # No priceable leg (unknown instance type / broker count) - the
+                # dollar cannot be defended, so fall through to the advisory.
+            recs.append(_to_advisory_rec(ctx, rec))
 
         sources = {"enhanced_checks": SourceBlock(count=len(recs), recommendations=tuple(recs))}
         # Count hygiene (mirror batch / step_functions / quicksight): every MSK
