@@ -57,12 +57,22 @@ class _FakeCloudWatch:
 
 
 def _pt(model_arn: str, *, units: int = 1, pt_id: str = "pt-1") -> dict[str, Any]:
+    # foundationModelArn is the real ProvisionedModelSummary member (the old
+    # currentModelArn key never existed in the API shape).
     return {
         "provisionedModelId": pt_id,
-        "currentModelArn": model_arn,
+        "foundationModelArn": model_arn,
         "modelUnits": units,
         "status": "InService",
     }
+
+
+def test_rate_key_strips_context_window_suffix() -> None:
+    import services.adapters.bedrock as b
+
+    assert b._rate_key("anthropic.claude-3-sonnet-20240229-v1:0:200k") == "anthropic.claude-3-sonnet"
+    assert b._rate_key("anthropic.claude-3-haiku-20240307-v1:0") == "anthropic.claude-3-haiku"
+    assert b._rate_key("amazon.titan-text-lite-v1") == "amazon.titan-text-lite"
 
 
 # --------------------------------------------------------------------------- #
@@ -85,14 +95,19 @@ def test_invocation_sum_with_datapoints_aggregates_and_is_definitive() -> None:
 # --------------------------------------------------------------------------- #
 # _check_idle_pt — surfacing + counted/advisory split
 # --------------------------------------------------------------------------- #
-def test_explicit_zero_datapoint_is_counted() -> None:
+def test_explicit_zero_datapoint_is_advisory_with_indicative_figure() -> None:
+    """BR-2: PT_HOURLY_PRICE is unverified against the Pricing API's PT SKUs
+    (order-of-magnitude discrepancies; rates vary by commitmentDuration) — a
+    proven-idle PT surfaces the figure in PotentialMonthlySavings, never as a
+    counted dollar."""
     cw = _FakeCloudWatch(datapoints=[{"Sum": 0.0}])
     recs = bedrock._check_idle_pt(_pt(_HAIKU_ARN), cw, pricing_multiplier=1.0, fast_mode=False)
     assert len(recs) == 1
     rec = recs[0]
-    assert rec["monthly_savings"] == pytest.approx(_HAIKU_MONTHLY, abs=0.01)
-    # Counted key absent → default counted (NOT explicitly demoted).
-    assert rec.get("Counted") is not False
+    assert rec["monthly_savings"] == 0.0
+    assert rec["Counted"] is False
+    assert rec["PotentialMonthlySavings"] == pytest.approx(_HAIKU_MONTHLY, abs=0.01)
+    assert "unverified" in rec["pricing_warning"]
     assert "explicit metric" in rec["reason"]
 
 
@@ -132,33 +147,79 @@ def test_unknown_rate_is_advisory_even_when_definitive() -> None:
     assert "committed rate unknown" in rec["pricing_warning"]
 
 
-def test_versioned_arn_strips_suffix_and_counts() -> None:
+def test_versioned_arn_maps_rate_key_and_surfaces_potential() -> None:
     cw = _FakeCloudWatch(datapoints=[{"Sum": 0.0}])
     recs = bedrock._check_idle_pt(_pt(_HAIKU_VERSIONED_ARN), cw, pricing_multiplier=1.0, fast_mode=False)
     assert len(recs) == 1
-    # -20240307-v1:0 stripped → matches the bare haiku key → counted.
-    assert recs[0]["monthly_savings"] == pytest.approx(_HAIKU_MONTHLY, abs=0.01)
-    assert recs[0].get("Counted") is not False
+    # -20240307-v1:0 stripped for the RATE key only → haiku figure surfaced.
+    assert recs[0]["PotentialMonthlySavings"] == pytest.approx(_HAIKU_MONTHLY, abs=0.01)
+    assert recs[0]["Counted"] is False
 
 
-def test_invocation_query_uses_bare_model_id_dimension() -> None:
+def test_invocation_query_uses_full_versioned_model_id_dimension() -> None:
+    """BR-1: the CloudWatch ModelId dimension VALUE is the full canonical id
+    including the version suffix — stripping it made every metric read match
+    nothing, killing the idle lever on real accounts. Only the rate-table key
+    is stripped."""
     cw = _FakeCloudWatch(datapoints=[{"Sum": 0.0}])
     bedrock._check_idle_pt(_pt(_HAIKU_VERSIONED_ARN), cw, pricing_multiplier=1.0, fast_mode=False)
     dims = cw.last_kwargs["Dimensions"]
-    assert dims == [{"Name": "ModelId", "Value": "anthropic.claude-3-haiku"}]
+    assert dims == [{"Name": "ModelId", "Value": "anthropic.claude-3-haiku-20240307-v1:0"}]
     assert cw.last_kwargs["MetricName"] == "Invocations"
 
 
-def test_pricing_multiplier_scales_counted_dollar() -> None:
+def test_titan_bare_version_suffix_maps_to_rate_key() -> None:
+    """Titan ids carry a bare -vN (no date): amazon.titan-text-lite-v1 must
+    resolve the amazon.titan-text-lite rate entry (BR-1)."""
+    titan_arn = "arn:aws:bedrock:us-east-1::foundation-model/amazon.titan-text-lite-v1"
+    cw = _FakeCloudWatch(datapoints=[{"Sum": 0.0}])
+    recs = bedrock._check_idle_pt(_pt(titan_arn), cw, pricing_multiplier=1.0, fast_mode=False)
+    assert len(recs) == 1
+    assert recs[0]["PotentialMonthlySavings"] == pytest.approx(0.30 * bedrock.HOURS_PER_MONTH, abs=0.01)
+    # And the CW read used the full id, unstripped.
+    assert cw.last_kwargs["Dimensions"] == [{"Name": "ModelId", "Value": "amazon.titan-text-lite-v1"}]
+
+
+def test_active_commitment_term_is_named_in_recommendation() -> None:
+    """BR-3: AWS refuses deleting a PT before its commitment term ends — an
+    idle PT under an active term must say so instead of recommending an
+    impossible delete."""
+    pt = _pt(_HAIKU_ARN)
+    pt["commitmentDuration"] = "SixMonths"
+    pt["commitmentExpirationTime"] = "2026-12-01T00:00:00Z"
+    cw = _FakeCloudWatch(datapoints=[{"Sum": 0.0}])
+    recs = bedrock._check_idle_pt(pt, cw, pricing_multiplier=1.0, fast_mode=False)
+    assert "SixMonths" in recs[0]["recommended_value"]
+    assert "2026-12-01" in recs[0]["recommended_value"]
+    # No commitment -> deletable now.
+    cw2 = _FakeCloudWatch(datapoints=[{"Sum": 0.0}])
+    recs2 = bedrock._check_idle_pt(_pt(_HAIKU_ARN), cw2, pricing_multiplier=1.0, fast_mode=False)
+    assert "deletable now" in recs2[0]["recommended_value"]
+
+
+def test_breakeven_is_advisory_with_indicative_figures() -> None:
+    """BR-4: both breakeven legs are indicative (blended token rate + the
+    unverified PT table) — $0 advisory, never a counted dollar."""
+    cw = _FakeCloudWatch(datapoints=[{"Sum": 1000.0}])  # token sums per read
+    recs = bedrock._check_pt_breakeven(_pt(_HAIKU_ARN), cw, pricing_multiplier=1.0, fast_mode=False)
+    assert len(recs) == 1
+    rec = recs[0]
+    assert rec["monthly_savings"] == 0.0
+    assert rec["Counted"] is False
+    assert rec["PotentialMonthlySavings"] > 0
+    assert "blended" in rec["pricing_warning"]
+
+
+def test_pricing_multiplier_scales_potential_figure() -> None:
     cw = _FakeCloudWatch(datapoints=[{"Sum": 0.0}])
     recs = bedrock._check_idle_pt(_pt(_HAIKU_ARN), cw, pricing_multiplier=1.5, fast_mode=False)
-    assert recs[0]["monthly_savings"] == pytest.approx(_HAIKU_MONTHLY * 1.5, abs=0.01)
+    assert recs[0]["PotentialMonthlySavings"] == pytest.approx(_HAIKU_MONTHLY * 1.5, abs=0.01)
 
 
-def test_multi_unit_pt_scales_counted_dollar() -> None:
+def test_multi_unit_pt_scales_potential_figure() -> None:
     cw = _FakeCloudWatch(datapoints=[{"Sum": 0.0}])
     recs = bedrock._check_idle_pt(_pt(_HAIKU_ARN, units=3), cw, pricing_multiplier=1.0, fast_mode=False)
-    assert recs[0]["monthly_savings"] == pytest.approx(_HAIKU_MONTHLY * 3, abs=0.01)
+    assert recs[0]["PotentialMonthlySavings"] == pytest.approx(_HAIKU_MONTHLY * 3, abs=0.01)
 
 
 def test_fast_mode_skips_pt_check() -> None:

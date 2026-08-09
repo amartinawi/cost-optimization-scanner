@@ -144,3 +144,96 @@ def test_full_scan_nets_zero_counted_but_renders_opportunities() -> None:
     assert every_rec, "scan should surface advisory recs"
     assert all(r.get("Counted") is False for r in every_rec)
     assert all(r.get("monthly_savings", 0.0) == 0.0 for r in every_rec)
+
+
+# --------------------------------------------------------------------------- #
+# NC-1 — the CE filter must use a dimension key/value pair that EXISTS.
+# "AWS Data Transfer" is a SERVICE dimension value; as a USAGE_TYPE_GROUP value
+# it matches nothing, so the adapter saw $0 spend on every account, forever,
+# with no error (C8 corollary: a wrong billing query returns $0,
+# indistinguishable from nothing billed). Assert on the REQUEST kwargs — a
+# mocked response answers regardless of the filter.
+# --------------------------------------------------------------------------- #
+# (The interim SERVICE-filter variant of this test was superseded by
+# test_transfer_spend_query_is_not_service_constrained below: transfer rows
+# bill under "EC2 - Other"/S3/CloudFront, so a SERVICE constraint repeats the
+# NC-1 bug shape.)
+
+
+def test_transfer_spend_query_is_not_service_constrained() -> None:
+    """Review follow-up to NC-1: transfer bills under "EC2 - Other", S3,
+    CloudFront, ... — a SERVICE filter drops the very rows the classifier
+    buckets (the repo's C8-corollary lesson: scope by usage type, not
+    service). The query must constrain REGION only."""
+    ce = _ce_with_spend()
+    ctx = SimpleNamespace(
+        pricing_multiplier=1.0,
+        region="eu-west-1",
+        client=lambda name, region=None: {"ce": ce}.get(name),
+        warn=lambda *a, **k: None,
+        permission_issue=lambda *a, **k: None,
+    )
+    total, breakdown = NetworkCostModule()._fetch_transfer_spend(
+        ce, {"Start": "2026-07-01", "End": "2026-08-01"}, ctx
+    )
+
+    assert abs(total - 900.0) < 0.01
+    kwargs = ce.get_cost_and_usage.call_args.kwargs
+    f = kwargs["Filter"]
+    clauses = f.get("And", [f])
+    keys = {c["Dimensions"]["Key"]: c["Dimensions"]["Values"] for c in clauses if "Dimensions" in c}
+    assert "USAGE_TYPE_GROUP" not in keys, f"dead filter dimension still in use: {f}"
+    assert "SERVICE" not in keys, f"SERVICE filter drops EC2 - Other/S3 transfer rows: {f}"
+    assert keys.get("REGION") == ["eu-west-1"]
+
+
+def test_unrelated_usage_types_are_not_swept_into_egress() -> None:
+    """With an unfiltered query, non-transfer rows (BoxUsage, storage, ...)
+    must be skipped — the old catch-all would have booked the region's entire
+    bill as internet egress."""
+    ce = MagicMock()
+    ce.get_cost_and_usage.return_value = {
+        "ResultsByTime": [
+            {
+                "Groups": [
+                    {"Keys": ["USE1-BoxUsage:m5.large"], "Metrics": {"UnblendedCost": {"Amount": "5000"}}},
+                    {"Keys": ["USE1-TimedStorage-ByteHrs"], "Metrics": {"UnblendedCost": {"Amount": "800"}}},
+                    {"Keys": ["USE1-DataTransfer-Out-Bytes"], "Metrics": {"UnblendedCost": {"Amount": "300"}}},
+                ]
+            }
+        ]
+    }
+    ctx = SimpleNamespace(
+        pricing_multiplier=1.0,
+        region="us-east-1",
+        client=lambda name, region=None: {"ce": ce}.get(name),
+        warn=lambda *a, **k: None,
+        permission_issue=lambda *a, **k: None,
+    )
+    total, breakdown = NetworkCostModule()._fetch_transfer_spend(
+        ce, {"Start": "2026-07-01", "End": "2026-08-01"}, ctx
+    )
+    assert abs(total - 300.0) < 0.01
+    assert abs(breakdown["egress"] - 300.0) < 0.01
+    assert breakdown["cross_az"] == 0.0 and breakdown["cross_region"] == 0.0
+
+
+def test_zero_result_query_warns() -> None:
+    """C8-corollary observability: zero groups from an unfiltered regional
+    query must surface a warning — this exact silence is how NC-1 hid for the
+    adapter's entire life."""
+    ce = MagicMock()
+    ce.get_cost_and_usage.return_value = {"ResultsByTime": [{"Groups": []}]}
+    warnings: list[str] = []
+    ctx = SimpleNamespace(
+        pricing_multiplier=1.0,
+        region="us-east-1",
+        client=lambda name, region=None: {"ce": ce}.get(name),
+        warn=lambda msg, service=None, **k: warnings.append(msg),
+        permission_issue=lambda *a, **k: None,
+    )
+    total, _ = NetworkCostModule()._fetch_transfer_spend(
+        ce, {"Start": "2026-07-01", "End": "2026-08-01"}, ctx
+    )
+    assert total == 0.0
+    assert warnings and "no usage rows" in warnings[0]

@@ -126,7 +126,10 @@ def get_enhanced_opensearch_checks(ctx: ScanContext) -> dict[str, Any]:
                         {
                             "DomainName": domain_name,
                             "StorageType": storage_type,
+                            # VolumeSize is PER DATA NODE (EBSOptions docs);
+                            # the adapter multiplies by InstanceCount (OS-2).
                             "EBSVolumeSize": ebs_volume_size,
+                            "InstanceCount": instance_count,
                             "Recommendation": "Migrate to gp3 volumes",
                             "EstimatedSavings": "20% storage cost",
                             "CheckCategory": "Storage Optimization",

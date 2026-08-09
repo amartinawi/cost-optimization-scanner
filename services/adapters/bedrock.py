@@ -17,6 +17,14 @@ from core.contracts import GroupingSpec, ServiceFindings, SourceBlock, StatCardS
 from services._aws_errors import record_aws_error
 from services._base import BaseServiceModule
 
+# UNVERIFIED indicative rates (sweep BR-2): the live Pricing API DOES publish
+# PT SKUs (features "Provisioned Throughput Inference - no commit / 1 month /
+# 6 months") and they disagree with this table by 1-2 orders of magnitude
+# (Titan Text Lite live: $7.10/$6.40/$5.10 per model-unit-hour vs 0.30 here);
+# rates also vary by commitmentDuration, which one number per model cannot
+# express. Until a live SKU lookup lands, these figures are INDICATIVE ONLY
+# and must never reach a counted dollar — every consumer emits $0 advisories
+# with the figure in PotentialMonthlySavings.
 PT_HOURLY_PRICE: dict[str, float] = {
     "anthropic.claude-3-haiku": 0.80,
     "anthropic.claude-3-sonnet": 4.00,
@@ -75,19 +83,16 @@ def _derive_model_id(pt: dict[str, Any]) -> str:
     ``PT_HOURLY_PRICE.get("", default)`` fabricate $1/hr and the CloudWatch
     ``Invocations``/``InputTokenCount``/``OutputTokenCount`` queries (dimension
     ``ModelId``) match nothing, short-circuiting both counted checks. The model
-    identity is the final path segment of the foundation-model ARN
-    (e.g. ``arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-3-haiku``
-    → ``anthropic.claude-3-haiku``) — that is both the ``PT_HOURLY_PRICE`` key
-    and the CloudWatch ``ModelId`` dimension value.
-
-    Versioned ARNs (e.g. ``.../anthropic.claude-3-haiku-20240307-v1:0``) carry a
-    ``-YYYYMMDD-vN:N`` suffix that would NOT match the bare PT_HOURLY_PRICE
-    keys, so the counted idle-PT path would still rarely fire. Strip the suffix
-    to recover the base model id.
+    identity is the final path segment of the foundation-model ARN, returned
+    VERBATIM — versioned when the ARN is versioned
+    (``.../anthropic.claude-3-haiku-20240307-v1:0`` →
+    ``anthropic.claude-3-haiku-20240307-v1:0``): that full form is the
+    CloudWatch ``ModelId`` dimension value (BR-1 — stripping it here made
+    every metric read match nothing). The ``PT_HOURLY_PRICE`` key is derived
+    separately by ``_rate_key``, which strips the version suffix.
     """
     raw = ""
     for key in (
-        "currentModelArn",
         "foundationModelArn",
         "modelArn",
         "desiredModelArn",
@@ -98,10 +103,25 @@ def _derive_model_id(pt: dict[str, Any]) -> str:
         if arn and "/" in arn:
             raw = str(arn).rsplit("/", 1)[-1]
             break
-    if not raw:
-        return ""
-    # Strip a trailing ``-YYYYMMDD-vN:N`` (or ``-YYYYMMDD-vN``) version suffix.
-    return re.sub(r"-\d{8}-v\d+(?::\d+)?$", "", raw)
+    # BR-1 — return the segment UNstripped: the CloudWatch ``ModelId``
+    # dimension value is the full canonical id INCLUDING the version suffix
+    # (``anthropic.claude-3-haiku-20240307-v1:0``). Stripping here made every
+    # metric read match nothing. The rate-table key is derived separately via
+    # ``_rate_key``.
+    return raw
+
+
+def _rate_key(model_id: str) -> str:
+    """PT_HOURLY_PRICE key for a canonical model id.
+
+    Strips the dated ``-YYYYMMDD-vN(:N)`` suffix AND the bare ``-vN(:N)`` form
+    (Titan ids like ``amazon.titan-text-lite-v1`` carry no date, which
+    previously missed the ``amazon.titan-text-lite`` key entirely — BR-1),
+    plus the trailing context-window token some Claude PT ids carry
+    (``...-v1:0:200k``). Over-stripping is harmless — an unmatched key lands
+    on the $0 "committed rate unknown" advisory.
+    """
+    return re.sub(r"(?:-\d{8})?-v\d+(?::\d+)?(?::\d+k)?$", "", model_id or "")
 
 
 def _get_pt_invocation_sum(cw: Any, model_id: str) -> tuple[float | None, bool]:
@@ -200,6 +220,18 @@ def _check_idle_pt(
     model_id = _derive_model_id(pt)
     model_units = pt.get("modelUnits", 1)
     status = pt.get("status", "Unknown")
+    # BR-3 — a PT cannot be deleted before its commitment term ends (AWS
+    # DeleteProvisionedModelThroughput refuses); name the constraint.
+    commitment = str(pt.get("commitmentDuration") or "")
+    expires = pt.get("commitmentExpirationTime")
+    if commitment and commitment.lower() not in ("", "none"):
+        expiry_txt = f" (expires {str(expires)[:10]})" if expires else ""
+        delete_action = (
+            f"Schedule deletion at commitment expiry{expiry_txt} — AWS refuses deleting a "
+            f"PT before its {commitment} term ends"
+        )
+    else:
+        delete_action = "Delete idle Provisioned Throughput (no-commitment PT — deletable now)"
 
     invocation_sum, definitive = _get_pt_invocation_sum(cw, model_id)
 
@@ -224,10 +256,10 @@ def _check_idle_pt(
         "status": status,
         "check_category": "Provisioned Throughput",
         "current_value": f"PT '{pt_id}' with {model_units} unit(s), 0 invocations in {window}",
-        "recommended_value": "Delete idle Provisioned Throughput",
+        "recommended_value": delete_action,
     }
 
-    hourly = PT_HOURLY_PRICE.get(model_id)
+    hourly = PT_HOURLY_PRICE.get(_rate_key(model_id))
     if hourly is None:
         # H1 — never fabricate the $1/hr default for an unknown-rate PT.
         # Surface the idle commitment as a $0 advisory so it renders without
@@ -251,15 +283,26 @@ def _check_idle_pt(
 
     monthly_waste = hourly * model_units * HOURS_PER_MONTH * pricing_multiplier
     if definitive:
-        # Explicit Sum=0 datapoint — proven idle. Count the recoverable spend
-        # (still gated at >$1/mo to suppress trivial sub-dollar noise).
+        # Explicit Sum=0 datapoint — proven idle. BR-2: the rate table is
+        # UNVERIFIED against the Pricing API's PT SKUs (order-of-magnitude
+        # discrepancies observed) and ignores commitmentDuration, so the
+        # dollar is indicative only — $0 advisory, figure preserved in
+        # PotentialMonthlySavings, never counted.
         if monthly_waste > 1.0:
             recs.append(
                 {
                     **base,
-                    "monthly_savings": round(monthly_waste, 2),
+                    "monthly_savings": 0.0,
+                    "Counted": False,
+                    "PotentialMonthlySavings": round(monthly_waste, 2),
+                    "pricing_warning": (
+                        "PT rate table unverified against the Pricing API PT SKUs "
+                        "(rates vary by commitmentDuration) — figure indicative; "
+                        "verify the committed rate in Billing"
+                    ),
                     "reason": f"Provisioned Throughput '{pt_id}' has zero invocations in "
-                    f"{window} (explicit metric) — wasting ${monthly_waste:.2f}/mo",
+                    f"{window} (explicit metric) — roughly ${monthly_waste:.2f}/mo of "
+                    f"committed spend recoverable ('$0.00/month — advisory').",
                 }
             )
         return recs
@@ -298,7 +341,7 @@ def _check_pt_breakeven(
     model_id = _derive_model_id(pt)
     model_units = pt.get("modelUnits", 1)
 
-    hourly = PT_HOURLY_PRICE.get(model_id)
+    hourly = PT_HOURLY_PRICE.get(_rate_key(model_id))
     if hourly is None:
         # H1 — cannot compute breakeven without the committed rate; skip rather
         # than fabricate the $1/hr default (the on-demand vs PT comparison would
@@ -320,17 +363,32 @@ def _check_pt_breakeven(
     if od_monthly_estimate < pt_monthly:
         savings = (pt_monthly - od_monthly_estimate) * pricing_multiplier
         if savings > 1.0:
+            # BR-4 — both legs of this delta are indicative, not defensible:
+            # the on-demand estimate applies one blended $3/M-token rate to
+            # every model and direction (Claude output is 5x input; Haiku
+            # input is 12x LOWER than the constant), and the PT leg comes
+            # from the unverified rate table (BR-2). $0 advisory carrying the
+            # indicative figure — never a counted dollar.
             recs.append(
                 {
                     "provisioned_model_id": pt_id,
                     "model_id": model_id,
                     "model_units": model_units,
                     "check_category": "PT Analysis",
-                    "current_value": f"PT commitment ${pt_monthly:.2f}/mo, estimated on-demand ${od_monthly_estimate:.2f}/mo",
-                    "recommended_value": "Switch to on-demand pricing",
-                    "monthly_savings": round(savings, 2),
-                    "reason": f"On-demand estimated at ${od_monthly_estimate:.2f}/mo vs PT cost "
-                    f"${pt_monthly:.2f}/mo — save ${savings:.2f}/mo by switching",
+                    "current_value": f"PT commitment ~${pt_monthly:.2f}/mo (indicative), "
+                    f"estimated on-demand ~${od_monthly_estimate:.2f}/mo (blended rate)",
+                    "recommended_value": "Review: on-demand may undercut this PT commitment",
+                    "monthly_savings": 0.0,
+                    "Counted": False,
+                    "PotentialMonthlySavings": round(savings, 2),
+                    "pricing_warning": (
+                        "on-demand estimate uses a blended $3/M-token indicative rate "
+                        "(per-model input/output SKUs not read) and the PT rate table is "
+                        "unverified — figures indicative only"
+                    ),
+                    "reason": f"Measured token volume prices to roughly ${od_monthly_estimate:.2f}/mo "
+                    f"on-demand vs ~${pt_monthly:.2f}/mo PT commitment — roughly ${savings:.2f}/mo "
+                    f"recoverable if the workload fits on-demand ('$0.00/month — advisory').",
                 }
             )
 
@@ -384,6 +442,7 @@ def _check_idle_knowledge_bases(ctx: Any, pricing_multiplier: float) -> list[dic
                 "current_value": f"KB '{kb_name}' active",
                 "recommended_value": "Review query volume and delete if unused",
                 "monthly_savings": 0.0,
+                "Counted": False,
                 "pricing_warning": "requires KB query/ingest CW metrics for quantified savings",
                 "reason": f"Knowledge Base '{kb_name}' detected; verify utilization via "
                 f"CloudWatch query metrics before deleting",
@@ -484,14 +543,18 @@ class BedrockModule(BaseServiceModule):
         agent_recs = _check_idle_agents(ctx, multiplier)
 
         all_recs = idle_pt_recs + breakeven_recs + kb_recs + agent_recs
-        total_savings = sum(r.get("monthly_savings", 0.0) for r in all_recs)
+        # D4/B1 — gate both the dollar and the count on Counted (advisories
+        # render but never inflate either headline).
+        total_savings = sum(
+            r.get("monthly_savings", 0.0) for r in all_recs if r.get("Counted") is not False
+        )
 
         kb_count = len(kb_recs)
         agent_count = len(agent_recs)
 
         return ServiceFindings(
             service_name="Bedrock",
-            total_recommendations=len(all_recs),
+            total_recommendations=sum(1 for r in all_recs if r.get("Counted") is not False),
             total_monthly_savings=round(total_savings, 2),
             sources={
                 "idle_provisioned_throughput": SourceBlock(

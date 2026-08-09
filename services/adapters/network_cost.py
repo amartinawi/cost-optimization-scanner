@@ -208,19 +208,28 @@ class NetworkCostModule(BaseServiceModule):
             results: list[dict[str, Any]] = []
             next_token: str | None = None
 
+            # NC-1 — the old filter (USAGE_TYPE_GROUP = "AWS Data Transfer",
+            # which is a SERVICE value, not a group) matched NOTHING, so this
+            # query returned $0 on every account with no error — the
+            # C8-corollary shape. Per that same lesson ("scope such reads by
+            # USAGE TYPE, not service"; transfer bills under "EC2 - Other",
+            # S3, CloudFront, ... — a SERVICE filter drops the very rows the
+            # classifier buckets), the query is deliberately UNconstrained by
+            # service: REGION-scoped only, grouped by USAGE_TYPE, with the
+            # transfer rows selected client-side by full usage-type tokens.
+            region = str(getattr(ctx, "region", "") or "")
+            ce_filter: dict[str, Any] | None = (
+                {"Dimensions": {"Key": "REGION", "Values": [region]}} if region else None
+            )
             while True:
                 kwargs: dict[str, Any] = {
                     "TimePeriod": tp,
                     "Granularity": "MONTHLY",
-                    "Filter": {
-                        "Dimensions": {
-                            "Key": "USAGE_TYPE_GROUP",
-                            "Values": ["AWS Data Transfer"],
-                        }
-                    },
                     "GroupBy": [{"Type": "DIMENSION", "Key": "USAGE_TYPE"}],
                     "Metrics": ["UnblendedCost", "UsageQuantity"],
                 }
+                if ce_filter is not None:
+                    kwargs["Filter"] = ce_filter
                 if next_token:
                     kwargs["NextPageToken"] = next_token
 
@@ -240,7 +249,6 @@ class NetworkCostModule(BaseServiceModule):
                 if cost <= 0:
                     continue
 
-                total += cost
                 usage_type = keys[0].lower() if keys else ""
 
                 # Anchor on full usage-type tokens (network_cost C1). Bare
@@ -249,15 +257,32 @@ class NetworkCostModule(BaseServiceModule):
                 # → cross_region; inter-region ``USE1-USW2-AWS-Out-Bytes`` fell
                 # through → egress; the ``az`` keyword set never fired. Order
                 # matters: test cross-AZ (Regional) BEFORE inter-region, since
-                # both can share a region prefix.
+                # both can share a region prefix. The query is UNfiltered by
+                # service, so a non-matching usage type is simply not a
+                # data-transfer row — skip it (a catch-all here would sweep the
+                # region's ENTIRE bill into egress).
                 if "datatransfer-regional-bytes" in usage_type:
-                    breakdown["cross_az"] += cost
+                    bucket = "cross_az"
                 elif "-aws-out-bytes" in usage_type or "-aws-in-bytes" in usage_type:
-                    breakdown["cross_region"] += cost
+                    bucket = "cross_region"
                 elif "datatransfer-out-bytes" in usage_type or "datatransfer-out-aabytes" in usage_type:
-                    breakdown["egress"] += cost
+                    bucket = "egress"
                 else:
-                    breakdown["egress"] += cost
+                    continue
+                total += cost
+                breakdown[bucket] += cost
+
+            if not results:
+                # C8 corollary — zero GROUPS from an unfiltered regional query
+                # is how a dead query scope hides ("indistinguishable from
+                # nothing billed"). Any active region has SOME usage rows, so
+                # say so instead of silently reporting $0 transfer spend.
+                ctx.warn(
+                    "Cost Explorer returned no usage rows for the transfer-spend query — "
+                    "data-transfer spend is unmeasured (empty region, or the query scope "
+                    "is wrong)",
+                    service="network_cost",
+                )
 
         except Exception as e:
             # H3 — CE AccessDenied/OptInRequired/throttle silently zeroed every
