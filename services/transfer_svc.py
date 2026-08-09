@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from core.scan_context import ScanContext
+from services._aws_errors import record_aws_error
 
 TRANSFER_OPTIMIZATION_DESCRIPTIONS: dict[str, dict[str, str]] = {
     "protocol_optimization": {
@@ -71,7 +72,17 @@ def get_enhanced_transfer_checks(ctx: ScanContext) -> dict[str, Any]:
                         end = datetime.now(timezone.utc)
                         start = end - timedelta(days=14)
                         uploaded = downloaded = 0.0
-                        for metric_name in ("BytesUploaded", "BytesDownloaded"):
+                        # TR-2 — AWS/Transfer publishes BytesIn / BytesOut
+                        # (dimension ServerId), NOT BytesUploaded /
+                        # BytesDownloaded: those names match no metric, so
+                        # GetMetricStatistics returned empty datapoints with no
+                        # error and this note never populated. Worse, any idle
+                        # gate built on this helper would have read "no traffic"
+                        # for every server — a fail-OPEN. Per the AWS docs the
+                        # metrics emit every 5 min *while a connection is
+                        # established* (0 when idle within a connection), so an
+                        # empty series means no connections at all in the window.
+                        for metric_name in ("BytesIn", "BytesOut"):
                             pts = cw.get_metric_statistics(
                                 Namespace="AWS/Transfer",
                                 MetricName=metric_name,
@@ -82,7 +93,7 @@ def get_enhanced_transfer_checks(ctx: ScanContext) -> dict[str, Any]:
                                 Statistics=["Sum"],
                             )
                             for dp in pts.get("Datapoints", []):
-                                if metric_name == "BytesUploaded":
+                                if metric_name == "BytesIn":
                                     uploaded += dp.get("Sum", 0)
                                 else:
                                     downloaded += dp.get("Sum", 0)
@@ -95,10 +106,19 @@ def get_enhanced_transfer_checks(ctx: ScanContext) -> dict[str, Any]:
                                 f"~${upload_gb * 0.04:.2f} upload + ${download_gb * 0.04:.2f} download"
                                 " (14-day; Transfer Family $0.04/GB each way)"
                             )
-                    except Exception:
+                    except Exception as cw_err:
+                        # Classify: an AccessDenied/throttle on the CW read is a
+                        # permission gap, not "no traffic" (E1). The per-rec note
+                        # stays for the empty-datapoints case, which is normal.
+                        record_aws_error(
+                            ctx,
+                            cw_err,
+                            service="transfer",
+                            context=f"cloudwatch:GetMetricStatistics BytesIn/BytesOut for {server_id}",
+                        )
                         rec["DataTransferCostNote"] = (
                             "CloudWatch unavailable — consider monitoring"
-                            " BytesUploaded/BytesDownloaded for S3 transfer cost"
+                            " BytesIn/BytesOut for S3 transfer cost"
                             " ($0.04/GB upload + $0.04/GB download — Transfer Family fee) awareness"
                         )
 

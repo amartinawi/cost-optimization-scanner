@@ -313,3 +313,77 @@ def test_shim_protocol_rec_does_not_fabricate_dollar() -> None:
     # 2 × 0.30 × 730 = 438 must NOT appear; honest advisory string instead.
     assert "438" not in proto[0]["EstimatedSavings"]
     assert proto[0]["EstimatedSavings"].startswith("$0.00")
+
+
+# --------------------------------------------------------------------------- #
+# TR-2 — AWS/Transfer publishes BytesIn/BytesOut, not BytesUploaded/Downloaded
+# --------------------------------------------------------------------------- #
+def test_data_transfer_note_uses_real_metric_names() -> None:
+    """Verified against AWS docs: the AWS/Transfer namespace publishes BytesIn /
+    BytesOut (dimension ServerId). The old BytesUploaded/BytesDownloaded names
+    match no metric, so GetMetricStatistics returned empty datapoints with no
+    error and the note never populated — and any idle gate built on this helper
+    would have read 'no traffic' for every server (fail-OPEN)."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    import services.transfer_svc as shim
+
+    GB = 1024**3
+    seen: list[str] = []
+
+    def _metrics(**kwargs):
+        name = kwargs.get("MetricName")
+        seen.append(name)
+        if name == "BytesIn":
+            return {"Datapoints": [{"Sum": 2 * GB}]}
+        if name == "BytesOut":
+            return {"Datapoints": [{"Sum": 3 * GB}]}
+        return {"Datapoints": []}  # any other name matches nothing, as in prod
+
+    cw = MagicMock()
+    cw.get_metric_statistics.side_effect = _metrics
+    transfer = MagicMock()
+    transfer.get_paginator.return_value.paginate.return_value = iter(
+        [{"Servers": [{"ServerId": "s-1", "State": "ONLINE", "Protocols": ["SFTP", "FTPS"]}]}]
+    )
+    ctx = SimpleNamespace(
+        region="us-east-1", fast_mode=False,
+        client=lambda name, region=None: {"transfer": transfer, "cloudwatch": cw}.get(name),
+        warn=lambda *a, **k: None, permission_issue=lambda *a, **k: None,
+    )
+
+    result = shim.get_enhanced_transfer_checks(ctx)
+    recs = result.get("recommendations", [])
+
+    assert "BytesIn" in seen and "BytesOut" in seen
+    assert "BytesUploaded" not in seen and "BytesDownloaded" not in seen
+    noted = [r for r in recs if r.get("DataTransferCostGB")]
+    assert noted, "a server with measured traffic must carry the transfer note"
+    assert noted[0]["DataTransferCostGB"] == pytest.approx(5.0, abs=0.01)
+
+
+def test_cw_failure_is_classified_not_swallowed() -> None:
+    """E1: a denied GetMetricStatistics must surface, not read as 'no traffic'."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    import services.transfer_svc as shim
+
+    cw = MagicMock()
+    cw.get_metric_statistics.side_effect = Exception("AccessDeniedException: denied")
+    transfer = MagicMock()
+    transfer.get_paginator.return_value.paginate.return_value = iter(
+        [{"Servers": [{"ServerId": "s-2", "State": "ONLINE", "Protocols": ["SFTP", "FTPS"]}]}]
+    )
+    perms: list = []
+    warns: list = []
+    ctx = SimpleNamespace(
+        region="us-east-1", fast_mode=False,
+        client=lambda name, region=None: {"transfer": transfer, "cloudwatch": cw}.get(name),
+        warn=lambda msg, service=None, **k: warns.append(msg),
+        permission_issue=lambda msg, service=None, action=None, **k: perms.append(msg),
+    )
+
+    shim.get_enhanced_transfer_checks(ctx)
+    assert perms or warns, "a CW failure must be recorded on ctx"
