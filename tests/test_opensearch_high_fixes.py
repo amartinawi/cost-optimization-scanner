@@ -558,3 +558,89 @@ def test_extended_support_fails_closed_without_region():
     assert _extended_support_breakdown(ctx) == (0.0, {})
     assert warns and "region unset" in warns[0]
     ce.get_cost_and_usage.assert_not_called()
+
+
+# --------------------------------------------------------------------------- #
+# OS-5 / OS-4 — the two abstentions that hit the most expensive fleets
+# --------------------------------------------------------------------------- #
+def test_graviton_map_covers_current_generation_intel() -> None:
+    """OS-5: the map stopped at m5/c5/r5/t3, so every current-gen Intel family
+    had no Graviton target and the lever abstained on the newest fleets."""
+    from services.adapters.opensearch import _graviton_family_for
+
+    assert _graviton_family_for("m6i") == "m6g"
+    assert _graviton_family_for("m7i") == "m7g"
+    assert _graviton_family_for("r7i") == "r7g"
+    assert _graviton_family_for("c7i") == "c7g"
+    # Legacy families keep their existing targets.
+    assert _graviton_family_for("m5") == "m6g"
+    assert _graviton_family_for("t3") == "t4g"
+
+
+def test_graviton_map_skips_families_that_are_already_graviton() -> None:
+    from services.adapters.opensearch import _graviton_family_for
+
+    for family in ("r6g", "m7g", "r6gd", "im4gn", "or1"):
+        assert _graviton_family_for(family) is None, family
+
+
+def test_smaller_sizes_walks_past_a_gap_in_the_family_ladder() -> None:
+    """OS-4: OpenSearch m5 offers no 8xlarge, so a one-rung step from
+    m5.12xlarge probed a nonexistent size and abstained - on the single most
+    expensive node in the domain."""
+    from services.adapters.opensearch import _smaller_sizes
+
+    ladder = _smaller_sizes("m5.12xlarge.search")
+    assert ladder[0] == "m5.8xlarge.search"
+    assert "m5.4xlarge.search" in ladder
+    assert ladder[-1] == "m5.large.search"  # size floor honoured
+
+
+def test_smaller_sizes_honours_the_large_floor() -> None:
+    from services.adapters.opensearch import _smaller_sizes
+
+    assert all(".medium." not in t for t in _smaller_sizes("r5.xlarge.search"))
+    # A family with no floor still reaches the small rungs.
+    assert "t3.micro.search" in _smaller_sizes("t3.medium.search")
+
+
+def test_downsize_delta_skips_an_unpriceable_rung() -> None:
+    from types import SimpleNamespace
+
+    from services.adapters.opensearch import _downsize_node_delta
+
+    prices = {"m5.12xlarge.search": 2000.0, "m5.4xlarge.search": 700.0}
+
+    ctx = SimpleNamespace(
+        pricing_engine=SimpleNamespace(
+            get_instance_monthly_price=lambda code, itype, **kw: prices.get(itype, 0.0)
+        )
+    )
+    delta, target = _downsize_node_delta(ctx, "m5.12xlarge.search")
+    # 8xlarge does not price, so the walk continues to 4xlarge.
+    assert target == "m5.4xlarge.search"
+    assert delta == pytest.approx(1300.0)
+
+
+def test_downsize_delta_abstains_when_nothing_below_prices() -> None:
+    from types import SimpleNamespace
+
+    from services.adapters.opensearch import _downsize_node_delta
+
+    ctx = SimpleNamespace(
+        pricing_engine=SimpleNamespace(
+            get_instance_monthly_price=lambda code, itype, **kw: 2000.0 if "12xlarge" in itype else 0.0
+        )
+    )
+    assert _downsize_node_delta(ctx, "m5.12xlarge.search") == (0.0, None)
+
+
+def test_downsize_delta_abstains_when_the_smaller_size_is_not_cheaper() -> None:
+    from types import SimpleNamespace
+
+    from services.adapters.opensearch import _downsize_node_delta
+
+    ctx = SimpleNamespace(
+        pricing_engine=SimpleNamespace(get_instance_monthly_price=lambda code, itype, **kw: 900.0)
+    )
+    assert _downsize_node_delta(ctx, "m5.12xlarge.search") == (0.0, None)

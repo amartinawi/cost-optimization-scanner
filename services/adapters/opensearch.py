@@ -32,6 +32,21 @@ _SURCHARGE_WINDOW_DAYS: int = 7
 # ~5-10%). The old flat GRAVITON_RATE=0.25 overstated it ~3-5x (live-audit H4).
 # Families with no clean same-size Graviton counterpart (storage i3/i2, etc.)
 # are omitted so the caller emits a $0 advisory instead of guessing a target.
+# OS-5 — the map used to stop at m5/c5/r5/t3, so every CURRENT-generation Intel
+# family (m6i/m7i, c6i/c7i, r6i/r7i) had no Graviton target and the lever
+# abstained on the newest, largest, most expensive fleets. Generation-aware, the
+# same shape as the Aurora map (AUR-C): same generation where a Graviton
+# counterpart exists, else the newest Graviton generation below it. A target
+# this map produces that OpenSearch does not actually offer prices to 0.0 via
+# get_instance_monthly_price and the caller abstains, so a wrong guess costs an
+# API call, never a fabricated delta.
+_GRAVITON_BY_GENERATION: dict[str, dict[int, str]] = {
+    "m": {3: "m6g", 4: "m6g", 5: "m6g", 6: "m6g", 7: "m7g", 8: "m8g"},
+    "c": {4: "c6g", 5: "c6g", 6: "c6g", 7: "c7g", 8: "c8g"},
+    "r": {3: "r6g", 4: "r6g", 5: "r6g", 6: "r6g", 7: "r7g", 8: "r8g"},
+    "t": {2: "t4g", 3: "t4g", 4: "t4g"},
+}
+# Fallback for families carrying no parsable generation digit.
 _X86_TO_GRAVITON_FAMILY: dict[str, str] = {
     "m3": "m6g",
     "m4": "m6g",
@@ -44,6 +59,26 @@ _X86_TO_GRAVITON_FAMILY: dict[str, str] = {
     "t2": "t4g",
     "t3": "t4g",
 }
+
+
+def _graviton_family_for(family: str) -> str | None:
+    """Graviton counterpart for an OpenSearch family, generation-aware."""
+    fam = family.lower()
+    if fam.endswith("g") or fam.endswith("gd") or fam.startswith(("or", "im4")):
+        return None  # already Graviton-based
+    exact = _X86_TO_GRAVITON_FAMILY.get(fam)
+    letter = fam[:1]
+    digits = "".join(ch for ch in fam[1:] if ch.isdigit())
+    by_gen = _GRAVITON_BY_GENERATION.get(letter, {})
+    if digits and by_gen:
+        generation = int(digits)
+        target = by_gen.get(generation)
+        if target is None:
+            lower = [g for g in by_gen if g < generation]
+            target = by_gen[max(lower)] if lower else None
+        if target:
+            return target
+    return exact
 
 # Standard OpenSearch instance size ladder (ascending). Used to derive the
 # one-size-down downsize target for an underutilized domain (OpenSearch C3).
@@ -99,6 +134,26 @@ def _one_size_down(instance_type: str | None) -> str | None:
     return ".".join(parts)
 
 
+def _smaller_sizes(instance_type: str) -> list[str]:
+    """Every valid smaller instance type for this family, largest first.
+
+    ``_one_size_down`` answers "the next rung"; this answers "every rung below",
+    so a family with a gap in the ladder (OpenSearch m5 offers no 8xlarge) can
+    still find its real downsize target instead of abstaining (OS-4).
+    """
+    parts = instance_type.split(".")
+    if len(parts) < 2 or parts[1] not in _SIZE_LADDER:
+        return []
+    family = parts[0]
+    floor = _SIZE_LADDER.index("large") if family in _LARGE_FLOOR_FAMILIES else 0
+    out: list[str] = []
+    for idx in range(_SIZE_LADDER.index(parts[1]) - 1, floor - 1, -1):
+        candidate = list(parts)
+        candidate[1] = _SIZE_LADDER[idx]
+        out.append(".".join(candidate))
+    return out
+
+
 def _downsize_node_delta(ctx: Any, instance_type: str | None) -> tuple[float, str | None]:
     """Per-node $/month saved by downsizing one OpenSearch instance size.
 
@@ -114,14 +169,19 @@ def _downsize_node_delta(ctx: Any, instance_type: str | None) -> tuple[float, st
     """
     if ctx.pricing_engine is None or not instance_type:
         return 0.0, None
-    target = _one_size_down(instance_type)
-    if target is None:
-        return 0.0, None
     current = ctx.pricing_engine.get_instance_monthly_price("AmazonES", instance_type)
-    smaller = ctx.pricing_engine.get_instance_monthly_price("AmazonES", target)
-    if current <= 0 or smaller <= 0 or smaller >= current:
+    if current <= 0:
         return 0.0, None
-    return current - smaller, target
+    # OS-4 — walk DOWN the ladder to the nearest size that actually prices.
+    # Stepping exactly one rung and giving up abstained on precisely the most
+    # expensive nodes, because OpenSearch families have gaps: m5/r5 offer no
+    # 8xlarge, r4/i3 no 12xlarge. A missing size prices to 0.0 (the generic
+    # lookup's miss value), so the walk is bounded and can never fabricate.
+    for target in _smaller_sizes(instance_type):
+        smaller = ctx.pricing_engine.get_instance_monthly_price("AmazonES", target)
+        if smaller > 0:
+            return (current - smaller, target) if smaller < current else (0.0, None)
+    return 0.0, None
 
 
 def _graviton_equivalent(instance_type: str | None) -> str | None:
@@ -137,7 +197,7 @@ def _graviton_equivalent(instance_type: str | None) -> str | None:
     parts = instance_type.split(".")
     if len(parts) < 2:
         return None
-    graviton_family = _X86_TO_GRAVITON_FAMILY.get(parts[0])
+    graviton_family = _graviton_family_for(parts[0])
     if graviton_family is None:
         return None
     parts[0] = graviton_family
