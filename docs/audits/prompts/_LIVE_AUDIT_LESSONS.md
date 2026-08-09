@@ -2,8 +2,10 @@
 
 Bug classes **confirmed in live deep audits** across multiple accounts/regions
 (eu-central-1, eu-west-1, ap-south-1, ap-southeast-1; accounts level-Shoes-prod,
-bnc, tadweer-prod — 2026-06-29 → 2026-06-30). Each was a real finding that shipped
-a fix. Paste this file **alongside** any per-service `*_AUDIT_PROMPT.md`: the
+bnc, tadweer-prod — 2026-06-29 → 2026-06-30), extended by the 31-adapter blind
+sweep and its six remediation tranches (2026-08-09 → 2026-08-10, see
+`docs/audits/SWEEP-FALSE-NEGATIVES-2026-08-09.md`). Each was a real finding that
+shipped a fix. Paste this file **alongside** any per-service `*_AUDIT_PROMPT.md`: the
 per-service prompt tells you what the adapter does; this file tells you the
 mistakes that actually recur and exactly how to catch them.
 
@@ -53,6 +55,17 @@ will eventually both count it. This is the single most common real finding.
   reconcile to the cent on a live re-scan? Two of three dedup fixes this cycle had
   a defect caught only by an independent skeptic pass.
 
+- **A6 — A dedup guard is only as good as its least-guarded PRODUCER.** When a
+  suppression decision keys off a shared set, grep every writer of that set, not
+  just the consumer you are editing. Routing CoH storage types into the `rds`
+  bucket needed those recs excluded from suppression in `rds_logic` *and* in the
+  aurora adapter — but a third path, `RdsModule` publishing its counted ids to
+  `ctx.rds_covered_instance_ids`, put the cluster id back into Aurora's
+  suppression set through the back door and defeated the guard added two lines
+  earlier. *Real: tranche 4, caught in self-review after the first two paths were
+  fixed.* **Sweep:** for each shared set (`coh_keys`, `covered`,
+  `rds_covered_instance_ids`, `multi_az_ids`, `counted_snapshot_ids`), list every
+  assignment site and confirm each applies the same filter.
 ## B. Advisory hygiene & string ↔ numeric agreement
 
 - **B1 — Advisory-leak: a DEMOTED-resource `Counted=False` rec with a non-zero
@@ -277,6 +290,34 @@ will eventually both count it. This is the single most common real finding.
   `services/rds_logic.reconcile_snapshot_savings` has the same shape (bnc: capped to
   $411.80 = 100% of billed backup storage, ignoring automated backups).
 
+- **C12 — A strict (no-fallback) price mode on a CACHED lookup needs its own cache
+  namespace.** When a method gains `allow_fallback=False` so a caller can probe
+  whether a *hypothetical* class exists, sharing one cache key lets any earlier
+  fallback-permitting caller poison it: the strict call returns the cached
+  fabricated rate and the guard silently does nothing. Two namespaces (a real-SKU
+  hit writes BOTH; a strict miss caches `0.0` so the probe is not repeated per
+  resource). *Real: `get_rds_instance_monthly_price` gained the flag for the Aurora
+  Graviton probe — and the RDS adapter, which prices with the default, primes the
+  shared key first, so the probe would have computed exactly the fabricated delta
+  the flag was added to prevent. Caught in self-review; `get_dms_instance_monthly_price`
+  already had the right shape.* **Sweep:** every `allow_fallback` parameter — does
+  its miss path write a distinct key?
+- **C13 — Know a metric's REPORTING CRITERIA before writing an idle gate; the two
+  polarities are opposite.** (a) Metrics emitted *only during activity*
+  (`AWS/Transfer` `BytesIn`/`BytesOut`: "emitted every 5 minutes **while a
+  connection is established**... if no files or bytes are transferred in the
+  period, `0` is emitted") — an EMPTY series proves idleness, a series of ZEROS
+  means the resource is in use. (b) Metrics emitted *continuously once the
+  resource exists* (`AWS/Kafka` `ConnectionCount`, published from the moment a
+  cluster is ACTIVE) — an empty series means the read found nothing and must
+  ABSTAIN; only present-and-zero proves idleness. A `sum == 0` gate conflates both
+  and recommends deleting resources people are actively using. Also check the
+  DIMENSIONS: a read whose dimension set does not exactly match what AWS publishes
+  returns nothing and reads as idle (MSK needs `Cluster Name` **and** `Broker ID`;
+  API Gateway stage traffic needs `(ApiName, Stage)`; SageMaker needs
+  `(EndpointName, VariantName)`). *Real: tranche 5 shipped both polarities in one
+  run (TR-1 on Transfer, MSK-1 on Kafka); SM-1 was the dimension-set form.*
+
 ## D. Render / tab / count semantics (`counted == rendered`, both directions)
 
 - **D1 — Counted-but-invisible (render desync).** Savings summed into the headline
@@ -297,6 +338,28 @@ will eventually both count it. This is the single most common real finding.
 - **D4 — `total_recommendations` counts COUNTED only.** `$0` advisories render as
   cards but never inflate the count or the dollar total; a `count` placeholder
   with no materialised recs is trusted.
+- **D5 — A NEW counted lever needs a render check, not just an adapter check.**
+  "Counted" and "actionable" are different properties, and in four consecutive
+  remediation tranches the surviving defect was render-side, never pricing-side.
+  The Phase-A detail extractors in `reporter_phase_a.py` are keyed to the rec
+  shapes that existed when they were written, so any rec with a NEW identity key
+  needs its extractor updated; everything outside `PHASE_A_DESCRIPTORS` falls
+  through `_render_generic_other_rec`, whose or-chain must contain that key.
+  Assert on rendered HTML: the resource is NAMED (no "Unknown"), the group total
+  equals the counted sum, and an advisory's figure never reads as a counted
+  dollar. *Real: LAM-2 (counted Provisioned-Concurrency dollar unrenderable);
+  renderers ignoring `Counted`; CF-4 cards rendering "Unknown" because the
+  extractor only knew `DistributionId` while the rec is keyed by certificate;
+  AG-3's two stages of one API rendering as identical rows.*
+- **D6 — A demoted rec's masked figure must reach the card.** Demotion zeroes the
+  numerics and parks the gross in `AdvisoryEstimate` / `PotentialMonthlySavings`
+  — but if the card prints only "$0.00/month — advisory", the reader has no
+  indication anything was withheld. Name the figure inside the advisory framing
+  ("$0.00/month — advisory ($418.20/month if realizable)"), in the grouped
+  renderers as well as the per-rec ones. *Real: AUR-G hid $418.20/mo behind a
+  $0.00 Aurora card; the first fix reached only the per-rec path, leaving the
+  grouped network/monitoring cards — where the tranche-6 demotions park their
+  exposure — still bare.*
 
 ## E. Silent failures & Cost-Hub plumbing
 
@@ -411,7 +474,20 @@ for s in svcs.get("ami", {}).get("sources", {}).values():
                 snap_amis[sid].add(r.get("ImageId"))
 assert not {s: a for s, a in snap_amis.items() if len(a) > 1}, "shared snapshot counted twice"
 
-# 5. scanned == rendered service tabs (D3); CoH dropped-type warnings present? (E2)
+# 5. Every COUNTED rec must name a resource on its card (D5). A rec whose identity
+#    key is absent from the renderer's or-chain renders as "Unknown" — counted but
+#    not actionable. This is the JSON-side pre-check; confirm in the HTML below.
+ID_KEYS = ("resource_id", "InstanceId", "LoadBalancerName", "ClusterName", "ServerId",
+           "ApiId", "DistributionId", "CertificateId", "LogGroupName", "FunctionName",
+           "DBInstanceIdentifier", "VpcEndpointId", "NatGatewayId", "AllocationId",
+           "EndpointName", "FileSystemId", "resourceArn", "resourceId")
+nameless = [(k, sn, r.get("CheckCategory")) for k, v in svcs.items()
+            for sn, s in v.get("sources", {}).items() for r in s.get("recommendations", [])
+            if isinstance(r, dict) and r.get("Counted") is not False and rec_dollar(r) > 0
+            and not any(r.get(key) for key in ID_KEYS)]
+assert nameless == [], nameless
+
+# 6. scanned == rendered service tabs (D3); CoH dropped-type warnings present? (E2)
 print("scanned:", d["summary"]["total_services_scanned"])
 print("dropped-type / fallback warnings:",
       [w["message"] for w in d.get("scan_warnings", []) if "dropped" in w["message"] or "fallback" in w["message"]])
@@ -420,7 +496,9 @@ print("permission_issues:", len(d.get("permission_issues", [])))
 
 Then **regenerate the HTML** (`generate_html_report_from_json`) and confirm: every
 service with rendered cards has an `id="tab-<key>"` + `id="panel-<key>"` (D2);
-advisory-only services included; the corrected headline figure appears.
+advisory-only services included; the corrected headline figure appears; no card
+title ends in `: Unknown` (D5); and every `$0.00/month — advisory` card that has
+an `AdvisoryEstimate`/`PotentialMonthlySavings` also names that figure (D6).
 
 ## How to verify a fix (especially a dedup)
 
@@ -428,6 +506,11 @@ advisory-only services included; the corrected headline figure appears.
    self-duplicate, etc.), asserting the dollar AND the `Counted` state.
 2. Run an **independent adversarial pass** that tries to REFUTE the fix — for a
    dedup, specifically: independent-resource under-count (A1), advisory-leak (B1),
-   claim-order (A4). This caught real defects in two of three dedup fixes.
+   claim-order (A4), and every other WRITER of the shared key set (A6). This
+   caught real defects in two of three dedup fixes.
+2b. For a **new counted lever**, additionally: render it (D5), check the metric's
+   reporting criteria and dimension set (C13), and confirm any strict pricing
+   probe has its own cache namespace (C12). Across six remediation tranches,
+   every self-review blocker fell into one of these three.
 3. Live re-scan and reconcile to the cent: the headline should move by **exactly**
    the predicted amount (the NAT recovery was +$43.07; the AMI dedup was −$43.47).
