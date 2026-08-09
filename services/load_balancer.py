@@ -10,11 +10,54 @@ import logging
 from datetime import datetime
 from typing import Any
 
-from core.pricing_engine import FALLBACK_ALB_MONTH, FALLBACK_GWLB_MONTH, FALLBACK_NLB_MONTH
+from core.pricing_engine import (
+    FALLBACK_ALB_MONTH,
+    FALLBACK_CLB_MONTH,
+    FALLBACK_GWLB_MONTH,
+    FALLBACK_NLB_MONTH,
+)
 from core.scan_context import ScanContext
 from services._aws_errors import record_aws_error
 
 logger = logging.getLogger(__name__)
+
+
+def _no_registered_targets(elbv2: Any, lb_arn: str) -> bool | None:
+    """True when the LB has target groups but NO registered targets anywhere.
+
+    An ALB/NLB with listeners but zero registered targets cannot be serving
+    traffic, while its base hourly bills regardless — definitive idleness from
+    describe APIs alone (NET-E). Returns:
+
+    * ``True``  — at least one target group, and every one is empty.
+    * ``False`` — at least one registered target (not idle).
+    * ``None``  — unknown: an enumeration failed, or the LB has no target
+      groups at all (it may be wired another way). The caller must abstain;
+      an ambiguous read must never produce a counted delete recommendation.
+    """
+    try:
+        groups: list[dict[str, Any]] = []
+        try:
+            paginator = elbv2.get_paginator("describe_target_groups")
+            for page in paginator.paginate(LoadBalancerArn=lb_arn):
+                groups.extend(page.get("TargetGroups", []))
+        except Exception:
+            resp = elbv2.describe_target_groups(LoadBalancerArn=lb_arn)
+            groups = resp.get("TargetGroups", [])
+
+        if not groups:
+            return None  # nothing to reason about — abstain
+
+        for group in groups:
+            arn = group.get("TargetGroupArn")
+            if not arn:
+                return None
+            health = elbv2.describe_target_health(TargetGroupArn=arn)
+            if health.get("TargetHealthDescriptions"):
+                return False
+        return True
+    except Exception:
+        return None
 
 
 def _is_kubernetes_managed_alb(ctx: ScanContext, elbv2: Any, lb_name: str, lb_arn: str) -> bool:
@@ -143,16 +186,54 @@ def get_load_balancer_checks(ctx: ScanContext) -> dict[str, Any]:
                 listeners = listeners_response.get("Listeners", [])
 
                 if len(listeners) == 0:
+                    # NET-B: emit the NUMERIC in lockstep with the string and at
+                    # full precision. The old ":.0f"-only string made the
+                    # headline take $16 for a $16.43 NLB, left every numeric
+                    # consumer (JSON download, invariant sweeps) reading $0, and
+                    # tripped the counted-but-$0 check.
+                    lb_monthly = lb_rate_by_type.get(lb_type, alb_monthly)
                     checks["idle_listeners"].append(
                         {
                             "LoadBalancerName": lb_name,
                             "Type": lb_type,
                             "Recommendation": "Load balancer has no listeners configured - verify configuration or delete if unused",
-                            "EstimatedSavings": f"${lb_rate_by_type.get(lb_type, alb_monthly):.0f}/month if deleted",
+                            "EstimatedSavings": f"${lb_monthly:.2f}/month if deleted",
+                            "EstimatedMonthlySavings": round(lb_monthly, 2),
                             "Action": "1. Check if listeners were accidentally deleted\n2. Verify if LB is still needed\n3. Configure listeners or delete LB",
                             "CheckCategory": "Load Balancer Configuration Issue",
                         }
                     )
+                elif lb_arn:
+                    # NET-E: an ALB/NLB whose target groups have NO registered
+                    # targets cannot be serving traffic — definitive idleness
+                    # from describe APIs alone (no CloudWatch, no new
+                    # permissions). The base hourly bills regardless, so the
+                    # whole base charge is recoverable on delete. Fails CLOSED:
+                    # any enumeration error, or zero target groups (which can
+                    # mean the LB is wired some other way), abstains entirely.
+                    idle_state = _no_registered_targets(elbv2, lb_arn)
+                    if idle_state is True:
+                        lb_monthly = lb_rate_by_type.get(lb_type, alb_monthly)
+                        checks["idle_listeners"].append(
+                            {
+                                "LoadBalancerName": lb_name,
+                                "Type": lb_type,
+                                "Recommendation": (
+                                    "Load balancer has listeners but NO registered targets in any "
+                                    "target group - delete if no longer needed"
+                                ),
+                                "EstimatedSavings": f"${lb_monthly:.2f}/month if deleted",
+                                "EstimatedMonthlySavings": round(lb_monthly, 2),
+                                "AuditBasis": {
+                                    "metric": "0 registered targets across all attached target groups",
+                                    "evidence": "elbv2:DescribeTargetGroups + DescribeTargetHealth",
+                                    "rate_monthly": round(lb_monthly, 2),
+                                    "formula": "full LB base charge (billed regardless of traffic)",
+                                },
+                                "Action": "1. Confirm no service is being migrated onto it\n2. Delete the load balancer",
+                                "CheckCategory": "Idle Load Balancer",
+                            }
+                        )
 
                 if lb_type == "application" and len(listeners) == 1 and not is_k8s_managed:
                     # NET-01: advisory $0 only. Counting full alb_monthly here per
@@ -260,6 +341,42 @@ def get_load_balancer_checks(ctx: ScanContext) -> dict[str, Any]:
         for elb in classic_lbs:
             elb_name = elb.get("LoadBalancerName")
             created_time = elb.get("CreatedTime")
+
+            # NET-E (Classic): DescribeLoadBalancers returns the registered
+            # instance list inline, so an empty Instances list is definitive
+            # idleness with no extra API call. `Instances` is always present on
+            # a real payload; treat a MISSING key as unknown and abstain.
+            if "Instances" in elb and not elb.get("Instances"):
+                try:
+                    clb_monthly = (
+                        ctx.pricing_engine.get_clb_monthly_price()
+                        if ctx.pricing_engine is not None
+                        else FALLBACK_CLB_MONTH * mult
+                    )
+                except Exception:
+                    # No defensible rate -> abstain from this counted delete rec
+                    # rather than abort the whole network check (C8).
+                    clb_monthly = 0.0
+                if clb_monthly <= 0:
+                    continue
+                checks["idle_listeners"].append(
+                    {
+                        "LoadBalancerName": elb_name,
+                        "Type": "classic",
+                        "Recommendation": (
+                            "Classic Load Balancer has no registered instances - delete if unused"
+                        ),
+                        "EstimatedSavings": f"${clb_monthly:.2f}/month if deleted",
+                        "EstimatedMonthlySavings": round(clb_monthly, 2),
+                        "AuditBasis": {
+                            "metric": "0 registered instances (elb:DescribeLoadBalancers)",
+                            "rate_monthly": round(clb_monthly, 2),
+                            "formula": "full Classic LB base charge (billed regardless of traffic)",
+                        },
+                        "Action": "1. Confirm no instances are being registered\n2. Delete the load balancer",
+                        "CheckCategory": "Idle Load Balancer",
+                    }
+                )
 
             if created_time:
                 age_days = (datetime.now(created_time.tzinfo) - created_time).days

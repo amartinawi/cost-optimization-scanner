@@ -50,11 +50,30 @@ class _FakeElbv2:
         listeners_by_arn: dict[str, list[dict[str, Any]]],
         tags_by_arn: dict[str, list[dict[str, str]]] | None = None,
         rules_by_listener: dict[str, list[dict[str, Any]]] | None = None,
+        tgs_by_lb: dict[str, list[str]] | None = None,
+        targets_by_tg: dict[str, list[dict[str, Any]]] | None = None,
+        tg_error: Exception | None = None,
     ) -> None:
         self._lbs = load_balancers
         self._listeners = listeners_by_arn
         self._tags = tags_by_arn or {}
         self._rules = rules_by_listener or {}
+        # NET-E: {lb_arn: [tg_arn, ...]} and {tg_arn: [target, ...]}
+        self._tgs_by_lb = tgs_by_lb or {}
+        self._targets_by_tg = targets_by_tg or {}
+        self._tg_error = tg_error
+
+    def describe_target_groups(self, LoadBalancerArn: str) -> dict[str, Any]:  # noqa: N803
+        if self._tg_error is not None:
+            raise self._tg_error
+        return {
+            "TargetGroups": [
+                {"TargetGroupArn": arn} for arn in self._tgs_by_lb.get(LoadBalancerArn, [])
+            ]
+        }
+
+    def describe_target_health(self, TargetGroupArn: str) -> dict[str, Any]:  # noqa: N803
+        return {"TargetHealthDescriptions": self._targets_by_tg.get(TargetGroupArn, [])}
 
     def get_paginator(self, name: str) -> _FakePaginator:
         if name == "describe_load_balancers":
@@ -108,11 +127,20 @@ def _ctx(
 _ALB_MONTHLY = 16.43
 
 
-def _pe(alb: float = _ALB_MONTHLY, nlb: float = _ALB_MONTHLY, gwlb: float = 9.49) -> SimpleNamespace:
+_CLB_MONTHLY = 18.25  # $0.025/hr x 730 (AWSELB "Load Balancer" productFamily)
+
+
+def _pe(
+    alb: float = _ALB_MONTHLY,
+    nlb: float = _ALB_MONTHLY,
+    gwlb: float = 9.49,
+    clb: float = _CLB_MONTHLY,
+) -> SimpleNamespace:
     return SimpleNamespace(
         get_alb_monthly_price=lambda: alb,
         get_nlb_monthly_price=lambda: nlb,
         get_gwlb_monthly_price=lambda: gwlb,
+        get_clb_monthly_price=lambda: clb,
     )
 
 
@@ -249,7 +277,11 @@ def test_idle_listener_lb_still_counts() -> None:
     rec = idle[0]
     # Counted (no Counted=False flag) and carries the real per-LB base saving.
     assert rec.get("Counted") is not False
-    assert parse_dollar_savings(rec["EstimatedSavings"]) == pytest.approx(round(_ALB_MONTHLY))
+    # NET-B: full precision, and the numeric agrees with the string — the old
+    # ":.0f"-only rec made the headline take $16 for a $16.43 LB while every
+    # numeric consumer read $0.
+    assert parse_dollar_savings(rec["EstimatedSavings"]) == pytest.approx(_ALB_MONTHLY, abs=0.01)
+    assert rec["EstimatedMonthlySavings"] == pytest.approx(_ALB_MONTHLY, abs=0.01)
     # A zero-listener ALB is NOT also flagged as a single_service consolidation candidate.
     assert _category(out, "single_service_albs") == []
 
@@ -266,3 +298,94 @@ def test_advisory_zero_holds_with_fallback_pricing() -> None:
     shared = _category(out, "shared_alb_opportunity")
     assert all(r["Counted"] is False and parse_dollar_savings(r["EstimatedSavings"]) == 0.0 for r in singles)
     assert all(r["Counted"] is False and parse_dollar_savings(r["EstimatedSavings"]) == 0.0 for r in shared)
+
+
+# --------------------------------------------------------------------------- #
+# NET-E — idle LB lever: zero registered targets is DEFINITIVE, and every
+# ambiguous read abstains (a delete rec must never rest on missing evidence).
+# --------------------------------------------------------------------------- #
+def _idle_case(tgs_by_lb, targets_by_tg, tg_error=None):
+    lbs, listeners = _build({"app-1": 1})  # has a listener, so NET-B doesn't fire
+    elbv2 = _FakeElbv2(
+        lbs, listeners, tgs_by_lb=tgs_by_lb, targets_by_tg=targets_by_tg, tg_error=tg_error
+    )
+    return get_load_balancer_checks(_ctx(elbv2, pricing_engine=_pe()))
+
+
+def _lb_arn(name: str = "app-1") -> str:
+    lbs, _ = _build({name: 1})
+    return lbs[0]["LoadBalancerArn"]
+
+
+def test_lb_with_no_registered_targets_is_counted_idle() -> None:
+    arn = _lb_arn()
+    out = _idle_case({arn: ["tg-1", "tg-2"]}, {"tg-1": [], "tg-2": []})
+    idle = [r for r in _category(out, "idle_listeners") if r["CheckCategory"] == "Idle Load Balancer"]
+    assert len(idle) == 1
+    assert idle[0]["EstimatedMonthlySavings"] == pytest.approx(_ALB_MONTHLY, abs=0.01)
+    assert idle[0].get("Counted") is not False
+    assert "0 registered targets" in idle[0]["AuditBasis"]["metric"]
+
+
+def test_lb_with_registered_targets_is_not_flagged() -> None:
+    arn = _lb_arn()
+    out = _idle_case({arn: ["tg-1", "tg-2"]}, {"tg-1": [], "tg-2": [{"Target": {"Id": "i-1"}}]})
+    assert [r for r in _category(out, "idle_listeners") if r["CheckCategory"] == "Idle Load Balancer"] == []
+
+
+def test_lb_with_no_target_groups_abstains() -> None:
+    """No target groups at all is ambiguous (the LB may be wired another way),
+    not proof of idleness."""
+    out = _idle_case({}, {})
+    assert [r for r in _category(out, "idle_listeners") if r["CheckCategory"] == "Idle Load Balancer"] == []
+
+
+def test_lb_target_enumeration_failure_abstains() -> None:
+    """C8: losing the evidence must never create a counted delete rec."""
+    arn = _lb_arn()
+    out = _idle_case({arn: ["tg-1"]}, {"tg-1": []}, tg_error=Exception("AccessDenied"))
+    assert [r for r in _category(out, "idle_listeners") if r["CheckCategory"] == "Idle Load Balancer"] == []
+
+
+def test_classic_lb_with_no_instances_is_counted_idle() -> None:
+    from datetime import datetime, timezone
+
+    clb = {
+        "LoadBalancerName": "clb-idle",
+        "CreatedTime": datetime(2020, 1, 1, tzinfo=timezone.utc),
+        "Instances": [],
+    }
+    lbs, listeners = _build({"app-1": 1})
+    out = get_load_balancer_checks(
+        _ctx(_FakeElbv2(lbs, listeners), _FakeElb([clb]), pricing_engine=_pe())
+    )
+    idle = [r for r in _category(out, "idle_listeners") if r["CheckCategory"] == "Idle Load Balancer"]
+    assert len(idle) == 1 and idle[0]["LoadBalancerName"] == "clb-idle"
+    assert idle[0]["EstimatedMonthlySavings"] == pytest.approx(_CLB_MONTHLY, abs=0.01)
+
+
+def test_classic_lb_with_instances_is_not_flagged() -> None:
+    from datetime import datetime, timezone
+
+    clb = {
+        "LoadBalancerName": "clb-busy",
+        "CreatedTime": datetime(2020, 1, 1, tzinfo=timezone.utc),
+        "Instances": [{"InstanceId": "i-1"}],
+    }
+    lbs, listeners = _build({"app-1": 1})
+    out = get_load_balancer_checks(
+        _ctx(_FakeElbv2(lbs, listeners), _FakeElb([clb]), pricing_engine=_pe())
+    )
+    assert [r for r in _category(out, "idle_listeners") if r["CheckCategory"] == "Idle Load Balancer"] == []
+
+
+def test_classic_lb_without_instances_key_abstains() -> None:
+    """A payload missing Instances entirely is unknown, not empty."""
+    from datetime import datetime, timezone
+
+    clb = {"LoadBalancerName": "clb-unknown", "CreatedTime": datetime(2020, 1, 1, tzinfo=timezone.utc)}
+    lbs, listeners = _build({"app-1": 1})
+    out = get_load_balancer_checks(
+        _ctx(_FakeElbv2(lbs, listeners), _FakeElb([clb]), pricing_engine=_pe())
+    )
+    assert [r for r in _category(out, "idle_listeners") if r["CheckCategory"] == "Idle Load Balancer"] == []
