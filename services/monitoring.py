@@ -7,6 +7,7 @@ This module will later become MonitoringModule (T-322) implementing ServiceModul
 
 from __future__ import annotations
 
+from datetime import UTC
 from typing import Any
 
 from core.scan_context import ScanContext
@@ -34,6 +35,77 @@ CW_CUSTOM_METRIC_TIER_3_LIMIT: int = 1_000_000
 # review (the old >100-metric CARDINALITY gate hid 99-metric namespaces
 # worth ~$30/mo while surfacing $2/mo ones on huge accounts).
 CW_CUSTOM_METRIC_SPEND_ADVISORY_FLOOR: float = 10.0
+
+# MON-3 — CloudWatch Logs ingestion, $/GB by log class. Validated against the
+# live Pricing API 2026-08-09 (AmazonCloudWatch, us-east-1, operation
+# PutLogEvents): Standard custom-log ingestion USE1-DataProcessing-Bytes =
+# $0.50/GB flat; Infrequent Access USE1-DataProcessingIA-Bytes = $0.25/GB flat.
+# Region-scaled by pricing_multiplier at the call site.
+CW_LOGS_INGEST_STANDARD_GB: float = 0.50
+CW_LOGS_INGEST_IA_GB: float = 0.25
+
+# One GetMetricData call carries at most 500 queries. Log-group counts can run
+# to thousands, so the probe covers the largest groups first and says so when it
+# truncates rather than silently reporting on a subset.
+_INGESTION_PROBE_LIMIT: int = 500
+_INGESTION_WINDOW_DAYS: int = 30
+
+
+def _log_group_ingestion_gb(
+    ctx: ScanContext, log_group_names: list[str]
+) -> dict[str, float]:
+    """{log group name: GB ingested over the window}, batched into one call.
+
+    Only groups CloudWatch actually reported are present; a missing name means
+    no data was returned, which the caller treats as "unknown", never as zero.
+    """
+    if not log_group_names:
+        return {}
+    from datetime import datetime, timedelta
+
+    queries = [
+        {
+            "Id": f"q{i}",
+            "MetricStat": {
+                "Metric": {
+                    "Namespace": "AWS/Logs",
+                    "MetricName": "IncomingBytes",
+                    "Dimensions": [{"Name": "LogGroupName", "Value": name}],
+                },
+                "Period": _INGESTION_WINDOW_DAYS * 86400,
+                "Stat": "Sum",
+            },
+            "ReturnData": True,
+        }
+        for i, name in enumerate(log_group_names)
+    ]
+    end = datetime.now(UTC)
+    start = end - timedelta(days=_INGESTION_WINDOW_DAYS)
+    try:
+        resp = ctx.client("cloudwatch").get_metric_data(
+            MetricDataQueries=queries, StartTime=start, EndTime=end
+        )
+    except Exception as exc:
+        record_aws_error(
+            ctx,
+            exc,
+            service="monitoring",
+            context="cloudwatch:GetMetricData IncomingBytes for log groups",
+        )
+        return {}
+
+    out: dict[str, float] = {}
+    for result in resp.get("MetricDataResults", []):
+        values = result.get("Values") or []
+        if not values:
+            continue
+        try:
+            index = int(str(result.get("Id", "q"))[1:])
+        except ValueError:
+            continue
+        if 0 <= index < len(log_group_names):
+            out[log_group_names[index]] = sum(values) / (1024**3)
+    return out
 
 # Tiered custom-metric rates re-verified against the AWS Pricing API on
 # 2026-06-27 (AmazonCloudWatch SKU KG586CTNGQ4VRZKZ, usagetype
@@ -78,6 +150,7 @@ def get_cloudwatch_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> 
 
     checks: dict[str, list[dict[str, Any]]] = {
         "never_expiring_logs": [],
+        "log_class_migration": [],
         "excessive_logging": [],
         "unused_custom_metrics": [],
         "high_resolution_metrics": [],
@@ -97,10 +170,84 @@ def get_cloudwatch_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> 
                 break
             log_groups_params["nextToken"] = next_token
 
+        # MON-3 — ingestion is the dominant CloudWatch Logs cost and had no
+        # lever at all. Probe the biggest groups first; one batched call.
+        standard_groups = [
+            str(lg.get("logGroupName"))
+            for lg in sorted(log_groups, key=lambda g: g.get("storedBytes", 0) or 0, reverse=True)
+            if lg.get("logGroupName")
+            and str(lg.get("logGroupClass") or "STANDARD").upper() == "STANDARD"
+        ]
+        probed = standard_groups[:_INGESTION_PROBE_LIMIT]
+        if len(standard_groups) > len(probed):
+            ctx.warn(
+                f"Log ingestion probed for the {len(probed)} largest Standard-class log "
+                f"groups of {len(standard_groups)}; the remainder were not measured.",
+                "monitoring",
+            )
+        ingestion_gb = {} if fast_mode else _log_group_ingestion_gb(ctx, probed)
+
         for log_group in log_groups:
             log_group_name = log_group.get("logGroupName")
             retention_days = log_group.get("retentionInDays")
             stored_bytes = log_group.get("storedBytes", 0)
+
+            monthly_gb = ingestion_gb.get(str(log_group_name))
+            if monthly_gb is not None and monthly_gb > 0:
+                delta = (CW_LOGS_INGEST_STANDARD_GB - CW_LOGS_INGEST_IA_GB) * pricing_multiplier
+                potential = monthly_gb * delta
+                checks["log_class_migration"].append(
+                    {
+                        "LogGroupName": log_group_name,
+                        "LogGroupClass": log_group.get("logGroupClass") or "STANDARD",
+                        "MonthlyIngestedGB": round(monthly_gb, 2),
+                        "Recommendation": (
+                            f"{monthly_gb:,.1f} GB/month ingested into the Standard log "
+                            "class - the Infrequent Access class ingests the same data at "
+                            "half the rate"
+                        ),
+                        # ADVISORY, deliberately. Unlike this tranche's other new
+                        # levers, the change is not a config toggle: AWS documents
+                        # that logGroupClass "can't be changed after a log group is
+                        # created", so realizing this means creating a new group and
+                        # repointing every producer. IA also drops EMF, Live Tail,
+                        # anomaly detection, pattern analysis and console viewing,
+                        # and nothing here can prove none of those are in use. Same
+                        # call as the FSx SSD->HDD demotion: an exact figure, but not
+                        # an in-place change, so the figure renders without being
+                        # counted.
+                        "EstimatedSavings": (
+                            f"$0.00/month - advisory: ${potential:,.2f}/month at the IA "
+                            "rate, but the log class cannot be changed in place and IA "
+                            "drops EMF / Live Tail / anomaly detection"
+                        ),
+                        "EstimatedMonthlySavings": 0.0,
+                        "PotentialMonthlySavings": round(potential, 2),
+                        "Counted": False,
+                        "CheckCategory": "CloudWatch Logs Class Migration",
+                        "AuditBasis": {
+                            "metric": "AWS/Logs IncomingBytes (Sum), dimension LogGroupName",
+                            "metric_window_days": _INGESTION_WINDOW_DAYS,
+                            "monthly_ingested_gb": round(monthly_gb, 2),
+                            "standard_rate_per_gb": CW_LOGS_INGEST_STANDARD_GB,
+                            "ia_rate_per_gb": CW_LOGS_INGEST_IA_GB,
+                            "region_multiplier": round(pricing_multiplier, 4),
+                            "rate_source": (
+                                "AmazonCloudWatch USE1-DataProcessing-Bytes / "
+                                "USE1-DataProcessingIA-Bytes, operation PutLogEvents "
+                                "(AWS Pricing API, validated 2026-08-09)"
+                            ),
+                            "formula": "ingested GB x (standard rate - IA rate)",
+                            "counted": False,
+                            "reason": (
+                                "logGroupClass cannot be changed after creation (AWS docs), "
+                                "so this needs a new log group and every producer "
+                                "repointed; IA also drops features whose use this scan "
+                                "cannot rule out"
+                            ),
+                        },
+                    }
+                )
 
             if retention_days is None:
                 stored_gb = stored_bytes / (1024**3)
