@@ -54,8 +54,27 @@ def get_enhanced_glue_checks(ctx: ScanContext) -> dict[str, Any]:
         record_aws_error(ctx, e, service="glue", context="glue:GetJobs")
 
     try:
-        dev_endpoints = glue.get_dev_endpoints()
-        for endpoint in dev_endpoints.get("DevEndpoints", []):
+        # GL-1 — dev endpoints are the ONLY counted Glue dollar ($0.44/DPU-hr x
+        # 730, i.e. $1,606/mo for a 5-DPU endpoint), and this was a one-shot
+        # call: every endpoint past the first page was silently dropped. The
+        # sibling get_jobs/get_crawlers calls already paginate.
+        endpoint_pages: list[dict[str, Any]] = []
+        try:
+            paginator = glue.get_paginator("get_dev_endpoints")
+            endpoint_pages = list(paginator.paginate())
+        except Exception:
+            # Paginator unavailable — walk NextToken manually rather than
+            # silently capping at one page.
+            params: dict[str, Any] = {}
+            while True:
+                resp = glue.get_dev_endpoints(**params)
+                endpoint_pages.append(resp)
+                token = resp.get("NextToken")
+                if not isinstance(token, str) or not token:
+                    break
+                params["NextToken"] = token
+
+        for endpoint in (ep for page in endpoint_pages for ep in page.get("DevEndpoints", [])):
             endpoint_name = endpoint.get("EndpointName")
             status = endpoint.get("Status")
 

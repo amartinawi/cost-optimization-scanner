@@ -380,3 +380,58 @@ def test_get_dev_endpoints_failure_isolated_and_warned() -> None:
     # GetJobs ran before the failing call and its rightsizing rec survived.
     jobs = [r for r in result["recommendations"] if r["CheckCategory"] == _JOB_CATEGORY]
     assert len(jobs) == 1
+
+
+# --------------------------------------------------------------------------- #
+# GL-1 — dev endpoints are the only counted Glue dollar; enumerate every page
+# --------------------------------------------------------------------------- #
+class _PagedGlueClient(_FakeGlueClient):
+    """Glue client whose get_dev_endpoints paginator returns several pages."""
+
+    def get_paginator(self, name: str):
+        if name == "get_dev_endpoints":
+            return _FakeGluePaginator(
+                [{"DevEndpoints": [ep]} for ep in self._dev_endpoints]
+            )
+        return super().get_paginator(name)
+
+
+class _NextTokenGlueClient(_FakeGlueClient):
+    """No paginator for get_dev_endpoints — forces the manual NextToken walk."""
+
+    def get_paginator(self, name: str):
+        if name == "get_dev_endpoints":
+            raise AssertionError("no paginator for get_dev_endpoints")
+        return super().get_paginator(name)
+
+    def get_dev_endpoints(self, **params: Any) -> dict[str, Any]:
+        token = params.get("NextToken")
+        if token is None:
+            return {"DevEndpoints": self._dev_endpoints[:1], "NextToken": "p2"}
+        return {"DevEndpoints": self._dev_endpoints[1:]}
+
+
+def _ready(name: str) -> dict[str, Any]:
+    return {"EndpointName": name, "Status": "READY", "NumberOfNodes": 5}
+
+
+def test_dev_endpoints_paginated() -> None:
+    """A one-shot get_dev_endpoints dropped every endpoint past page 1 — at
+    $0.44/DPU-hr x 730 that is $1,606/mo per 5-DPU endpoint silently missing."""
+    from services.glue import get_enhanced_glue_checks
+
+    client = _PagedGlueClient(dev_endpoints=[_ready("ep1"), _ready("ep2"), _ready("ep3")])
+    ctx = _ctx(client=lambda name, **kw: client)
+    out = get_enhanced_glue_checks(ctx)
+    names = [r["EndpointName"] for r in out["checks"]["dev_endpoints"]]
+    assert names == ["ep1", "ep2", "ep3"]
+
+
+def test_dev_endpoints_next_token_fallback() -> None:
+    """When no paginator exists the manual NextToken loop must still walk pages."""
+    from services.glue import get_enhanced_glue_checks
+
+    client = _NextTokenGlueClient(dev_endpoints=[_ready("ep1"), _ready("ep2")])
+    ctx = _ctx(client=lambda name, **kw: client)
+    out = get_enhanced_glue_checks(ctx)
+    assert [r["EndpointName"] for r in out["checks"]["dev_endpoints"]] == ["ep1", "ep2"]
