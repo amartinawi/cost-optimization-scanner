@@ -421,3 +421,66 @@ def test_pc_configs_collected_across_all_pages() -> None:
     # One rec per PC config across both pages — neither page is dropped.
     assert len(pc) == 2
     assert {r["ProvisionedConcurrency"] for r in pc} == {2, 5}
+
+
+# --------------------------------------------------------------------------- #
+# LAM-1/LAM-2 — the PC lever is Compute-SP covered, and it must render
+# --------------------------------------------------------------------------- #
+def test_pc_counted_string_matches_the_counted_dollar(monkeypatch: pytest.MonkeyPatch) -> None:
+    """LAM-2: the shim leaves a percentage string on the PC rec and the Phase-B
+    renderer prefers the string (falling back only to camelCase), so the counted
+    PC dollar was unrenderable — the card showed 'Up to 90% if not needed' while
+    the headline counted real money."""
+    rec = _pc_rec("x86_64", util=0.25)
+    rec["EstimatedSavings"] = "Up to 90% if not needed"  # what the shim really sets
+    monkeypatch.setattr(adapter_mod, "get_lambda_compute_optimizer_recommendations", lambda c: [])
+    monkeypatch.setattr(adapter_mod, "get_enhanced_lambda_checks", lambda c: {"recommendations": [rec]})
+
+    findings = LambdaModule().scan(_recording_ctx())
+
+    emitted = findings.sources["enhanced_checks"].recommendations[0]
+    expected = _expected_pc(_LAMBDA_PC_PRICE_PER_GB_SEC, 1024, 2, 0.25)
+    assert emitted["EstimatedSavings"] == f"${expected:,.2f}/month"
+    assert "%" not in emitted["EstimatedSavings"]
+
+
+def test_pc_savings_demoted_under_an_active_compute_sp(monkeypatch: pytest.MonkeyPatch) -> None:
+    """LAM-1: Compute Savings Plans cover Provisioned Concurrency and PC
+    Duration, not just invocation duration. The gate demoted CoH+CO then set
+    savings = formula_savings — exempting the ONE locally counted lever, so PC
+    dollars stayed in the headline while the commitment billed regardless."""
+    from services.commitment_coverage import CommitmentCoverage
+
+    rec = _pc_rec("x86_64", util=0.25)
+    monkeypatch.setattr(adapter_mod, "get_lambda_compute_optimizer_recommendations", lambda c: [])
+    monkeypatch.setattr(adapter_mod, "get_enhanced_lambda_checks", lambda c: {"recommendations": [rec]})
+
+    ctx = _recording_ctx()
+    ctx.commitment_coverage = CommitmentCoverage(region="us-east-1", has_compute_sp=True)
+    findings = LambdaModule().scan(ctx)
+
+    assert findings.total_monthly_savings == pytest.approx(0.0)
+    emitted = findings.sources["enhanced_checks"].recommendations[0]
+    assert emitted["Counted"] is False
+    assert emitted["EstimatedMonthlySavings"] == 0.0
+    expected = _expected_pc(_LAMBDA_PC_PRICE_PER_GB_SEC, 1024, 2, 0.25)
+    assert emitted["AdvisoryEstimate"] == pytest.approx(round(expected, 2))
+    assert "Provisioned Concurrency" in emitted["CommitmentCoverageNote"]
+
+
+def test_pc_savings_counted_without_a_compute_sp(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No Compute SP -> the PC dollar stays counted (accounts without
+    commitments are unaffected by the LAM-1 gate)."""
+    from services.commitment_coverage import CommitmentCoverage
+
+    rec = _pc_rec("x86_64", util=0.25)
+    monkeypatch.setattr(adapter_mod, "get_lambda_compute_optimizer_recommendations", lambda c: [])
+    monkeypatch.setattr(adapter_mod, "get_enhanced_lambda_checks", lambda c: {"recommendations": [rec]})
+
+    ctx = _recording_ctx()
+    ctx.commitment_coverage = CommitmentCoverage(region="us-east-1")  # no SP
+    findings = LambdaModule().scan(ctx)
+
+    expected = _expected_pc(_LAMBDA_PC_PRICE_PER_GB_SEC, 1024, 2, 0.25)
+    assert findings.total_monthly_savings == pytest.approx(expected, rel=1e-6)
+    assert findings.sources["enhanced_checks"].recommendations[0].get("Counted") is not False
