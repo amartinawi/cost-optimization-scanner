@@ -81,6 +81,10 @@ def get_enhanced_dms_checks(ctx: ScanContext) -> dict[str, Any]:
         "unused_instances": [],
     }
 
+    # Config-only Multi-AZ candidates, published separately from `checks` so the
+    # adapter's Multi-AZ lever no longer depends on the CPU path (DMS-1).
+    multi_az_instances: list[dict[str, Any]] = []
+
     try:
         dms = ctx.client("dms")
 
@@ -97,6 +101,22 @@ def get_enhanced_dms_checks(ctx: ScanContext) -> dict[str, Any]:
                 # AZ-specific Pricing SKU (InstanceUsg vs Multi-AZUsg) and drive
                 # the Multi-AZ->Single-AZ per-AZ-delta lever (dms H1/H2).
                 multi_az = bool(instance.get("MultiAZ", False))
+
+                # DMS-1 — the Multi-AZ -> Single-AZ lever is a pure CONFIG
+                # finding, but the adapter reached it only through recs produced
+                # by the CloudWatch CPU path below. A dev Multi-AZ instance at
+                # normal utilization therefore produced no rec at all and its
+                # per-AZ delta (~$204/mo on an r5.large) was never seen. Publish
+                # every billable Multi-AZ instance here, independent of any metric.
+                if multi_az and status not in _NON_BILLABLE_STATES and instance_class:
+                    multi_az_instances.append(
+                        {
+                            "InstanceId": instance_id,
+                            "InstanceClass": instance_class,
+                            "MultiAZ": True,
+                            "Tags": instance.get("Tags", []),
+                        }
+                    )
 
                 if status not in _NON_BILLABLE_STATES and instance_class:
                     try:
@@ -206,4 +226,8 @@ def get_enhanced_dms_checks(ctx: ScanContext) -> dict[str, Any]:
     for _category, recs in checks.items():
         all_recommendations.extend(recs)
 
-    return {"recommendations": all_recommendations, "checks": checks}
+    return {
+        "recommendations": all_recommendations,
+        "checks": checks,
+        "multi_az_instances": multi_az_instances,
+    }
