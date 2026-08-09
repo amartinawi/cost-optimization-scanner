@@ -45,11 +45,20 @@ WORKSPACE_BUNDLE_MONTHLY: dict[str, float] = {
     "PERFORMANCE": 50.0,
     "POWER": 78.0,
     "POWERPRO": 140.0,
+    # AlwaysOn Windows+Included, us-east-1 (Pricing API SKU YAV27NTHHAA2B7YK,
+    # usagetype USE1-AW-HW-GP-4xlarge, verified 2026-08-09) — the most
+    # expensive non-GPU bundle, previously unpriced so every such WorkSpace
+    # yielded $0 (WS-1).
+    "GENERALPURPOSE_4XLARGE": 295.0,
     "GRAPHICS": 350.0,
     "GRAPHICS_G4DN": 537.0,
     "GRAPHICSPRO": 999.0,
     "GRAPHICSPRO_G4DN": 959.0,
 }
+# Compute types AWS documents but this table does not price (GENERALPURPOSE_8XLARGE
+# and the whole G6/GR6/G6F GPU family). They resolve to $0 -> the adapter emits a
+# $0 advisory rather than a fabricated dollar; add rows here as they are
+# live-validated (WS-1 remainder).
 
 # AWS WorkSpaces AutoStop pricing per bundle: (fixed_monthly_fee, hourly_rate),
 # us-east-1 Windows-licensed, validated against the live AWS Pricing API
@@ -73,6 +82,9 @@ WORKSPACE_AUTOSTOP_PRICING: dict[str, tuple[float, float]] = {
     "PERFORMANCE": (13.0, 0.47),
     "POWER": (19.0, 0.68),
     "POWERPRO": (19.0, 1.53),
+    # us-east-1 Windows+Included AutoStop: $19.00/mo fee + $2.28/hr (Pricing API
+    # SKUs FK4G9EQ3KH5BJEY4 / 6RFFX2WY637JKAFF, verified 2026-08-09).
+    "GENERALPURPOSE_4XLARGE": (19.0, 2.28),
     "GRAPHICSPRO": (66.0, 11.62),
 }
 
@@ -216,7 +228,12 @@ def get_enhanced_workspaces_checks(ctx: ScanContext) -> dict[str, Any]:
                 running_mode = props.get("RunningMode")
                 # C3: carry the real bundle so scan() prices the actual ComputeType
                 # rather than defaulting every rec to STANDARD.
-                compute_type = props.get("ComputeTypeName", "STANDARD")
+                # WS-3 (C2/C8): ComputeTypeName is documented Required: No, and a
+                # silent "STANDARD" default fed a fabricated $35 counted dollar —
+                # highest-risk on ERROR-state WorkSpaces, which are exactly what
+                # the Unused check targets. Carry "" so the adapter abstains, as
+                # it already does for an unknown RunningMode.
+                compute_type = props.get("ComputeTypeName") or ""
                 # workspaces L1: the bundle price tables are us-east-1
                 # Windows+Included rates. A POSITIVELY non-Windows OS or a
                 # BRING_YOUR_OWN_LICENSE WorkSpace makes the bundle figure
