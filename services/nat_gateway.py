@@ -154,12 +154,22 @@ def get_nat_gateway_checks(
             if n["environment"] not in _DEV_TEST_ENVS:
                 continue
             sole_in_vpc = len(vpc_nats[n["vpc_id"]]) == 1
-            if sole_in_vpc:
-                savings_str = f"${nat_monthly:.2f}/month base if replaced with a NAT instance or scheduled off"
-                monthly = round(nat_monthly, 2)
-            else:
-                savings_str = "$0.00/month - removable base counted under NAT consolidation findings"
-                monthly = 0.0
+            # NET-C — this used to COUNT the NAT's full base on the strength of
+            # an Environment tag alone. Two things are wrong with that. First,
+            # the structurally identical EC2 non-prod-scheduling lever is
+            # corroboration-gated on a CloudWatch idle signal (C7/C9), and no
+            # such signal is collected here. Second, neither remediation this
+            # rec proposes recovers the full base: a NAT *instance* is a
+            # replacement that still bills as EC2, and a scheduled shutdown
+            # recovers only the off-hours fraction. The figure is kept in
+            # PotentialMonthlySavings so the reader still sees the exposure.
+            ceiling = round(nat_monthly, 2) if sole_in_vpc else 0.0
+            reason = (
+                "replacement/scheduling saving is a delta, not the full base, and no "
+                "traffic or idle corroboration is collected for this NAT"
+                if sole_in_vpc
+                else "removable base is counted under the NAT consolidation findings"
+            )
             checks["nat_in_dev_test"].append(
                 {
                     "NatGatewayId": n["nat_id"],
@@ -168,8 +178,16 @@ def get_nat_gateway_checks(
                     "Environment": n["environment"],
                     "ResourceName": f"NAT Gateway {n['nat_id']} ({n['az']})",
                     "Recommendation": "Consider a NAT instance or scheduled shutdown for dev/test",
-                    "EstimatedSavings": savings_str,
-                    "EstimatedMonthlySavings": monthly,
+                    "EstimatedSavings": f"$0.00/month - advisory: {reason}",
+                    "EstimatedMonthlySavings": 0.0,
+                    "PotentialMonthlySavings": ceiling,
+                    "Counted": False,
+                    "AuditBasis": {
+                        "nat_base_monthly": round(nat_monthly, 2),
+                        "sole_nat_in_vpc": sole_in_vpc,
+                        "counted": False,
+                        "reason": reason,
+                    },
                     "CheckCategory": "Dev/Test NAT Optimization",
                 }
             )

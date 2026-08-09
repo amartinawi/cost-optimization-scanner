@@ -233,15 +233,25 @@ def test_dev_test_nat_advisory_when_vpc_has_multiple_nats() -> None:
     assert all(r["EstimatedMonthlySavings"] == 0.0 for r in dev)  # consolidation owns the $
 
 
-def test_dev_test_nat_counted_when_sole_in_vpc() -> None:
+def test_dev_test_nat_is_advisory_not_counted() -> None:
+    """NET-C — this used to COUNT the full base off an Environment tag alone.
+
+    The structurally identical EC2 non-prod-scheduling lever is corroboration-
+    gated on a CloudWatch idle signal, and neither remediation this rec proposes
+    recovers the full base anyway: a NAT *instance* still bills as EC2, and a
+    scheduled shutdown recovers only the off-hours fraction.
+    """
     nat_pages = [{"NatGateways": [_nat("nat-1", "vpc-solo", "sub-1", env="test")]}]
     ec2 = _FakeEc2(nat_pages=nat_pages, subnet_az={"sub-1": "az-a"})
     out = get_nat_gateway_checks(_ctx(ec2, pricing_engine=_nat_engine(32.85)))
     dev = out["nat_in_dev_test"]
     assert len(dev) == 1
-    assert dev[0]["EstimatedMonthlySavings"] == 32.85
+    assert dev[0]["Counted"] is False
+    assert dev[0]["EstimatedMonthlySavings"] == 0.0
+    assert parse_dollar_savings(dev[0]["EstimatedSavings"]) == 0.0
+    # The exposure still reaches the reader.
+    assert dev[0]["PotentialMonthlySavings"] == 32.85
     assert "+ 0.85" not in dev[0]["EstimatedSavings"]  # M1: no fabricated addend
-    assert parse_dollar_savings(dev[0]["EstimatedSavings"]) == 32.85
 
 
 def test_net06_no_missing_endpoint_advisory_from_nat_shim() -> None:
@@ -514,8 +524,9 @@ def test_nat_fallback_region_scaled() -> None:
     ec2 = _FakeEc2(nat_pages=nat_pages, subnet_az={"sub-1": "az-a"})
     out = get_nat_gateway_checks(_ctx(ec2, pricing_engine=None, pricing_multiplier=1.5))
     rec = out["nat_in_dev_test"][0]
-    # String is formatted with .2f, so compare against the rounded display value.
-    assert parse_dollar_savings(rec["EstimatedSavings"]) == float(f"{FALLBACK_NAT_MONTH * 1.5:.2f}")
+    # The lever is advisory (NET-C), so the region-scaled fallback shows up in
+    # the potential figure rather than a counted dollar.
+    assert rec["PotentialMonthlySavings"] == float(f"{FALLBACK_NAT_MONTH * 1.5:.2f}")
 
 
 # --------------------------------------------------------------------------- #
@@ -716,3 +727,46 @@ def test_exactly_two_endpoints_are_flagged() -> None:
 def test_a_single_endpoint_per_service_is_not_flagged() -> None:
     out = _endpoint_checks([_interface("vpce-1", service="ssm"), _interface("vpce-2", service="ec2")])
     assert out["duplicate_endpoints"] == []
+
+
+# --------------------------------------------------------------------------- #
+# NET-D — multiple EIPs per instance: removability never established
+# --------------------------------------------------------------------------- #
+def test_multiple_eips_per_instance_is_advisory() -> None:
+    """The rec's own text says "review if all are necessary", and its sibling
+    Public IP Optimization lever is already Counted=False for the same reason.
+    A multi-NIC or multi-service instance legitimately holds several EIPs."""
+    from services.elastic_ip import get_elastic_ip_checks
+
+    addresses = [
+        {"AllocationId": f"eipalloc-{i}", "InstanceId": "i-1", "PublicIp": f"1.2.3.{i}"} for i in range(3)
+    ]
+    ec2 = _FakeEc2(
+        addresses=addresses,
+        instances_pages=[
+            {"Reservations": [{"Instances": [{"InstanceId": "i-1", "State": {"Name": "running"}}]}]}
+        ],
+    )
+    out = get_elastic_ip_checks(_ctx(ec2, pricing_engine=SimpleNamespace(get_eip_monthly_price=lambda: 3.65)))
+    multi = out["multiple_eips_per_instance"]
+    assert len(multi) == 1
+    assert multi[0]["Counted"] is False
+    assert multi[0]["EstimatedMonthlySavings"] == 0.0
+    # 2 surplus EIPs x $3.65 stays visible as the ceiling.
+    assert multi[0]["PotentialMonthlySavings"] == pytest.approx(2 * 3.65)
+
+
+def test_unassociated_eip_is_still_counted() -> None:
+    """The definite saving must not be demoted along with the speculative one:
+    an unassociated EIP is definitely billed and definitely removable."""
+    from services.elastic_ip import get_elastic_ip_checks
+
+    ec2 = _FakeEc2(
+        addresses=[{"AllocationId": "eipalloc-x", "PublicIp": "1.2.3.9"}],
+        instances_pages=[{"Reservations": []}],
+    )
+    out = get_elastic_ip_checks(_ctx(ec2, pricing_engine=SimpleNamespace(get_eip_monthly_price=lambda: 3.65)))
+    unassoc = out["unassociated_eips"]
+    assert len(unassoc) == 1
+    assert unassoc[0].get("Counted") is not False
+    assert unassoc[0]["EstimatedMonthlySavings"] == pytest.approx(3.65)
