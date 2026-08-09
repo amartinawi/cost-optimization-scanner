@@ -122,3 +122,53 @@ def test_drain_pricing_warnings_noop_when_no_engine():
     ScanOrchestrator(ctx, [])._drain_pricing_warnings()
 
     assert [w for w in ctx._warnings if w.service == "pricing"] == []
+
+
+# --------------------------------------------------------------------------- #
+# CoH type_map hygiene — every key must be a REAL ResourceType (sweep rank 7)
+# --------------------------------------------------------------------------- #
+def test_coh_type_map_keys_are_real_resource_types():
+    """RedshiftCluster / OpenSearchDomain / EksCluster / RdsDbCluster / EcsTask /
+    EcsCluster are not in AWS's ResourceType enum, so those keys could never
+    match a payload and the buckets they fed were permanently empty — which is
+    why the redshift tab (CoH-only counted source) is structurally $0."""
+    import gzip
+    import json
+    import re
+    from pathlib import Path
+
+    import botocore
+
+    model = (
+        Path(botocore.__file__).parent
+        / "data" / "cost-optimization-hub" / "2022-07-26" / "service-2.json.gz"
+    )
+    if not model.exists():  # botocore layout changed — skip rather than false-fail
+        import pytest
+
+        pytest.skip("cost-optimization-hub model not present in this botocore build")
+    enum = set(json.load(gzip.open(model))["shapes"]["ResourceType"]["enum"])
+
+    src = Path("core/scan_orchestrator.py").read_text()
+    block = src.split("type_map = {", 1)[1].split("}", 1)[0]
+    keys = set(re.findall(r'"([A-Za-z0-9]+)":', block))
+
+    # Case-insensitive: real payloads spell some types with a lowercase c2
+    # (Ec2ReservedInstances), and the map deliberately carries both spellings.
+    lowered = {e.lower() for e in enum}
+    # Deliberate defensive alias: the pre-rename Elasticsearch spelling of
+    # OpenSearchReservedInstances (paired in services/commitment_scenarios.py).
+    # It routes to the SAME tab as the real key, so an unmatched alias costs
+    # nothing — unlike a key that feeds an adapter's only counted bucket.
+    known_aliases = {"EsReservedInstances"}
+    unknown = {k for k in keys if k.lower() not in lowered} - known_aliases
+    assert unknown == set(), f"type_map keys absent from AWS ResourceType enum: {sorted(unknown)}"
+
+
+def test_coh_type_map_has_no_dead_cluster_keys():
+    from pathlib import Path
+
+    block = Path("core/scan_orchestrator.py").read_text().split("type_map = {", 1)[1].split("}", 1)[0]
+    for dead in ("RedshiftCluster", "OpenSearchDomain", "EksCluster", "RdsDbCluster",
+                 "EcsTask", "EcsCluster"):
+        assert f'"{dead}":' not in block, f"{dead} is not a CoH ResourceType"
