@@ -102,8 +102,28 @@ def get_elastic_ip_checks(ctx: ScanContext) -> dict[str, Any]:
                         "EIPCount": eip_count,
                         "InstanceType": instance.get("InstanceType", "N/A"),
                         "Recommendation": f"Instance has {eip_count} EIPs - review if all are necessary",
-                        "EstimatedSavings": f"${(eip_count - 1) * eip_monthly:.2f}/month if reduced to 1 EIP",
-                        "EstimatedMonthlySavings": round((eip_count - 1) * eip_monthly, 2),
+                        # NET-D — "review if all are necessary" is an admission
+                        # that removability was never established, and a
+                        # multi-NIC or multi-service instance legitimately holds
+                        # several EIPs. The sibling Public IP Optimization lever
+                        # below is already Counted=False for exactly this reason;
+                        # this one counted (eip_count - 1) anyway. Unassociated
+                        # EIPs stay counted - those are definitely billed and
+                        # definitely removable.
+                        "EstimatedSavings": (
+                            "$0.00/month - advisory: reducing to one EIP assumes the extras "
+                            "are unused; multi-NIC and multi-service instances legitimately "
+                            "hold several"
+                        ),
+                        "EstimatedMonthlySavings": 0.0,
+                        "PotentialMonthlySavings": round((eip_count - 1) * eip_monthly, 2),
+                        "Counted": False,
+                        "AuditBasis": {
+                            "eip_monthly": round(eip_monthly, 2),
+                            "surplus_eips": eip_count - 1,
+                            "counted": False,
+                            "reason": "removability of the extra EIPs is not established",
+                        },
                         "CheckCategory": "Multiple EIPs per Instance",
                     }
                 )

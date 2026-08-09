@@ -56,6 +56,29 @@ def _counted_savings_line(group: List[Rec]) -> str:
     return ""
 
 
+def _advisory_line(rec: Rec) -> str:
+    """Savings line for an advisory (``Counted is False``) rec.
+
+    AUR-G — a demoted rec keeps its gross in ``AdvisoryEstimate`` (commitment
+    coverage) or ``PotentialMonthlySavings`` (evidence-gated levers), but the
+    card only ever printed "$0.00/month — advisory", so the masked figure was
+    invisible to the reader. Naming it costs nothing and keeps the reason for
+    the demotion legible.
+    """
+    for key in ("AdvisoryEstimate", "PotentialMonthlySavings"):
+        value = rec.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+            return (
+                '<p class="savings muted"><strong>Estimated Savings:</strong> '
+                f"$0.00/month — advisory (not added to the tab total; "
+                f"${float(value):,.2f}/month if realizable)</p>"
+            )
+    return (
+        '<p class="savings muted"><strong>Estimated Savings:</strong> '
+        "$0.00/month — advisory (not added to the tab total)</p>"
+    )
+
+
 def _grouped_text_savings_line(group: List[Rec]) -> str:
     """Card savings line for free-text-savings renderers (network, monitoring).
 
@@ -86,6 +109,21 @@ def _grouped_text_savings_line(group: List[Rec]) -> str:
         return ""
     if total > 0:
         return f'<p class="savings"><strong>Estimated Savings:</strong> ${total:,.2f}/month</p>'
+    # AUR-G, grouped form: name the group's masked figure rather than showing a
+    # bare $0.00. The network and monitoring levers demoted in tranche 6 park
+    # their exposure in PotentialMonthlySavings, and it must reach the card.
+    masked = 0.0
+    for rec in group:
+        for key in ("AdvisoryEstimate", "PotentialMonthlySavings"):
+            value = rec.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+                masked += float(value)
+                break
+    if masked > 0:
+        return (
+            '<p class="savings"><strong>Estimated Savings:</strong> $0.00/month — advisory '
+            f"(${masked:,.2f}/month if realizable)</p>"
+        )
     return '<p class="savings"><strong>Estimated Savings:</strong> $0.00/month — advisory</p>'
 
 
@@ -1768,10 +1806,7 @@ def _render_generic_lambda_rec(content: str, rec: Rec) -> str:
     # without this branch a Compute-SP account rendered full-dollar cards under
     # a $0 tab headline. Mirrors _render_generic_other_rec.
     if rec.get("Counted") is False:
-        content += (
-            '<p class="savings muted"><strong>Estimated Savings:</strong> '
-            "$0.00/month — advisory (not added to the tab total)</p>"
-        )
+        content += _advisory_line(rec)
     elif "EstimatedSavings" in rec:
         content += f'<p class="savings"><strong>Estimated Savings:</strong> {rec["EstimatedSavings"]}</p>'
     elif "estimatedMonthlySavings" in rec:
@@ -1899,10 +1934,7 @@ def _render_generic_other_rec(content: str, rec: Rec, source_name: str) -> str:
     # $0 to the tab total; a counted rec renders its computed EstimatedMonthlySavings
     # (not a free-text percentage / RI string); otherwise fall back to the string.
     if rec.get("Counted") is False:
-        content += (
-            '<p class="savings muted"><strong>Estimated Savings:</strong> '
-            "$0.00/month — advisory (not added to the tab total)</p>"
-        )
+        content += _advisory_line(rec)
     elif "EstimatedMonthlySavings" in rec:
         try:
             ems = float(rec.get("EstimatedMonthlySavings") or 0.0)

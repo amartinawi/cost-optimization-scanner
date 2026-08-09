@@ -19,9 +19,11 @@ GLUE_DPU_HOURLY: float = 0.44
 # is the full month of DPU-hours.
 DEV_ENDPOINT_MONTHLY_HOURS: float = 730.0
 
-# AWS default DPU allocation for a dev endpoint when neither a WorkerType
-# footprint nor a legacy NumberOfNodes is reported.
-DEFAULT_DEV_ENDPOINT_DPU: float = 5.0
+# GL-4 — there is deliberately NO default DPU allocation. A dev endpoint whose
+# footprint cannot be read used to fall back to AWS's 5-DPU default and count
+# $0.44 x 5 x 730 = $1,606/month on a quantity nobody measured. That is the same
+# fabrication class as the WorkSpaces STANDARD default (WS-3) and the MSK
+# 3-broker default (MSK-5), both of which now abstain.
 
 # WorkerType -> DPU-per-worker multiplier. Glue prices the same $0.44/DPU-hour
 # but a worker is NOT one DPU for the larger types: treating NumberOfWorkers as
@@ -48,15 +50,15 @@ def _dev_endpoint_dpu(rec: dict[str, Any]) -> tuple[float, str]:
 
     Prefer the explicit ``WorkerType`` x ``NumberOfWorkers`` footprint (applying
     the WorkerType->DPU multiplier), then the legacy ``NumberOfNodes`` (already a
-    DPU count), and finally the AWS default allocation (5 DPU) when neither is
-    reported.
+    DPU count). An unreadable footprint - including a ``WorkerType`` absent from
+    the multiplier table - returns ``0.0`` so the caller abstains (GL-4).
 
     Args:
         rec: A dev-endpoint recommendation dict from the Glue shim.
 
     Returns:
         ``(dpu_count, basis)`` where ``basis`` names the source used
-        (``"worker_type"`` / ``"number_of_nodes"`` / ``"default_5_dpu"``).
+        (``"worker_type"`` / ``"number_of_nodes"`` / ``"unknown"``).
     """
     worker_type = rec.get("WorkerType")
     num_workers = rec.get("NumberOfWorkers")
@@ -75,7 +77,7 @@ def _dev_endpoint_dpu(rec: dict[str, Any]) -> tuple[float, str]:
         except (TypeError, ValueError):
             pass
 
-    return DEFAULT_DEV_ENDPOINT_DPU, "default_5_dpu"
+    return 0.0, "unknown"
 
 
 class GlueModule(BaseServiceModule):
@@ -119,6 +121,34 @@ class GlueModule(BaseServiceModule):
                 # COUNT it. Counted == rendered: the EstimatedSavings string is
                 # derived from the same number summed into total_monthly_savings.
                 dpu, basis = _dev_endpoint_dpu(rec)
+                if dpu <= 0:
+                    # GL-4 — no readable DPU footprint, so there is no defensible
+                    # dollar. Render the finding, count nothing.
+                    rec["Counted"] = False
+                    rec["EstimatedMonthlySavings"] = 0.0
+                    rec["EstimatedSavings"] = (
+                        "$0.00/month - advisory: the endpoint's provisioned DPU footprint "
+                        "could not be read (no WorkerType/NumberOfWorkers and no "
+                        "NumberOfNodes), so its cost cannot be priced"
+                    )
+                    rec["AuditBasis"] = {
+                        "rate_per_dpu_hour": GLUE_DPU_HOURLY,
+                        "dpu_basis": basis,
+                        "worker_type": rec.get("WorkerType"),
+                        "number_of_workers": rec.get("NumberOfWorkers"),
+                        "number_of_nodes": rec.get("NumberOfNodes"),
+                        "counted": False,
+                        "reason": (
+                            "unknown DPU footprint; the previous 5-DPU default counted "
+                            "$1,606/month on a fabricated quantity"
+                        ),
+                    }
+                    ctx.warn(
+                        f"Glue dev endpoint {rec.get('EndpointName')!r} reports no readable "
+                        "DPU footprint; its cost was not counted.",
+                        "glue",
+                    )
+                    continue
                 monthly = round(dpu * GLUE_DPU_HOURLY * DEV_ENDPOINT_MONTHLY_HOURS * multiplier, 2)
                 rec["Counted"] = True
                 rec["EstimatedMonthlySavings"] = monthly

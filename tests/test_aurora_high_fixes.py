@@ -391,3 +391,82 @@ def test_rds_publishes_covered_instance_ids(monkeypatch):
     )
     RdsModule().scan(ctx)
     assert ctx.rds_covered_instance_ids == {"aurora-prod-1", "co-inst"}
+
+
+# --------------------------------------------------------------------------- #
+# AUR-C — the Graviton map sent every x86 family to a Graviton2 target
+# --------------------------------------------------------------------------- #
+def test_graviton_target_matches_the_source_generation() -> None:
+    """db.r7i -> db.r7g. The old map said db.r6g, which is the migration nobody
+    would make, priced against a cheaper class than the real target."""
+    from services.aurora_logic import graviton_equivalent
+
+    assert graviton_equivalent("db.r7i") == "db.r7g"
+    assert graviton_equivalent("db.m8i") == "db.m8g"
+    assert graviton_equivalent("db.c7i") == "db.c7g"
+
+
+def test_graviton_target_for_generations_without_a_counterpart() -> None:
+    """r5 has no r5g, so Graviton2 is the real target; an unknown family maps to
+    nothing rather than being guessed."""
+    from services.aurora_logic import graviton_equivalent
+
+    assert graviton_equivalent("db.r5") == "db.r6g"
+    assert graviton_equivalent("db.m5") == "db.m6g"
+    assert graviton_equivalent("db.z1d") is None
+    # Already Graviton: nothing to migrate.
+    assert graviton_equivalent("db.r7g") is None
+
+
+def test_graviton_delta_refuses_a_fallback_priced_target() -> None:
+    """A Graviton class the engine/region does not offer prices to the flat RDS
+    fallback constant; a delta against a live base price would be fabrication."""
+    from services.adapters.aurora import _check_provisioned_instances
+
+    calls: list[dict] = []
+
+    class _Pricing:
+        def get_rds_instance_monthly_price(self, engine, cls, **kw):
+            calls.append({"class": cls, **kw})
+            if not kw.get("allow_fallback", True) and cls.endswith("g.large"):
+                return 0.0  # no live SKU for the Graviton target
+            return 500.0
+
+    instances = [
+        {
+            "DBInstanceIdentifier": "aurora-1",
+            "DBInstanceClass": "db.r7i.large",
+            "Engine": "aurora-mysql",
+            "DBInstanceStatus": "available",
+            "DBClusterIdentifier": "cl-1",
+        }
+    ]
+    ctx = SimpleNamespace(pricing_engine=_Pricing(), pricing_multiplier=1.0, region="us-east-1")
+    ctx.warn = lambda *a, **k: None
+    ctx.permission_issue = lambda *a, **k: None
+    recs = _check_provisioned_instances(
+        ctx, rds=None, cw=None, fast_mode=True, instances=instances
+    )
+    assert [r for r in recs if r.get("check_type") == "instance_graviton"] == []
+    # Both legs must ask for the live SKU only.
+    assert all(c.get("allow_fallback") is False for c in calls if "allow_fallback" in c)
+
+
+def test_strict_rds_lookup_is_not_satisfied_by_a_cached_fallback() -> None:
+    """The RDS adapter prices with allow_fallback=True and would otherwise
+    poison the Aurora Graviton probe through a shared cache key."""
+    from unittest.mock import MagicMock
+
+    from core.pricing_engine import PricingEngine
+
+    pricing = MagicMock()
+    pricing.get_products.return_value = {"PriceList": []}  # no live SKU, ever
+    engine = PricingEngine(region_code="us-east-1", pricing_client=pricing)
+
+    lenient = engine.get_rds_instance_monthly_price("aurora-mysql", "db.r9z.large")
+    assert lenient > 0, "the lenient path still returns the documented fallback"
+
+    strict = engine.get_rds_instance_monthly_price(
+        "aurora-mysql", "db.r9z.large", allow_fallback=False
+    )
+    assert strict == 0.0, "a fallback must never satisfy a strict lookup"

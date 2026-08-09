@@ -126,7 +126,20 @@ class DmsModule(BaseServiceModule):
         # the lever — dms H1/H2). Use the deterministic AZ-pinned price method.
         multi_az_recs: list[dict[str, Any]] = []
         multi_az_ids: set[str] = set()
-        for rec in recs:
+        # DMS-1 — iterate the shim's config-only candidate list, not `recs`.
+        # `recs` only ever contains instances that produced a CloudWatch CPU
+        # finding, so a dev Multi-AZ instance at normal utilization never
+        # reached this lever at all. Fall back to `recs` for any candidate the
+        # shim did not publish (older payload shapes).
+        candidates = result.get("multi_az_instances") or []
+        seen_ids = {c.get("InstanceId") for c in candidates}
+        candidates = list(candidates) + [
+            r
+            for r in recs
+            if r.get("MultiAZ")
+            and (r.get("InstanceId") or r.get("ReplicationInstanceIdentifier")) not in seen_ids
+        ]
+        for rec in candidates:
             if not rec.get("MultiAZ"):
                 continue
             instance_class = rec.get("InstanceClass", "unknown")
@@ -285,7 +298,32 @@ class DmsModule(BaseServiceModule):
                         }
                     )
                 else:
-                    enriched.append(dict(rec))
+                    # DMS-4 — this fall-through used to append the rec UNCHANGED:
+                    # no Counted flag (so the headline counted it), no
+                    # EstimatedMonthlySavings (so it contributed $0), and the
+                    # shim's prose intact - "Rightsize for ~35% savings on
+                    # instance cost" or "Full instance cost if terminated". The
+                    # count and the dollar disagreed (D4) while the card claimed
+                    # a percentage nothing computed (B3).
+                    enriched.append(
+                        {
+                            **rec,
+                            "EstimatedMonthlySavings": 0.0,
+                            "Counted": False,
+                            "EstimatedSavings": (
+                                "$0.00/month — advisory: no live Pricing-API price for "
+                                f"{instance_class or 'this instance class'}, so the saving "
+                                "could not be computed"
+                            ),
+                            "AuditBasis": {
+                                "counted": False,
+                                "reason": (
+                                    "instance class or pricing unavailable; the previous "
+                                    "behaviour kept the shim's '~35%' prose on an uncounted rec"
+                                ),
+                            },
+                        }
+                    )
             if enriched:
                 sources[category] = SourceBlock(count=len(enriched), recommendations=tuple(enriched))
 

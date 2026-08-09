@@ -233,15 +233,25 @@ def test_dev_test_nat_advisory_when_vpc_has_multiple_nats() -> None:
     assert all(r["EstimatedMonthlySavings"] == 0.0 for r in dev)  # consolidation owns the $
 
 
-def test_dev_test_nat_counted_when_sole_in_vpc() -> None:
+def test_dev_test_nat_is_advisory_not_counted() -> None:
+    """NET-C — this used to COUNT the full base off an Environment tag alone.
+
+    The structurally identical EC2 non-prod-scheduling lever is corroboration-
+    gated on a CloudWatch idle signal, and neither remediation this rec proposes
+    recovers the full base anyway: a NAT *instance* still bills as EC2, and a
+    scheduled shutdown recovers only the off-hours fraction.
+    """
     nat_pages = [{"NatGateways": [_nat("nat-1", "vpc-solo", "sub-1", env="test")]}]
     ec2 = _FakeEc2(nat_pages=nat_pages, subnet_az={"sub-1": "az-a"})
     out = get_nat_gateway_checks(_ctx(ec2, pricing_engine=_nat_engine(32.85)))
     dev = out["nat_in_dev_test"]
     assert len(dev) == 1
-    assert dev[0]["EstimatedMonthlySavings"] == 32.85
+    assert dev[0]["Counted"] is False
+    assert dev[0]["EstimatedMonthlySavings"] == 0.0
+    assert parse_dollar_savings(dev[0]["EstimatedSavings"]) == 0.0
+    # The exposure still reaches the reader.
+    assert dev[0]["PotentialMonthlySavings"] == 32.85
     assert "+ 0.85" not in dev[0]["EstimatedSavings"]  # M1: no fabricated addend
-    assert parse_dollar_savings(dev[0]["EstimatedSavings"]) == 32.85
 
 
 def test_net06_no_missing_endpoint_advisory_from_nat_shim() -> None:
@@ -514,8 +524,9 @@ def test_nat_fallback_region_scaled() -> None:
     ec2 = _FakeEc2(nat_pages=nat_pages, subnet_az={"sub-1": "az-a"})
     out = get_nat_gateway_checks(_ctx(ec2, pricing_engine=None, pricing_multiplier=1.5))
     rec = out["nat_in_dev_test"][0]
-    # String is formatted with .2f, so compare against the rounded display value.
-    assert parse_dollar_savings(rec["EstimatedSavings"]) == float(f"{FALLBACK_NAT_MONTH * 1.5:.2f}")
+    # The lever is advisory (NET-C), so the region-scaled fallback shows up in
+    # the potential figure rather than a counted dollar.
+    assert rec["PotentialMonthlySavings"] == float(f"{FALLBACK_NAT_MONTH * 1.5:.2f}")
 
 
 # --------------------------------------------------------------------------- #
@@ -637,3 +648,125 @@ def test_net04_asg_generic_error_is_warning() -> None:
     assert not ctx.permissions
     service, msg = ctx.warnings[0]
     assert service == "ec2"
+
+
+# --------------------------------------------------------------------------- #
+# NET-A / NET-F — the VPC interface-endpoint double-count and the threshold
+# whose rationale belonged to gateway endpoints.
+#
+# The duplicate lever had NO test asserting its dollar at all, which is how an
+# endpoint could be priced by both loops for eight scans without anything
+# failing.
+# --------------------------------------------------------------------------- #
+def _interface(endpoint_id: str, *, service: str = "ssm", subnets: int = 2, env: str | None = None) -> dict:
+    ep = {
+        "VpcEndpointId": endpoint_id,
+        "VpcId": "vpc-a",
+        "VpcEndpointType": "Interface",
+        "ServiceName": f"com.amazonaws.us-east-1.{service}",
+        "SubnetIds": [f"s{i}" for i in range(subnets)],
+        "State": "available",
+    }
+    if env is not None:
+        ep["Tags"] = [{"Key": "Environment", "Value": env}]
+    return ep
+
+
+def _endpoint_checks(endpoints: list[dict]) -> dict:
+    ec2 = _FakeEc2(
+        vpcs_pages=[{"Vpcs": [{"VpcId": "vpc-a"}]}],
+        vpce_pages=[{"VpcEndpoints": endpoints}],
+    )
+    eng = SimpleNamespace(get_vpc_endpoint_monthly_price=lambda: 7.30)
+    return get_vpc_endpoints_checks(_ctx(ec2, pricing_engine=eng))
+
+
+def test_nonprod_duplicate_endpoint_is_counted_exactly_once() -> None:
+    """NET-A: an endpoint that is BOTH nonprod-tagged AND a duplicate of its
+    service used to be priced by both loops."""
+    out = _endpoint_checks([_interface(f"vpce-{i}", env="dev") for i in range(3)])
+
+    nonprod_total = sum(r["EstimatedMonthlySavings"] for r in out["interface_endpoints_in_nonprod"])
+    duplicate_total = sum(r["EstimatedMonthlySavings"] for r in out["duplicate_endpoints"])
+
+    # 3 endpoints x 2 AZs x $7.30, counted once - by the nonprod lever only.
+    assert nonprod_total == pytest.approx(3 * 2 * 7.30)
+    assert duplicate_total == 0.0
+
+
+def test_duplicate_ceiling_excludes_endpoints_the_nonprod_lever_owns() -> None:
+    """Even the advisory ceiling must not re-report an already-counted endpoint."""
+    out = _endpoint_checks([_interface("vpce-1"), _interface("vpce-2", env="dev")])
+    dup = out["duplicate_endpoints"][0]
+    # vpce-2 is the surplus endpoint AND nonprod-owned, so the ceiling is $0.
+    assert dup["PotentialMonthlySavings"] == 0.0
+    assert "excluded from this ceiling" in dup["PricingWarning"]
+
+
+def test_duplicate_endpoints_are_advisory_not_counted() -> None:
+    """NET-D class: the rec's own text asks the reader to review whether each is
+    needed - removability is not established, so it must not count."""
+    out = _endpoint_checks([_interface("vpce-1"), _interface("vpce-2"), _interface("vpce-3")])
+    dup = out["duplicate_endpoints"][0]
+    assert dup["Counted"] is False
+    assert dup["EstimatedMonthlySavings"] == 0.0
+    assert dup["EstimatedSavings"].startswith("$0.00")
+    # The figure survives for the reader: 2 surplus x 2 AZs x $7.30.
+    assert dup["PotentialMonthlySavings"] == pytest.approx(2 * 2 * 7.30)
+
+
+def test_exactly_two_endpoints_are_flagged() -> None:
+    """NET-F: the old `> 2` threshold silently exempted the exactly-2 case on a
+    route-table rationale that applies to GATEWAY endpoints, not interface ones."""
+    out = _endpoint_checks([_interface("vpce-1"), _interface("vpce-2")])
+    assert len(out["duplicate_endpoints"]) == 1
+    assert out["duplicate_endpoints"][0]["EndpointCount"] == 2
+    assert "route table" not in out["duplicate_endpoints"][0]["Recommendation"].lower()
+
+
+def test_a_single_endpoint_per_service_is_not_flagged() -> None:
+    out = _endpoint_checks([_interface("vpce-1", service="ssm"), _interface("vpce-2", service="ec2")])
+    assert out["duplicate_endpoints"] == []
+
+
+# --------------------------------------------------------------------------- #
+# NET-D — multiple EIPs per instance: removability never established
+# --------------------------------------------------------------------------- #
+def test_multiple_eips_per_instance_is_advisory() -> None:
+    """The rec's own text says "review if all are necessary", and its sibling
+    Public IP Optimization lever is already Counted=False for the same reason.
+    A multi-NIC or multi-service instance legitimately holds several EIPs."""
+    from services.elastic_ip import get_elastic_ip_checks
+
+    addresses = [
+        {"AllocationId": f"eipalloc-{i}", "InstanceId": "i-1", "PublicIp": f"1.2.3.{i}"} for i in range(3)
+    ]
+    ec2 = _FakeEc2(
+        addresses=addresses,
+        instances_pages=[
+            {"Reservations": [{"Instances": [{"InstanceId": "i-1", "State": {"Name": "running"}}]}]}
+        ],
+    )
+    out = get_elastic_ip_checks(_ctx(ec2, pricing_engine=SimpleNamespace(get_eip_monthly_price=lambda: 3.65)))
+    multi = out["multiple_eips_per_instance"]
+    assert len(multi) == 1
+    assert multi[0]["Counted"] is False
+    assert multi[0]["EstimatedMonthlySavings"] == 0.0
+    # 2 surplus EIPs x $3.65 stays visible as the ceiling.
+    assert multi[0]["PotentialMonthlySavings"] == pytest.approx(2 * 3.65)
+
+
+def test_unassociated_eip_is_still_counted() -> None:
+    """The definite saving must not be demoted along with the speculative one:
+    an unassociated EIP is definitely billed and definitely removable."""
+    from services.elastic_ip import get_elastic_ip_checks
+
+    ec2 = _FakeEc2(
+        addresses=[{"AllocationId": "eipalloc-x", "PublicIp": "1.2.3.9"}],
+        instances_pages=[{"Reservations": []}],
+    )
+    out = get_elastic_ip_checks(_ctx(ec2, pricing_engine=SimpleNamespace(get_eip_monthly_price=lambda: 3.65)))
+    unassoc = out["unassociated_eips"]
+    assert len(unassoc) == 1
+    assert unassoc[0].get("Counted") is not False
+    assert unassoc[0]["EstimatedMonthlySavings"] == pytest.approx(3.65)
