@@ -68,7 +68,9 @@ class CloudfrontModule(BaseServiceModule):
 
         return ServiceFindings(
             service_name="CloudFront",
-            total_recommendations=sum(1 for r in recs if r.get("Counted") is not False),
+            # Every rec above is unconditionally demoted; the count is 0 by
+            # construction (result_builder recounts from Counted regardless).
+            total_recommendations=0,
             total_monthly_savings=0.0,
             sources={"enhanced_checks": SourceBlock(count=len(recs), recommendations=tuple(recs))},
             optimization_descriptions={

@@ -321,7 +321,7 @@ def get_enhanced_container_checks(ctx: ScanContext) -> dict[str, Any]:
     EKS is owned by the dedicated ``eks_cost`` adapter and is intentionally NOT
     analyzed here (avoids cross-adapter double display of EKS node groups).
 
-    ECS rightsizing is metric-gated (Container Insights, 7-day window) and
+    ECS rightsizing is metric-gated (standard AWS/ECS metrics, 7-day window) and
     carries the task's real Cpu/Memory/TaskCount + launch type + architecture/OS
     so the adapter can compute a Fargate-priced saving snapped to a valid combo.
     ECR findings are advisory (no deduplicated-layer-storage data to quantify).
@@ -392,7 +392,7 @@ def collect_ecs_fargate_rightsizing_recs(ctx: ScanContext) -> list[dict[str, Any
 
         if ctx.fast_mode and cluster_arns:
             ctx.warn(
-                "fast mode: skipping ECS Container Insights utilization reads; "
+                "fast mode: skipping ECS CloudWatch utilization reads; "
                 "Fargate rightsizing savings not quantified",
                 "containers",
             )

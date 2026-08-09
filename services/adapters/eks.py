@@ -507,6 +507,8 @@ class EksCostModule(BaseServiceModule):
         tag_filters = (
             {"Name": "tag:aws:eks:cluster-name", "Values": [cluster_name]},
             {"Name": "tag:eks:cluster-name", "Values": [cluster_name]},
+            # Karpenter's documented default discovery tag spelling.
+            {"Name": "tag:eks:eks-cluster-name", "Values": [cluster_name]},
             {"Name": f"tag:kubernetes.io/cluster/{cluster_name}", "Values": ["owned"]},
         )
         try:

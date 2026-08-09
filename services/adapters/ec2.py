@@ -249,15 +249,21 @@ class EC2Module(BaseServiceModule):
         # by an AWS source, then keep at most ONE finding per instance — the
         # highest-savings one — so overlapping checks (idle + prev-gen + cron …)
         # on the same instance never stack.
-        # ec2 H2 — advisory advanced recs (Counted=False) still render as visible
-        # architectural nudges but never compete for the per-instance slot and are
-        # never summed; only counted heuristics contend in best_by_instance.
+        # ec2 H2 — advisory recs (Counted=False) still render as visible
+        # nudges but never compete for the per-instance slot and are never
+        # summed; only counted heuristics contend in best_by_instance.
+        # Review blocker (tranche 2): ENHANCED advisories previously had no
+        # advisory path at all — a $0 enhanced rec (e.g. the demoted
+        # dedicated-tenancy lever) fell out of best_by_instance and was
+        # silently DELETED instead of rendered.
+        counted_enhanced = [r for r in enhanced_recs if r.get("Counted", True) is not False]
+        advisory_enhanced = [r for r in enhanced_recs if r.get("Counted", True) is False]
         counted_advanced = [r for r in advanced_recs if r.get("Counted", True) is not False]
         advisory_advanced = [r for r in advanced_recs if r.get("Counted", True) is False]
 
         best_by_instance: dict[str, tuple[str, dict[str, Any], float]] = {}
         for origin, rec in (
-            [("enhanced", r) for r in enhanced_recs] + [("advanced", r) for r in counted_advanced]
+            [("enhanced", r) for r in counted_enhanced] + [("advanced", r) for r in counted_advanced]
         ):
             iid = str(rec.get("InstanceId", "") or "")
             if iid and iid in covered:
@@ -274,14 +280,20 @@ class EC2Module(BaseServiceModule):
         advanced_counted_final = [rec for origin, rec, _ in best_by_instance.values() if origin == "advanced"]
         # Advisory recs render unless the instance is already owned by an AWS source
         # (CoH/CO/ASG). They carry "$0.00" EstimatedSavings, so the savings sum below
-        # leaves them at $0 — rendered, never counted.
+        # leaves them at $0 — rendered, never counted. Enhanced advisories stay in
+        # the enhanced block so their CloudWatch evidence + "Metric Backed" badge
+        # survive rendering (review suggestion 5).
         advisory_final = [r for r in advisory_advanced if str(r.get("InstanceId", "") or "") not in covered]
+        advisory_enhanced_final = [
+            r for r in advisory_enhanced if str(r.get("InstanceId", "") or "") not in covered
+        ]
 
         # EC2-4 (C8) — when ASG membership could not be enumerated, the
         # per-instance heuristics cannot be deduped against managed instances,
         # and counting them would make a DENIED autoscaling:Describe* RAISE
         # the counted total. Fail closed: demote every selected heuristic rec
-        # to a $0 advisory (still rendered, never summed).
+        # to a $0 advisory (still rendered, never summed) — enhanced ones keep
+        # their block so the evidence that justified them stays on the card.
         if not asg_ok and (enhanced_final or advanced_counted_final):
             for rec in enhanced_final + advanced_counted_final:
                 gross = parse_dollar_savings(rec.get("EstimatedSavings", ""))
@@ -293,7 +305,8 @@ class EC2Module(BaseServiceModule):
                     "(autoscaling:DescribeAutoScalingGroups failed) — cannot rule "
                     "out a managed instance"
                 )
-            advisory_final = advisory_final + enhanced_final + advanced_counted_final
+            advisory_enhanced_final = advisory_enhanced_final + enhanced_final
+            advisory_final = advisory_final + advanced_counted_final
             enhanced_final = []
             advanced_counted_final = []
 
@@ -366,7 +379,7 @@ class EC2Module(BaseServiceModule):
         cost_hub_out = coh_counted + coh_adv
         co_out = co_counted + co_adv
         asg_out = asg_counted + asg_adv
-        enhanced_out = enh_counted + enh_adv
+        enhanced_out = enh_counted + enh_adv + advisory_enhanced_final
         advanced_out = adv_counted + adv_cov_adv + advisory_final
 
         total_recs = (

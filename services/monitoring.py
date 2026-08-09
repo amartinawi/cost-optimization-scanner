@@ -7,7 +7,6 @@ This module will later become MonitoringModule (T-322) implementing ServiceModul
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from core.scan_context import ScanContext
@@ -30,6 +29,11 @@ CW_CUSTOM_METRIC_TIER_4: float = 0.02
 CW_CUSTOM_METRIC_TIER_1_LIMIT: int = 10_000
 CW_CUSTOM_METRIC_TIER_2_LIMIT: int = 250_000
 CW_CUSTOM_METRIC_TIER_3_LIMIT: int = 1_000_000
+# Spend floor for the custom-metric advisory: surface a namespace only when
+# its proportional share of the account's custom-metric bill is worth a
+# review (the old >100-metric CARDINALITY gate hid 99-metric namespaces
+# worth ~$30/mo while surfacing $2/mo ones on huge accounts).
+CW_CUSTOM_METRIC_SPEND_ADVISORY_FLOOR: float = 10.0
 
 # Tiered custom-metric rates re-verified against the AWS Pricing API on
 # 2026-06-27 (AmazonCloudWatch SKU KG586CTNGQ4VRZKZ, usagetype
@@ -37,14 +41,6 @@ CW_CUSTOM_METRIC_TIER_3_LIMIT: int = 1_000_000
 # $0.02 above 1M. The 4th tier was previously observed but never coded, so
 # tier_3 covered everything above 250k at $0.05 — overstating the marginal
 # rate (and the saving) for any account with >1M custom metrics (monitoring L2).
-
-# A custom metric that published NO datapoints over this trailing window is
-# treated as stale (removable). Drives the H3 removable quantity from a
-# measured staleness signal instead of a fabricated count//2.
-
-# GetMetricData accepts at most 500 MetricDataQueries per call.
-_GET_METRIC_DATA_BATCH: int = 500
-
 
 def _cw_custom_metrics_monthly_cost(count: int) -> float:
     """Return CloudWatch custom metrics monthly cost for `count` metrics
@@ -185,8 +181,6 @@ def get_cloudwatch_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> 
                 namespace = metric.get("Namespace", "")
                 namespace_counts[namespace] = namespace_counts.get(namespace, 0) + 1
 
-            high_volume = {ns for ns, c in namespace_counts.items() if c > 100}
-
             # MON-1/MON-2 — the previous lever counted "stale" custom metrics
             # as a removable dollar. That was inverted twice over: CloudWatch
             # bills per PutMetricData-ACTIVE metric-month, so a metric that
@@ -197,17 +191,19 @@ def get_cloudwatch_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> 
             # healthy accounts and non-empty exactly when the GetMetricData
             # probe broke (its StatusCode was never checked): dead code when
             # healthy, phantom when it fired. Replaced with a MEASURED-SPEND
-            # advisory: what the namespace's active metrics bill at the
-            # account-wide marginal tier ($0 counted — the only way to save is
-            # to stop publishing, which this scan cannot verify anyone wants).
-            running_account_count = len(custom_metrics)
-            for namespace in sorted(high_volume):
-                count = namespace_counts[namespace]
-                spend = (
-                    _cw_custom_metrics_monthly_cost(running_account_count)
-                    - _cw_custom_metrics_monthly_cost(running_account_count - count)
-                ) * pricing_multiplier
-                running_account_count -= count
+            # advisory ($0 counted — the only way to save is to stop
+            # publishing, which this scan cannot verify anyone wants). Each
+            # namespace's figure is its PROPORTIONAL share of the account's
+            # tiered custom-metric bill (order-independent — a marginal
+            # off-the-top walk priced identical namespaces differently by
+            # sort position), gated on a spend floor rather than the old
+            # cardinality threshold.
+            total_custom = len(custom_metrics)
+            account_monthly_cost = _cw_custom_metrics_monthly_cost(total_custom) * pricing_multiplier
+            for namespace, count in sorted(namespace_counts.items()):
+                spend = account_monthly_cost * (count / total_custom) if total_custom else 0.0
+                if spend < CW_CUSTOM_METRIC_SPEND_ADVISORY_FLOOR:
+                    continue
                 checks["unused_custom_metrics"].append(
                     {
                         "Namespace": namespace,
@@ -235,10 +231,11 @@ def get_cloudwatch_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> 
                                 CW_CUSTOM_METRIC_TIER_4,
                             ],
                             "region_multiplier": round(pricing_multiplier, 4),
-                            "account_marginal_anchor": running_account_count + count,
+                            "account_total_custom_metrics": total_custom,
+                            "account_monthly_cost": round(account_monthly_cost, 2),
                             "formula": (
-                                "(tiered_cost(anchor) - tiered_cost(anchor - count)) x "
-                                "region_multiplier — MEASURED SPEND, not a saving"
+                                "account_monthly_cost x (namespace_count / total_count) — "
+                                "proportional share of MEASURED SPEND, not a saving"
                             ),
                             "reason": (
                                 "idle custom metrics are not billed and cannot be deleted; "

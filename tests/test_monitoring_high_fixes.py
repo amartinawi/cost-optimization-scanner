@@ -245,21 +245,37 @@ def test_custom_metrics_advisory_reports_measured_spend_never_counts() -> None:
     assert cw.get_metric_data_calls == 0
 
 
-def test_custom_metrics_spend_uses_account_wide_marginal_tier() -> None:
+def test_custom_metrics_spend_is_proportional_and_order_independent() -> None:
     # AWS tiers custom metrics account-wide per region ($0.30 first 10k, then
-    # $0.10). Two high-volume namespaces (8000 + 4000 = 12000 metrics) must
-    # attribute spend at the marginal tier, not as if each started at $0.30.
+    # $0.10): cost(12000) = $3200, NOT 12000*0.30 = $3600. Each namespace gets
+    # its PROPORTIONAL share — a marginal off-the-top walk priced identical
+    # namespaces differently depending on sort position (review suggestion 3).
     metrics = _custom_metrics("nsA", 8000) + _custom_metrics("nsB", 4000)
     cw = _FakeCloudWatchClient(metrics=metrics)
     ctx = _shim_ctx({"logs": _FakeLogsClient([]), "cloudwatch": cw})
 
     result = get_cloudwatch_checks(ctx, pricing_multiplier=1.0)
-    recs = result["unused_custom_metrics"]
-    total_billed = sum(r["AuditBasis"]["billed_monthly_estimate"] for r in recs)
-    # cost(12000) = 10000*0.30 + 2000*0.10 = $3200 — not 12000*0.30 = $3600.
-    assert total_billed == pytest.approx(3200.0)
+    recs = {r["Namespace"]: r for r in result["unused_custom_metrics"]}
+    assert recs["nsA"]["AuditBasis"]["billed_monthly_estimate"] == pytest.approx(3200.0 * 8 / 12, abs=0.01)
+    assert recs["nsB"]["AuditBasis"]["billed_monthly_estimate"] == pytest.approx(3200.0 * 4 / 12, abs=0.01)
+    total_billed = sum(r["AuditBasis"]["billed_monthly_estimate"] for r in recs.values())
+    assert total_billed == pytest.approx(3200.0, abs=0.02)
     # Nothing counted, ever.
     assert _counted_sum(result["recommendations"]) == 0.0
+
+
+def test_custom_metrics_advisory_gated_on_spend_floor_not_cardinality() -> None:
+    # Review suggestion 4: the old >100-METRIC gate hid a 99-metric namespace
+    # (~$29.70/mo) while surfacing trivial ones on huge accounts. The gate is
+    # now a spend floor.
+    metrics = _custom_metrics("worth-a-look", 99) + _custom_metrics("tiny", 10)
+    cw = _FakeCloudWatchClient(metrics=metrics)
+    ctx = _shim_ctx({"logs": _FakeLogsClient([]), "cloudwatch": cw})
+
+    result = get_cloudwatch_checks(ctx, pricing_multiplier=1.0)
+    names = [r["Namespace"] for r in result["unused_custom_metrics"]]
+    assert "worth-a-look" in names  # ~$29.70/mo >= $10 floor
+    assert "tiny" not in names      # ~$3/mo < floor
 
 
 def test_custom_metrics_spend_estimate_region_scaled() -> None:
