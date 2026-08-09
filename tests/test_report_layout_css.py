@@ -35,5 +35,10 @@ def test_print_panels_flow_across_pages():
     print_block = css[css.index("@media print"):]
     tab_rule = re.search(r"\.tab-content \{[^}]*\}", print_block).group(0)
     assert "display: block !important" in tab_rule
-    assert "page-break-inside" not in tab_rule   # the blank-pages bug
+    assert "page-break-inside" not in tab_rule   # blank-pages bug #1 (avoid on panels)
+    # Blank-pages bug #2: overflow-x:auto computes overflow-y:auto, and Chrome
+    # clips scroll containers in print instead of paginating — the reset must
+    # cover BOTH axes, and the fadeIn animation must not run at print time.
+    assert "overflow: visible !important" in tab_rule
+    assert "animation: none !important" in tab_rule
     assert "page-break-before: always" in print_block
