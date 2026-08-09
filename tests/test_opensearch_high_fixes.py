@@ -490,7 +490,7 @@ def test_extended_support_measured_from_billing_and_scaled():
                    ("APS1-OpenSearchExtendedSupport", 61.78),
                    ("APS1-ES:GP3-Storage", 19.48)],
                   resource_error=RuntimeError("resource granularity disabled"))
-    ctx = SimpleNamespace(client=lambda _n: ce, warn=lambda *a, **k: None)
+    ctx = SimpleNamespace(client=lambda _n: ce, warn=lambda *a, **k: None, region="ap-southeast-1")
     total, per_domain = _extended_support_breakdown(ctx)
     assert total == pytest.approx(61.78 / 7 * 30, rel=1e-6)   # ~$264.77/mo (bnc)
     assert per_domain == {}          # unattributed -> caller must name no domain
@@ -506,7 +506,7 @@ def test_extended_support_attributes_to_the_billed_domain():
         resources=[("arn:aws:es:ap-southeast-1:1:domain/production-bnc", 61.78),
                    ("NoResourceId", 0.0)],
     )
-    ctx = SimpleNamespace(client=lambda _n: ce, warn=lambda *a, **k: None)
+    ctx = SimpleNamespace(client=lambda _n: ce, warn=lambda *a, **k: None, region="ap-southeast-1")
     total, per_domain = _extended_support_breakdown(ctx)
     assert total == pytest.approx(61.78 / 7 * 30, rel=1e-6)
     assert list(per_domain) == ["production-bnc"]            # innocent domain not named
@@ -518,7 +518,7 @@ def test_extended_support_zero_when_not_billed():
     from services.adapters.opensearch import _extended_support_breakdown
 
     ce = _ce_with([("APS1-ESInstance:m5.xlarge", 350.46)])
-    ctx = SimpleNamespace(client=lambda _n: ce, warn=lambda *a, **k: None)
+    ctx = SimpleNamespace(client=lambda _n: ce, warn=lambda *a, **k: None, region="ap-southeast-1")
     assert _extended_support_breakdown(ctx) == (0.0, {})
 
 
@@ -530,7 +530,7 @@ def test_extended_support_fails_closed_on_ce_error():
     ce = MagicMock()
     ce.get_cost_and_usage.side_effect = RuntimeError("AccessDenied")
     warns = []
-    ctx = SimpleNamespace(client=lambda _n: ce, warn=lambda m, s=None: warns.append(m))
+    ctx = SimpleNamespace(client=lambda _n: ce, warn=lambda m, s=None: warns.append(m), region="ap-southeast-1")
     assert _extended_support_breakdown(ctx) == (0.0, {})   # never invent a charge
     assert warns
 
@@ -543,3 +543,18 @@ def test_one_size_down_respects_large_floor():
     assert _one_size_down("r5.large.search") is None
     assert _one_size_down("r5.xlarge.search") == "r5.large.search"
     assert _one_size_down("t3.medium.search") is not None  # t3 goes smaller
+
+
+def test_extended_support_fails_closed_without_region():
+    """Review: an account-wide CE read IS the OS-1 phantom — no region, no
+    surcharge measurement (warn + (0.0, {}))."""
+    from types import SimpleNamespace
+
+    from services.adapters.opensearch import _extended_support_breakdown
+
+    ce = _ce_with([("APS1-OpenSearchExtendedSupport", 61.78)])
+    warns: list[str] = []
+    ctx = SimpleNamespace(client=lambda _n: ce, warn=lambda m, s=None: warns.append(m))
+    assert _extended_support_breakdown(ctx) == (0.0, {})
+    assert warns and "region unset" in warns[0]
+    ce.get_cost_and_usage.assert_not_called()

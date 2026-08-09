@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from core.contracts import ServiceFindings, SourceBlock
@@ -57,6 +58,10 @@ class AppRunnerModule(BaseServiceModule):
                 parts = str(mem_str).strip().split()
                 value = float(parts[0])
                 unit = parts[1].upper() if len(parts) > 1 else ""
+                if not math.isfinite(value) or value <= 0:
+                    # "inf"/"nan"/negatives parse as floats but must never
+                    # reach a counted dollar (review nit — fail to advisory).
+                    raise ValueError(f"non-positive/non-finite memory {value!r}")
                 if unit.startswith("GB"):
                     mem_gb = value
                 elif unit.startswith("MB") or not unit:

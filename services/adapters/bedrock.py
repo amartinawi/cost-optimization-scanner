@@ -83,19 +83,16 @@ def _derive_model_id(pt: dict[str, Any]) -> str:
     ``PT_HOURLY_PRICE.get("", default)`` fabricate $1/hr and the CloudWatch
     ``Invocations``/``InputTokenCount``/``OutputTokenCount`` queries (dimension
     ``ModelId``) match nothing, short-circuiting both counted checks. The model
-    identity is the final path segment of the foundation-model ARN
-    (e.g. ``arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-3-haiku``
-    → ``anthropic.claude-3-haiku``) — that is both the ``PT_HOURLY_PRICE`` key
-    and the CloudWatch ``ModelId`` dimension value.
-
-    Versioned ARNs (e.g. ``.../anthropic.claude-3-haiku-20240307-v1:0``) carry a
-    ``-YYYYMMDD-vN:N`` suffix that would NOT match the bare PT_HOURLY_PRICE
-    keys, so the counted idle-PT path would still rarely fire. Strip the suffix
-    to recover the base model id.
+    identity is the final path segment of the foundation-model ARN, returned
+    VERBATIM — versioned when the ARN is versioned
+    (``.../anthropic.claude-3-haiku-20240307-v1:0`` →
+    ``anthropic.claude-3-haiku-20240307-v1:0``): that full form is the
+    CloudWatch ``ModelId`` dimension value (BR-1 — stripping it here made
+    every metric read match nothing). The ``PT_HOURLY_PRICE`` key is derived
+    separately by ``_rate_key``, which strips the version suffix.
     """
     raw = ""
     for key in (
-        "currentModelArn",
         "foundationModelArn",
         "modelArn",
         "desiredModelArn",
@@ -119,9 +116,12 @@ def _rate_key(model_id: str) -> str:
 
     Strips the dated ``-YYYYMMDD-vN(:N)`` suffix AND the bare ``-vN(:N)`` form
     (Titan ids like ``amazon.titan-text-lite-v1`` carry no date, which
-    previously missed the ``amazon.titan-text-lite`` key entirely — BR-1).
+    previously missed the ``amazon.titan-text-lite`` key entirely — BR-1),
+    plus the trailing context-window token some Claude PT ids carry
+    (``...-v1:0:200k``). Over-stripping is harmless — an unmatched key lands
+    on the $0 "committed rate unknown" advisory.
     """
-    return re.sub(r"(?:-\d{8})?-v\d+(?::\d+)?$", "", model_id or "")
+    return re.sub(r"(?:-\d{8})?-v\d+(?::\d+)?(?::\d+k)?$", "", model_id or "")
 
 
 def _get_pt_invocation_sum(cw: Any, model_id: str) -> tuple[float | None, bool]:

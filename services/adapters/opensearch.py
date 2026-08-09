@@ -220,11 +220,20 @@ def _extended_support_breakdown(ctx: Any) -> tuple[float, dict[str, float]]:
         "Dimensions": {"Key": "SERVICE", "Values": [_CE_OPENSEARCH_SERVICE]}
     }
     region = str(getattr(ctx, "region", "") or "")
-    ce_filter: dict[str, Any] = (
-        {"And": [service_clause, {"Dimensions": {"Key": "REGION", "Values": [region]}}]}
-        if region
-        else service_clause
-    )
+    if not region:
+        # Fail closed (review): an account-wide read IS the OS-1 phantom —
+        # this feeds a Counted lever, so no region means no measurement.
+        # (In practice region is a required CLI positional; this is the
+        # encode-the-right-default guard.)
+        ctx.warn(
+            "OpenSearch Extended Support read skipped: ctx.region unset "
+            "(account-wide CE read would re-count the surcharge per region)",
+            "opensearch",
+        )
+        return 0.0, {}
+    ce_filter: dict[str, Any] = {
+        "And": [service_clause, {"Dimensions": {"Key": "REGION", "Values": [region]}}]
+    }
     try:
         resp = ce.get_cost_and_usage(
             TimePeriod=period,

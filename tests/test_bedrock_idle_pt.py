@@ -57,12 +57,22 @@ class _FakeCloudWatch:
 
 
 def _pt(model_arn: str, *, units: int = 1, pt_id: str = "pt-1") -> dict[str, Any]:
+    # foundationModelArn is the real ProvisionedModelSummary member (the old
+    # currentModelArn key never existed in the API shape).
     return {
         "provisionedModelId": pt_id,
-        "currentModelArn": model_arn,
+        "foundationModelArn": model_arn,
         "modelUnits": units,
         "status": "InService",
     }
+
+
+def test_rate_key_strips_context_window_suffix() -> None:
+    import services.adapters.bedrock as b
+
+    assert b._rate_key("anthropic.claude-3-sonnet-20240229-v1:0:200k") == "anthropic.claude-3-sonnet"
+    assert b._rate_key("anthropic.claude-3-haiku-20240307-v1:0") == "anthropic.claude-3-haiku"
+    assert b._rate_key("amazon.titan-text-lite-v1") == "amazon.titan-text-lite"
 
 
 # --------------------------------------------------------------------------- #
