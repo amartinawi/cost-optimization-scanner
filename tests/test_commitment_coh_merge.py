@@ -143,3 +143,30 @@ def test_string_summary_type_absent_from_cards_stays_unmatched():
     merged, matched = merge_coh_concurrence(cards, coh)
     assert matched == []                                # renders standalone, no guessing
     assert "coh_concurs_monthly" not in merged[0]
+
+
+def test_concurrence_narrows_by_rec_region_across_same_type_cards():
+    """Live af-south-1 audit: the region-filtered prefetch fetched af-south-1's
+    cache.r7g.large rec ($841.83) but type-only narrowing let max() hand it to
+    the RICHER eu-west-1 card of the same type ($934.25)."""
+    af = dict(_ri_card("ElastiCache", 841.83), instance_type="cache.r7g.large", region="af-south-1")
+    eu = dict(_ri_card("ElastiCache", 934.25), instance_type="cache.r7g.large", region="eu-west-1")
+    coh = [{"actionType": "PurchaseReservedInstances",
+            "currentResourceType": "ElastiCacheReservedInstances",
+            "estimatedMonthlySavings": 841.83, "region": "af-south-1",
+            "recommendedResourceSummary":
+                "9 cache.r7g.large Valkey in af-south-1 with three years term (AllUpfront)"}]
+    merged, matched = merge_coh_concurrence([eu, af], coh)
+    assert matched == [0]
+    assert merged[1].get("coh_concurs_monthly") == pytest.approx(841.83)  # af card
+    assert "coh_concurs_monthly" not in merged[0]                          # not richer eu card
+
+
+def test_concurrence_rec_region_without_matching_card_stays_unmatched():
+    cards = [dict(_ri_card("ElastiCache", 934.25), instance_type="cache.r7g.large", region="eu-west-1")]
+    coh = [{"actionType": "PurchaseReservedInstances",
+            "currentResourceType": "ElastiCacheReservedInstances",
+            "estimatedMonthlySavings": 100.0, "region": "ap-south-1"}]
+    merged, matched = merge_coh_concurrence(cards, coh)
+    assert matched == []
+    assert "coh_concurs_monthly" not in merged[0]

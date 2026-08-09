@@ -465,6 +465,16 @@ def _ri_targets_for_rec(rec: dict[str, Any], service_targets: list[dict[str, Any
     """
     if not service_targets:
         return []
+    # Region narrowing first (af-south-1 live audit): the prefetch is
+    # scan-region-filtered but the CE purchase matrix builds cards for EVERY
+    # region, so a type present in two regions must not let max() hand this
+    # region's concurrence to the other region's richer card. A rec that
+    # names a region absent from every card stays unmatched (no guessing).
+    rec_region = str(rec.get("region") or "")
+    if rec_region:
+        service_targets = [c for c in service_targets if c.get("region") in ("", rec_region)]
+        if not service_targets:
+            return []
     named_type = _coh_rec_instance_type(rec, service_targets[0]["service"])
     if named_type is None:
         return service_targets
