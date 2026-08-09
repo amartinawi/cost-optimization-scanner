@@ -56,6 +56,29 @@ def _get_instance_monthly(ctx: Any, instance_type: str) -> float:
 _CW_PERIOD_1D: int = 86400  # AWS CloudWatch max Period for ≤15-day queries.
 
 
+def _invocation_dimension_sets(cw: Any, endpoint_name: str) -> list[frozenset[str]] | None:
+    """Dimension sets AWS published for this endpoint's ``Invocations`` metric.
+
+    ``ListMetrics`` returns only metrics with datapoints in roughly the last
+    two weeks, so the result doubles as an activity probe: an empty list means
+    nothing was published recently, and a list containing only sets we do not
+    read (e.g. inference-component dimensions) means the endpoint HAD traffic
+    the per-variant read would miss. ``None`` on failure — the caller abstains.
+    """
+    try:
+        resp = cw.list_metrics(
+            Namespace="AWS/SageMaker",
+            MetricName="Invocations",
+            Dimensions=[{"Name": "EndpointName", "Value": endpoint_name}],
+        )
+    except Exception:
+        return None
+    return [
+        frozenset(str(d.get("Name")) for d in m.get("Dimensions", []) or [])
+        for m in resp.get("Metrics", []) or []
+    ]
+
+
 def _variant_invocations_sum(
     cw: Any,
     endpoint_name: str,
@@ -178,28 +201,59 @@ def _check_idle_endpoints(
                 # Cannot dimension the metric read or price the fleet — abstain.
                 continue
 
-            invocations = _variant_invocations_sum(cw, name, cfg_variants)
+            # Review 🔴3 — discover which dimension sets AWS actually published
+            # for this endpoint's Invocations before trusting an empty read.
+            # ListMetrics only returns metrics with data in ~2 weeks, so:
+            #   None       -> discovery failed: abstain.
+            #   has {EN,VN}-> the roll-up exists; per-variant sums are readable.
+            #   only other sets (e.g. inference-component dims) -> the endpoint
+            #                 HAD recent traffic under dims we do not read:
+            #                 abstain, never declare idle.
+            #   empty      -> nothing published in ~2 weeks; combined with the
+            #                 age gates below, that is the idle signal.
+            dim_sets = _invocation_dimension_sets(cw, name)
+            if dim_sets is None:
+                continue
+            readable = frozenset({"EndpointName", "VariantName"})
+            if dim_sets and readable not in dim_sets:
+                continue  # published under sets we cannot read — abstain
+            if not dim_sets:
+                invocations: float | None = 0.0
+            else:
+                invocations = _variant_invocations_sum(cw, name, cfg_variants)
             if invocations is None or invocations > 0:
                 continue
 
-            # C8 guard — an endpoint younger than the lookback window has an
-            # empty metric series for benign reasons; never a delete rec.
-            created = ep.get("CreationTime")
-            if created is not None:
+            # C8 guards — the empty-series verdict is only trustworthy when the
+            # endpoint BOTH existed for the whole window AND was not redeployed
+            # inside it (UpdateEndpoint with new VariantNames resets the series
+            # while CreationTime stays old). Missing evidence abstains — it
+            # must never enable a counted irreversible delete (review 🔴2).
+            last_modified = ep.get("LastModifiedTime") or detail.get("LastModifiedTime")
+            aged_out = False
+            for ts in (ep.get("CreationTime"), last_modified):
+                if ts is None:
+                    aged_out = True
+                    break
                 try:
-                    if (datetime.now(timezone.utc) - created).days < IDLE_ENDPOINT_DAYS:
-                        continue
+                    if (datetime.now(timezone.utc) - ts).days < IDLE_ENDPOINT_DAYS:
+                        aged_out = True
+                        break
                 except TypeError:
-                    continue  # unreadable creation time — abstain
+                    aged_out = True
+                    break
+            if aged_out:
+                continue
 
             # PricingEngine returns region-correct prices already; do not
             # re-multiply by pricing_multiplier (would double-count).
             _ = pricing_multiplier
             # SM-3 — the recoverable cost is the whole fleet: every variant's
-            # instance price x its instance count (live CurrentInstanceCount
-            # when present, else the config's initial count). Any unpriceable
-            # variant abstains the whole rec (sagemaker C2 — no partial-fleet
-            # placeholder dollar).
+            # instance price x its instance count. The LIVE CurrentInstanceCount
+            # is authoritative even at 0 (a scaled-to-zero variant costs nothing
+            # and must contribute $0 — review 🔴1); the config's initial count
+            # is only the fallback when the live value is absent. Any
+            # unpriceable variant abstains the whole rec (sagemaker C2).
             desc_counts = {
                 str(v.get("VariantName") or ""): v.get("CurrentInstanceCount")
                 for v in detail.get("ProductionVariants", []) or []
@@ -209,7 +263,10 @@ def _check_idle_endpoints(
             for variant in cfg_variants:
                 vtype = str(variant.get("InstanceType") or "")
                 vname = str(variant.get("VariantName") or "")
-                count = int(desc_counts.get(vname) or variant.get("InitialInstanceCount") or 1)
+                current = desc_counts.get(vname)
+                count = int(current) if current is not None else int(variant.get("InitialInstanceCount") or 1)
+                if count <= 0:
+                    continue  # scaled to zero — nothing to recover for this variant
                 per_instance = _get_instance_monthly(ctx, vtype)
                 if per_instance <= 0:
                     instance_monthly = 0.0
@@ -219,6 +276,7 @@ def _check_idle_endpoints(
             if instance_monthly <= 0:
                 continue
             instance_type = str(cfg_variants[0].get("InstanceType") or "unknown")
+            fleet_desc = "; ".join(variant_summary)
 
             recs.append(
                 {
@@ -226,7 +284,10 @@ def _check_idle_endpoints(
                     "instance_type": instance_type,
                     "check_category": "Idle Endpoints",
                     "Counted": True,
-                    "current_value": f"Endpoint '{name}' ({instance_type}) has 0 invocations in {IDLE_ENDPOINT_DAYS} days",
+                    "current_value": (
+                        f"Endpoint '{name}' ({fleet_desc}) has 0 invocations "
+                        f"in {IDLE_ENDPOINT_DAYS} days"
+                    ),
                     "recommended_value": "Delete endpoint or reduce instance count",
                     "EstimatedMonthlySavings": round(instance_monthly, 2),
                     "EstimatedSavings": f"${instance_monthly:,.2f}/month",

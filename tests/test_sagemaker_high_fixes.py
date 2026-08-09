@@ -63,12 +63,14 @@ class _FakeSageMaker:
         notebooks: list[dict[str, Any]] | None = None,
         training_jobs: list[dict[str, Any]] | None = None,
         training_details: dict[str, dict[str, Any]] | None = None,
+        describe_extra: dict[str, dict[str, Any]] | None = None,
     ) -> None:
         self._endpoints = endpoints or []
         self._endpoint_configs = endpoint_configs or {}
         self._notebooks = notebooks or []
         self._training_jobs = training_jobs or []
         self._training_details = training_details or {}
+        self._describe_extra = describe_extra or {}
 
     def get_paginator(self, name: str) -> _FakePaginator:
         if name == "list_endpoints":
@@ -78,7 +80,9 @@ class _FakeSageMaker:
     def describe_endpoint(self, EndpointName: str) -> dict[str, Any]:  # noqa: N803
         for ep in self._endpoints:
             if ep.get("EndpointName") == EndpointName:
-                return {"EndpointConfigName": ep.get("EndpointConfigName", "")}
+                base = {"EndpointConfigName": ep.get("EndpointConfigName", "")}
+                base.update(self._describe_extra.get(EndpointName, {}))
+                return base
         return {}
 
     def describe_endpoint_config(self, EndpointConfigName: str) -> dict[str, Any]:  # noqa: N803
@@ -101,9 +105,30 @@ class _FakeCloudWatch:
         self,
         invocations_by_name: dict[str, float] | None = None,
         error: Exception | None = None,
+        dimension_sets_by_name: dict[str, list[list[str]]] | None = None,
     ) -> None:
         self._inv = invocations_by_name or {}
         self._error = error
+        self._dim_sets = dimension_sets_by_name or {}
+
+    def list_metrics(self, **kwargs: Any) -> dict[str, Any]:
+        """ListMetrics semantics: only metrics with recent data are returned.
+
+        Endpoints present in ``invocations_by_name`` published the standard
+        (EndpointName, VariantName) roll-up; absent endpoints published
+        nothing; ``dimension_sets_by_name`` overrides (e.g. IC-only sets)."""
+        if self._error is not None:
+            raise self._error
+        dims = {d["Name"]: d["Value"] for d in kwargs.get("Dimensions", [])}
+        name = dims.get("EndpointName")
+        sets = self._dim_sets.get(str(name))
+        if sets is None:
+            sets = [["EndpointName", "VariantName"]] if name in self._inv else []
+        return {
+            "Metrics": [
+                {"Dimensions": [{"Name": n, "Value": "x"} for n in s]} for s in sets
+            ]
+        }
 
     def get_metric_statistics(self, **kwargs: Any) -> dict[str, Any]:
         if self._error is not None:
@@ -155,8 +180,19 @@ def _ctx(
 
 
 def _endpoint(name: str, instance_type: str = "ml.m5.xlarge", status: str = "InService"):
+    from datetime import datetime, timedelta, timezone
+
     cfg = f"{name}-cfg"
-    ep = {"EndpointName": name, "EndpointStatus": status, "EndpointConfigName": cfg}
+    aged = datetime.now(timezone.utc) - timedelta(days=90)
+    ep = {
+        "EndpointName": name,
+        "EndpointStatus": status,
+        "EndpointConfigName": cfg,
+        # The idle verdict is fail-closed on age: both timestamps must exist
+        # and predate the lookback window (review 🔴2).
+        "CreationTime": aged,
+        "LastModifiedTime": aged,
+    }
     config = {
         cfg: {
             "ProductionVariants": [
@@ -191,8 +227,17 @@ def test_idle_endpoint_priced_at_fleet_size() -> None:
     """SM-3: an idle endpoint's recoverable cost is sum(variant instance price x
     instance count) across ALL ProductionVariants, not one instance of
     variants[0]."""
+    from datetime import datetime, timedelta, timezone
+
     cfg = "fleet-cfg"
-    ep = {"EndpointName": "fleet-ep", "EndpointStatus": "InService", "EndpointConfigName": cfg}
+    aged = datetime.now(timezone.utc) - timedelta(days=90)
+    ep = {
+        "EndpointName": "fleet-ep",
+        "EndpointStatus": "InService",
+        "EndpointConfigName": cfg,
+        "CreationTime": aged,
+        "LastModifiedTime": aged,
+    }
     configs = {
         cfg: {
             "ProductionVariants": [
@@ -210,6 +255,80 @@ def test_idle_endpoint_priced_at_fleet_size() -> None:
     rec = findings.sources["idle_endpoints"].recommendations[0]
     assert rec["EstimatedMonthlySavings"] == pytest.approx(8 * M5_XLARGE_MONTHLY)
     assert findings.total_monthly_savings == pytest.approx(8 * M5_XLARGE_MONTHLY)
+
+
+def test_scaled_to_zero_variant_contributes_nothing() -> None:
+    """Review 🔴1: a live CurrentInstanceCount of 0 (scale-to-zero) is
+    authoritative — the config's InitialInstanceCount must not resurrect a
+    counted dollar for instances AWS reports as gone."""
+    ep, cfg = _endpoint("scaled-to-zero", "ml.m5.xlarge")
+    cfg["scaled-to-zero-cfg"]["ProductionVariants"][0]["InitialInstanceCount"] = 4
+    sm = _FakeSageMaker(
+        endpoints=[ep],
+        endpoint_configs=cfg,
+        describe_extra={
+            "scaled-to-zero": {
+                "ProductionVariants": [{"VariantName": "AllTraffic", "CurrentInstanceCount": 0}]
+            }
+        },
+    )
+    cw = _FakeCloudWatch({})
+    ctx = _ctx(sm, cw, prices={"ml.m5.xlarge": M5_XLARGE_MONTHLY})
+
+    findings = SageMakerModule().scan(ctx)
+
+    assert findings.sources["idle_endpoints"].count == 0
+    assert findings.total_monthly_savings == 0.0
+
+
+def test_missing_creation_time_abstains() -> None:
+    """Review 🔴2a: missing evidence must not enable a counted delete."""
+    ep, cfg = _endpoint("no-created", "ml.m5.xlarge")
+    del ep["CreationTime"]
+    sm = _FakeSageMaker(endpoints=[ep], endpoint_configs=cfg)
+    cw = _FakeCloudWatch({})
+    ctx = _ctx(sm, cw, prices={"ml.m5.xlarge": M5_XLARGE_MONTHLY})
+
+    findings = SageMakerModule().scan(ctx)
+
+    assert findings.sources["idle_endpoints"].count == 0
+
+
+def test_recent_redeploy_abstains() -> None:
+    """Review 🔴2b: UpdateEndpoint with new VariantNames resets the metric
+    series while CreationTime stays old — a recent LastModifiedTime must
+    withhold the idle verdict."""
+    from datetime import datetime, timedelta, timezone
+
+    ep, cfg = _endpoint("redeployed", "ml.m5.xlarge")
+    ep["LastModifiedTime"] = datetime.now(timezone.utc) - timedelta(days=2)
+    sm = _FakeSageMaker(endpoints=[ep], endpoint_configs=cfg)
+    cw = _FakeCloudWatch({})
+    ctx = _ctx(sm, cw, prices={"ml.m5.xlarge": M5_XLARGE_MONTHLY})
+
+    findings = SageMakerModule().scan(ctx)
+
+    assert findings.sources["idle_endpoints"].count == 0
+
+
+def test_inference_component_dimension_sets_abstain() -> None:
+    """Review 🔴3: an endpoint whose Invocations publish only under
+    inference-component dimension sets HAD recent traffic our per-variant read
+    cannot see — abstain, never flag idle."""
+    ep, cfg = _endpoint("llm-ep", "ml.g5.2xlarge")
+    sm = _FakeSageMaker(endpoints=[ep], endpoint_configs=cfg)
+    cw = _FakeCloudWatch(
+        {},
+        dimension_sets_by_name={
+            "llm-ep": [["EndpointName", "VariantName", "InferenceComponentName", "InstanceId", "ContainerId"]]
+        },
+    )
+    ctx = _ctx(sm, cw, prices={"ml.g5.2xlarge": 1000.0})
+
+    findings = SageMakerModule().scan(ctx)
+
+    assert findings.sources["idle_endpoints"].count == 0
+    assert findings.total_monthly_savings == 0.0
 
 
 def test_endpoint_younger_than_window_is_not_flagged_idle() -> None:
