@@ -148,8 +148,9 @@ def test_aurora_describe_clusters_classified() -> None:
 # --------------------------------------------------------------------------- #
 def test_ec2_asg_member_failure_classified() -> None:
     ctx = _Ctx({"autoscaling": _Boom(_access_denied("DescribeAutoScalingGroups"))})
-    ids = ec2_adapter._asg_member_instance_ids(ctx)
+    ids, ok = ec2_adapter._asg_member_instance_ids(ctx)
     assert ids == set()
+    assert ok is False  # EC2-4: the caller must fail closed on this signal
     assert "ec2" in _perm_services(ctx)
 
 

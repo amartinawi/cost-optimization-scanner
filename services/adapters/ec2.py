@@ -106,8 +106,8 @@ def _co_is_cost_actionable(rec: dict[str, Any]) -> bool:
     return True
 
 
-def _asg_member_instance_ids(ctx: Any) -> set[str]:
-    """Instance ids that belong to an Auto Scaling Group.
+def _asg_member_instance_ids(ctx: Any) -> tuple[set[str], bool]:
+    """(ASG-member instance ids, enumeration_ok).
 
     ASG members are sized via their launch template and covered by ASG Compute
     Optimizer, so per-instance heuristics must defer to that source rather than
@@ -115,14 +115,16 @@ def _asg_member_instance_ids(ctx: Any) -> set[str]:
 
     H1 — a *silent* empty set re-enables the per-instance heuristics AND the
     ``asg_compute_optimizer`` block on managed instances (double-counting managed
-    dollars). On a failed read we classify the error so the degraded dedup is
-    visible, and return the partial set gathered so far rather than wiping it.
+    dollars). On a failed read we classify the error AND return ``ok=False``:
+    the caller must fail CLOSED (EC2-4 / C8 — a denied
+    ``autoscaling:DescribeAutoScalingGroups`` previously made the counted total
+    RISE, because every ASG member's heuristics re-enabled).
     """
     ids: set[str] = set()
     try:
         autoscaling = ctx.client("autoscaling")
         if not autoscaling:
-            return ids
+            return ids, True
         paginator = autoscaling.get_paginator("describe_auto_scaling_groups")
         for page in paginator.paginate():
             for group in page.get("AutoScalingGroups", []):
@@ -137,7 +139,8 @@ def _asg_member_instance_ids(ctx: Any) -> set[str]:
             service="ec2",
             context="autoscaling:DescribeAutoScalingGroups failed (ASG-member dedup degraded)",
         )
-    return ids
+        return ids, False
+    return ids, True
 
 
 class EC2Module(BaseServiceModule):
@@ -228,7 +231,8 @@ class EC2Module(BaseServiceModule):
 
         # ASG members defer to ASG Compute Optimizer / launch-template sizing —
         # never rightsize a managed instance individually.
-        covered |= _asg_member_instance_ids(ctx)
+        asg_member_ids, asg_ok = _asg_member_instance_ids(ctx)
+        covered |= asg_member_ids
 
         # ASG CO recs: drop the non-actionable ones (NOT_OPTIMIZED / $0, which
         # carry no opportunity yet inflate the count) and any whose ASG is already
@@ -272,6 +276,26 @@ class EC2Module(BaseServiceModule):
         # (CoH/CO/ASG). They carry "$0.00" EstimatedSavings, so the savings sum below
         # leaves them at $0 — rendered, never counted.
         advisory_final = [r for r in advisory_advanced if str(r.get("InstanceId", "") or "") not in covered]
+
+        # EC2-4 (C8) — when ASG membership could not be enumerated, the
+        # per-instance heuristics cannot be deduped against managed instances,
+        # and counting them would make a DENIED autoscaling:Describe* RAISE
+        # the counted total. Fail closed: demote every selected heuristic rec
+        # to a $0 advisory (still rendered, never summed).
+        if not asg_ok and (enhanced_final or advanced_counted_final):
+            for rec in enhanced_final + advanced_counted_final:
+                gross = parse_dollar_savings(rec.get("EstimatedSavings", ""))
+                rec["Counted"] = False
+                rec["AdvisoryEstimate"] = round(gross, 2)
+                rec["EstimatedMonthlySavings"] = 0.0
+                rec["EstimatedSavings"] = (
+                    "$0.00/month — advisory: ASG membership unknown "
+                    "(autoscaling:DescribeAutoScalingGroups failed) — cannot rule "
+                    "out a managed instance"
+                )
+            advisory_final = advisory_final + enhanced_final + advanced_counted_final
+            enhanced_final = []
+            advanced_counted_final = []
 
         # --- Active-commitment demotion ----------------------------------------
         # Rightsizing / Graviton-migration / idle recs are computed on an
