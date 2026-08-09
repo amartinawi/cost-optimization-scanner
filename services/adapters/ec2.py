@@ -309,7 +309,15 @@ class EC2Module(BaseServiceModule):
             )
 
         def _co_type(r: dict[str, Any]) -> str:
-            return str(r.get("currentInstanceType", "") or "")
+            # Per-instance CO recs carry ``currentInstanceType`` (the raw API
+            # field); NORMALIZED ASG recs carry ``current_config.instanceType``
+            # (EC2-2 — reading only the former returned "" for every ASG rec,
+            # covers_ec2("") matched nothing, and ASG recs bypassed the
+            # commitment gate at full on-demand gross).
+            direct = r.get("currentInstanceType")
+            if direct:
+                return str(direct)
+            return str((r.get("current_config") or {}).get("instanceType") or "")
 
         def _heur_type(r: dict[str, Any]) -> str:
             return str(r.get("InstanceType", "") or "")

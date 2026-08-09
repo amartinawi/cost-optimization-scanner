@@ -848,3 +848,45 @@ def test_c6_coh_and_local_gates_share_ledger() -> None:
     removed = demote_covered_in_place(local, cov, "rds", lambda r: r["DBInstanceClass"])
     assert removed == pytest.approx(180.0)
     assert local[0]["Counted"] is False
+
+
+def test_ec2_adapter_demotes_sp_covered_asg_co_recs(monkeypatch) -> None:
+    """EC2-2: normalized ASG Compute-Optimizer recs carry the instance type at
+    current_config.instanceType, not currentInstanceType — the old accessor
+    returned "" for every ASG rec, covers_ec2("") matched nothing, and ASG
+    recs bypassed the commitment gate at full on-demand gross."""
+    import services.adapters.ec2 as ec2_adapter
+    from services.adapters.ec2 import EC2Module
+
+    asg_rec = {
+        "resource_id": "web-asg",
+        "resource_name": "web-asg",
+        "resource_type": "Auto Scaling Group",
+        "finding": "NotOptimized",
+        "current_config": {"instanceType": "m5.xlarge", "desiredCapacity": 3},
+        "recommended_config": {"instanceType": "m6g.xlarge"},
+        "estimatedMonthlySavings": 200.0,
+    }
+    monkeypatch.setattr(ec2_adapter, "get_ec2_compute_optimizer_recommendations", lambda ctx: [])
+    monkeypatch.setattr(ec2_adapter, "get_asg_compute_optimizer_recommendations", lambda ctx: [dict(asg_rec)])
+    monkeypatch.setattr(ec2_adapter, "get_enhanced_ec2_checks", lambda *a, **k: {"recommendations": []})
+    monkeypatch.setattr(ec2_adapter, "get_advanced_ec2_checks", lambda *a, **k: {"recommendations": []})
+    monkeypatch.setattr(ec2_adapter, "get_ec2_instance_count", lambda ctx: 3)
+
+    ctx = SimpleNamespace(
+        cost_hub_splits={"ec2": []},
+        commitment_coverage=_ec2_cov(),  # m5 family carries an EC2-Instance SP
+        pricing_multiplier=1.0,
+        fast_mode=False,
+        client=lambda name, region=None: None,
+        warn=lambda *a, **k: None,
+        permission_issue=lambda *a, **k: None,
+    )
+    findings = EC2Module().scan(ctx)
+
+    # The SP-covered ASG rec must demote: nothing counted.
+    assert findings.total_monthly_savings == pytest.approx(0.0)
+    recs = findings.sources["asg_compute_optimizer"].recommendations
+    assert len(recs) == 1
+    assert recs[0].get("Counted") is False
+    assert recs[0]["AdvisoryEstimate"] == pytest.approx(200.0)
