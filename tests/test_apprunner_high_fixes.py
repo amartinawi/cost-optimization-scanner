@@ -143,6 +143,37 @@ def test_idle_service_counted_dollar_end_to_end() -> None:
     assert ctx.permissions == [] and ctx.warnings == []
 
 
+def test_bare_mb_memory_priced_as_mb_not_gb() -> None:
+    """AR-1: App Runner's Memory string is valid in MB or GB; the bare numeric
+    forms (512|1024|...|12288) are MB — routine on CloudFormation/CDK/Terraform
+    services. Parsing '2048' as 2048 GB counted a 1024x phantom
+    ($10,465/mo for an idle 2 GB service)."""
+    svc = _svc(name="iac-idle", service_id="sid-mb")
+    ar = _FakeAppRunner([svc], configs={svc["ServiceArn"]: {"Memory": "2048", "Cpu": "1024"}})
+    cw = _FakeCloudWatch(requests_sum=0.0)
+    ctx = _ctx(ar, cw)
+
+    findings = AppRunnerModule().scan(ctx)
+
+    expected = 2 * APP_RUNNER_MEM_GB_HOURLY * HOURS_PER_MONTH  # 2048 MB == 2 GB -> $10.22
+    assert findings.total_monthly_savings == pytest.approx(round(expected, 2), abs=0.001)
+    rec = findings.sources["enhanced_checks"].recommendations[0]
+    assert rec["EstimatedMonthlySavings"] == pytest.approx(10.22, abs=0.01)
+    assert rec["AuditBasis"]["memory_gb"] == pytest.approx(2.0)
+
+
+def test_fractional_gb_memory_priced_as_gb() -> None:
+    svc = _svc(name="half-gb", service_id="sid-hg")
+    ar = _FakeAppRunner([svc], configs={svc["ServiceArn"]: {"Memory": "0.5 GB"}})
+    cw = _FakeCloudWatch(requests_sum=0.0)
+    ctx = _ctx(ar, cw)
+
+    findings = AppRunnerModule().scan(ctx)
+
+    expected = 0.5 * APP_RUNNER_MEM_GB_HOURLY * HOURS_PER_MONTH
+    assert findings.total_monthly_savings == pytest.approx(round(expected, 2), abs=0.001)
+
+
 def test_cloudwatch_uses_servicename_and_serviceid_dimensions() -> None:
     """The invalid 'Service' dimension is replaced by ServiceName + ServiceID."""
     svc = _svc(name="idle", service_id="abc123")
