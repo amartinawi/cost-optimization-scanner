@@ -4,11 +4,12 @@ Analyzes AWS Cost Explorer data to surface under-utilized commitments,
 coverage gaps, expiring commitments, and purchase recommendations.
 
 AWS API cost: Cost Explorer charges $0.01 per API request. This adapter
-makes ~62 calls per scan (~$0.62/scan). The calls are:
+makes ~61 calls per scan (~$0.61/scan). The calls are:
 
 1. ``get_savings_plans_utilization`` — overall SP utilization rate (1 call)
-2. ``get_savings_plans_utilization_details`` — per-SP utilization and the
-   expiry scan (2 calls: one in _check_sp_utilization, one in _check_expiring)
+2. ``get_savings_plans_utilization_details`` — per-SP utilization (1 call).
+   Expiry no longer reads CE at all: end timestamps are not on this shape, so
+   _check_expiring uses savingsplans:DescribeSavingsPlans (free) — H3.
 3. ``get_savings_plans_coverage`` — SP coverage rate by service (1 call)
 4. ``get_reservation_utilization`` — RI utilization rate (1 call)
 5. ``get_reservation_coverage`` — RI coverage rate (1 call)
@@ -83,7 +84,7 @@ class CommitmentAnalysisModule(BaseServiceModule):
     Uses Cost Explorer to detect under-utilized commitments, coverage gaps,
     expiring commitments, and purchase recommendations.
 
-    CE API cost: ~$0.62 per scan (~62 calls at $0.01 each including the full
+    CE API cost: ~$0.61 per scan (~61 calls at $0.01 each including the full
     RI (6 services) and SP (3 types) purchase matrices, each across 2 terms
     x 3 payment options).
     """
@@ -503,7 +504,9 @@ class CommitmentAnalysisModule(BaseServiceModule):
                         continue
 
                     days_left = (end_dt - now).days
-                    if days_left <= 90:
+                    # states=["active"] should preclude a past end date;
+                    # never render a negative countdown if one slips through.
+                    if 0 <= days_left <= 90:
                         severity = "HIGH" if days_left <= 30 else ("MEDIUM" if days_left <= 60 else "LOW")
                         recs.append(
                             {

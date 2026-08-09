@@ -1761,7 +1761,18 @@ def _render_generic_lambda_rec(content: str, rec: Rec) -> str:
                 f"<p><strong>Recommendation:</strong> {rec['actionType']} Lambda function for cost optimization</p>"
             )
 
-    if "EstimatedSavings" in rec:
+    # A commitment-demoted rec deliberately KEEPS its full-dollar string /
+    # camelCase numeric (the sanctioned B1-iii shape, so the card can explain
+    # what the commitment is masking) — which only works if the renderer honors
+    # Counted. Lambda has no PHASE_B_HANDLERS entry, so every source lands here;
+    # without this branch a Compute-SP account rendered full-dollar cards under
+    # a $0 tab headline. Mirrors _render_generic_other_rec.
+    if rec.get("Counted") is False:
+        content += (
+            '<p class="savings muted"><strong>Estimated Savings:</strong> '
+            "$0.00/month — advisory (not added to the tab total)</p>"
+        )
+    elif "EstimatedSavings" in rec:
         content += f'<p class="savings"><strong>Estimated Savings:</strong> {rec["EstimatedSavings"]}</p>'
     elif "estimatedMonthlySavings" in rec:
         monthly_savings = rec["estimatedMonthlySavings"]

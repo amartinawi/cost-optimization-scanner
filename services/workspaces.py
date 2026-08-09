@@ -100,8 +100,12 @@ WORKSPACE_BUNDLE_RANK: dict[str, int] = {
     "PERFORMANCE": 2,
     "POWER": 3,
     "POWERPRO": 4,
-    "GRAPHICS": 5,
-    "GRAPHICSPRO": 6,
+    # Ranked above POWERPRO so the rightsizing advisory can fire for it; the
+    # bundle tables price it (WS-1). Without a rank the lookup returns -1 and
+    # the lever silently skips the most expensive non-GPU bundle.
+    "GENERALPURPOSE_4XLARGE": 5,
+    "GRAPHICS": 6,
+    "GRAPHICSPRO": 7,
 }
 
 WORKSPACES_OPTIMIZATION_DESCRIPTIONS: dict[str, dict[str, str]] = {

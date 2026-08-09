@@ -151,7 +151,7 @@ class DynamoDbModule(BaseServiceModule):
                             "target = ceil(avg_consumed x buffer) per base+GSI when utilization < 20%"
                         ),
                     }
-                    savings += capped
+                    savings += round(capped, 2)  # same basis the demotion subtracts
                 else:
                     rec["EstimatedMonthlySavings"] = 0.0
                     rec["Counted"] = False
@@ -182,13 +182,15 @@ class DynamoDbModule(BaseServiceModule):
         ]
 
         def _coh_table_name(rec: dict[str, Any]) -> str:
-            """Table segment of a CoH resourceId.
+            """Table segment of a CoH rec's resource identifier.
 
-            Handles plain table ARNs (...:table/Name) and index ARNs
-            (...:table/Name/index/GSI) — a naive split("/")[-1] yields the GSI
-            name, so an index rec would not match its own table (DynamoDB L3).
+            Prefers ``resourceArn`` then ``resourceId`` (the order the shared
+            ``coh_key`` helper uses), and handles plain table ARNs
+            (...:table/Name) and index ARNs (...:table/Name/index/GSI) — a naive
+            split("/")[-1] yields the GSI name, so an index rec would not match
+            its own table (DynamoDB L3).
             """
-            resource_id = str(rec.get("resourceId", "") or "")
+            resource_id = str(rec.get("resourceArn") or rec.get("resourceId") or "")
             if ":table/" in resource_id:
                 return resource_id.split(":table/")[-1].split("/")[0]
             return resource_id.split("/")[-1]
@@ -198,8 +200,19 @@ class DynamoDbModule(BaseServiceModule):
         for rec in cost_hub_recs:
             coh_kept.append(rec)
             table_name = _coh_table_name(rec)
-            if table_name:
-                coh_tables.add(table_name)
+            if not table_name:
+                # Fail CLOSED: with no resolvable table we cannot demote the
+                # matching local lever, so counting this rec too would double
+                # the table's dollar. Surface it as advisory instead.
+                gross = float(rec.get("estimatedMonthlySavings", 0.0) or 0.0)
+                rec["Counted"] = False
+                rec["AdvisoryEstimate"] = round(gross, 2)
+                rec["PricingWarning"] = (
+                    "no resourceArn/resourceId on the Cost Optimization Hub rec — "
+                    "cannot dedupe against local levers, so not counted"
+                )
+                continue
+            coh_tables.add(table_name)
             savings += float(rec.get("estimatedMonthlySavings", 0.0) or 0.0)
 
         # Demote any LOCAL counted lever on a CoH-covered table so the same

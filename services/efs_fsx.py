@@ -346,6 +346,8 @@ def get_efs_findings(
                     # Anything the API did not attribute stays at the Standard
                     # rate (conservative: never cheaper than reality).
                     residual_std_gb = max(total_gb - ia_gb - archive_gb, 0.0)
+                    # Archive is a Regional-only class (no One Zone variant),
+                    # so it does not switch on is_one_zone like Standard/IA.
                     archive_rate = _efs_rate(ctx, "Archive", pricing_multiplier)
                     savings = (
                         efs_idle_savings(residual_std_gb, std_rate)

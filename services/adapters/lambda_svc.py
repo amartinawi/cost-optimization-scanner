@@ -279,7 +279,14 @@ class LambdaModule(BaseServiceModule):
                 )
             savings = 0.0
 
-        total_recs = len(cost_hub_recs) + len(co_recs) + len(enhanced_recs)
+        # D4 count hygiene: advisories render but never inflate the headline
+        # count (under a Compute SP every rec here is demoted, so the tab would
+        # otherwise report N recommendations worth $0.00).
+        total_recs = sum(
+            1
+            for rec in list(cost_hub_recs) + list(co_recs) + list(enhanced_recs)
+            if rec.get("Counted") is not False
+        )
 
         return ServiceFindings(
             service_name="Lambda",

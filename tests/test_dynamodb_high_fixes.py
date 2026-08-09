@@ -573,3 +573,62 @@ def test_scan_drops_non_renderable_coh_recs(monkeypatch):
 
     assert findings.sources["cost_optimization_hub"].count == 1
     assert findings.total_monthly_savings == pytest.approx(25.0, abs=0.01)
+
+
+def test_coh_rec_without_a_resource_key_is_not_counted(monkeypatch):
+    """Review finding 2: the dedup read only resourceId, so a rec carrying just
+    resourceArn (the key the shared coh_key helper prefers) resolved to an empty
+    table name — no local demotion, both dollars counted. Losing evidence must
+    never RAISE a counted total, so an unresolvable rec is advisory."""
+    over_rec = {
+        "TableName": "MyTable", "ReadCapacityUnits": 500, "WriteCapacityUnits": 300,
+        "RightsizedReadCapacity": 36, "RightsizedWriteCapacity": 9,
+        "MetricsAvailable": True, "LowUtilization": True,
+        "CheckCategory": "DynamoDB Over-Provisioned Capacity",
+    }
+    coh = [{"resourceArn": "arn:aws:dynamodb:us-east-1:1:table/MyTable",
+            "estimatedMonthlySavings": 90.0}]
+    monkeypatch.setattr(dynamodb_adapter, "get_dynamodb_table_analysis", lambda ctx: {"optimization_opportunities": []})
+    monkeypatch.setattr(
+        dynamodb_adapter, "get_enhanced_dynamodb_checks", lambda ctx: {"recommendations": [dict(over_rec)]}
+    )
+    findings = dynamodb_adapter.DynamoDbModule().scan(_ctx(cost_hub_splits={"dynamodb": coh}))
+    # resourceArn resolves the table -> CoH counted once, local demoted.
+    assert findings.total_monthly_savings == pytest.approx(90.0, abs=0.01)
+    assert findings.sources["enhanced_checks"].recommendations[0]["Counted"] is False
+
+
+def test_coh_rec_with_no_identifier_fails_closed(monkeypatch):
+    over_rec = {
+        "TableName": "MyTable", "ReadCapacityUnits": 500, "WriteCapacityUnits": 300,
+        "RightsizedReadCapacity": 36, "RightsizedWriteCapacity": 9,
+        "MetricsAvailable": True, "LowUtilization": True,
+        "CheckCategory": "DynamoDB Over-Provisioned Capacity",
+    }
+    coh = [{"resourceId": "", "resourceArn": "", "estimatedMonthlySavings": 90.0}]
+    monkeypatch.setattr(dynamodb_adapter, "get_dynamodb_table_analysis", lambda ctx: {"optimization_opportunities": []})
+    monkeypatch.setattr(
+        dynamodb_adapter, "get_enhanced_dynamodb_checks", lambda ctx: {"recommendations": [dict(over_rec)]}
+    )
+    findings = dynamodb_adapter.DynamoDbModule().scan(_ctx(cost_hub_splits={"dynamodb": coh}))
+    # Unresolvable CoH rec is NOT counted; only the local lever stands.
+    expected = _expected_delta(500, 300, 36, 9)
+    assert findings.total_monthly_savings == pytest.approx(expected, abs=0.01)
+    coh_rec = findings.sources["cost_optimization_hub"].recommendations[0]
+    assert coh_rec["Counted"] is False
+
+
+def test_table_level_and_gsi_level_coh_recs_both_count(monkeypatch):
+    """Review finding 3: the old rule dropped every CoH rec, so nothing pinned
+    this. GSI capacity bills separately from the base table, so a table-level
+    and an index-level rec are distinct dollars — both count, and the single
+    local lever for that table demotes once."""
+    coh = [
+        {"resourceId": "arn:aws:dynamodb:us-east-1:1:table/T", "estimatedMonthlySavings": 30.0},
+        {"resourceId": "arn:aws:dynamodb:us-east-1:1:table/T/index/G", "estimatedMonthlySavings": 12.0},
+    ]
+    monkeypatch.setattr(dynamodb_adapter, "get_dynamodb_table_analysis", lambda ctx: {"optimization_opportunities": []})
+    monkeypatch.setattr(dynamodb_adapter, "get_enhanced_dynamodb_checks", lambda ctx: {"recommendations": []})
+    findings = dynamodb_adapter.DynamoDbModule().scan(_ctx(cost_hub_splits={"dynamodb": coh}))
+    assert findings.sources["cost_optimization_hub"].count == 2
+    assert findings.total_monthly_savings == pytest.approx(42.0, abs=0.01)

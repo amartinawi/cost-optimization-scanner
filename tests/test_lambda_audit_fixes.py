@@ -484,3 +484,46 @@ def test_pc_savings_counted_without_a_compute_sp(monkeypatch: pytest.MonkeyPatch
     expected = _expected_pc(_LAMBDA_PC_PRICE_PER_GB_SEC, 1024, 2, 0.25)
     assert findings.total_monthly_savings == pytest.approx(expected, rel=1e-6)
     assert findings.sources["enhanced_checks"].recommendations[0].get("Counted") is not False
+
+
+def test_demoted_lambda_recs_render_as_advisory() -> None:
+    """Tranche-3 review blocker: a commitment-demoted rec deliberately KEEPS its
+    full-dollar string (B1-iii) so the card can explain what the SP masks — but
+    Lambda has no PHASE_B_HANDLERS entry, so every source lands on the generic
+    renderer, which ignored Counted. Result on a Compute-SP account: a $0 tab
+    headline over full-dollar cards."""
+    from reporter_phase_b import _render_generic_lambda_rec
+
+    demoted = {
+        "resourceId": "arn:aws:lambda:us-east-1:1:function:fn",
+        "FunctionName": "fn",
+        "EstimatedSavings": "$150.00/month",
+        "EstimatedMonthlySavings": 150.0,
+        "estimatedMonthlySavings": 150.0,
+        "Counted": False,
+        "CommitmentCoverageNote": "Covered by an active Compute Savings Plan",
+    }
+    html = _render_generic_lambda_rec("", demoted)
+    assert "$150.00/month" not in html
+    assert "advisory" in html
+
+    counted = dict(demoted)
+    counted.pop("Counted")
+    assert "$150.00/month" in _render_generic_lambda_rec("", counted)
+
+
+def test_total_recommendations_excludes_demoted_recs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """D4: under a Compute SP every Lambda rec demotes, so the tab must not
+    report N recommendations worth $0.00."""
+    from services.commitment_coverage import CommitmentCoverage
+
+    rec = _pc_rec("x86_64", util=0.25)
+    monkeypatch.setattr(adapter_mod, "get_lambda_compute_optimizer_recommendations", lambda c: [])
+    monkeypatch.setattr(adapter_mod, "get_enhanced_lambda_checks", lambda c: {"recommendations": [rec]})
+
+    ctx = _recording_ctx()
+    ctx.commitment_coverage = CommitmentCoverage(region="us-east-1", has_compute_sp=True)
+    findings = LambdaModule().scan(ctx)
+
+    assert findings.total_monthly_savings == pytest.approx(0.0)
+    assert findings.total_recommendations == 0
