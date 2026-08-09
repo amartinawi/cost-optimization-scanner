@@ -40,8 +40,17 @@ class AwsSessionFactory:
         return self._session
 
     def account_id(self) -> str:
-        """Resolve the AWS account ID via STS GetCallerIdentity."""
-        sts = self.session().client("sts", region_name=self._region, config=self._retry_config)
+        """Resolve the AWS account ID via STS GetCallerIdentity.
+
+        Deliberately pinned to us-east-1, never the scan region: with an
+        assume-role profile, an STS client in an OPT-IN region (af-south-1,
+        me-central-1, ...) routes the AssumeRole through that region's STS,
+        which rejects v1/SSO source tokens (InvalidClientTokenId) and kills
+        the scan at startup. GetCallerIdentity has no regional semantics, and
+        role credentials resolved via a default region are valid in every
+        enabled region afterwards (live-verified, afs-prod / af-south-1).
+        """
+        sts = self.session().client("sts", region_name="us-east-1", config=self._retry_config)
         return str(sts.get_caller_identity()["Account"])
 
     def retry_config(self) -> Config:
