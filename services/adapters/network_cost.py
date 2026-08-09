@@ -208,16 +208,27 @@ class NetworkCostModule(BaseServiceModule):
             results: list[dict[str, Any]] = []
             next_token: str | None = None
 
+            # NC-1 — "AWS Data Transfer" is a SERVICE dimension value; as a
+            # USAGE_TYPE_GROUP value it matches NOTHING (live get-dimension-
+            # values returns only service-prefixed groups like "EC2: Data
+            # Transfer - Inter AZ"), so this query returned $0 on every account
+            # with no error — the C8-corollary shape ("a wrong billing query
+            # returns $0, indistinguishable from nothing billed"). Filter on
+            # SERVICE, REGION-scoped like the sibling CE reads.
+            service_clause: dict[str, Any] = {
+                "Dimensions": {"Key": "SERVICE", "Values": ["AWS Data Transfer"]}
+            }
+            region = str(getattr(ctx, "region", "") or "")
+            ce_filter: dict[str, Any] = (
+                {"And": [service_clause, {"Dimensions": {"Key": "REGION", "Values": [region]}}]}
+                if region
+                else service_clause
+            )
             while True:
                 kwargs: dict[str, Any] = {
                     "TimePeriod": tp,
                     "Granularity": "MONTHLY",
-                    "Filter": {
-                        "Dimensions": {
-                            "Key": "USAGE_TYPE_GROUP",
-                            "Values": ["AWS Data Transfer"],
-                        }
-                    },
+                    "Filter": ce_filter,
                     "GroupBy": [{"Type": "DIMENSION", "Key": "USAGE_TYPE"}],
                     "Metrics": ["UnblendedCost", "UsageQuantity"],
                 }

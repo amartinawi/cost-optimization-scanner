@@ -144,3 +144,32 @@ def test_full_scan_nets_zero_counted_but_renders_opportunities() -> None:
     assert every_rec, "scan should surface advisory recs"
     assert all(r.get("Counted") is False for r in every_rec)
     assert all(r.get("monthly_savings", 0.0) == 0.0 for r in every_rec)
+
+
+# --------------------------------------------------------------------------- #
+# NC-1 — the CE filter must use a dimension key/value pair that EXISTS.
+# "AWS Data Transfer" is a SERVICE dimension value; as a USAGE_TYPE_GROUP value
+# it matches nothing, so the adapter saw $0 spend on every account, forever,
+# with no error (C8 corollary: a wrong billing query returns $0,
+# indistinguishable from nothing billed). Assert on the REQUEST kwargs — a
+# mocked response answers regardless of the filter.
+# --------------------------------------------------------------------------- #
+def test_transfer_spend_query_filters_on_service_dimension() -> None:
+    ce = _ce_with_spend()
+    ctx = SimpleNamespace(
+        pricing_multiplier=1.0,
+        region="eu-west-1",
+        client=lambda name, region=None: {"ce": ce}.get(name),
+        warn=lambda *a, **k: None,
+        permission_issue=lambda *a, **k: None,
+    )
+    total, breakdown = NetworkCostModule()._fetch_transfer_spend(ce, {"Start": "2026-07-01", "End": "2026-08-01"}, ctx)
+
+    assert abs(total - 900.0) < 0.01
+    kwargs = ce.get_cost_and_usage.call_args.kwargs
+    f = kwargs["Filter"]
+    clauses = f.get("And", [f])
+    keys = {c["Dimensions"]["Key"]: c["Dimensions"]["Values"] for c in clauses if "Dimensions" in c}
+    assert "USAGE_TYPE_GROUP" not in keys, f"dead filter dimension still in use: {f}"
+    assert keys.get("SERVICE") == ["AWS Data Transfer"]
+    assert keys.get("REGION") == ["eu-west-1"]
