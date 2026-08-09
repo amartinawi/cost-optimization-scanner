@@ -174,3 +174,15 @@ def test_storage_rec_is_never_demoted_by_an_rds_reservation() -> None:
         [storage_rec], coverage, "rds", lambda r: float(r["estimatedMonthlySavings"])
     )
     assert len(counted) == 1 and demoted == []
+
+
+def test_rds_does_not_publish_storage_ids_to_aurora() -> None:
+    """RdsModule publishes its CoH/CO-covered ids for the Aurora adapter to
+    suppress against. Leaking a storage rec's id there defeats aurora's own
+    guard through the back door, so BOTH paths must skip it."""
+    import services.adapters.rds as rds_mod
+
+    src = Path(rds_mod.__file__).read_text()
+    loop = src.split("for r in coh_kept + co_kept:", 1)[1][:500]
+    assert "is_storage_coh_rec(r)" in loop
+    assert loop.index("is_storage_coh_rec(r)") < loop.index("normalize_rds_arn")
