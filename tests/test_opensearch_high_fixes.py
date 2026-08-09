@@ -819,3 +819,42 @@ def test_uncorroborated_idle_domain_stays_fully_advisory() -> None:
     )
     assert emitted["Counted"] is False
     assert emitted["EstimatedMonthlySavings"] == 0.0
+
+
+def test_repromoted_idle_domain_carries_no_stale_advisory_estimate() -> None:
+    """The demotion parks the full gross in AdvisoryEstimate; on a rec that is
+    counted again that would render as a property row claiming more than the
+    card's own dollar."""
+    from types import SimpleNamespace
+
+    import services.adapters.opensearch as mod
+    from services.commitment_coverage import CommitmentCoverage
+
+    ctx = SimpleNamespace(
+        pricing_engine=SimpleNamespace(
+            get_instance_monthly_price=lambda code, itype, **kw: 100.0 if "r6g" in itype else 0.0
+        ),
+        pricing_multiplier=1.0,
+        region="us-east-1",
+        fast_mode=True,
+        cost_hub_splits={},
+        commitment_coverage=CommitmentCoverage(opensearch_ri_types=frozenset({"r6g.large"})),
+    )
+    ctx.client = lambda name, region=None: None
+    ctx.warn = lambda *a, **k: None
+    ctx.permission_issue = lambda *a, **k: None
+
+    findings = _scan_idle_with(mod, ctx, {"idle_domains": [_idle_rec()]})
+    emitted = next(
+        r
+        for block in findings.sources.values()
+        for r in block.recommendations
+        if r["CheckCategory"] == "Idle Domain"
+    )
+    assert "AdvisoryEstimate" not in emitted
+    # counted == rendered at the field level.
+    from services._savings import parse_dollar_savings
+
+    assert parse_dollar_savings(emitted["EstimatedSavings"]) == pytest.approx(
+        emitted["EstimatedMonthlySavings"], abs=0.01
+    )

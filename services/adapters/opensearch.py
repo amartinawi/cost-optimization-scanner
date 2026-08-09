@@ -631,7 +631,13 @@ class OpensearchModule(BaseServiceModule):
             gross = float(rec.get("AdvisoryEstimate") or 0.0)
             rec["Counted"] = True
             rec["EstimatedMonthlySavings"] = storage_leg
+            rec["EstimatedSavings"] = f"${storage_leg:,.2f}/month"
             rec["InstanceLegCoveredByReservation"] = round(max(gross - storage_leg, 0.0), 2)
+            # The demotion left AdvisoryEstimate at the FULL gross. On a rec that
+            # is counted again it would render as a property row claiming a
+            # bigger number than the card's own dollar; the covered instance leg
+            # above already carries that information, explicitly.
+            rec.pop("AdvisoryEstimate", None)
             rec["CommitmentCoverageNote"] = (
                 f"{rec['CommitmentCoverageNote']} — instance hours are reserved, but the "
                 "domain's EBS storage is not, so the storage leg stays counted"
