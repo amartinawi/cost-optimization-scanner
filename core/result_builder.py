@@ -87,6 +87,25 @@ class ScanResultBuilder:
         return total
 
     @staticmethod
+    def _advisory_recommendations(f: ServiceFindings) -> int:
+        """Count recs that RENDER a card but are not counted (``Counted is False``).
+
+        Counted DIRECTLY rather than as ``rendered - counted`` (LS-6): a rec that
+        is somehow both ``Counted`` and ``OPTIMIZED`` makes that subtraction
+        negative, and the report would print "-2 advisory findings".
+
+        A source carrying a ``count`` placeholder with no materialised recs is
+        already trusted as counted, so it contributes nothing here.
+        """
+        return sum(
+            sum(1 for rec in sb.recommendations
+                if isinstance(rec, dict)
+                and rec.get("Counted") is False
+                and rec.get("finding") != "OPTIMIZED")
+            for sb in f.sources.values()
+        )
+
+    @staticmethod
     def _serialize(f: ServiceFindings) -> dict[str, Any]:
         """Convert ServiceFindings to a dict, merging extras over base fields."""
         extras: dict[str, Any] = dict(f.extras) if f.extras else {}
@@ -125,6 +144,12 @@ class ScanResultBuilder:
         return {
             "total_services_scanned": scanned,
             "total_recommendations": sum(ScanResultBuilder._counted_recommendations(f) for f in findings.values()),
+            # LS-6 — the headline stays COUNTED-only, which is the right
+            # semantics, but the report has to be able to explain the advisory
+            # cards a reader can see below it. Without this the summary said
+            # "no recommendations / well-optimized" above 52 rendered cards.
+            "total_advisory_recommendations": sum(
+                ScanResultBuilder._advisory_recommendations(f) for f in findings.values()),
             "total_monthly_savings": sum(f.total_monthly_savings for f in findings.values()),
             # Projections are reported BESIDE the counted headline, never inside
             # it (commitment deep-dive spec, non-overlap rule).
