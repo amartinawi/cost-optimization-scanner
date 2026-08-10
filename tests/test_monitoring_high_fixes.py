@@ -391,3 +391,84 @@ def test_small_account_prices_every_zone_at_tier_one() -> None:
     zones = [_zone(i, records=1) for i in range(3)]
     out = get_route53_checks(_r53_ctx(zones), 1.0)
     assert sum(r["EstimatedMonthlySavings"] for r in out["unused_hosted_zones"]) == pytest.approx(1.50)
+
+
+# --------------------------------------------------------------------------- #
+# MON-8 — the duplicate-private-zone lever counted a dollar while its own
+# recommendation text asked the reader to "check VPC associations".
+#
+# Two same-named private zones attached to DIFFERENT VPCs are split-horizon
+# DNS: a correct, common design that cannot be consolidated at all.
+# --------------------------------------------------------------------------- #
+def _dup_ctx(zone_vpcs, *, get_error=None):
+    """zone_vpcs: {zone id -> [vpc ids]}; two zones share the name dup.example.com."""
+    from types import SimpleNamespace
+
+    zones = [
+        {
+            "Id": f"/hostedzone/{zid}",
+            "Name": "dup.example.com.",
+            "Config": {"PrivateZone": True},
+            "ResourceRecordSetCount": 40,
+        }
+        for zid in zone_vpcs
+    ]
+
+    class _R53:
+        def get_paginator(self, name):
+            return SimpleNamespace(paginate=lambda **kw: [{"HostedZones": zones}])
+
+        def list_resource_record_sets(self, **kw):
+            return {"ResourceRecordSets": []}
+
+        def list_health_checks(self, **kw):
+            return {"HealthChecks": []}
+
+        def get_hosted_zone(self, Id):
+            if get_error is not None:
+                raise get_error
+            return {"VPCs": [{"VPCRegion": "us-east-1", "VPCId": v} for v in zone_vpcs[Id]]}
+
+    ctx = SimpleNamespace(region="us-east-1", fast_mode=False, warnings=[])
+    ctx.client = lambda name, region=None: _R53()
+    ctx.warn = lambda msg, service=None: ctx.warnings.append(msg)
+    ctx.permission_issue = lambda msg, service=None, action=None: None
+    return ctx
+
+
+def _dup_rec(ctx):
+    from services.route53 import get_route53_checks
+
+    out = get_route53_checks(ctx, 1.0)
+    return out["duplicate_private_zones"][0]
+
+
+def test_zones_sharing_a_vpc_are_counted() -> None:
+    """Genuinely redundant: both zones answer for the same VPC."""
+    rec = _dup_rec(_dup_ctx({"Z1": ["vpc-a"], "Z2": ["vpc-a"]}))
+    assert rec["Counted"] is True
+    assert rec["EstimatedMonthlySavings"] > 0
+    assert rec["AuditBasis"]["zones_share_a_vpc"] is True
+
+
+def test_zones_on_different_vpcs_are_advisory() -> None:
+    """Split-horizon DNS is not a duplicate. The old lever counted it anyway."""
+    rec = _dup_rec(_dup_ctx({"Z1": ["vpc-a"], "Z2": ["vpc-b"]}))
+    assert rec["Counted"] is False
+    assert rec["EstimatedMonthlySavings"] == 0.0
+    assert "split-horizon" in rec["EstimatedSavings"]
+    # The figure still reaches the reader.
+    assert rec["PotentialMonthlySavings"] > 0
+
+
+def test_unreadable_vpc_associations_abstain() -> None:
+    ctx = _dup_ctx({"Z1": ["vpc-a"], "Z2": ["vpc-a"]}, get_error=Exception("AccessDenied"))
+    rec = _dup_rec(ctx)
+    assert rec["Counted"] is False
+    assert "could not be read" in rec["EstimatedSavings"]
+    assert ctx.warnings
+
+
+def test_private_zone_with_no_reported_vpcs_abstains() -> None:
+    rec = _dup_rec(_dup_ctx({"Z1": [], "Z2": ["vpc-a"]}))
+    assert rec["Counted"] is False

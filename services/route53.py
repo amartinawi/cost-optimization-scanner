@@ -38,6 +38,32 @@ def _route53_zone_monthly_cost(extra_zones: int, *, base_zones_in_account: int =
     return cheap_removable + expensive_removable
 
 
+def _zones_share_a_vpc(ctx: ScanContext, zone_ids: list[str]) -> bool | None:
+    """True when two of these private zones are attached to a common VPC.
+
+    ``True``  — at least one VPC is shared, so the zones really are redundant.
+    ``False`` — every zone serves a disjoint VPC set (split-horizon DNS).
+    ``None``  — the associations could not be read; the caller must abstain
+                rather than assume redundancy (MON-8).
+    """
+    seen: set[tuple[str, str]] = set()
+    try:
+        route53 = ctx.client("route53")
+        for zone_id in zone_ids:
+            resp = route53.get_hosted_zone(Id=_normalize_zone_id(zone_id))
+            vpcs = resp.get("VPCs") or []
+            if not vpcs:
+                return None  # private zone with no reported VPCs — unknown
+            keys = {(str(v.get("VPCRegion", "")), str(v.get("VPCId", ""))) for v in vpcs}
+            if keys & seen:
+                return True
+            seen |= keys
+        return False
+    except Exception as exc:
+        ctx.warn(f"Could not read VPC associations for duplicate private zones: {exc}", "route53")
+        return None
+
+
 def _normalize_zone_id(raw: str) -> str:
     """Reduce a hosted-zone identifier to its bare id for cross-check dedup.
 
@@ -202,6 +228,14 @@ def get_route53_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> dic
 
         for zone_name, zone_ids in zone_names.items():
             if len(zone_ids) > 1:
+                # MON-8 — the rec's own text says "check VPC associations", and
+                # that is exactly the evidence that decides whether these are
+                # duplicates at all. Two same-named private zones attached to
+                # DIFFERENT VPCs are split-horizon DNS, a correct and common
+                # design: consolidating them is impossible, so counting a dollar
+                # against them asserts something the check never established.
+                # Only zones sharing at least one VPC are genuinely redundant.
+                shares_vpc = _zones_share_a_vpc(ctx, zone_ids)
                 # Consolidating N same-name zones removes (N-1) of them.
                 removable = len(zone_ids) - 1
                 # H4 — any of these zones already counted by the unused check
@@ -213,6 +247,10 @@ def get_route53_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> dic
                 consolidate_savings = _route53_zone_monthly_cost(
                     dedup_removable, base_zones_in_account=len(hosted_zones) - zones_claimed
                 ) * pricing_multiplier
+                if shares_vpc is not True:
+                    # Disjoint VPCs (False) or unreadable associations (None):
+                    # the figure is shown, never counted.
+                    consolidate_savings = 0.0
                 rec: dict[str, Any] = {
                     "ZoneName": zone_name,
                     "ZoneCount": len(zone_ids),
@@ -225,6 +263,7 @@ def get_route53_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> dic
                         "duplicate_zone_count": len(zone_ids),
                         "removable_zones": dedup_removable,
                         "already_counted_as_unused": overlap,
+                        "zones_share_a_vpc": shares_vpc,
                         "base_zones_in_account": len(hosted_zones) - zones_claimed,
                         "region_multiplier": round(pricing_multiplier, 4),
                         "formula": (
@@ -235,6 +274,18 @@ def get_route53_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> dic
                 }
                 if consolidate_savings > 0:
                     rec["EstimatedSavings"] = f"${consolidate_savings:.2f}/month if consolidated"
+                elif shares_vpc is False:
+                    rec["EstimatedSavings"] = (
+                        "$0.00/month — advisory: these zones are attached to different "
+                        "VPCs (split-horizon DNS), so they are not consolidatable"
+                    )
+                    rec["Counted"] = False
+                elif shares_vpc is None:
+                    rec["EstimatedSavings"] = (
+                        "$0.00/month — advisory: VPC associations could not be read, so "
+                        "whether these zones are genuinely redundant is unproven"
+                    )
+                    rec["Counted"] = False
                 else:
                     # Every removable duplicate is already counted under Unused
                     # Hosted Zones → advisory $0 here (no double-count).
@@ -243,6 +294,15 @@ def get_route53_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> dic
                         "under Unused Hosted Zones"
                     )
                     rec["Counted"] = False
+                if not rec.get("Counted"):
+                    rec["PotentialMonthlySavings"] = round(
+                        _route53_zone_monthly_cost(
+                            dedup_removable,
+                            base_zones_in_account=len(hosted_zones) - zones_claimed,
+                        )
+                        * pricing_multiplier,
+                        2,
+                    )
                 checks["duplicate_private_zones"].append(rec)
 
     except Exception as e:
