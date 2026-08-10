@@ -83,6 +83,58 @@ def _current_cost_basis(ctx: Any, rec: dict[str, Any]) -> dict[str, Any]:
     return basis
 
 
+def _serverless_advisory(ctx: Any, rec: dict[str, Any]) -> dict[str, Any]:
+    """MSK-3 — surface a serverless cluster's unconditional cluster-hour cost.
+
+    ADVISORY, and the reason is a dimension problem rather than a pricing one.
+    The $0.75/cluster-hour charge is exact and unconditional, but every MSK
+    Serverless CloudWatch metric (``BytesInPerSec``, ``MessagesInPerSec``, …)
+    is dimensioned by ``Cluster Name`` **and** ``Topic``, and the topic list is
+    a Kafka admin-API concept this scanner cannot read. A Cluster-Name-only
+    read matches no dimension set, returns nothing, and would make every
+    serverless cluster look idle — a fail-OPEN of exactly the shape LAM-3
+    avoided. So the charge is shown, not counted.
+    """
+    engine = getattr(ctx, "pricing_engine", None)
+    multiplier = float(getattr(ctx, "pricing_multiplier", 1.0) or 1.0)
+    if engine is not None:
+        hourly = engine.get_msk_serverless_cluster_hourly()
+    else:
+        from core.pricing_engine import FALLBACK_MSK_SERVERLESS_CLUSTER_HOURLY
+
+        hourly = FALLBACK_MSK_SERVERLESS_CLUSTER_HOURLY * multiplier
+    monthly = round(hourly * HOURS_PER_MONTH, 2)
+    new_rec = dict(rec)
+    new_rec["Counted"] = False
+    new_rec["EstimatedMonthlySavings"] = 0.0
+    new_rec["PotentialMonthlySavings"] = monthly
+    new_rec["Recommendation"] = (
+        f"Serverless cluster bills ${monthly:,.2f}/month of cluster-hours before any "
+        "partition, storage or traffic charge - delete it if it is no longer used"
+    )
+    new_rec["EstimatedSavings"] = (
+        f"$0.00/month - advisory: ${monthly:,.2f}/month is unconditional, but MSK "
+        "Serverless publishes no cluster-level activity metric to prove idleness"
+    )
+    new_rec["AuditBasis"] = {
+        "cluster_hour_rate": round(hourly, 4),
+        "hours_per_month": HOURS_PER_MONTH,
+        "monthly_cluster_hours_cost": monthly,
+        "rate_source": (
+            "AmazonMSK USE1-KafkaServerless-ClusterHours, operation Serverless "
+            "(AWS Pricing API, validated 2026-08-10)"
+        ),
+        "counted": False,
+        "reason": (
+            "every MSK Serverless metric is dimensioned by Cluster Name AND Topic, and "
+            "the topic list is a Kafka admin-API concept unavailable here; a "
+            "cluster-name-only read would match no dimension set and make every "
+            "serverless cluster look idle"
+        ),
+    }
+    return new_rec
+
+
 def _to_advisory_rec(ctx: Any, rec: dict[str, Any]) -> dict[str, Any]:
     """Return a NEW $0-advisory rec carrying the live-priced AuditBasis."""
     new_rec = dict(rec)
@@ -180,6 +232,9 @@ class MskModule(BaseServiceModule):
                     continue
                 # No priceable leg (unknown instance type / broker count) - the
                 # dollar cannot be defended, so fall through to the advisory.
+            if rec.get("CheckCategory") == "MSK Serverless Cluster":
+                recs.append(_serverless_advisory(ctx, rec))
+                continue
             recs.append(_to_advisory_rec(ctx, rec))
 
         sources = {"enhanced_checks": SourceBlock(count=len(recs), recommendations=tuple(recs))}

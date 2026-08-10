@@ -10,7 +10,7 @@ Analyzes Bedrock for:
 from __future__ import annotations
 
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from core.contracts import GroupingSpec, ServiceFindings, SourceBlock, StatCardSpec
@@ -70,6 +70,98 @@ def _list_provisioned_throughputs(bedrock: Any, ctx: Any = None) -> list[dict[st
                     ctx, e, service="bedrock", context="list_provisioned_model_throughputs failed"
                 )
     return pts
+
+
+# BR-6 — custom (fine-tuned) model storage. $1.95 per Model/month, validated
+# against the live Pricing API 2026-08-10: AmazonBedrock publishes 22
+# "*-Customization-Storage" SKUs (Nova Pro, Nova Canvas, Titan Text Express,
+# …) and every one carries the same $1.95 rate with unit "Model/month".
+# Region-scaled on the fallback path via pricing_multiplier.
+CUSTOM_MODEL_STORAGE_PER_MONTH: float = 1.95
+
+
+def _list_custom_models(bedrock: Any, ctx: Any = None) -> list[dict[str, Any]]:
+    """Custom (fine-tuned) models in the account, or ``[]`` on failure.
+
+    An enumeration failure is classified, never read as "no custom models" —
+    otherwise a denied ``bedrock:ListCustomModels`` looks exactly like an
+    account that has none (E1).
+    """
+    models: list[dict[str, Any]] = []
+    try:
+        paginator = bedrock.get_paginator("list_custom_models")
+        for page in paginator.paginate():
+            models.extend(page.get("modelSummaries", []))
+        return models
+    except Exception:
+        pass
+    try:
+        resp = bedrock.list_custom_models()
+        return list(resp.get("modelSummaries", []))
+    except Exception as e:
+        if ctx is not None:
+            record_aws_error(ctx, e, service="bedrock", context="list_custom_models failed")
+        return []
+
+
+def _check_custom_model_storage(
+    models: list[dict[str, Any]], pricing_multiplier: float
+) -> list[dict[str, Any]]:
+    """BR-6 — one advisory per stored custom model.
+
+    Every custom model bills $1.95/month for as long as it exists, whether or
+    not anything invokes it, and nothing measured that before. Accounts
+    accumulate abandoned fine-tunes, so the aggregate is worth surfacing.
+
+    ADVISORY, deliberately. Deleting a fine-tuned model destroys an artifact
+    that cost money to produce, and there is no per-model invocation signal at
+    scan time to prove it is unused — Bedrock supports on-demand inference for
+    custom models, so the absence of a Provisioned Throughput no longer implies
+    the model cannot be invoked. The figure renders in
+    ``PotentialMonthlySavings`` so the accumulating charge is visible without
+    the headline claiming it.
+    """
+    rate = CUSTOM_MODEL_STORAGE_PER_MONTH * pricing_multiplier
+    recs: list[dict[str, Any]] = []
+    for model in models:
+        name = model.get("modelName") or model.get("modelArn") or "unknown"
+        recs.append(
+            {
+                "custom_model_name": name,
+                "model_arn": model.get("modelArn"),
+                "base_model": model.get("baseModelName") or model.get("baseModelArn"),
+                "creation_time": str(model.get("creationTime") or ""),
+                "CheckCategory": "Bedrock Custom Model Storage",
+                "Recommendation": (
+                    f"Custom model '{name}' bills ${rate:.2f}/month of storage for as long "
+                    "as it exists - delete it if the fine-tune is superseded"
+                ),
+                "EstimatedSavings": (
+                    f"$0.00/month - advisory: ${rate:.2f}/month is real and unconditional, but "
+                    "no per-model invocation signal exists at scan time and deleting a "
+                    "fine-tune destroys the artifact"
+                ),
+                "monthly_savings": 0.0,
+                "EstimatedMonthlySavings": 0.0,
+                "PotentialMonthlySavings": round(rate, 2),
+                "Counted": False,
+                "AuditBasis": {
+                    "rate_per_model_month": CUSTOM_MODEL_STORAGE_PER_MONTH,
+                    "region_multiplier": round(pricing_multiplier, 4),
+                    "rate_source": (
+                        "AmazonBedrock *-Customization-Storage, unit Model/month "
+                        "(AWS Pricing API, validated 2026-08-10)"
+                    ),
+                    "counted": False,
+                    "reason": (
+                        "charge is unconditional but realizability is not established: "
+                        "custom models support on-demand inference, so no Provisioned "
+                        "Throughput does not prove the model is unused"
+                    ),
+                },
+            }
+        )
+    return recs
 
 
 def _derive_model_id(pt: dict[str, Any]) -> str:
@@ -144,7 +236,7 @@ def _get_pt_invocation_sum(cw: Any, model_id: str) -> tuple[float | None, bool]:
     Uses Period=86400 (the CW max for queries ≤15 days); aggregates the per-day
     Sum datapoints. Larger Period values silently fail.
     """
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     start = now - timedelta(days=CW_LOOKBACK_DAYS)
     try:
         resp = cw.get_metric_statistics(
@@ -169,7 +261,7 @@ def _get_pt_token_counts(cw: Any, model_id: str) -> tuple[float | None, float | 
 
     Same Period=86400 constraint as ``_get_pt_invocation_sum``.
     """
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     start = now - timedelta(days=CW_LOOKBACK_DAYS)
     input_total: float | None = None
     output_total: float | None = None
@@ -541,8 +633,13 @@ class BedrockModule(BaseServiceModule):
 
         kb_recs = _check_idle_knowledge_bases(ctx, multiplier)
         agent_recs = _check_idle_agents(ctx, multiplier)
+        # BR-6 — custom-model storage bills whether or not anything invokes the
+        # model, and nothing measured it. Config-only, so no fast-mode gate.
+        custom_model_recs = _check_custom_model_storage(
+            _list_custom_models(bedrock, ctx), multiplier
+        )
 
-        all_recs = idle_pt_recs + breakeven_recs + kb_recs + agent_recs
+        all_recs = idle_pt_recs + breakeven_recs + kb_recs + agent_recs + custom_model_recs
         # D4/B1 — gate both the dollar and the count on Counted (advisories
         # render but never inflate either headline).
         total_savings = sum(
@@ -557,6 +654,10 @@ class BedrockModule(BaseServiceModule):
             total_recommendations=sum(1 for r in all_recs if r.get("Counted") is not False),
             total_monthly_savings=round(total_savings, 2),
             sources={
+                "custom_model_storage": SourceBlock(
+                    count=len(custom_model_recs),
+                    recommendations=tuple(custom_model_recs),
+                ),
                 "idle_provisioned_throughput": SourceBlock(
                     count=len(idle_pt_recs),
                     recommendations=tuple(idle_pt_recs),

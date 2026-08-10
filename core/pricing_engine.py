@@ -302,6 +302,23 @@ FALLBACK_FSX_MULTI_AZ_GB_MONTH: dict[tuple[str, str], float] = {
     ("ONTAP", "SSD"): 0.250,
     ("OPENZFS", "SSD"): 0.18,
 }
+
+# FSx provisioned THROUGHPUT capacity, $/MBps-month, keyed by (fileSystemType,
+# deploymentOption). Validated against the live Pricing API 2026-08-10
+# (AmazonFSx, us-east-1, productFamily "Provisioned Throughput", unit MiBps-Mo).
+# Throughput is billed alongside storage and bills 24/7 whether or not anyone
+# mounts the file system, so an idle file system wastes BOTH legs (FS-7).
+# Lustre is deliberately absent: its classic persistent throughput is sold in
+# per-TiB-of-storage tiers rather than a flat MBps rate, so there is no single
+# defensible constant — the caller omits the leg instead of guessing.
+FALLBACK_FSX_THROUGHPUT_MBPS_MONTH: dict[tuple[str, str], float] = {
+    ("WINDOWS", "SINGLE-AZ"): 2.20,
+    ("WINDOWS", "MULTI-AZ"): 4.50,
+    ("ONTAP", "SINGLE-AZ"): 0.72,
+    ("ONTAP", "MULTI-AZ"): 1.20,
+    ("OPENZFS", "SINGLE-AZ"): 0.26,
+    ("OPENZFS", "MULTI-AZ"): 0.87,
+}
 # AWS Pricing API ``fileSystemType`` attribute values, keyed by the upper-cased
 # token the adapter passes. ``str.capitalize()`` mangles ONTAP -> "Ontap" and
 # OPENZFS -> "Openzfs", which never match, so the live lookup must use this map.
@@ -354,6 +371,12 @@ MSK_BROKER_OVER_EC2: float = 2.19
 # Last-ditch MSK broker $/hr used only when BOTH the live MSK lookup and EC2
 # pricing fail; region-scaled via the fallback multiplier at the call site.
 FALLBACK_MSK_BROKER_HOURLY: float = 0.15
+# MSK Serverless cluster-hour charge, billed for the cluster's EXISTENCE
+# independent of partitions, storage or traffic. Validated against the live
+# Pricing API 2026-08-10 (AmazonMSK, us-east-1, usagetype
+# USE1-KafkaServerless-ClusterHours, operation Serverless, unit hours):
+# $0.75/cluster-hour = $547.50/month.
+FALLBACK_MSK_SERVERLESS_CLUSTER_HOURLY: float = 0.75
 
 # AWS Fargate compute rates (us-east-1, verified via Pricing API 2026-06).
 # Keyed by (architecture, os). ARM is ~20% cheaper than x86; Windows adds a
@@ -433,7 +456,7 @@ class PricingEngine:
             "api_errors": 0,
         }
 
-    def for_region(self, region_code: str) -> "PricingEngine":
+    def for_region(self, region_code: str) -> PricingEngine:
         """Return a ``PricingEngine`` scoped to ``region_code``.
 
         Returns ``self`` when ``region_code`` matches this engine's region;
@@ -814,6 +837,25 @@ class PricingEngine:
         self._cache.set(key, price)
         return price
 
+    def get_msk_serverless_cluster_hourly(self) -> float:
+        """$/cluster-hour for an MSK Serverless cluster in self._region.
+
+        This is the flat charge for the cluster existing — partitions, storage
+        and traffic bill on top of it — so it is the one MSK Serverless figure
+        that can be stated without any usage signal.
+        """
+        key = ("msk_serverless_cluster_hour",)
+        if (cached := self._get_cached(key)) is not None:
+            return cached
+        price = self._fetch_msk_serverless_cluster_hourly()
+        if price is None:
+            price = self._use_fallback(
+                FALLBACK_MSK_SERVERLESS_CLUSTER_HOURLY * self._fallback_multiplier,
+                f"Pricing API unavailable for the MSK Serverless cluster-hour in {self._region}; using fallback",
+            )
+        self._cache.set(key, price)
+        return price
+
     def get_msk_broker_hourly_price(self, instance_type: str) -> float:
         """On-Demand $/broker-hour for an MSK broker instance in self._region.
 
@@ -941,6 +983,38 @@ class PricingEngine:
             price = self._use_fallback(
                 fallback * self._fallback_multiplier,
                 f"Pricing API unavailable for FSx {fs_type} {st} ({deployment_option}) in {self._region}; using fallback",
+            )
+        self._cache.set(key, price)
+        return price
+
+    def get_fsx_throughput_price_per_mbps(
+        self, file_system_type: str, deployment_option: str = "Single-AZ"
+    ) -> float:
+        """$/MBps/month for FSx provisioned throughput capacity in self._region.
+
+        Returns ``0.0`` when neither the live SKU nor a fallback constant covers
+        the (type, deployment) pair — Lustre in particular, whose persistent
+        throughput is sold in per-TiB-of-storage tiers rather than a flat MBps
+        rate. The caller must omit the throughput leg rather than guess.
+        """
+        fs_type = file_system_type.strip().upper()
+        key = ("fsx_throughput", fs_type, deployment_option)
+        if (cached := self._get_cached(key)) is not None:
+            return cached
+        price = self._fetch_fsx_throughput_price(fs_type, deployment_option)
+        if price is None:
+            az = "MULTI-AZ" if "MULTI" in deployment_option.upper() else "SINGLE-AZ"
+            fallback = FALLBACK_FSX_THROUGHPUT_MBPS_MONTH.get((fs_type, az))
+            if fallback is None:
+                # No defensible constant for this pair (Lustre): 0.0 so the
+                # caller omits the leg. Not a fallback event — nothing was
+                # substituted.
+                self._cache.set(key, 0.0)
+                return 0.0
+            price = self._use_fallback(
+                fallback * self._fallback_multiplier,
+                f"Pricing API unavailable for FSx {fs_type} throughput "
+                f"({deployment_option}) in {self._region}; using fallback",
             )
         self._cache.set(key, price)
         return price
@@ -1890,6 +1964,65 @@ class PricingEngine:
             {"Type": "TERM_MATCH", "Field": "deploymentOption", "Value": deployment_option},
         ]
         return self._call_pricing_api("AmazonFSx", filters)
+
+    def _fetch_msk_serverless_cluster_hourly(self) -> float | None:
+        """Live $/cluster-hour for MSK Serverless, or None.
+
+        ``operation=Serverless`` returns five rows for one region (cluster-hours,
+        partition-hours, storage, data-in, data-out), so the usagetype suffix —
+        not the row order — selects the cluster-hour one.
+        """
+        filters = [
+            {"Type": "TERM_MATCH", "Field": "location", "Value": self._display_name},
+            {"Type": "TERM_MATCH", "Field": "operation", "Value": "Serverless"},
+        ]
+        try:
+            resp = self._pricing.get_products(ServiceCode="AmazonMSK", Filters=filters, MaxResults=100)
+            self._stats["api_calls"] += 1
+            for raw in resp.get("PriceList", []):
+                item = json.loads(raw)
+                usagetype = item.get("product", {}).get("attributes", {}).get("usagetype", "")
+                if not usagetype.endswith("KafkaServerless-ClusterHours"):
+                    continue
+                price, unit = _extract_usd_with_unit(item)
+                if price is not None and str(unit).lower().startswith("hour"):
+                    logger.debug("pricing:GetProducts  AmazonMSK  serverless cluster-hour → $%.4f/hr", price)
+                    return price
+            logger.debug("pricing:GetProducts  AmazonMSK  no serverless ClusterHours row")
+            return None
+        except Exception as exc:
+            logger.debug("pricing:GetProducts  AmazonMSK  serverless cluster-hour failed: %s", exc)
+            return None
+
+    def _fetch_fsx_throughput_price(
+        self, file_system_type: str, deployment_option: str
+    ) -> float | None:
+        """Live $/MBps-month for FSx provisioned throughput, or None.
+
+        ``deploymentOption`` values on this productFamily are finer-grained than
+        the storage ones (ONTAP publishes Single-AZ_2N / Single-AZ_2N-2 /
+        Multi-AZ / Multi-AZ-2; OpenZFS adds the _HA variants), so an exact match
+        is tried first and a coarse Single-AZ / Multi-AZ prefix match second.
+        """
+        fs_label = _FSX_FILE_SYSTEM_TYPE_LABELS.get(file_system_type.strip().upper(), file_system_type)
+        base = [
+            {"Type": "TERM_MATCH", "Field": "location", "Value": self._display_name},
+            {"Type": "TERM_MATCH", "Field": "productFamily", "Value": "Provisioned Throughput"},
+            {"Type": "TERM_MATCH", "Field": "fileSystemType", "Value": fs_label},
+        ]
+        exact = self._call_pricing_api(
+            "AmazonFSx",
+            [*base, {"Type": "TERM_MATCH", "Field": "deploymentOption", "Value": deployment_option}],
+        )
+        if exact is not None:
+            return exact
+        coarse = "Multi-AZ" if "MULTI" in deployment_option.upper() else "Single-AZ"
+        if coarse == deployment_option:
+            return None
+        return self._call_pricing_api(
+            "AmazonFSx",
+            [*base, {"Type": "TERM_MATCH", "Field": "deploymentOption", "Value": coarse}],
+        )
 
     def _fetch_eip_price(self) -> float | None:
         # EIP pricing lives in AmazonVPC (not AmazonEC2) since AWS rebilled all

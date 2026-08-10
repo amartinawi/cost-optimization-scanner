@@ -238,3 +238,104 @@ def test_unpriceable_idle_cluster_falls_back_to_advisory() -> None:
     )
     assert rec["Counted"] is False
     assert findings.total_monthly_savings == 0.0
+
+
+# --------------------------------------------------------------------------- #
+# MSK-3 — serverless clusters were enumerated and thrown away.
+#
+# Most of a serverless cluster's cost really is usage-variable, but ONE leg is
+# not: $0.75/cluster-hour ($547.50/month, live SKU
+# USE1-KafkaServerless-ClusterHours) bills for the cluster's existence,
+# independent of partitions, storage and traffic.
+#
+# Advisory, and for a dimension reason rather than a pricing one: every MSK
+# Serverless metric is dimensioned by Cluster Name AND Topic, and the topic
+# list is a Kafka admin-API concept this scanner cannot read. A
+# cluster-name-only read would match no dimension set and make every
+# serverless cluster look idle.
+# --------------------------------------------------------------------------- #
+class _FakeKafkaV2:
+    def __init__(self, provisioned, serverless):
+        self._provisioned = provisioned
+        self._serverless = serverless
+
+    def get_paginator(self, name):
+        if name == "list_clusters":
+            return _FakePaginator([{"ClusterInfoList": self._provisioned}])
+        if name == "list_clusters_v2":
+            return _FakePaginator([{"ClusterInfoList": self._serverless}])
+        return _FakePaginator([{"ClusterInfoList": []}])
+
+
+def _v2_ctx(serverless, provisioned=None):
+    from types import SimpleNamespace
+
+    ctx = SimpleNamespace(
+        pricing_engine=SimpleNamespace(
+            get_msk_broker_hourly_price=lambda t: 0.21,
+            get_msk_serverless_cluster_hourly=lambda: 0.75,
+        ),
+        pricing_multiplier=1.0,
+        region="us-east-1",
+        fast_mode=True,
+        warnings=[],
+        permissions=[],
+    )
+    clients = {"kafka": _FakeKafkaV2(provisioned or [], serverless), "cloudwatch": None}
+    ctx.client = lambda name, region=None: clients.get(name)
+    ctx.warn = lambda msg, service=None: ctx.warnings.append(msg)
+    ctx.permission_issue = lambda msg, service=None, action=None: ctx.permissions.append(msg)
+    return ctx
+
+
+def _serverless(name="sl-1", state="ACTIVE", cluster_type="SERVERLESS"):
+    return {
+        "ClusterName": name,
+        "ClusterArn": f"arn:aws:kafka:us-east-1:1:cluster/{name}",
+        "ClusterType": cluster_type,
+        "State": state,
+    }
+
+
+def test_serverless_cluster_is_surfaced_with_its_cluster_hour_cost() -> None:
+    findings = MskModule().scan(_v2_ctx([_serverless()]))
+    recs = [
+        r
+        for block in findings.sources.values()
+        for r in block.recommendations
+        if r["CheckCategory"] == "MSK Serverless Cluster"
+    ]
+    assert len(recs) == 1
+    # $0.75/hr x 730 = $547.50/month, before any partition or traffic charge.
+    assert recs[0]["PotentialMonthlySavings"] == pytest.approx(547.50, abs=0.01)
+    assert recs[0]["ClusterName"] == "sl-1"
+
+
+def test_serverless_cluster_is_advisory_and_names_the_dimension_reason() -> None:
+    findings = MskModule().scan(_v2_ctx([_serverless()]))
+    rec = next(
+        r
+        for block in findings.sources.values()
+        for r in block.recommendations
+        if r["CheckCategory"] == "MSK Serverless Cluster"
+    )
+    assert rec["Counted"] is False
+    assert rec["EstimatedMonthlySavings"] == 0.0
+    assert findings.total_monthly_savings == 0.0
+    assert "Topic" in rec["AuditBasis"]["reason"]
+
+
+def test_provisioned_clusters_from_v2_are_not_treated_as_serverless() -> None:
+    """list_clusters_v2 returns BOTH types; only SERVERLESS belongs here."""
+    findings = MskModule().scan(_v2_ctx([_serverless(cluster_type="PROVISIONED")]))
+    assert not [
+        r
+        for block in findings.sources.values()
+        for r in block.recommendations
+        if r["CheckCategory"] == "MSK Serverless Cluster"
+    ]
+
+
+def test_no_serverless_clusters_emits_nothing() -> None:
+    findings = MskModule().scan(_v2_ctx([]))
+    assert findings.total_monthly_savings == 0.0

@@ -115,7 +115,7 @@ def _efs_rate(ctx: ScanContext, storage_class: str, pricing_multiplier: float) -
     """Region-correct EFS $/GB-month for a storage class (fallback when no engine)."""
     if ctx.pricing_engine is not None:
         return ctx.pricing_engine.get_efs_monthly_price_per_gb(storage_class)
-    from core.pricing_engine import FALLBACK_EFS_GB_MONTH, FALLBACK_EFS_GB_MONTH_BY_CLASS, _EFS_STORAGE_CLASS_LABELS
+    from core.pricing_engine import _EFS_STORAGE_CLASS_LABELS, FALLBACK_EFS_GB_MONTH, FALLBACK_EFS_GB_MONTH_BY_CLASS
 
     api_class = _EFS_STORAGE_CLASS_LABELS.get(storage_class.strip().lower(), "General Purpose")
     return FALLBACK_EFS_GB_MONTH_BY_CLASS.get(api_class, FALLBACK_EFS_GB_MONTH) * pricing_multiplier
@@ -160,6 +160,73 @@ def _efs_access_signal(cloudwatch: Any, fs_id: str) -> float | None:
     if not found:
         return None
     return total_bytes / (1024**3)
+
+
+# FS-7 — window for the idle-FSx verdict.
+FSX_IDLE_WINDOW_DAYS = 30
+
+
+def _fsx_activity_bytes(cloudwatch: Any, fs_id: str) -> float | None:
+    """Bytes read+written on an FSx file system over the window, or ``None``.
+
+    ``None`` means UNKNOWN, not idle. AWS publishes ``DataReadBytes`` /
+    ``DataWriteBytes`` into ``AWS/FSx`` **for all file systems** at 1-minute
+    periods, so the series exists whenever the file system does — which makes a
+    present-and-zero series proof of idleness and an EMPTY series a reason to
+    abstain (the C13 polarity, opposite to Transfer Family's connection-scoped
+    metrics). AWS also documents that metrics "might not be published ... during
+    file system maintenance or infrastructure component replacement", and for
+    Multi-AZ during failover, which is exactly when an empty read would
+    otherwise be mistaken for an unused file system.
+
+    ``ClientConnections`` would be the more direct signal but AWS only publishes
+    it for file systems with at least 32 MBps of throughput capacity, so a small
+    file system would read as having no connections. AWS errors propagate for
+    permission classification.
+    """
+    end = datetime.now(UTC)
+    start = end - timedelta(days=FSX_IDLE_WINDOW_DAYS)
+    total = 0.0
+    found = False
+    for metric in ("DataReadBytes", "DataWriteBytes"):
+        resp = cloudwatch.get_metric_statistics(
+            Namespace="AWS/FSx",
+            MetricName=metric,
+            Dimensions=[{"Name": "FileSystemId", "Value": fs_id}],
+            StartTime=start,
+            EndTime=end,
+            Period=86400,
+            Statistics=["Sum"],
+        )
+        datapoints = resp.get("Datapoints", [])
+        if datapoints:
+            found = True
+            total += sum(d.get("Sum", 0.0) for d in datapoints)
+    return total if found else None
+
+
+def _fsx_throughput_rate(ctx: ScanContext, fs_type: str, deployment: str, pricing_multiplier: float) -> float:
+    """Region-correct FSx $/MBps-month, or 0.0 when no defensible rate exists."""
+    if ctx.pricing_engine is not None:
+        return ctx.pricing_engine.get_fsx_throughput_price_per_mbps(fs_type, deployment)
+    from core.pricing_engine import FALLBACK_FSX_THROUGHPUT_MBPS_MONTH
+
+    az = "MULTI-AZ" if "MULTI" in deployment.upper() else "SINGLE-AZ"
+    rate = FALLBACK_FSX_THROUGHPUT_MBPS_MONTH.get((fs_type.upper(), az))
+    return rate * pricing_multiplier if rate else 0.0
+
+
+def _fsx_throughput_capacity(fs: dict[str, Any]) -> int:
+    """Provisioned throughput capacity in MBps, or 0 when not reported."""
+    for cfg_key in ("WindowsConfiguration", "OntapConfiguration", "OpenZFSConfiguration"):
+        cfg = fs.get(cfg_key) or {}
+        capacity = cfg.get("ThroughputCapacity")
+        if capacity:
+            try:
+                return int(capacity)
+            except (TypeError, ValueError):
+                return 0
+    return 0
 
 
 def _fsx_rate(ctx: ScanContext, fs_type: str, storage_type: str, deployment: str, pricing_multiplier: float) -> float:
@@ -531,6 +598,8 @@ def get_fsx_findings(ctx: ScanContext, pricing_multiplier: float) -> dict[str, l
     """Return ``{"counted": [...], "advisory": [...]}`` for FSx file systems & caches."""
     counted: list[dict[str, Any]] = []
     advisory: list[dict[str, Any]] = []
+    fast_mode = bool(getattr(ctx, "fast_mode", False))
+    cloudwatch = None if fast_mode else ctx.client("cloudwatch")
     try:
         fsx = ctx.client("fsx")
         region = getattr(ctx, "region", "")
@@ -547,6 +616,79 @@ def get_fsx_findings(ctx: ScanContext, pricing_multiplier: float) -> dict[str, l
             if fs.get("Lifecycle", "") not in ("AVAILABLE", ""):
                 continue
             deployment = _fsx_deployment_option(fs)
+
+            # FS-7 — an unused FSx file system wastes BOTH of its provisioned
+            # legs: storage capacity and throughput capacity bill 24/7 whether
+            # or not anything mounts it. Nothing measured this before.
+            idle_bytes = None
+            if cloudwatch is not None:
+                try:
+                    idle_bytes = _fsx_activity_bytes(cloudwatch, fs_id)
+                except Exception as cw_err:
+                    _report_aws_error(
+                        ctx,
+                        cw_err,
+                        f"Could not read FSx activity metrics for {fs_id}",
+                        "fsx",
+                        "cloudwatch:GetMetricStatistics",
+                    )
+                    idle_bytes = None
+            if idle_bytes == 0.0 and capacity:
+                storage_rate = _fsx_rate(ctx, fs_type, storage_type, deployment, pricing_multiplier)
+                storage_monthly = capacity * storage_rate
+                throughput_mbps = _fsx_throughput_capacity(fs)
+                throughput_rate = _fsx_throughput_rate(ctx, fs_type, deployment, pricing_multiplier)
+                throughput_monthly = throughput_mbps * throughput_rate
+                basis: dict[str, Any] = {
+                    "metric": "AWS/FSx DataReadBytes + DataWriteBytes (Sum), dimension FileSystemId",
+                    "metric_window_days": FSX_IDLE_WINDOW_DAYS,
+                    "bytes_transferred": 0,
+                    "storage_capacity_gb": capacity,
+                    "storage_rate_per_gb_month": round(storage_rate, 4),
+                    "storage_monthly": round(storage_monthly, 2),
+                    "evidence": (
+                        "datapoints present across the window and every one zero. AWS "
+                        "publishes these metrics for ALL FSx file systems at 1-minute "
+                        "periods, so an EMPTY series means the read found nothing (or the "
+                        "file system was in maintenance/failover) and abstains - only a "
+                        "present-and-zero series proves idleness"
+                    ),
+                    "formula": "storage_gb x storage_rate + throughput_mbps x throughput_rate",
+                }
+                if throughput_monthly > 0:
+                    basis["throughput_capacity_mbps"] = throughput_mbps
+                    basis["throughput_rate_per_mbps_month"] = round(throughput_rate, 4)
+                    basis["throughput_monthly"] = round(throughput_monthly, 2)
+                elif throughput_mbps:
+                    basis["throughput_leg"] = (
+                        f"omitted — no flat MBps rate for {fs_type} (Lustre persistent "
+                        "throughput is sold in per-TiB-of-storage tiers)"
+                    )
+                total = storage_monthly + throughput_monthly
+                if total > 0:
+                    counted.append(
+                        {
+                            "FileSystemId": fs_id,
+                            "FileSystemType": fs_type,
+                            "StorageCapacity": capacity,
+                            "StorageType": storage_type,
+                            "DeploymentType": deployment,
+                            "CheckCategory": "Idle FSx File System",
+                            "Recommendation": (
+                                f"No data read or written in the last {FSX_IDLE_WINDOW_DAYS} days "
+                                "- delete the file system (back it up first) to stop both the "
+                                "storage and throughput charges"
+                            ),
+                            "EstimatedSavings": f"${total:,.2f}/month",
+                            "EstimatedMonthlySavings": round(total, 2),
+                            "_savings": round(total, 2),
+                            "AuditBasis": basis,
+                        }
+                    )
+                    # An idle file system is being deleted whole; the SSD->HDD
+                    # advisory below is a different remediation on the same
+                    # resource and must not also render against it.
+                    continue
 
             # Counted: SSD -> HDD storage swap (deterministic price delta).
             # Windows ONLY: Single-AZ ($0.130->$0.013) and Multi-AZ ($0.230->

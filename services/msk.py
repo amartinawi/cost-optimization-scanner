@@ -94,6 +94,7 @@ def get_enhanced_msk_checks(ctx: ScanContext) -> dict[str, Any]:
         "serverless_migration": [],
         "storage_optimization": [],
         "idle_clusters": [],
+        "serverless_clusters": [],
     }
 
     try:
@@ -180,11 +181,27 @@ def get_enhanced_msk_checks(ctx: ScanContext) -> dict[str, Any]:
         try:
             paginator_v2 = kafka.get_paginator("list_clusters_v2")
             for page in paginator_v2.paginate():
-                serverless_clusters = page.get("ClusterInfoList", [])
-
-                # MSK Serverless monitor finding removed: "Variable based on usage" with
-                # no concrete per-cluster quantification.
-                _ = serverless_clusters
+                for cluster_v2 in page.get("ClusterInfoList", []):
+                    # MSK-3 — serverless clusters were enumerated and thrown
+                    # away on the grounds that their cost is "variable based on
+                    # usage". Most of it is, but ONE leg is not: MSK Serverless
+                    # bills a flat cluster-hour for the cluster's existence
+                    # ($0.75/hr = $547.50/month, live SKU
+                    # USE1-KafkaServerless-ClusterHours), independent of
+                    # partitions, storage and traffic. That figure can be stated
+                    # with no usage signal at all, so the cluster is surfaced
+                    # rather than discarded.
+                    if str(cluster_v2.get("ClusterType", "")).upper() != "SERVERLESS":
+                        continue
+                    checks["serverless_clusters"].append(
+                        {
+                            "ClusterName": cluster_v2.get("ClusterName"),
+                            "ClusterArn": cluster_v2.get("ClusterArn"),
+                            "ClusterType": "SERVERLESS",
+                            "State": cluster_v2.get("State"),
+                            "CheckCategory": "MSK Serverless Cluster",
+                        }
+                    )
         except Exception:
             pass
 
