@@ -39,6 +39,68 @@ REST_PER_M = 3.50
 HTTP_PER_M = 1.00
 SAVINGS_PER_M = REST_PER_M - HTTP_PER_M
 
+# AG-1 — the real request-price LADDERS, validated against the live Pricing API
+# 2026-08-10 (AmazonApiGateway us-east-1, usagetype USE1-ApiGatewayRequest /
+# USE1-ApiGatewayHttpRequest). Each entry is (upper_bound_requests, $/million);
+# the final bound is None for "and above".
+#
+# A flat first-tier delta is NOT a conservative floor above the first tier, it
+# is a CEILING: REST falls to $2.80/M after 333M while HTTP only falls to
+# $0.90/M after 300M, so the gap narrows as volume grows. At 500M requests the
+# flat $2.50/M claims $1,250/month where the ladders give $1,153.10 — $96.90
+# overstated, and worse at higher volumes.
+REST_REQUEST_TIERS: tuple[tuple[int | None, float], ...] = (
+    (333_000_000, 3.50),
+    (1_000_000_000, 2.80),
+    (20_000_000_000, 2.38),
+    (None, 1.51),
+)
+HTTP_REQUEST_TIERS: tuple[tuple[int | None, float], ...] = (
+    (300_000_000, 1.00),
+    (None, 0.90),
+)
+
+
+def tiered_request_cost(requests: float, tiers: tuple[tuple[int | None, float], ...]) -> float:
+    """Monthly $ for ``requests`` priced through a tier ladder.
+
+    Tiers fill from the bottom, so this is the real bill rather than
+    ``volume x first_tier_rate``.
+    """
+    if requests <= 0:
+        return 0.0
+    total = 0.0
+    consumed = 0.0
+    for upper, rate_per_million in tiers:
+        ceiling = float(upper) if upper is not None else float("inf")
+        billable = min(requests, ceiling) - consumed
+        if billable <= 0:
+            continue
+        total += (billable / 1_000_000) * rate_per_million
+        consumed += billable
+        if consumed >= requests:
+            break
+    return total
+
+
+def rest_to_http_savings(account_requests: float, api_requests: float) -> float:
+    """This API's share of the ACCOUNT-WIDE REST -> HTTP saving.
+
+    AG-1's second half: request tiers are account-wide (per region), not
+    per-API, so pricing each API independently walks every one of them up from
+    the first tier and overstates the total. The account-wide delta is computed
+    once on the summed volume and allocated pro-rata by each API's share, so the
+    per-API figures reconcile to the account total by construction.
+    """
+    if account_requests <= 0 or api_requests <= 0:
+        return 0.0
+    delta = tiered_request_cost(account_requests, REST_REQUEST_TIERS) - tiered_request_cost(
+        account_requests, HTTP_REQUEST_TIERS
+    )
+    if delta <= 0:
+        return 0.0
+    return delta * (api_requests / account_requests)
+
 API_GATEWAY_OPTIMIZATION_DESCRIPTIONS: dict[str, dict[str, str]] = {
     "rest_vs_http": {
         "title": "Migrate Simple REST APIs to HTTP API",
@@ -259,9 +321,9 @@ def get_enhanced_api_gateway_checks(ctx: ScanContext) -> dict[str, Any]:
                                 )
                                 metric_read_failed = True
 
-                        estimated_savings = (
-                            (monthly_requests / 1_000_000) * SAVINGS_PER_M if monthly_requests > 0 else 0.0
-                        )
+                        # AG-1 — priced after the walk, once the account-wide
+                        # request total is known (tiers are account-wide).
+                        estimated_savings = 0.0
 
                         rec = {
                             "ApiId": api_id,
@@ -277,15 +339,20 @@ def get_enhanced_api_gateway_checks(ctx: ScanContext) -> dict[str, Any]:
                             # validated live: AmazonApiGateway us-east-1, AWS
                             # Pricing API publication 2025-11-20.
                             "AuditBasis": {
-                                "rest_rate_per_million": REST_PER_M,
-                                "http_rate_per_million": HTTP_PER_M,
-                                "savings_rate_per_million": SAVINGS_PER_M,
+                                "rest_first_tier_per_million": REST_PER_M,
+                                "http_first_tier_per_million": HTTP_PER_M,
+                                "rest_tiers": [list(t) for t in REST_REQUEST_TIERS],
+                                "http_tiers": [list(t) for t in HTTP_REQUEST_TIERS],
                                 "rate_source": "AmazonApiGateway USE1-ApiGatewayRequest / "
-                                "USE1-ApiGatewayHttpRequest (AWS Pricing API 2025-11-20)",
+                                "USE1-ApiGatewayHttpRequest tier ladders "
+                                "(AWS Pricing API, validated 2026-08-10)",
                                 "metric": "AWS/ApiGateway Count (Sum)",
                                 "metric_window_days": 30,
                                 "monthly_requests": monthly_requests,
-                                "formula": "(monthly_requests / 1e6) * (REST_PER_M - HTTP_PER_M)",
+                                "formula": (
+                                    "account-wide (tiered REST cost - tiered HTTP cost), "
+                                    "allocated by this API's share of account requests"
+                                ),
                             },
                         }
                         if metric_read_failed:
@@ -318,6 +385,24 @@ def get_enhanced_api_gateway_checks(ctx: ScanContext) -> dict[str, Any]:
         # H1 — classify the outer failure (account-wide AccessDenied on
         # GetRestApis must read as a permission gap, not an empty tab).
         record_aws_error(ctx, e, service="api_gateway", context="API Gateway checks failed")
+
+    # AG-1 — second pass. Request tiers are account-wide, so the delta is
+    # computed once on the summed volume and allocated by share; pricing each
+    # API independently walked every one of them up from the first tier.
+    candidates = [r for r in checks["rest_vs_http"] if r.get("Counted") is not False]
+    account_requests = sum(float(r.get("MonthlyRequests") or 0.0) for r in candidates)
+    for rec in candidates:
+        api_requests = float(rec.get("MonthlyRequests") or 0.0)
+        saving = rest_to_http_savings(account_requests, api_requests)
+        rec["EstimatedMonthlySavings"] = round(saving, 2)
+        rec["AuditBasis"]["account_monthly_requests"] = account_requests
+        rec["AuditBasis"]["account_request_share"] = (
+            round(api_requests / account_requests, 6) if account_requests else 0.0
+        )
+        if saving > 0:
+            # B2 — the string and the numeric must agree; the shim used to leave
+            # a "10-30% cost reduction" percentage on a counted rec (AG-2).
+            rec["EstimatedSavings"] = f"${saving:,.2f}/month"
 
     all_recommendations: list[dict[str, Any]] = []
     for _category, recs in checks.items():

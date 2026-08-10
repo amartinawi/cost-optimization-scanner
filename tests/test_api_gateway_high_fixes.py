@@ -188,13 +188,16 @@ def test_counted_dollar_from_measured_requests() -> None:
     rec = findings.sources["enhanced_checks"].recommendations[0]
     assert rec["EstimatedMonthlySavings"] == pytest.approx(5.00)
     assert rec.get("Counted") is not False  # counted, not advisory
-    # AuditBasis defends the dollar from the report alone (rule 8).
+    # AuditBasis defends the dollar from the report alone (rule 8). AG-1 made
+    # the basis carry the full tier LADDERS rather than a single flat rate.
     basis = rec["AuditBasis"]
-    assert basis["rest_rate_per_million"] == REST_PER_M == 3.50
-    assert basis["http_rate_per_million"] == HTTP_PER_M == 1.00
-    assert basis["savings_rate_per_million"] == SAVINGS_PER_M == 2.50
+    assert basis["rest_first_tier_per_million"] == REST_PER_M == 3.50
+    assert basis["http_first_tier_per_million"] == HTTP_PER_M == 1.00
+    assert basis["rest_tiers"][0] == [333_000_000, 3.50]
+    assert basis["http_tiers"][0] == [300_000_000, 1.00]
     assert basis["metric_window_days"] == 30
     assert basis["monthly_requests"] == 2_000_000.0
+    assert basis["account_monthly_requests"] == 2_000_000.0
 
 
 def test_region_multiplier_not_applied_us_constant_floor() -> None:
@@ -323,3 +326,93 @@ def test_get_resources_access_denied_classified() -> None:
     assert result["recommendations"] == []
     assert ctx.permissions, "GetResources AccessDenied must classify as permission_issue"
     assert ctx.permissions[0][0] == "api_gateway"
+
+
+# --------------------------------------------------------------------------- #
+# AG-1 — the flat first-tier delta is a CEILING above the first tier, not a
+# floor, and request tiers are account-wide rather than per-API.
+#
+# Ladders validated against the live Pricing API 2026-08-10:
+#   REST  $3.50/M to 333M, $2.80/M to 1B, $2.38/M to 20B, $1.51/M above
+#   HTTP  $1.00/M to 300M, $0.90/M above
+# REST falls after 333M while HTTP only falls after 300M, so the gap NARROWS
+# as volume grows — which is why a flat first-tier delta overstates.
+# --------------------------------------------------------------------------- #
+def test_tiered_cost_walks_the_ladder() -> None:
+    from services.api_gateway import REST_REQUEST_TIERS, tiered_request_cost
+
+    # 333M x $3.50 = $1,165.50; the next 167M x $2.80 = $467.60.
+    assert tiered_request_cost(500_000_000, REST_REQUEST_TIERS) == pytest.approx(1633.10, abs=0.01)
+    assert tiered_request_cost(0, REST_REQUEST_TIERS) == 0.0
+
+
+def test_high_volume_saving_is_below_the_flat_first_tier_figure() -> None:
+    """The exact defect: at 500M the flat $2.50/M claims $1,250 where the real
+    delta is $1,153.10 — $96.90/month overstated."""
+    from services.api_gateway import SAVINGS_PER_M, rest_to_http_savings
+
+    true_delta = rest_to_http_savings(500_000_000, 500_000_000)
+    flat = (500_000_000 / 1_000_000) * SAVINGS_PER_M
+    assert true_delta == pytest.approx(1153.10, abs=0.01)
+    assert flat == pytest.approx(1250.00)
+    assert true_delta < flat
+
+
+def test_small_api_is_unchanged_by_the_ladder() -> None:
+    """Below the first tier boundary the ladder and the flat rate agree, so
+    ordinary accounts see no change."""
+    from services.api_gateway import SAVINGS_PER_M, rest_to_http_savings
+
+    assert rest_to_http_savings(10_000_000, 10_000_000) == pytest.approx(
+        (10_000_000 / 1_000_000) * SAVINGS_PER_M
+    )
+
+
+def test_tiers_are_account_wide_not_per_api() -> None:
+    """Two 500M APIs share one account-wide ladder. Pricing each independently
+    would walk both up from the first tier and claim $2,306.20."""
+    from services.api_gateway import rest_to_http_savings
+
+    allocated = 2 * rest_to_http_savings(1_000_000_000, 500_000_000)
+    independent = 2 * rest_to_http_savings(500_000_000, 500_000_000)
+    assert allocated == pytest.approx(2103.10, abs=0.01)
+    assert allocated < independent
+
+
+def test_per_api_savings_reconcile_to_the_account_total() -> None:
+    from services.api_gateway import rest_to_http_savings, tiered_request_cost
+    from services.api_gateway import HTTP_REQUEST_TIERS, REST_REQUEST_TIERS
+
+    volumes = [400_000_000, 250_000_000, 50_000_000]
+    total = sum(volumes)
+    account_delta = tiered_request_cost(total, REST_REQUEST_TIERS) - tiered_request_cost(
+        total, HTTP_REQUEST_TIERS
+    )
+    assert sum(rest_to_http_savings(total, v) for v in volumes) == pytest.approx(
+        account_delta, abs=0.01
+    )
+
+
+def test_two_apis_scan_allocates_by_share() -> None:
+    apigw = _FakeApiGateway(
+        apis=[{"id": "a1", "name": "big"}, {"id": "a2", "name": "small"}],
+        resource_counts={"a1": 3, "a2": 3},
+    )
+
+    class _PerApiCw:
+        def get_metric_statistics(self, **kwargs):
+            name = next(d["Value"] for d in kwargs["Dimensions"] if d["Name"] == "ApiName")
+            total = 400_000_000.0 if name == "big" else 100_000_000.0
+            return {"Datapoints": [{"Sum": total}]}
+
+    ctx = _recording_ctx(pricing_multiplier=1.0)
+    ctx.client = _client_factory(apigw, _PerApiCw())
+    findings = ApiGatewayModule().scan(ctx)
+
+    recs = {r["ApiName"]: r for r in findings.sources["enhanced_checks"].recommendations}
+    assert recs["big"]["EstimatedMonthlySavings"] > recs["small"]["EstimatedMonthlySavings"]
+    # The headline is the account-wide delta, not the sum of independent ones.
+    assert findings.total_monthly_savings == pytest.approx(
+        recs["big"]["EstimatedMonthlySavings"] + recs["small"]["EstimatedMonthlySavings"], abs=0.01
+    )
+    assert recs["big"]["AuditBasis"]["account_monthly_requests"] == 500_000_000.0
