@@ -90,6 +90,16 @@ def get_enhanced_opensearch_checks(ctx: ScanContext) -> dict[str, Any]:
                 engine_version = domain.get("EngineVersion", "")
                 instance_type = domain.get("ClusterConfig", {}).get("InstanceType", "")
                 instance_count = domain.get("ClusterConfig", {}).get("InstanceCount", 0)
+                # OS-7 — dedicated master and UltraWarm nodes bill ON TOP of the
+                # data nodes and are deleted with the domain, so an idle-domain
+                # figure that prices only ClusterConfig.InstanceType/InstanceCount
+                # under-counts every domain that has them (a 3-node master tier is
+                # a common production default).
+                cluster = domain.get("ClusterConfig", {}) or {}
+                master_type = cluster.get("DedicatedMasterType") if cluster.get("DedicatedMasterEnabled") else None
+                master_count = cluster.get("DedicatedMasterCount", 0) if master_type else 0
+                warm_type = cluster.get("WarmType") if cluster.get("WarmEnabled") else None
+                warm_count = cluster.get("WarmCount", 0) if warm_type else 0
                 storage_type = domain.get("EBSOptions", {}).get("VolumeType", "")
                 ebs_volume_size = domain.get("EBSOptions", {}).get("VolumeSize", 0)
 
@@ -203,6 +213,11 @@ def get_enhanced_opensearch_checks(ctx: ScanContext) -> dict[str, Any]:
                                     "InstanceType": instance_type,
                                     "InstanceCount": instance_count,
                                     "EBSVolumeSize": ebs_volume_size,
+                                    # OS-7 — extra node tiers, deleted with the domain.
+                                    "DedicatedMasterType": master_type,
+                                    "DedicatedMasterCount": master_count,
+                                    "WarmType": warm_type,
+                                    "WarmCount": warm_count,
                                     "AvgCPU": round(avg_cpu, 2),
                                     "AvgSearchRate": round(search_avg, 3) if search_avg is not None else None,
                                     "AvgIndexingRate": round(indexing_avg, 3) if indexing_avg is not None else None,

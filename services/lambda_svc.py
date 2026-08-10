@@ -85,6 +85,37 @@ PC_UTIL_LOOKBACK_DAYS: int = 14
 PC_UTIL_METRIC_PERIOD_1D: int = 86400
 
 
+def _read_invocation_count(cloudwatch: Any, function_name: str, days: int) -> float:
+    """Total ``Invocations`` for a function over ``days``. Raises on API error.
+
+    LAM-3 — the discriminator for a never-invoked Provisioned Concurrency
+    config. ``ProvisionedConcurrencyUtilization`` is the natural signal but AWS
+    documents it as emitted "for each function version and alias", so a
+    FunctionName-only read of it rests on a dimension set AWS does not document,
+    and an empty result there would read as "never invoked" for EVERY function
+    with PC - a fail-OPEN across whole accounts.
+
+    ``Invocations`` at ``FunctionName`` is beyond doubt: it is the canonical
+    Lambda metric at the canonical dimension. A function with ZERO invocations
+    over the window certainly ran nothing on its provisioned concurrency, so the
+    whole allocation is waste. This under-counts (a function invoked on-demand
+    but never on PC is still wasting the allocation), which is the safe
+    direction.
+    """
+    end_time = datetime.now(UTC)
+    start_time = end_time - timedelta(days=days)
+    resp = cloudwatch.get_metric_statistics(
+        Namespace="AWS/Lambda",
+        MetricName="Invocations",
+        Dimensions=[{"Name": "FunctionName", "Value": function_name}],
+        StartTime=start_time,
+        EndTime=end_time,
+        Period=INVOCATION_METRIC_PERIOD_1D,
+        Statistics=["Sum"],
+    )
+    return float(sum(dp["Sum"] for dp in resp.get("Datapoints", [])))
+
+
 def _read_pc_max_utilization(cloudwatch: Any, function_name: str) -> float | None:
     """Return the peak ProvisionedConcurrencyUtilization (0..1) for a function.
 
@@ -231,12 +262,27 @@ def get_enhanced_lambda_checks(ctx: ScanContext) -> dict[str, Any]:
                     # configs (the metric is keyed by FunctionName). Skipped in
                     # fast mode; on no-data / error the adapter emits a $0 advisory.
                     max_util: float | None = None
+                    never_invoked: bool | None = None
                     if not fast_mode:
                         try:
                             max_util = _read_pc_max_utilization(cloudwatch, function_name)
                         except Exception as e:
                             _note_cw_failure(e)
                             max_util = None
+                        # LAM-3 — a no-datapoints utilization read used to be
+                        # indistinguishable from a FAILED one, and both fell to a
+                        # $0 advisory. AWS documents that Lambda "doesn't emit
+                        # this metric" when a function is inactive, so emptiness
+                        # is meaningful - but only once corroborated by a metric
+                        # whose dimension set is not in question.
+                        try:
+                            invocations = _read_invocation_count(
+                                cloudwatch, function_name, PC_UTIL_LOOKBACK_DAYS
+                            )
+                            never_invoked = invocations == 0.0
+                        except Exception as e:
+                            _note_cw_failure(e)
+                            never_invoked = None
                     for pc_config in pc_configs:
                         pc_rec: dict[str, Any] = {
                             "FunctionName": function_name,
@@ -250,6 +296,9 @@ def get_enhanced_lambda_checks(ctx: ScanContext) -> dict[str, Any]:
                         }
                         if max_util is not None:
                             pc_rec["MaxUtilization"] = round(float(max_util), 4)
+                        if never_invoked is not None:
+                            pc_rec["NeverInvoked"] = never_invoked
+                            pc_rec["InvocationWindowDays"] = PC_UTIL_LOOKBACK_DAYS
                         checks["provisioned_concurrency"].append(pc_rec)
 
                 # Lambda VPC configuration finding removed: mixed cost/performance ("improve

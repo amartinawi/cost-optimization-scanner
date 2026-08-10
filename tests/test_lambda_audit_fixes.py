@@ -527,3 +527,119 @@ def test_total_recommendations_excludes_demoted_recs(monkeypatch: pytest.MonkeyP
 
     assert findings.total_monthly_savings == pytest.approx(0.0)
     assert findings.total_recommendations == 0
+
+
+# --------------------------------------------------------------------------- #
+# LAM-3 — a never-invoked Provisioned Concurrency config is 100% waste.
+#
+# The no-datapoints case used to be indistinguishable from a FAILED read and
+# both fell to $0. AWS documents that Lambda "doesn't emit this metric" when a
+# function is inactive, so emptiness IS evidence - but only once corroborated
+# by a metric whose dimension set is not in question.
+# ProvisionedConcurrencyUtilization is documented as emitted "for each function
+# version and alias", so a FunctionName-only read of IT would report no data
+# for every PC function and turn this branch into an account-wide fail-OPEN.
+# The corroboration is Invocations at the canonical FunctionName dimension.
+# --------------------------------------------------------------------------- #
+def _lam3_rec(**kw):
+    rec = {
+        "FunctionName": "pc-fn",
+        "MemorySize": 1024,
+        "Architecture": "x86_64",
+        "ProvisionedConcurrency": 2,
+        "Recommendation": "Provisioned concurrency is expensive - review necessity",
+        "EstimatedSavings": "Up to 90% if not needed",
+        "CheckCategory": "Lambda Provisioned Concurrency",
+    }
+    rec.update(kw)
+    return rec
+
+
+def _pc_findings(rec, monkeypatch):
+    from types import SimpleNamespace
+
+    import services.adapters.lambda_svc as adapter_mod
+
+    monkeypatch.setattr(
+        adapter_mod,
+        "get_enhanced_lambda_checks",
+        lambda _ctx: {
+            "recommendations": [rec],
+            "checks": {"provisioned_concurrency": [rec]},
+        },
+    )
+    monkeypatch.setattr(adapter_mod, "get_lambda_compute_optimizer_recommendations", lambda _ctx: [])
+    ctx = SimpleNamespace(
+        pricing_engine=None,
+        pricing_multiplier=1.0,
+        region="us-east-1",
+        fast_mode=False,
+        cost_hub_splits={},
+        commitment_coverage=None,
+        warnings=[],
+    )
+    ctx.client = lambda name, region=None: None
+    ctx.warn = lambda *a, **k: None
+    ctx.permission_issue = lambda *a, **k: None
+    return adapter_mod.LambdaModule().scan(ctx)
+
+
+def test_never_invoked_pc_counts_the_whole_allocation(monkeypatch) -> None:
+    findings = _pc_findings(
+        _lam3_rec(NeverInvoked=True, InvocationWindowDays=14), monkeypatch
+    )
+    rec = next(
+        r
+        for block in findings.sources.values()
+        for r in block.recommendations
+        if r["CheckCategory"] == "Lambda Provisioned Concurrency"
+    )
+    assert rec["Counted"] is True
+    assert rec["EstimatedMonthlySavings"] > 0
+    # 1 GB x $0.0000041667 x 730 x 3600 x 2 ~= $21.90
+    assert rec["EstimatedMonthlySavings"] == pytest.approx(21.90, abs=0.5)
+    assert "never invoked" in rec["Recommendation"].lower()
+    assert rec["AuditBasis"]["invocations"] == 0
+    # Counted == rendered.
+    assert "Up to 90%" not in rec["EstimatedSavings"]
+
+
+def test_invoked_function_without_utilization_stays_advisory(monkeypatch) -> None:
+    findings = _pc_findings(
+        _lam3_rec(NeverInvoked=False, InvocationWindowDays=14), monkeypatch
+    )
+    rec = next(
+        r
+        for block in findings.sources.values()
+        for r in block.recommendations
+        if r["CheckCategory"] == "Lambda Provisioned Concurrency"
+    )
+    assert rec["Counted"] is False
+    assert rec["EstimatedMonthlySavings"] == 0.0
+    assert rec["PotentialMonthlySavings"] > 0
+
+
+def test_unreadable_invocations_stays_advisory(monkeypatch) -> None:
+    """A failed corroboration read leaves NeverInvoked absent - which must not
+    read as "never invoked"."""
+    findings = _pc_findings(_lam3_rec(), monkeypatch)
+    rec = next(
+        r
+        for block in findings.sources.values()
+        for r in block.recommendations
+        if r["CheckCategory"] == "Lambda Provisioned Concurrency"
+    )
+    assert rec["Counted"] is False
+    assert rec["EstimatedMonthlySavings"] == 0.0
+
+
+def test_shim_corroborates_with_invocations_at_the_canonical_dimension() -> None:
+    """The read must be Invocations/FunctionName, not a FunctionName-only read
+    of ProvisionedConcurrencyUtilization."""
+    import inspect
+
+    import services.lambda_svc as shim
+
+    src = inspect.getsource(shim._read_invocation_count)
+    assert '"Invocations"' in src
+    assert '{"Name": "FunctionName"' in src

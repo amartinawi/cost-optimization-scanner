@@ -10,8 +10,10 @@ from services._savings import mark_zero_savings_advisory
 from services.advisor import get_lambda_compute_optimizer_recommendations
 from services.lambda_svc import (
     LAMBDA_OPTIMIZATION_DESCRIPTIONS,
-    PC_UTIL_LOOKBACK_DAYS as _PC_UTIL_WINDOW_DAYS,
     get_enhanced_lambda_checks,
+)
+from services.lambda_svc import (
+    PC_UTIL_LOOKBACK_DAYS as _PC_UTIL_WINDOW_DAYS,
 )
 
 # AWS Lambda Provisioned Concurrency rates (us-east-1, verified via Pricing API
@@ -185,8 +187,53 @@ class LambdaModule(BaseServiceModule):
                 )
                 max_util = rec.get("MaxUtilization")
                 if max_util is None:
+                    # LAM-3 — a missing utilization metric has two very different
+                    # causes and they used to collapse to the same $0. AWS
+                    # documents that Lambda "doesn't emit this metric" when a
+                    # function is inactive, so no-datapoints is evidence of
+                    # idleness, not absence of evidence — provided the read
+                    # actually succeeded. The shim corroborates with Invocations
+                    # at the canonical FunctionName dimension (never_invoked),
+                    # because ProvisionedConcurrencyUtilization is documented as
+                    # emitted per version/alias and a FunctionName-only read of
+                    # IT would report "no data" for every PC function, turning
+                    # this branch into a fail-OPEN across whole accounts.
+                    if rec.get("NeverInvoked") is True:
+                        pc_savings = allocation * ctx.pricing_multiplier
+                        rec["EstimatedMonthlySavings"] = round(pc_savings, 2)
+                        rec["EstimatedSavings"] = f"${pc_savings:,.2f}/month"
+                        rec["Counted"] = True
+                        rec["Recommendation"] = (
+                            "Function was never invoked in the last "
+                            f"{rec.get('InvocationWindowDays', '?')} days - the whole "
+                            "provisioned-concurrency allocation is waste"
+                        )
+                        rec["AuditBasis"] = {
+                            "metric": "AWS/Lambda Invocations (Sum), dimension FunctionName",
+                            "metric_window_days": rec.get("InvocationWindowDays"),
+                            "invocations": 0,
+                            "provisioned_concurrency": pc_count,
+                            "memory_gb": round(mem_gb, 4),
+                            "pc_rate_per_gb_second": pc_rate,
+                            "architecture": arch,
+                            "region_multiplier": round(ctx.pricing_multiplier, 4),
+                            "evidence": (
+                                "zero invocations over the window, so nothing ran on the "
+                                "provisioned concurrency; corroborated with Invocations "
+                                "rather than ProvisionedConcurrencyUtilization, whose "
+                                "documented dimension is the version/alias"
+                            ),
+                            "formula": "mem_gb x rate x 730h x 3600s x pc_count x region_multiplier",
+                        }
+                        continue
                     rec["EstimatedMonthlySavings"] = 0.0
+                    rec["Counted"] = False
+                    rec["EstimatedSavings"] = (
+                        "$0.00/month — advisory: requires the "
+                        "ProvisionedConcurrencyUtilization metric"
+                    )
                     rec["PricingWarning"] = "requires ProvisionedConcurrencyUtilization metric"
+                    rec["PotentialMonthlySavings"] = round(allocation * ctx.pricing_multiplier, 2)
                     continue
                 unused_fraction = max(0.0, 1.0 - float(max_util))
                 pc_savings = allocation * unused_fraction * ctx.pricing_multiplier

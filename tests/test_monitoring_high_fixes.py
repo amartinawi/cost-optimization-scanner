@@ -322,3 +322,72 @@ def test_no_get_metric_data_probe_remains() -> None:
     rec = result["unused_custom_metrics"][0]
     assert rec["Counted"] is False
     assert cw.get_metric_data_calls == 0
+
+
+# --------------------------------------------------------------------------- #
+# MON-7 — the Route 53 tier ladder must descend as zones are claimed.
+#
+# Route 53 bills the first 25 hosted zones at $0.50 and the rest at $0.10.
+# Pricing every removable zone against the SAME starting count made the ladder
+# stand still: with 26 zones and 3 removable, all three priced at the $0.10
+# tier when only the first one sits there.
+# --------------------------------------------------------------------------- #
+def _r53_ctx(zones):
+    from types import SimpleNamespace
+
+    class _R53:
+        def get_paginator(self, name):
+            return SimpleNamespace(paginate=lambda **kw: [{"HostedZones": zones}])
+
+        def list_resource_record_sets(self, **kw):
+            return {"ResourceRecordSets": []}
+
+        def list_health_checks(self, **kw):
+            return {"HealthChecks": []}
+
+    ctx = SimpleNamespace(region="us-east-1", fast_mode=False, warnings=[])
+    ctx.client = lambda name, region=None: _R53()
+    ctx.warn = lambda *a, **k: None
+    ctx.permission_issue = lambda *a, **k: None
+    return ctx
+
+
+def _zone(i, records=1):
+    return {
+        "Id": f"/hostedzone/Z{i}",
+        "Name": f"z{i}.example.com.",
+        "Config": {"PrivateZone": False},
+        "ResourceRecordSetCount": records,
+    }
+
+
+def test_zone_ladder_descends_as_zones_are_claimed() -> None:
+    """26 zones, 3 removable: the first sits in the $0.10 tier, the next two
+    fall back into the $0.50 tier as the count descends. $1.10, not $0.30."""
+    from services.route53 import get_route53_checks
+
+    zones = [_zone(i, records=1) for i in range(3)] + [_zone(i, records=9) for i in range(3, 26)]
+    out = get_route53_checks(_r53_ctx(zones), 1.0)
+    unused = out["unused_hosted_zones"]
+    assert len(unused) == 3
+    assert sum(r["EstimatedMonthlySavings"] for r in unused) == pytest.approx(1.10, abs=0.01)
+
+
+def test_zone_ladder_matches_the_batch_calculation() -> None:
+    """Walking one zone at a time must equal pricing the batch in one call."""
+    from services.route53 import _route53_zone_monthly_cost
+
+    walked, base = 0.0, 26
+    for _ in range(3):
+        walked += _route53_zone_monthly_cost(1, base_zones_in_account=base)
+        base -= 1
+    assert walked == pytest.approx(_route53_zone_monthly_cost(3, base_zones_in_account=26))
+
+
+def test_small_account_prices_every_zone_at_tier_one() -> None:
+    """Below the 25-zone limit nothing changes: every removable zone is $0.50."""
+    from services.route53 import get_route53_checks
+
+    zones = [_zone(i, records=1) for i in range(3)]
+    out = get_route53_checks(_r53_ctx(zones), 1.0)
+    assert sum(r["EstimatedMonthlySavings"] for r in out["unused_hosted_zones"]) == pytest.approx(1.50)

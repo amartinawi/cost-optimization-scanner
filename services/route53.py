@@ -97,6 +97,14 @@ def get_route53_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> dic
         # same zone's monthly $ a second time (count each zone once).
         counted_unused_ids: set[str] = set()
 
+        # MON-7 — each removable zone must be priced against the account size
+        # AFTER the ones already claimed. Pricing every zone against the same
+        # starting count makes the ladder stand still: with 26 zones and 3
+        # removable, all three price at the $0.10 tier ($0.30) when only the
+        # first one actually sits there — the real saving is $1.10, because the
+        # next two fall back into the $0.50 tier as the count descends.
+        zones_claimed = 0
+
         for zone in hosted_zones:
             zone_id = _normalize_zone_id(zone.get("Id") or "")
             zone_name = zone.get("Name")
@@ -105,9 +113,11 @@ def get_route53_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> dic
 
             if record_count <= 2:
                 # Tier-1 zone removal (most accounts have <25 zones — apply tier-1 rate).
+                remaining_zones = len(hosted_zones) - zones_claimed
                 zone_savings = _route53_zone_monthly_cost(
-                    1, base_zones_in_account=len(hosted_zones)
+                    1, base_zones_in_account=remaining_zones
                 ) * pricing_multiplier
+                zones_claimed += 1
                 counted_unused_ids.add(zone_id)
                 checks["unused_hosted_zones"].append(
                     {
@@ -126,7 +136,8 @@ def get_route53_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> dic
                                 ROUTE53_HOSTED_ZONE_TIER_1,
                                 ROUTE53_HOSTED_ZONE_TIER_2,
                             ],
-                            "base_zones_in_account": len(hosted_zones),
+                            "base_zones_in_account": remaining_zones,
+                            "zones_already_claimed": zones_claimed - 1,
                             "record_count": record_count,
                             "region_multiplier": round(pricing_multiplier, 4),
                             "formula": "route53_tiered_cost(1) x region_multiplier",
@@ -200,7 +211,7 @@ def get_route53_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> dic
                 overlap = len(normalized_group & counted_unused_ids)
                 dedup_removable = max(0, removable - overlap)
                 consolidate_savings = _route53_zone_monthly_cost(
-                    dedup_removable, base_zones_in_account=len(hosted_zones)
+                    dedup_removable, base_zones_in_account=len(hosted_zones) - zones_claimed
                 ) * pricing_multiplier
                 rec: dict[str, Any] = {
                     "ZoneName": zone_name,
@@ -214,7 +225,7 @@ def get_route53_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> dic
                         "duplicate_zone_count": len(zone_ids),
                         "removable_zones": dedup_removable,
                         "already_counted_as_unused": overlap,
-                        "base_zones_in_account": len(hosted_zones),
+                        "base_zones_in_account": len(hosted_zones) - zones_claimed,
                         "region_multiplier": round(pricing_multiplier, 4),
                         "formula": (
                             "route53_tiered_cost((zone_count - 1) - unused_overlap) "

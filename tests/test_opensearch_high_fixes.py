@@ -558,3 +558,303 @@ def test_extended_support_fails_closed_without_region():
     assert _extended_support_breakdown(ctx) == (0.0, {})
     assert warns and "region unset" in warns[0]
     ce.get_cost_and_usage.assert_not_called()
+
+
+# --------------------------------------------------------------------------- #
+# OS-5 / OS-4 — the two abstentions that hit the most expensive fleets
+# --------------------------------------------------------------------------- #
+def test_graviton_map_covers_current_generation_intel() -> None:
+    """OS-5: the map stopped at m5/c5/r5/t3, so every current-gen Intel family
+    had no Graviton target and the lever abstained on the newest fleets."""
+    from services.adapters.opensearch import _graviton_family_for
+
+    assert _graviton_family_for("m6i") == "m6g"
+    assert _graviton_family_for("m7i") == "m7g"
+    assert _graviton_family_for("r7i") == "r7g"
+    assert _graviton_family_for("c7i") == "c7g"
+    # Legacy families keep their existing targets.
+    assert _graviton_family_for("m5") == "m6g"
+    assert _graviton_family_for("t3") == "t4g"
+
+
+def test_graviton_map_skips_families_that_are_already_graviton() -> None:
+    from services.adapters.opensearch import _graviton_family_for
+
+    for family in ("r6g", "m7g", "r6gd", "im4gn", "or1"):
+        assert _graviton_family_for(family) is None, family
+
+
+def test_smaller_sizes_walks_past_a_gap_in_the_family_ladder() -> None:
+    """OS-4: OpenSearch m5 offers no 8xlarge, so a one-rung step from
+    m5.12xlarge probed a nonexistent size and abstained - on the single most
+    expensive node in the domain."""
+    from services.adapters.opensearch import _smaller_sizes
+
+    ladder = _smaller_sizes("m5.12xlarge.search")
+    assert ladder[0] == "m5.8xlarge.search"
+    assert "m5.4xlarge.search" in ladder
+    assert ladder[-1] == "m5.large.search"  # size floor honoured
+
+
+def test_smaller_sizes_honours_the_large_floor() -> None:
+    from services.adapters.opensearch import _smaller_sizes
+
+    assert all(".medium." not in t for t in _smaller_sizes("r5.xlarge.search"))
+    # A family with no floor still reaches the small rungs.
+    assert "t3.micro.search" in _smaller_sizes("t3.medium.search")
+
+
+def test_downsize_delta_skips_an_unpriceable_rung() -> None:
+    from types import SimpleNamespace
+
+    from services.adapters.opensearch import _downsize_node_delta
+
+    prices = {"m5.12xlarge.search": 2000.0, "m5.4xlarge.search": 700.0}
+
+    ctx = SimpleNamespace(
+        pricing_engine=SimpleNamespace(
+            get_instance_monthly_price=lambda code, itype, **kw: prices.get(itype, 0.0)
+        )
+    )
+    delta, target = _downsize_node_delta(ctx, "m5.12xlarge.search")
+    # 8xlarge does not price, so the walk continues to 4xlarge.
+    assert target == "m5.4xlarge.search"
+    assert delta == pytest.approx(1300.0)
+
+
+def test_downsize_delta_abstains_when_nothing_below_prices() -> None:
+    from types import SimpleNamespace
+
+    from services.adapters.opensearch import _downsize_node_delta
+
+    ctx = SimpleNamespace(
+        pricing_engine=SimpleNamespace(
+            get_instance_monthly_price=lambda code, itype, **kw: 2000.0 if "12xlarge" in itype else 0.0
+        )
+    )
+    assert _downsize_node_delta(ctx, "m5.12xlarge.search") == (0.0, None)
+
+
+def test_downsize_delta_abstains_when_the_smaller_size_is_not_cheaper() -> None:
+    from types import SimpleNamespace
+
+    from services.adapters.opensearch import _downsize_node_delta
+
+    ctx = SimpleNamespace(
+        pricing_engine=SimpleNamespace(get_instance_monthly_price=lambda code, itype, **kw: 900.0)
+    )
+    assert _downsize_node_delta(ctx, "m5.12xlarge.search") == (0.0, None)
+
+
+def _scan_idle_with(mod, ctx, checks: dict):
+    """Drive OpensearchModule.scan with a stubbed shim result (OS-7/OS-9 tests).
+
+    Named distinctly from the file's existing ``_scan_with`` helper, which has a
+    different signature.
+    """
+    recs = [r for v in checks.values() for r in v]
+    original = mod.get_enhanced_opensearch_checks
+    try:
+        mod.get_enhanced_opensearch_checks = lambda _c: {"recommendations": recs, "checks": checks}
+        return mod.OpensearchModule().scan(ctx)
+    finally:
+        mod.get_enhanced_opensearch_checks = original
+
+
+
+# --------------------------------------------------------------------------- #
+# OS-7 / OS-9 — the idle-domain legs
+# --------------------------------------------------------------------------- #
+def _idle_rec(**kw):
+    rec = {
+        "DomainName": "logs",
+        "InstanceType": "r6g.large.search",
+        "InstanceCount": 3,
+        "EBSVolumeSize": 100,
+        "IdleCorroborated": True,
+        "CheckCategory": "Idle Domain",
+        "Recommendation": "Delete idle domain",
+        "EstimatedSavings": "100% of domain cost",
+    }
+    rec.update(kw)
+    return rec
+
+
+def test_idle_domain_price_includes_master_and_warm_nodes() -> None:
+    """OS-7: master and UltraWarm nodes bill on top of the data nodes and are
+    deleted with the domain. A master tier is a common production default."""
+    from types import SimpleNamespace
+
+    import services.adapters.opensearch as mod
+
+    rates = {"r6g.large.search": 100.0, "m6g.large.search": 90.0, "ultrawarm1.medium.search": 50.0}
+    ctx = SimpleNamespace(
+        pricing_engine=SimpleNamespace(
+            get_instance_monthly_price=lambda code, itype, **kw: rates.get(itype, 0.0)
+        ),
+        pricing_multiplier=1.0,
+        region="us-east-1",
+        fast_mode=True,
+        cost_hub_splits={},
+        commitment_coverage=None,
+    )
+    ctx.client = lambda name, region=None: None
+    ctx.warn = lambda *a, **k: None
+    ctx.permission_issue = lambda *a, **k: None
+
+    rec = _idle_rec(
+        DedicatedMasterType="m6g.large.search",
+        DedicatedMasterCount=3,
+        WarmType="ultrawarm1.medium.search",
+        WarmCount=2,
+    )
+    findings = _scan_idle_with(mod, ctx, {"idle_domains": [rec]})
+    emitted = next(
+        r
+        for block in findings.sources.values()
+        for r in block.recommendations
+        if r["CheckCategory"] == "Idle Domain"
+    )
+    # 3x100 data + 100GB x 3 x gp3 storage + 3x90 master + 2x50 warm.
+    assert emitted["AuditBasis"]["master_count"] == 3
+    assert emitted["AuditBasis"]["warm_type"] == "ultrawarm1.medium.search"
+    assert emitted["EstimatedMonthlySavings"] > 300 + 270 + 100
+
+
+def test_master_leg_omitted_when_it_has_no_live_sku() -> None:
+    from types import SimpleNamespace
+
+    import services.adapters.opensearch as mod
+
+    ctx = SimpleNamespace(
+        pricing_engine=SimpleNamespace(
+            get_instance_monthly_price=lambda code, itype, **kw: 100.0 if itype == "r6g.large.search" else 0.0
+        ),
+        pricing_multiplier=1.0,
+        region="us-east-1",
+        fast_mode=True,
+        cost_hub_splits={},
+        commitment_coverage=None,
+    )
+    ctx.client = lambda name, region=None: None
+    ctx.warn = lambda *a, **k: None
+    ctx.permission_issue = lambda *a, **k: None
+
+    rec = _idle_rec(DedicatedMasterType="mystery.search", DedicatedMasterCount=3)
+    findings = _scan_idle_with(mod, ctx, {"idle_domains": [rec]})
+    emitted = next(
+        r
+        for block in findings.sources.values()
+        for r in block.recommendations
+        if r["CheckCategory"] == "Idle Domain"
+    )
+    assert "no live SKU" in emitted["AuditBasis"]["master_leg"]
+
+
+def test_reservation_covered_idle_domain_keeps_its_storage_leg() -> None:
+    """OS-9: an OpenSearch RI covers instance HOURS. Deleting the domain still
+    frees every provisioned GB, so demoting the whole rec threw money away."""
+    from types import SimpleNamespace
+
+    import services.adapters.opensearch as mod
+    from services.commitment_coverage import CommitmentCoverage
+
+    ctx = SimpleNamespace(
+        pricing_engine=SimpleNamespace(
+            get_instance_monthly_price=lambda code, itype, **kw: 100.0 if "r6g" in itype else 0.0
+        ),
+        pricing_multiplier=1.0,
+        region="us-east-1",
+        fast_mode=True,
+        cost_hub_splits={},
+        commitment_coverage=CommitmentCoverage(
+            # normalize_type strips the .search suffix, as the RI resolver does on the way in.
+            opensearch_ri_types=frozenset({"r6g.large"})
+        ),
+    )
+    ctx.client = lambda name, region=None: None
+    ctx.warn = lambda *a, **k: None
+    ctx.permission_issue = lambda *a, **k: None
+
+    findings = _scan_idle_with(mod, ctx, {"idle_domains": [_idle_rec()]})
+    emitted = next(
+        r
+        for block in findings.sources.values()
+        for r in block.recommendations
+        if r["CheckCategory"] == "Idle Domain"
+    )
+    storage = 100 * 3 * mod.GP3_PRICE_PER_GB_MONTH
+    assert emitted["Counted"] is True
+    assert emitted["EstimatedMonthlySavings"] == pytest.approx(storage, abs=0.01)
+    assert emitted["InstanceLegCoveredByReservation"] == pytest.approx(300.0, abs=0.01)
+    assert "storage leg stays counted" in emitted["CommitmentCoverageNote"]
+    assert findings.total_monthly_savings == pytest.approx(storage, abs=0.01)
+
+
+def test_uncorroborated_idle_domain_stays_fully_advisory() -> None:
+    """A rec demoted for lack of idle evidence has no evidence of idleness at
+    all - the storage re-promotion must not resurrect it."""
+    from types import SimpleNamespace
+
+    import services.adapters.opensearch as mod
+
+    ctx = SimpleNamespace(
+        pricing_engine=SimpleNamespace(get_instance_monthly_price=lambda code, itype, **kw: 100.0),
+        pricing_multiplier=1.0,
+        region="us-east-1",
+        fast_mode=True,
+        cost_hub_splits={},
+        commitment_coverage=None,
+    )
+    ctx.client = lambda name, region=None: None
+    ctx.warn = lambda *a, **k: None
+    ctx.permission_issue = lambda *a, **k: None
+
+    findings = _scan_idle_with(mod, ctx, {"idle_domains": [_idle_rec(IdleCorroborated=False)]})
+    emitted = next(
+        r
+        for block in findings.sources.values()
+        for r in block.recommendations
+        if r["CheckCategory"] == "Idle Domain"
+    )
+    assert emitted["Counted"] is False
+    assert emitted["EstimatedMonthlySavings"] == 0.0
+
+
+def test_repromoted_idle_domain_carries_no_stale_advisory_estimate() -> None:
+    """The demotion parks the full gross in AdvisoryEstimate; on a rec that is
+    counted again that would render as a property row claiming more than the
+    card's own dollar."""
+    from types import SimpleNamespace
+
+    import services.adapters.opensearch as mod
+    from services.commitment_coverage import CommitmentCoverage
+
+    ctx = SimpleNamespace(
+        pricing_engine=SimpleNamespace(
+            get_instance_monthly_price=lambda code, itype, **kw: 100.0 if "r6g" in itype else 0.0
+        ),
+        pricing_multiplier=1.0,
+        region="us-east-1",
+        fast_mode=True,
+        cost_hub_splits={},
+        commitment_coverage=CommitmentCoverage(opensearch_ri_types=frozenset({"r6g.large"})),
+    )
+    ctx.client = lambda name, region=None: None
+    ctx.warn = lambda *a, **k: None
+    ctx.permission_issue = lambda *a, **k: None
+
+    findings = _scan_idle_with(mod, ctx, {"idle_domains": [_idle_rec()]})
+    emitted = next(
+        r
+        for block in findings.sources.values()
+        for r in block.recommendations
+        if r["CheckCategory"] == "Idle Domain"
+    )
+    assert "AdvisoryEstimate" not in emitted
+    # counted == rendered at the field level.
+    from services._savings import parse_dollar_savings
+
+    assert parse_dollar_savings(emitted["EstimatedSavings"]) == pytest.approx(
+        emitted["EstimatedMonthlySavings"], abs=0.01
+    )
