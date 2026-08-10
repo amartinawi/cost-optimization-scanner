@@ -371,6 +371,12 @@ MSK_BROKER_OVER_EC2: float = 2.19
 # Last-ditch MSK broker $/hr used only when BOTH the live MSK lookup and EC2
 # pricing fail; region-scaled via the fallback multiplier at the call site.
 FALLBACK_MSK_BROKER_HOURLY: float = 0.15
+# MSK Serverless cluster-hour charge, billed for the cluster's EXISTENCE
+# independent of partitions, storage or traffic. Validated against the live
+# Pricing API 2026-08-10 (AmazonMSK, us-east-1, usagetype
+# USE1-KafkaServerless-ClusterHours, operation Serverless, unit hours):
+# $0.75/cluster-hour = $547.50/month.
+FALLBACK_MSK_SERVERLESS_CLUSTER_HOURLY: float = 0.75
 
 # AWS Fargate compute rates (us-east-1, verified via Pricing API 2026-06).
 # Keyed by (architecture, os). ARM is ~20% cheaper than x86; Windows adds a
@@ -450,7 +456,7 @@ class PricingEngine:
             "api_errors": 0,
         }
 
-    def for_region(self, region_code: str) -> "PricingEngine":
+    def for_region(self, region_code: str) -> PricingEngine:
         """Return a ``PricingEngine`` scoped to ``region_code``.
 
         Returns ``self`` when ``region_code`` matches this engine's region;
@@ -827,6 +833,25 @@ class PricingEngine:
             price = self._use_fallback(
                 0.0,
                 f"Pricing API returned no result for EC2 {instance_type} ({os}, {license_model}) in {self._region}",
+            )
+        self._cache.set(key, price)
+        return price
+
+    def get_msk_serverless_cluster_hourly(self) -> float:
+        """$/cluster-hour for an MSK Serverless cluster in self._region.
+
+        This is the flat charge for the cluster existing — partitions, storage
+        and traffic bill on top of it — so it is the one MSK Serverless figure
+        that can be stated without any usage signal.
+        """
+        key = ("msk_serverless_cluster_hour",)
+        if (cached := self._get_cached(key)) is not None:
+            return cached
+        price = self._fetch_msk_serverless_cluster_hourly()
+        if price is None:
+            price = self._use_fallback(
+                FALLBACK_MSK_SERVERLESS_CLUSTER_HOURLY * self._fallback_multiplier,
+                f"Pricing API unavailable for the MSK Serverless cluster-hour in {self._region}; using fallback",
             )
         self._cache.set(key, price)
         return price
@@ -1939,6 +1964,35 @@ class PricingEngine:
             {"Type": "TERM_MATCH", "Field": "deploymentOption", "Value": deployment_option},
         ]
         return self._call_pricing_api("AmazonFSx", filters)
+
+    def _fetch_msk_serverless_cluster_hourly(self) -> float | None:
+        """Live $/cluster-hour for MSK Serverless, or None.
+
+        ``operation=Serverless`` returns five rows for one region (cluster-hours,
+        partition-hours, storage, data-in, data-out), so the usagetype suffix —
+        not the row order — selects the cluster-hour one.
+        """
+        filters = [
+            {"Type": "TERM_MATCH", "Field": "location", "Value": self._display_name},
+            {"Type": "TERM_MATCH", "Field": "operation", "Value": "Serverless"},
+        ]
+        try:
+            resp = self._pricing.get_products(ServiceCode="AmazonMSK", Filters=filters, MaxResults=100)
+            self._stats["api_calls"] += 1
+            for raw in resp.get("PriceList", []):
+                item = json.loads(raw)
+                usagetype = item.get("product", {}).get("attributes", {}).get("usagetype", "")
+                if not usagetype.endswith("KafkaServerless-ClusterHours"):
+                    continue
+                price, unit = _extract_usd_with_unit(item)
+                if price is not None and str(unit).lower().startswith("hour"):
+                    logger.debug("pricing:GetProducts  AmazonMSK  serverless cluster-hour → $%.4f/hr", price)
+                    return price
+            logger.debug("pricing:GetProducts  AmazonMSK  no serverless ClusterHours row")
+            return None
+        except Exception as exc:
+            logger.debug("pricing:GetProducts  AmazonMSK  serverless cluster-hour failed: %s", exc)
+            return None
 
     def _fetch_fsx_throughput_price(
         self, file_system_type: str, deployment_option: str
