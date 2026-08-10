@@ -491,6 +491,14 @@ def get_efs_findings(
                                         "ia_rate_per_gb_month": round(ia_rate, 6),
                                         "ia_access_rate_per_gb": round(ia_access_rate, 6),
                                         "gross_savings": round(est.gross_savings, 2),
+                                        # FS-4 — always 0.0. The accessed bytes
+                                        # are already excluded from cold_gb, so
+                                        # they never transition to IA and cannot
+                                        # generate an IA access charge; levying
+                                        # one penalised the same fact twice. The
+                                        # rate is recorded below as the exposure
+                                        # on any FUTURE access to today's cold
+                                        # bytes, which the window cannot see.
                                         "ia_access_charge": round(est.access_charge, 2),
                                         "basis": (
                                             "cold_gb = Standard - bytes accessed in window; "

@@ -272,6 +272,14 @@ def get_enhanced_workspaces_checks(ctx: ScanContext) -> dict[str, Any]:
                     }
                     if measured_hours is not None:
                         rec["MeasuredMonthlyHours"] = round(float(measured_hours), 1)
+                    # WS-4 — AutoStop keeps billing for the configured timeout
+                    # AFTER each disconnect, so connected hours alone understate
+                    # the projected AutoStop cost and overstate the saving. Carry
+                    # the timeout so the adapter can charge for it; a WorkSpace
+                    # that does not report one cannot be projected at all.
+                    timeout_minutes = props.get("RunningModeAutoStopTimeoutInMinutes")
+                    if timeout_minutes is not None:
+                        rec["AutoStopTimeoutMinutes"] = timeout_minutes
                     checks["billing_mode_optimization"].append(rec)
 
                 if state in ["STOPPED", "ERROR", "SUSPENDED"]:

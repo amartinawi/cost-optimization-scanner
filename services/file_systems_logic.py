@@ -52,7 +52,7 @@ class EfsLifecycleEstimate(NamedTuple):
 
     cold_gb: float          # Standard bytes not accessed in the metric window
     gross_savings: float    # cold_gb x (Standard - IA) rate delta
-    access_charge: float    # monthly accessed bytes x IA per-GB access rate
+    access_charge: float    # always 0.0 — see FS-4 in efs_lifecycle_net_savings
     net_savings: float      # gross_savings - access_charge
 
 
@@ -66,14 +66,22 @@ def efs_lifecycle_net_savings(
     """NET monthly saving from enabling EFS IA lifecycle, from measured access.
 
     ``cold_gb`` is the measured Standard bytes MINUS the bytes actually read or
-    written over the metric window (anything touched in the window is treated as
-    hot and excluded — conservative). The IA per-GB access charge on the accessed
-    bytes is netted out, so the result is a defensible NET, not a gross figure.
+    written over the metric window: anything touched in the window is treated as
+    hot and excluded from the saving entirely. That exclusion is the model's
+    conservative margin.
+
+    FS-4 — the IA per-GB access charge used to be levied on those same accessed
+    bytes, which is a DOUBLE penalty for one fact. Bytes excluded from the cold
+    set never transition to IA, so they can never generate an IA access charge:
+    the fee priced an event that cannot occur under this model. It is therefore
+    zero here, and ``ia_access_rate`` is retained in the signature so callers
+    keep recording the rate they would pay on any FUTURE access to bytes that
+    are cold today — the residual risk the 30-day window cannot see.
     """
     cold_gb = max(standard_gb - max(monthly_access_gb, 0.0), 0.0)
     gross = cold_gb * max(standard_rate - ia_rate, 0.0)
-    access_charge = max(monthly_access_gb, 0.0) * max(ia_access_rate, 0.0)
-    return EfsLifecycleEstimate(cold_gb, gross, access_charge, gross - access_charge)
+    _ = ia_access_rate  # see FS-4 above: not charged against excluded bytes
+    return EfsLifecycleEstimate(cold_gb, gross, 0.0, gross)
 
 
 def efs_one_zone_savings(total_gb: float, regional_rate: float, one_zone_rate: float) -> float:

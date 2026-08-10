@@ -28,6 +28,13 @@ def _compute_type_of(rec: dict[str, Any]) -> str:
     return (compute_type or "").upper()
 
 
+# WS-4 — AutoStop bills for the timeout window after every disconnect, and
+# there is no session-count metric. One disconnect per day is assumed and
+# recorded in the AuditBasis; more sessions cost MORE, so this is a floor on
+# the timeout charge rather than an assumption in the saving's favour.
+_ASSUMED_MONTHLY_SESSIONS: int = 30
+
+
 class WorkspacesModule(BaseServiceModule):
     """ServiceModule adapter for WorkSpaces. Live-pricing savings strategy."""
 
@@ -192,13 +199,39 @@ class WorkspacesModule(BaseServiceModule):
             return
         fee, hourly = autostop
         hours = float(measured_hours)
-        projected_autostop = fee + hourly * hours
+        # WS-4 — AutoStop does not stop billing when the user disconnects: the
+        # WorkSpace keeps running for RunningModeAutoStopTimeoutInMinutes and
+        # every one of those minutes is billed. Projecting from connected hours
+        # alone understates the AutoStop cost and overstates the saving, and
+        # with a long timeout it can flip the sign outright — the rec would
+        # recommend a switch that COSTS money.
+        timeout_minutes = rec.get("AutoStopTimeoutMinutes")
+        if timeout_minutes is None:
+            self._advisory(
+                rec,
+                "WorkSpace reports no AutoStop timeout, so the post-disconnect hours "
+                "AutoStop would bill cannot be projected",
+            )
+            return
+        try:
+            timeout_hours = max(0.0, float(timeout_minutes) / 60.0)
+        except (TypeError, ValueError):
+            self._advisory(rec, f"unreadable AutoStop timeout {timeout_minutes!r}")
+            return
+        # One disconnect per day is the assumption, stated in the basis. There
+        # is no session-count metric, and MORE sessions cost more, so this is a
+        # floor on the timeout charge rather than a guess in our favour.
+        idle_hours = _ASSUMED_MONTHLY_SESSIONS * timeout_hours
+        billed_hours = hours + idle_hours
+        projected_autostop = fee + hourly * billed_hours
         delta = always_on - projected_autostop
         if delta <= 0:
             self._advisory(
                 rec,
-                f"at {hours:.0f} connected hrs/mo AutoStop (${projected_autostop:.2f}) is not "
-                f"cheaper than AlwaysOn (${always_on:.2f})",
+                f"at {hours:.0f} connected hrs/mo plus {idle_hours:.0f} hrs of "
+                f"{timeout_hours * 60:.0f}-minute AutoStop timeout, AutoStop "
+                f"(${projected_autostop:.2f}) is not cheaper than AlwaysOn "
+                f"(${always_on:.2f})",
             )
             return
         saving = delta * multiplier
@@ -210,9 +243,16 @@ class WorkspacesModule(BaseServiceModule):
             "autostop_fee_monthly": fee,
             "autostop_hourly": hourly,
             "measured_monthly_hours": round(hours, 1),
+            "autostop_timeout_minutes": timeout_minutes,
+            "assumed_monthly_sessions": _ASSUMED_MONTHLY_SESSIONS,
+            "post_disconnect_billed_hours": round(idle_hours, 1),
+            "projected_autostop_monthly": round(projected_autostop, 2),
             "region_multiplier": round(multiplier, 4),
             "metric": "AWS/WorkSpaces UserConnected hours over 30d, scaled to 730h",
-            "formula": "(always_on - (autostop_fee + autostop_hourly x hours)) x region_multiplier",
+            "formula": (
+                "(always_on - (autostop_fee + autostop_hourly x (connected_hours + "
+                "sessions x timeout_hours))) x region_multiplier"
+            ),
             "rate_source": _RATE_SOURCE,
         }
 
