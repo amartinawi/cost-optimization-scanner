@@ -139,14 +139,18 @@ class WorkspacesModule(BaseServiceModule):
 
         # Count hygiene: $0 (metric-gated / abstained) recs are shown but excluded
         # from the counted total AND the rec-count headline (mirrors lambda_svc).
+        # D4 — the CoH recs must go through the same $0 gate as the local ones.
+        # A CoH payload with no estimatedMonthlySavings would otherwise be
+        # counted in the rec headline while contributing $0 to the dollar total.
+        mark_zero_savings_advisory(
+            recs + coh_recs, lambda r: float(r.get("EstimatedMonthlySavings", 0) or 0)
+        )
+        counted_recs = sum(1 for r in recs + coh_recs if r.get("Counted") is not False)
         savings += sum(
             float(r.get("EstimatedMonthlySavings", 0.0) or 0.0)
             for r in coh_recs
             if r.get("Counted") is not False
         )
-
-        mark_zero_savings_advisory(recs, lambda r: float(r.get("EstimatedMonthlySavings", 0) or 0))
-        counted_recs = sum(1 for r in recs + coh_recs if r.get("Counted") is not False)
 
         sources = {
             "enhanced_checks": SourceBlock(count=len(recs), recommendations=tuple(recs)),

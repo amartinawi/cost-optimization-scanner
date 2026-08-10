@@ -269,3 +269,21 @@ def test_sagemaker_savings_plan_demotes_the_coh_rec_too(monkeypatch) -> None:
     rec = findings.sources["cost_optimization_hub"].recommendations[0]
     assert rec["Counted"] is False
     assert findings.total_monthly_savings == 0.0
+
+
+def test_zero_dollar_coh_workspace_rec_does_not_inflate_the_count(monkeypatch) -> None:
+    """D4 — a CoH payload with no estimatedMonthlySavings must go through the
+    same $0 gate as the local recs, or it counts as a recommendation while
+    contributing nothing to the dollar total."""
+    rec = _coh("ws-1", 0.0, rtype="WorkSpaces")
+    ctx = _ws_ctx([rec], [], monkeypatch)
+    findings = WorkspacesModule().scan(ctx)
+    assert findings.total_recommendations == 0
+    assert findings.total_monthly_savings == 0.0
+    assert findings.sources["cost_optimization_hub"].recommendations[0]["Counted"] is False
+
+
+def test_zero_dollar_coh_sagemaker_rec_does_not_inflate_the_count() -> None:
+    findings = SageMakerModule().scan(_sm_ctx([_coh("ep-1", 0.0, rtype="SageMakerEndpoint")], []))
+    assert findings.total_recommendations == 0
+    assert findings.total_monthly_savings == 0.0
