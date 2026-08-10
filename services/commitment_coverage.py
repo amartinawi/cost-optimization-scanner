@@ -55,6 +55,16 @@ COMMITMENT_SENSITIVE_SERVICES: frozenset[str] = frozenset(
 # Aurora instances draw on the same Reserved DB Instance pool as RDS.
 _RDS_RI_SERVICES: frozenset[str] = frozenset({"rds", "aurora"})
 
+# Services a Savings Plan can cover, by plan family. The SP read is gated on the
+# union: a Database SP is invisible to every compute service, so gating on the
+# compute set alone silently disabled it for the services it actually covers.
+# Redshift is deliberately absent from the Database set (LS-8) — see
+# CommitmentCoverage.has_database_sp.
+_COMPUTE_SP_SERVICES: frozenset[str] = frozenset({"ec2", "lambda", "containers", "sagemaker"})
+_DATABASE_SP_SERVICES: frozenset[str] = frozenset(
+    {"rds", "aurora", "elasticache", "opensearch", "dynamodb"}
+)
+
 # Services whose Reserved Instances/Nodes are matched at EXACT type granularity
 # (their reservations are NOT size-flexible): a Redshift Reserved Node / OpenSearch
 # Reserved Instance covers only the purchased node/instance type, not the family.
@@ -132,6 +142,16 @@ class CommitmentCoverage:
     ec2_ri_types: frozenset[str] = field(default_factory=frozenset)
     has_compute_sp: bool = False
     has_sagemaker_sp: bool = False
+    # Database Savings Plan (GA 2025-12) — region-flexible, and covers a whole
+    # SET of services rather than one. Live offering productTypes (LS-8):
+    # RDS, DynamoDB, DSQL, Neptune, DocDB, ElastiCache, Timestream, Keyspaces,
+    # DMS, OpenSearch. **Redshift is deliberately absent** — demoting a Redshift
+    # rec on this flag would under-count a real saving.
+    # Deliberately imprecise in the SAFE direction: the plan's rates reach only
+    # Gen7+ RDS families, Valkey-era ElastiCache nodes and Graviton OpenSearch,
+    # but this boolean demotes every family of a covered service. Over-demotion
+    # under-counts, which the tie-break rule prefers to any risk of overstating.
+    has_database_sp: bool = False
     # Data-store / cache Reserved Instances (family-flexible unless noted).
     # RDS/Aurora share one pool; RIs are engine-scoped, so the (family, engine)
     # pairs are authoritative and ``rds_ri_families`` is the engine-agnostic
@@ -179,8 +199,8 @@ class CommitmentCoverage:
         return self.has_sagemaker_sp
 
     def covers_dynamodb(self) -> bool:
-        """True if the account holds DynamoDB reserved capacity."""
-        return self.dynamodb_reserved
+        """True if DynamoDB reserved capacity or a Database SP covers the table."""
+        return self.dynamodb_reserved or self.has_database_sp
 
     def covers_rds(self, instance_class: str, engine: str = "") -> bool:
         """True if a Reserved DB Instance covers this instance's family + engine.
@@ -190,6 +210,11 @@ class CommitmentCoverage:
         ``engine`` is given and engine-tagged RIs were resolved, both must match;
         otherwise falls back to the engine-agnostic family check.
         """
+        if self.has_database_sp:
+            # A Database SP is engine-agnostic, so it is checked BEFORE the
+            # engine-scoped RI logic — otherwise an engine-tagged RI set would
+            # veto coverage the SP genuinely provides (LS-8).
+            return True
         fam = instance_family(instance_class)
         if engine and self.rds_ri_engine_families:
             return (fam, normalize_engine(engine)) in self.rds_ri_engine_families
@@ -200,16 +225,20 @@ class CommitmentCoverage:
         return self.covers_rds(instance_class, engine)
 
     def covers_elasticache(self, node_type: str) -> bool:
-        """True if a Reserved Cache Node covers this node's family."""
-        return instance_family(node_type) in self.elasticache_ri_families
+        """True if a Reserved Cache Node or a Database SP covers this node."""
+        return self.has_database_sp or instance_family(node_type) in self.elasticache_ri_families
 
     def covers_redshift(self, node_type: str) -> bool:
         """True if a Reserved Node covers this EXACT node type (not size-flexible)."""
         return normalize_type(node_type) in self.redshift_ri_types
 
     def covers_opensearch(self, instance_type: str) -> bool:
-        """True if a Reserved Instance covers this EXACT type (not size-flexible)."""
-        return normalize_type(instance_type) in self.opensearch_ri_types
+        """True if a Reserved Instance or a Database SP covers this instance.
+
+        The RI leg is exact-type (OpenSearch RIs are not size-flexible); the
+        Database SP leg is not type-scoped at all.
+        """
+        return self.has_database_sp or normalize_type(instance_type) in self.opensearch_ri_types
 
     def covers(self, service: str, resource_type: str, engine: str = "") -> bool:
         """Dispatch coverage check by service key (for the data-store adapters)."""
@@ -276,6 +305,7 @@ class CommitmentCoverage:
         return bool(
             self.has_compute_sp
             or self.has_sagemaker_sp
+            or self.has_database_sp
             or self.dynamodb_reserved
             or self.ec2_sp_families
             or self.ec2_ri_families
@@ -574,14 +604,22 @@ def _report(ctx: Any, exc: Exception, message: str, action: str) -> None:
         ctx.warn(f"{message}: {exc}", service="commitment_coverage")
 
 
-def _fetch_savings_plans(ctx: Any) -> tuple[frozenset[str], bool, bool]:
-    """Return (region EC2-Instance SP families, any Compute SP, any SageMaker SP).
+def _fetch_savings_plans(ctx: Any) -> tuple[frozenset[str], bool, bool, bool]:
+    """Return (region EC2-Instance SP families, Compute SP, SageMaker SP, Database SP).
 
-    EC2-Instance SPs are region-locked (filter on ``region``); Compute and
-    SageMaker SPs are region-flexible (a plan anywhere covers the scan region).
+    EC2-Instance SPs are region-locked (filter on ``region``); Compute,
+    SageMaker and Database SPs are region-flexible (a plan anywhere covers the
+    scan region).
+
+    LS-8 — ``Database`` was previously matched by no branch at all, so an active
+    Database Savings Plan was invisible and the rightsizing recs it already
+    absorbs stayed counted (C6). Its region-flexibility is not assumed: the live
+    offering record carries no ``region`` field, exactly like the Compute
+    offering (``savingsplans:DescribeSavingsPlansOfferings``, offering
+    ``bf9234b3-5784-4a5e-9ef4-29095d898aaf``, verified 2026-08-10).
     """
     families: set[str] = set()
-    has_compute = has_sagemaker = False
+    has_compute = has_sagemaker = has_database = False
     try:
         client = ctx.client("savingsplans")
         token: str | None = None
@@ -596,16 +634,24 @@ def _fetch_savings_plans(ctx: Any) -> tuple[frozenset[str], bool, bool]:
                     has_compute = True
                 elif sp_type == "SageMaker":
                     has_sagemaker = True
+                elif sp_type == "Database":
+                    has_database = True
                 elif sp_type == "EC2Instance" and sp.get("region", "") == ctx.region:
                     fam = (sp.get("ec2InstanceFamily", "") or "").lower()
                     if fam:
                         families.add(fam)
-            token = resp.get("nextToken")
-            if not token:
+            next_token = resp.get("nextToken")
+            # Same termination guard as the CE pager below: a non-string or
+            # repeated token ends the loop instead of spinning forever. The
+            # guard was previously unreachable in practice because the SP read
+            # only fired for compute scans; LS-8 widened that gate, so an
+            # unterminated pager would now hang far more scans.
+            if not isinstance(next_token, str) or not next_token or next_token == token:
                 break
+            token = next_token
     except Exception as exc:  # noqa: BLE001 — fail-safe: no demotion on read failure
         _report(ctx, exc, "Could not read Savings Plans (rightsizing recs not SP-adjusted)", "savingsplans:DescribeSavingsPlans")
-    return frozenset(families), has_compute, has_sagemaker
+    return frozenset(families), has_compute, has_sagemaker, has_database
 
 
 def _fetch_ec2_reserved(ctx: Any) -> tuple[frozenset[str], frozenset[str]]:
@@ -833,19 +879,23 @@ def fetch_commitment_coverage(ctx: Any, selected: set[str]) -> CommitmentCoverag
     surfaces a warning/permission issue, so the scan never crashes and
     degradation is visible.
     """
-    want_sp = bool(selected & {"ec2", "lambda", "containers", "sagemaker"})
+    # LS-8 — the SP read must also fire for the DATABASE-SP services. Gating it
+    # on the compute set alone meant a scan of only database services never
+    # read the plans, so has_database stayed False and the recs an active
+    # Database SP already absorbs kept counting.
+    want_sp = bool(selected & (_COMPUTE_SP_SERVICES | _DATABASE_SP_SERVICES))
     ec2_fams: frozenset[str] = frozenset()
-    has_compute = has_sagemaker = False
+    has_compute = has_sagemaker = has_database = False
     ec2_ri_fams: frozenset[str] = frozenset()
     ec2_ri_types: frozenset[str] = frozenset()
     util_pct = unused = None
 
     if want_sp:
-        ec2_fams, has_compute, has_sagemaker = _fetch_savings_plans(ctx)
+        ec2_fams, has_compute, has_sagemaker, has_database = _fetch_savings_plans(ctx)
     if "ec2" in selected:
         ec2_ri_fams, ec2_ri_types = _fetch_ec2_reserved(ctx)
 
-    has_sp = bool(ec2_fams or has_compute or has_sagemaker)
+    has_sp = bool(ec2_fams or has_compute or has_sagemaker or has_database)
     if has_sp:
         util_pct, unused = _fetch_sp_utilization(ctx)
 
@@ -862,6 +912,7 @@ def fetch_commitment_coverage(ctx: Any, selected: set[str]) -> CommitmentCoverag
         ec2_ri_types=ec2_ri_types,
         has_compute_sp=has_compute,
         has_sagemaker_sp=has_sagemaker,
+        has_database_sp=has_database,
         rds_ri_families=rds_fams,
         rds_ri_engine_families=rds_engine_fams,
         elasticache_ri_families=_fetch_ri_families(ctx, "elasticache") if "elasticache" in selected else frozenset(),
