@@ -1880,6 +1880,9 @@ def _render_generic_other_rec(content: str, rec: Rec, source_name: str) -> str:
         or rec.get("ClusterArn", "").split("/")[-1]
         or rec.get("ContainerName")
         or rec.get("WorkgroupName")
+        # Redshift Serverless uses WorkgroupName; Athena uses WorkGroup. Both,
+        # not either — they are different services (ATH-1 D5).
+        or rec.get("WorkGroup")
         or rec.get("WorkspaceId")
         or rec.get("Namespace")
         or rec.get("FileSystemId")

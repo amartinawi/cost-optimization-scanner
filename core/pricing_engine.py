@@ -837,6 +837,32 @@ class PricingEngine:
         self._cache.set(key, price)
         return price
 
+    def get_athena_data_scanned_price_per_tb(self) -> float | None:
+        """$/TB scanned for Athena in self._region, or ``None``.
+
+        Returns ``None`` — never a fallback — when the region is not in
+        ``REGION_DISPLAY_NAMES`` or the SKU is missing. ``self._display_name``
+        silently defaults to "US East (N. Virginia)" for an unmapped region, so
+        a fallback here would price sa-east-1 ($9.00/TB) at the us-east-1 rate
+        ($5.00) and the caller would label it with the real region name. Five
+        regions in ``CostOptimizer.REGIONAL_PRICING`` are absent from
+        ``REGION_DISPLAY_NAMES`` today, so this is reachable, not theoretical.
+
+        Athena's scan surface does NOT track the generic pricing multiplier:
+        sa-east-1 is 1.80x on scanned TB while its DPU-hour rate is identical to
+        us-east-1. Callers must use this rate directly and never scale it (C1).
+        """
+        if self._region not in REGION_DISPLAY_NAMES:
+            return None
+        key = ("athena_scanned_tb",)
+        if (cached := self._get_cached(key)) is not None:
+            return cached or None
+        price = self._fetch_athena_scanned_tb()
+        # Cache the miss as 0.0 so the probe is not repeated per workgroup; the
+        # `or None` above turns it back into an abstain for the caller.
+        self._cache.set(key, price if price is not None else 0.0)
+        return price
+
     def get_msk_serverless_cluster_hourly(self) -> float:
         """$/cluster-hour for an MSK Serverless cluster in self._region.
 
@@ -1964,6 +1990,34 @@ class PricingEngine:
             {"Type": "TERM_MATCH", "Field": "deploymentOption", "Value": deployment_option},
         ]
         return self._call_pricing_api("AmazonFSx", filters)
+
+    def _fetch_athena_scanned_tb(self) -> float | None:
+        """Live $/TB for the Athena DataScannedInTB SKU, or None.
+
+        AmazonAthena publishes three usagetypes per region (DataScannedInTB,
+        ReservedCapacityInDPUHours, CodeExecutionInDPUHours), so the suffix
+        match is unique.
+        """
+        filters = [
+            {"Type": "TERM_MATCH", "Field": "location", "Value": self._display_name},
+        ]
+        try:
+            resp = self._pricing.get_products(ServiceCode="AmazonAthena", Filters=filters, MaxResults=100)
+            self._stats["api_calls"] += 1
+            for raw in resp.get("PriceList", []):
+                item = json.loads(raw)
+                usagetype = item.get("product", {}).get("attributes", {}).get("usagetype", "")
+                if not usagetype.endswith("DataScannedInTB"):
+                    continue
+                price, unit = _extract_usd_with_unit(item)
+                if price is not None and price > 0:
+                    logger.debug("pricing:GetProducts  AmazonAthena  DataScannedInTB → $%.2f/%s", price, unit)
+                    return price
+            logger.debug("pricing:GetProducts  AmazonAthena  no DataScannedInTB row for %s", self._display_name)
+            return None
+        except Exception as exc:
+            logger.debug("pricing:GetProducts  AmazonAthena  DataScannedInTB failed: %s", exc)
+            return None
 
     def _fetch_msk_serverless_cluster_hourly(self) -> float | None:
         """Live $/cluster-hour for MSK Serverless, or None.

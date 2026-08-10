@@ -175,16 +175,19 @@ def test_h5_athena_fast_mode_recs_are_advisory(monkeypatch: pytest.MonkeyPatch) 
         athena_mod, "get_enhanced_athena_checks", lambda ctx: {"recommendations": recs}
     )
 
-    ctx = SimpleNamespace(fast_mode=True, pricing_multiplier=1.0)
+    warnings: list[str] = []
+    ctx = SimpleNamespace(fast_mode=True, pricing_multiplier=1.0, pricing_engine=None)
+    ctx.warn = lambda msg, service=None: warnings.append(msg)
+    ctx.permission_issue = lambda msg, service=None, action=None: None
     findings = athena_mod.AthenaModule().scan(ctx)
 
     assert findings.total_monthly_savings == 0.0
-    # $0 advisory recs render but are excluded from the headline count.
     assert findings.total_recommendations == 0
-    for rec in recs:
-        assert rec["EstimatedMonthlySavings"] == 0.0
-        assert rec["Counted"] is False
-        assert rec["PricingWarning"]
+    # ATH-1: fast mode measures nothing, so it emits no cards at all rather than
+    # one identical "could not measure" advisory per workgroup. The gap is
+    # surfaced as a warning, which is where an unmeasurable read belongs.
+    assert findings.sources["enhanced_checks"].recommendations == ()
+    assert len(warnings) == len(recs)
 
 
 # --------------------------------------------------------------------------- #
