@@ -72,6 +72,88 @@ The sweep confirms the verification's extrapolation: material false negatives ex
 - **monitoring/workspaces:** MON-3 CW Logs ingestion (the dominant CW cost) has no lever — Standard→IA class is measurable from `logGroupClass` + `IncomingBytes`; MON-4 CloudTrail stub reserves a client and renders an empty block while duplicate-trail charges are deterministic; MON-6 worst-in-repo D4 (advisory-heavy tab); MON-7 Route53 tier ladder never walks down (under-count above 25 zones); MON-8 duplicate-private-zone counted without the VPC-association evidence its own text asks for; WS-2 OS/BYOL caveat attached only to the advisory, not the two counted levers (~$4/WS/mo, contradicts CLAUDE.md's claim); WS-3 missing ComputeType silently defaults to STANDARD and counts $35 (highest-risk on ERROR-state WorkSpaces — the Unused check's own target); WS-4 AutoStop projection ignores the auto-stop timeout (can flip the saving's sign); WS-5 never-connected AlwaysOn gets only the AutoStop rec; WS-6 dead branches + rank-table gaps.
 - **[KNOWN] restatements** (blind agents independently rediscovering report/Pass-3 items — a useful convergence signal): aurora CW helpers, opensearch/msk/transfer/monitoring E1s, athena CW E1, lambda PC dimension, bedrock blended rate + KB Counted, network VPC-endpoint double-count (reproduced at 150% of pool).
 
+## Reconciled backlog (2026-08-10, after tranche 10)
+
+Counted by reading the three findings sections above and matching every id
+against what each tranche actually landed — not by decrementing an estimate.
+The earlier running "~N items remaining" figure was wrong and is withdrawn.
+
+| | count |
+|---|---|
+| Findings enumerated by the sweep | **153** |
+| Landed across tranches 1–10 | **69** |
+| **Remaining** | **84** |
+
+**The headline correction: 1 CRITICAL and 7 HIGH findings are still open.**
+The priority ranking that drove tranches 1–5 never included them, and the
+themed tail slices (6, 7, 9, 10) did not reach them either. Each is verified
+against current code below.
+
+### Still open — CRITICAL
+
+- **ATH-1** `athena` — an unconditional `* 0.75` on every counted Athena dollar,
+  emitted for every ENABLED workgroup with zero format/partition evidence.
+  **Verified present at `services/adapters/athena.py:71`.**
+
+### Still open — HIGH
+
+- **RS-A** `redshift` — the tab's only counted source is its CoH bucket, and
+  `RedshiftCluster` is not a CoH ResourceType, so the bucket can never receive
+  a rec. Every local heuristic is `$0` by construction. **Verified: the adapter
+  sets only `Counted=False` / `EstimatedMonthlySavings = 0.0`.** The tab is
+  structurally incapable of reporting a dollar from either direction.
+- **QS-1** `quicksight` — the only counted lever is gated on
+  `quicksight.describe_spice_capacity`, which **does not exist in boto3
+  (verified)**, so the tab is empty on every real scan. `list_data_sets` /
+  `describe_data_set` DO exist and expose `ConsumedSpiceCapacityInBytes`.
+- **QS-2**, **QS-3** `quicksight` — latent behind QS-1: a flat SPICE rate that is
+  region-scaled (C1), and counting bundled per-Author capacity that is neither
+  billed nor releasable (C11, ~4.5x overstatement). Both activate the moment
+  QS-1 is fixed, so they must land together.
+- **MS-1**, **MS-2** `mediastore` — the counted path is unreachable (wrong metric
+  name) AND the unused gate requires datapoints from opt-in metrics that idle
+  containers never emit — unsatisfiable for its own target population.
+  **Verified: the counted branch is gated on `EstimatedStorageGB > 0`.**
+  MS-6 asks whether MediaStore's EOL makes retiring the adapter the better fix.
+- **FS-2** `file_systems` — the lifecycle lever subtracts I/O *volume* from
+  *stored bytes*, which is dimensionally wrong: a file system that reads one 1 GB
+  file a hundred times reports 100 GB of "access" against 1 GB of hot data, so
+  an active file system can never produce the counted lifecycle dollar.
+  **Verified at `services/file_systems_logic.py:81`** — adjacent to the FS-4 fix
+  in tranche 10, which corrected the access *fee* but not this subtraction.
+
+### Still open — MEDIUM/LOW, by service (explicit ids, no ranges)
+
+- **ami** (2): AM-1, AM-2
+- **api_gateway** (2): AG-2, AG-4
+- **athena** (5): ATH-2, ATH-3, ATH-6, ATH-7, ATH-8
+- **aurora** (4): AUR-D, AUR-E, AUR-F, AUR-H
+- **batch** (1): BATCH-rec_gross
+- **bedrock** (2): BR-7, BR-8
+- **cloudfront** (3): CF-3, CF-5, CF-6
+- **commitment** (6): M1, M2, M3, L1, L2, L3
+- **containers** (3): CN-2, CN-3, CN-4
+- **dms** (3): DMS-2, DMS-3, DMS-5
+- **dynamodb** (1): DDB-B
+- **ebs** (2): EB-1, EB-2
+- **ec2** (3): EC2-5, EC2-6, EC2-7
+- **eks_cost** (3): EKS-3, EKS-4, EKS-5
+- **file_systems** (4): FS-3, FS-5, FS-8, FS-9
+- **glue** (4): GL-2, GL-3, GL-5, GL-6
+- **lambda** (4): LAM-4, LAM-5, LAM-6, LAM-7
+- **mediastore** (4): MS-3, MS-4, MS-5, MS-6
+- **monitoring** (2): MON-4, MON-6
+- **msk** (2): MSK-2, MSK-4
+- **network_cost** (1): NC-2
+- **opensearch** (4): OS-3, OS-6, OS-8, OS-10
+- **quicksight** (3): QS-4, QS-5, QS-6
+- **redshift** (2): RS-B, RS-C
+- **sagemaker** (2): SM-4, SM-5
+- **step_functions** (1): SF-1
+- **workspaces** (3): WS-2, WS-5, WS-6
+
+Descriptions for every id above are in the MEDIUM/LOW section of this document.
+
 ## Fix status (2026-08-09, branch `fix/sweep-priority-1`)
 
 **Adversarially reviewed** (Code Reviewer verdict: 3/5 commits sound as shipped; sagemaker and network_cost had blockers, all fixed in follow-up commits `74121d0`, `8e1ebf5`, `d8b8a2a`): the sagemaker idle verdict is now fully fail-closed (live `CurrentInstanceCount=0` authoritative — scale-to-zero endpoints contribute nothing; BOTH CreationTime and LastModifiedTime must predate the window — blue/green redeploys abstain; `ListMetrics` dimension-set discovery — inference-component-only endpoints abstain); network_cost dropped the SERVICE constraint entirely (transfer bills under "EC2 - Other"/S3/CloudFront — the repo's own C8-corollary lesson), classifies client-side with a strict token allowlist (no catch-all), and warns on zero rows so this bug class can never hide again; opensearch fails closed on a missing region; bedrock's `_rate_key` handles the Claude context-window suffix and the dead `currentModelArn` key is gone. Residual follow-up: validate the unfiltered transfer query against ONE live account scan (the fake CE cannot prove real CE row shapes), and normalize idle-notebook/spot advisories onto `PotentialMonthlySavings`.
@@ -154,7 +236,7 @@ Carried forward from the tranche-3 review (not blockers): the `get_recommendatio
 
 - **Two CoH types remain unrouted BY DESIGN**: `MemoryDBCluster` and `DocumentDBCluster` have no adapter and no report tab. Routing them is not the work — writing a MemoryDB / DocumentDB adapter is, and only then does a bucket make sense.
 - **New levers worth building next** (not from the original ranking, surfaced while working it): a **CloudWatch Logs retention** lever — unlike MON-3's class migration, `PutRetentionPolicy` IS an in-place change, so a never-expiring group's deletable bytes are a genuinely countable saving once an age-of-bytes signal (Logs Insights) is wired; and **apigatewayv2** coverage, still out of scope per the api_gateway module docstring.
-- **The MEDIUM/LOW tail** (**count not reliably known** — the running "~N items" figure carried through these fix-status blocks was decremented tranche by tranche and never re-derived; expanding the id ranges below gives ~79 individual findings, matching landed ids against them gives ~15, and neither method is trustworthy because the ranges and the prose cross-reference each other. Treat the per-service list below as the authoritative enumeration and count it properly before planning off it; tranches 6 and 7 took the wrong-dollar and under-count slices in the compressed section above): aurora AUR-D/AUR-E/AUR-F/AUR-H, redshift RS-A/RS-B/RS-C, DDB-B/DDB-D, opensearch OS-6/OS-8/OS-10, msk MSK-2/MSK-4, ec2 EC2-5…EC2-8, eks EKS-3…EKS-5, containers CN-2…CN-4, file_systems FS-2/FS-3/FS-5/FS-8/FS-9, dms DMS-2/DMS-3/DMS-5, glue GL-2/GL-3/GL-5/GL-6, lambda LAM-4…LAM-7, athena ATH-2…ATH-8, quicksight QS-1…QS-6, network (NET-A/C/D/F done), api_gateway AG-4, mediastore MS-1…MS-6, commitment M1–M3/L1–L3, sagemaker SM-4/SM-5, bedrock BR-5/BR-7/BR-8, monitoring MON-4/MON-5/MON-6 (MON-3, MON-7, MON-8 done), workspaces WS-2/WS-5/WS-6, ebs/ami EB-1/EB-2/AM-1/AM-2, lightsail LS-2/LS-3.
+- **The MEDIUM/LOW tail** — see the **Reconciled backlog** section above for the explicit per-service list; the ranges in the MEDIUM/LOW section are the descriptions, that section is the count.
 - **Carried from the tranche-10 review**: nothing blocking. The five recurring classes are recorded in `_LIVE_AUDIT_LESSONS.md` (**A6** least-guarded dedup producer, **C12** strict price mode needs a strict cache namespace, **C13** metric reporting-criteria polarity + dimension sets, **D5** a new counted lever needs a render check, **D6** a demoted rec's masked figure must reach the card), along with a nameless-counted-rec invariant sweep and a new-counted-lever verification checklist.
 - **Live validation** (from the verification doc): confirm the rewritten network_cost transfer query returns real rows on ONE live account scan — fakes cannot prove real CE row shapes.
 
