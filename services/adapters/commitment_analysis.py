@@ -93,9 +93,7 @@ class CommitmentAnalysisModule(BaseServiceModule):
     cli_aliases: tuple[str, ...] = ("commitment_analysis", "commitments", "savings_plans", "ri")
     display_name: str = "Commitment Analysis"
 
-    AVG_SP_DISCOUNT_RATE: float = 0.30
     UTILIZATION_THRESHOLD: float = 0.95
-    COVERAGE_GAP_THRESHOLD: float = 0.80
 
     stat_cards: tuple[StatCardSpec, ...] = (
         StatCardSpec(label="SP Utilization", source_path="extras.sp_utilization_rate", formatter="percent"),
@@ -283,14 +281,62 @@ class CommitmentAnalysisModule(BaseServiceModule):
         return recs, overall_rate
 
     def _check_sp_coverage(self, ctx: Any, ce: Any, tp: dict[str, str]) -> tuple[list[dict[str, Any]], float | None]:
-        """Check Savings Plans coverage by service and flag coverage gaps.
+        """Account-wide Savings Plans coverage rate. Emits no recommendations.
+
+        LS-2 — this used to emit one "SP Coverage Gap" card per under-covered
+        service, carrying ``od * (1.0 - rate) * AVG_SP_DISCOUNT_RATE`` where
+        that last factor was a flat ``0.30``. Three defects in one expression:
+
+        * the flat ``0.30`` was a fabricated fraction with no account-specific
+          input — the ATH-1 defect class, and the rec's own reason string
+          conceded "verify against live offering rates";
+        * ``(1.0 - rate)`` double-discounted. CE's ``OnDemandCost`` is ALREADY
+          the uncovered residue (``TotalCost == OnDemandCost +
+          SpendCoveredBySavingsPlans``, and ``CoveragePercentage ==
+          covered / TotalCost`` — both pinned by the live fixture in
+          ``tests/test_commitment_utilization.py``), so on a row with $200
+          uncovered at 88.9% coverage the old formula reported $22.20;
+        * the result was stored under ``monthly_savings``, which
+          ``reporter_phase_b._advisory_line`` never reads — it looks at
+          ``AdvisoryEstimate`` / ``PotentialMonthlySavings``. The figure was
+          silently dropped, which is why the defect survived unnoticed.
+
+        Removing the projection leaves a card with no dollar: a service name, a
+        coverage percentage and an "80%+" target. That is a best-practice
+        nudge, and this project's scope is strictly cost — every emitted
+        recommendation must produce a concrete account-specific $ saving. So
+        the emission goes, as the MediaStore storage lever and the OpenSearch
+        version-upgrade nudges did.
+
+        ``OnDemandCost`` cannot rescue the card. CE documents it as the cost of
+        usage *at the public On-Demand rate* — a rate equivalent, not billed
+        spend, and this query is not region-filtered. Live on 597637668689 the
+        EC2 row read $13.37 while actual unblended on-demand was ~$0.0000009
+        (free tier). Rendering it would contradict the "Uncovered On-Demand
+        ($/mo)" stat card on this same tab, which is built from
+        ``UnblendedCost`` filtered by REGION and PURCHASE_TYPE.
+
+        What remains is the honest half: the account-wide coverage RATE behind
+        the "SP Coverage" stat card. A stat is context, not a recommendation.
+        The accumulators below therefore run for EVERY returned service,
+        including ones that would previously have been skipped — moving a
+        suppression above them would silently redefine that stat card.
+
+        Coverage gap (filed, LS-7): SP coverage for the DATABASE_SP services
+        (DynamoDB, RDS/Aurora, ElastiCache, OpenSearch, Neptune, DocumentDB,
+        Keyspaces, Timestream, DMS) is now unattributed, because
+        ``commitment_scenarios.SP_TYPES`` fetches only COMPUTE_SP /
+        EC2_INSTANCE_SP / SAGEMAKER_SP. Database Savings Plans went GA
+        2025-12 and ``DATABASE_SP`` is in the live CE enum, but adding it needs
+        its own verification: that plan ships a 1-year No-Upfront term only, so
+        the existing 2-term x 3-payment matrix cannot be fanned out blindly.
 
         Args:
             ce: Cost Explorer boto3 client.
             tp: Time period dict with Start/End keys.
 
         Returns:
-            Tuple of (coverage gap recommendations list, overall rate 0-1).
+            Tuple of (always-empty recommendations list, overall rate 0-1).
         """
         recs: list[dict[str, Any]] = []
         overall_rate = 0.0
@@ -309,34 +355,13 @@ class CommitmentAnalysisModule(BaseServiceModule):
                     cov = entry.get("Coverage", {})
                     od = float(cov.get("OnDemandCost", "0"))
                     covered = float(cov.get("SpendCoveredBySavingsPlans", "0"))  # real CE key (was nonexistent "CoveredCost")
+                    # Accumulate only — no per-service card is emitted (LS-2,
+                    # see the docstring). These two lines feed the "SP Coverage"
+                    # stat card and must stay unconditional: a gate placed here
+                    # would report account-wide coverage over a filtered subset
+                    # of services under the same label.
                     total_od += od
                     total_covered += covered
-                    rate = self._parse_pct(cov.get("CoveragePercentage", "0"))
-                    if rate < self.COVERAGE_GAP_THRESHOLD:
-                        svc = entry.get("Attributes", {}).get("SERVICE", "Unknown")  # CE attribute keys are UPPERCASE
-                        # An unattributable coverage gap (CE returned no service —
-                        # typical when the account holds NO active Savings Plans, so
-                        # all on-demand spend aggregates under "Unknown") is not
-                        # account-specific or actionable: the concrete buy scenarios
-                        # already come from purchase_recommendations. Emitting a
-                        # flat-30%-of-everything "$X potential" tied to "Unknown" is
-                        # misleading noise (it can exceed the whole counted headline),
-                        # so skip it. The spend still fed overall_rate above.
-                        if not svc or svc == "Unknown":
-                            continue
-                        potential = od * (1.0 - rate) * self.AVG_SP_DISCOUNT_RATE
-                        recs.append(
-                            {
-                                "resource_id": svc,
-                                "check_type": "sp_coverage",
-                                "check_category": "SP Coverage Gap",
-                                "current_value": f"{rate:.1%}",
-                                "recommended_value": f"{self.COVERAGE_GAP_THRESHOLD:.0%}+",
-                                "monthly_savings": round(potential, 2),
-                                "severity": "MEDIUM",
-                                "reason": f"{svc} has {rate:.1%} SP coverage (below {self.COVERAGE_GAP_THRESHOLD:.0%} threshold; potential estimated using {self.AVG_SP_DISCOUNT_RATE:.0%} flat avg SP discount — verify against live offering rates)",
-                            }
-                        )
                 next_token = resp.get("NextToken")
                 if not next_token:
                     break

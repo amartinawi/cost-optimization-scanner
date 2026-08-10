@@ -354,18 +354,30 @@ def _cov_ce(service_attr: dict):
     )
 
 
-def test_sp_coverage_gap_skips_unknown_service():
+def test_sp_coverage_unattributable_spend_still_feeds_the_rate():
     mod = CommitmentAnalysisModule()
     tp = {"Start": "2026-06-01", "End": "2026-06-30"}
-    recs, rate = mod._check_sp_coverage(_cov_ctx(), _cov_ce({}), tp)  # no 'service' attr -> "Unknown"
-    assert recs == []  # the unattributable gap is suppressed
+    recs, rate = mod._check_sp_coverage(_cov_ctx(), _cov_ce({}), tp)  # no 'service' attr
+    assert recs == []
     assert rate == 0.0  # 0% coverage still computed for the stat card
 
 
-def test_sp_coverage_gap_emits_for_known_service():
+def test_sp_coverage_emits_no_card_for_a_known_service():
+    """LS-2 — this used to assert ``monthly_savings > 0`` from
+    ``9578.93 x (1-0) x 0.30``. Every factor in that was wrong: the 0.30 was
+    fabricated, the ``(1-rate)`` double-discounted an already-uncovered figure,
+    and the result went to a key no renderer reads. With the projection gone the
+    card carries no dollar, so it is not emitted at all.
+
+    The SERVICE value is also corrected here: Cost Explorer's SERVICE dimension
+    never returns "Amazon EC2" — the real string is
+    "Amazon Elastic Compute Cloud - Compute" (confirmed live on 597637668689).
+    The old fixture modelled a shape AWS does not produce.
+    """
     mod = CommitmentAnalysisModule()
     tp = {"Start": "2026-06-01", "End": "2026-06-30"}
-    recs, rate = mod._check_sp_coverage(_cov_ctx(), _cov_ce({"SERVICE": "Amazon EC2"}), tp)
-    assert len(recs) == 1
-    assert recs[0]["resource_id"] == "Amazon EC2"
-    assert recs[0]["monthly_savings"] > 0  # 9578.93 × (1-0) × 0.30
+    recs, rate = mod._check_sp_coverage(
+        _cov_ctx(), _cov_ce({"SERVICE": "Amazon Elastic Compute Cloud - Compute"}), tp
+    )
+    assert recs == []
+    assert rate == 0.0  # the $9,578.93 uncovered still reaches the stat card
