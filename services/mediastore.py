@@ -84,24 +84,27 @@ def get_enhanced_mediastore_checks(ctx: ScanContext) -> dict[str, Any]:
                     if activity_read_failed:
                         continue
 
-                    try:
-                        size_metrics = cloudwatch.get_metric_statistics(
-                            Namespace="AWS/MediaStore",
-                            MetricName="BucketSizeBytes",
-                            Dimensions=[{"Name": "ContainerName", "Value": container_name}],
-                            StartTime=start_time,
-                            EndTime=end_time,
-                            Period=86400,
-                            Statistics=["Average"],
-                        )
-                        storage_bytes = size_metrics["Datapoints"][-1]["Average"] if size_metrics["Datapoints"] else 0
-                        storage_gb = storage_bytes / (1024**3)
-                    except Exception:
-                        storage_gb = 0
-
-                    storage_cost_per_gb = 0.023 * ctx.pricing_multiplier
-                    estimated_savings = storage_gb * storage_cost_per_gb
-                    savings_str = f"${estimated_savings:.2f}/month" if estimated_savings > 0 else "$0.00/month"
+                    # MS-1 — the size read that used to sit here queried
+                    # AWS/MediaStore for `BucketSizeBytes`, a metric MediaStore
+                    # does not publish (that is the S3 name). It always returned
+                    # no datapoints, so `storage_gb` was always 0, so the counted
+                    # branch below was unreachable on every account since the
+                    # adapter was written. It also took `Datapoints[-1]`, which
+                    # assumes an ordering CloudWatch does not guarantee (MS-4),
+                    # and paired an engine-priced string with a fallback-priced
+                    # numeric (MS-3). All three are removed rather than repaired:
+                    # MediaStore publishes NO storage-size metric and `Container`
+                    # carries no size field, so the QUANTITY half of rate x
+                    # quantity is unobtainable at scan time. A rate without a
+                    # quantity is not a saving, and AWS has announced MediaStore's
+                    # end of life, so there is no case for building the recursive
+                    # mediastore-data crawl that would be the only other route.
+                    #
+                    # No replacement advisory is emitted either: this project's
+                    # scope is strictly cost, every rec must carry a concrete
+                    # account-specific dollar, and an EOL/migration notice carries
+                    # none — the same reasoning that deleted the OpenSearch
+                    # version-upgrade nudges (services/opensearch.py).
 
                     # Only flag unused when every activity read succeeded AND
                     # returned no datapoints (confirmed idle), never on a
@@ -111,12 +114,17 @@ def get_enhanced_mediastore_checks(ctx: ScanContext) -> dict[str, Any]:
                             {
                                 "ContainerName": container_name,
                                 "ActivityLast14Days": total_activity,
-                                "EstimatedStorageGB": storage_gb,
                                 "Recommendation": (
-                                    f"Container shows no activity in last 14 days "
-                                    f"({storage_gb:.1f} GB stored) - consider deletion"
+                                    "Container shows no activity in last 14 days - "
+                                    "consider deletion"
                                 ),
-                                "EstimatedSavings": savings_str,
+                                "EstimatedSavings": (
+                                    "$0.00/month - advisory: MediaStore publishes no "
+                                    "storage-size metric and Container carries no size "
+                                    "field, so the stored bytes cannot be measured"
+                                ),
+                                "EstimatedMonthlySavings": 0.0,
+                                "Counted": False,
                                 "CheckCategory": "Unused Resource Cleanup",
                             }
                         )

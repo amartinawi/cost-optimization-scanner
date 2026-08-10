@@ -36,47 +36,27 @@ class MediastoreModule(BaseServiceModule):
         result = get_enhanced_mediastore_checks(ctx)
         source_recs = result.get("recommendations", [])
 
-        if ctx.pricing_engine:
-            # PricingEngine returns region-correct $/GB; no multiplier.
-            price_per_gb = ctx.pricing_engine.get_s3_monthly_price_per_gb("STANDARD")
-            rate_source = "S3 STANDARD via PricingEngine (region-correct)"
-        else:
-            # Module-const fallback path → apply multiplier (L2.3.2).
-            price_per_gb = 0.023 * ctx.pricing_multiplier
-            rate_source = f"$0.023/GB-Mo S3 STANDARD fallback x{ctx.pricing_multiplier} multiplier"
-
+        # MS-1 — the counted branch that used to sit here priced
+        # `EstimatedStorageGB` against an S3 rate. That field came from an
+        # `AWS/MediaStore BucketSizeBytes` read, a metric MediaStore does not
+        # publish, so the field was always 0 and the branch was unreachable on
+        # every account since it was written. It is deleted rather than repaired:
+        # MediaStore exposes no storage-size metric and `Container` carries no
+        # size field, so the QUANTITY half of rate x quantity is unobtainable at
+        # scan time — and a rate with no quantity is not a saving.
+        #
+        # Deleting it also removes MS-3 (an engine-priced string paired with a
+        # fallback-priced numeric) and MS-4 (`Datapoints[-1]`, an ordering
+        # CloudWatch does not guarantee) by construction. This tab's
+        # total_monthly_savings is now a structural 0.0. Blast radius on existing
+        # reports is zero: the branch never fired.
         recs: list[dict[str, Any]] = []
         savings = 0.0
         for src in source_recs:
             # Immutability: build a NEW rec; never mutate the shim's dict.
             rec = dict(src)
-            estimated_gb = rec.get("EstimatedStorageGB", 0) or 0
-            if estimated_gb > 0:
-                rec_savings = round(estimated_gb * price_per_gb, 2)
-                rec["EstimatedMonthlySavings"] = rec_savings
-                # Each counted dollar carries a defensible AuditBasis.
-                rec["AuditBasis"] = {
-                    "rate": f"${price_per_gb:.4f}/GB-Mo",
-                    "region": getattr(ctx, "region", "us-east-1"),
-                    "metric_window": "BucketSizeBytes 14-day Average (AWS/MediaStore)",
-                    "formula": (
-                        f"{estimated_gb:.2f} GB x ${price_per_gb:.4f}/GB-Mo "
-                        f"= ${rec_savings:.2f}/mo"
-                    ),
-                    "rate_source": rate_source,
-                }
-                savings += rec_savings
-            else:
-                # No storage figure → cannot quantify a real dollar. Demote to a
-                # $0 advisory (Counted=False) so the card still renders but is
-                # excluded from BOTH the dollar total AND total_recommendations
-                # (mediastore H1 count hygiene) — never fabricate a saving.
-                rec["EstimatedMonthlySavings"] = 0.0
-                rec["Counted"] = False
-                rec["EstimatedSavings"] = (
-                    "$0.00/month — advisory: requires EstimatedStorageGB for quantified savings"
-                )
-                rec["PricingWarning"] = "requires EstimatedStorageGB for quantified savings"
+            rec.setdefault("EstimatedMonthlySavings", 0.0)
+            rec.setdefault("Counted", False)
             recs.append(rec)
 
         sources = {"enhanced_checks": SourceBlock(count=len(recs), recommendations=tuple(recs))}

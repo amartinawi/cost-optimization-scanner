@@ -1,21 +1,23 @@
-"""HIGH cost-correctness fixes for the MediaStore adapter (mediastore H1).
+"""MediaStore — the counted path is gone (MS-1/MS-3/MS-4).
 
-mediastore H1 — count hygiene: a `$0` no-storage "recommendation"
-(`EstimatedStorageGB <= 0`) was counted in `total_recommendations`, inflating
-the rec headline with no realizable dollar. The fix demotes it to a
-`Counted=False` advisory and counts only `Counted is not False` recs.
+The adapter used to price `EstimatedStorageGB` at an S3 rate. That field came
+from an `AWS/MediaStore BucketSizeBytes` read — a metric MediaStore does not
+publish (that is the S3 name) — so it was always 0 and **the counted branch was
+unreachable on every account since it was written**. The tests below used to
+pass only because their fakes supplied the field directly, which is the
+"fixture models an impossible shape" trap this repo has hit repeatedly.
 
-Two drive paths are exercised:
-  * pure logic — `scan()` with `get_enhanced_mediastore_checks` monkeypatched to
-    return hand-built recs, proving each counted dollar / advisory $0 explicitly;
-  * the real `scan()` -> `get_enhanced_mediastore_checks` shim driven end-to-end
-    with fake boto3 `mediastore` + `cloudwatch` clients, proving the count
-    hygiene survives the actual rec-building path.
+The branch is deleted rather than repaired: MediaStore exposes no storage-size
+metric and `Container` carries no size field, so the QUANTITY half of
+rate x quantity is unobtainable at scan time, and a rate with no quantity is not
+a saving. Deleting it removes MS-3 (engine-priced string vs fallback-priced
+numeric) and MS-4 (`Datapoints[-1]`, an ordering CloudWatch does not guarantee)
+by construction.
 
-Validated rate (live AWS Pricing API, us-east-1, 2026-06-27): S3 STANDARD
-`TimedStorage-ByteHrs` = $0.023/GB-Mo (first 50 TB tier, SKU WP9ANXZGBYYSGJEA,
-volumeType=Standard / storageClass=General Purpose / unit GB-Mo). This matches
-the adapter's fallback constant and the per-GB rate used for the counted dollar.
+No replacement advisory is emitted: this project's scope is strictly cost and
+every rec must carry a concrete account-specific dollar. An EOL/migration notice
+carries none — the same reasoning that deleted the OpenSearch version-upgrade
+nudges. This tab's `total_monthly_savings` is now a structural 0.0.
 """
 
 from __future__ import annotations
@@ -59,109 +61,54 @@ def _ctx(*, pricing_engine=_FakePricing(), pricing_multiplier: float = 1.0, clie
     )
 
 
+def _patch_checks(monkeypatch, recs):
+    monkeypatch.setattr(
+        mediastore_adapter, "get_enhanced_mediastore_checks",
+        lambda ctx: {"recommendations": [dict(r) for r in recs]},
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Pure logic — counted dollar
 # --------------------------------------------------------------------------- #
-def test_counted_rec_prices_storage_at_s3_rate(monkeypatch: pytest.MonkeyPatch) -> None:
-    recs = [
-        {
-            "ContainerName": "media-c1",
-            "EstimatedStorageGB": 100.0,
-            "CheckCategory": "Unused Resource Cleanup",
-        }
-    ]
-    monkeypatch.setattr(
-        mediastore_adapter,
-        "get_enhanced_mediastore_checks",
-        lambda ctx: {"recommendations": [dict(r) for r in recs]},
-    )
+def test_storage_backed_rec_is_no_longer_counted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Even a rec carrying EstimatedStorageGB counts nothing now. Nothing in
+    production ever produced that field, and the rate it was priced at was
+    borrowed from S3."""
+    _patch_checks(monkeypatch, [{"ContainerName": "c1", "EstimatedStorageGB": 100.0,
+                                 "CheckCategory": "Unused Resource Cleanup"}])
     findings = mediastore_adapter.MediastoreModule().scan(_ctx())
-    expected = round(100.0 * S3_STANDARD_RATE, 2)  # $2.30
-    assert findings.total_monthly_savings == pytest.approx(expected, abs=0.001)
-    assert findings.total_recommendations == 1  # the real dollar IS counted
-    rec = findings.sources["enhanced_checks"].recommendations[0]
-    assert rec["EstimatedMonthlySavings"] == pytest.approx(expected, abs=0.001)
-    assert rec.get("Counted") is not False
-    # Counted dollar carries a defensible AuditBasis (rate/region/window/formula).
-    basis = rec["AuditBasis"]
-    assert basis["region"] == "us-east-1"
-    assert "GB-Mo" in basis["rate"]
-    assert "/mo" in basis["formula"]
 
-
-# --------------------------------------------------------------------------- #
-# Pure logic — mediastore H1: no-storage rec is advisory, NOT counted
-# --------------------------------------------------------------------------- #
-def test_no_storage_rec_is_advisory_zero_and_uncounted(monkeypatch: pytest.MonkeyPatch) -> None:
-    recs = [
-        {
-            "ContainerName": "media-empty",
-            "EstimatedStorageGB": 0,
-            "CheckCategory": "Unused Resource Cleanup",
-        }
-    ]
-    monkeypatch.setattr(
-        mediastore_adapter,
-        "get_enhanced_mediastore_checks",
-        lambda ctx: {"recommendations": [dict(r) for r in recs]},
-    )
-    findings = mediastore_adapter.MediastoreModule().scan(_ctx())
-    rec = findings.sources["enhanced_checks"].recommendations[0]
-    assert rec.get("Counted") is False
-    assert rec["EstimatedMonthlySavings"] == 0.0
-    assert rec["EstimatedSavings"].startswith("$0.00/month")
-    # H1 count hygiene: the $0 advisory renders but is excluded from the headline.
-    assert findings.total_recommendations == 0
     assert findings.total_monthly_savings == 0.0
-    # ...yet it is still present in the source block (rendered, not counted).
-    assert findings.sources["enhanced_checks"].count == 1
+    assert findings.total_recommendations == 0
+    rec = findings.sources["enhanced_checks"].recommendations[0]
+    assert rec["Counted"] is False
+    assert rec["EstimatedMonthlySavings"] == 0.0
 
 
-# --------------------------------------------------------------------------- #
-# Pure logic — mixed: only the storage-backed rec feeds the headline count
-# --------------------------------------------------------------------------- #
-def test_mixed_recs_count_only_the_realizable_dollar(monkeypatch: pytest.MonkeyPatch) -> None:
-    recs = [
-        {"ContainerName": "has-gb", "EstimatedStorageGB": 50.0, "CheckCategory": "Unused Resource Cleanup"},
-        {"ContainerName": "no-gb", "EstimatedStorageGB": 0, "CheckCategory": "Unused Resource Cleanup"},
-    ]
-    monkeypatch.setattr(
-        mediastore_adapter,
-        "get_enhanced_mediastore_checks",
-        lambda ctx: {"recommendations": [dict(r) for r in recs]},
-    )
+def test_tab_total_is_structurally_zero(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_checks(monkeypatch, [
+        {"ContainerName": "a", "EstimatedStorageGB": 10.0},
+        {"ContainerName": "b"},
+        {"ContainerName": "c", "EstimatedStorageGB": 0},
+    ])
     findings = mediastore_adapter.MediastoreModule().scan(_ctx())
-    expected = round(50.0 * S3_STANDARD_RATE, 2)  # $1.15
-    assert findings.total_recommendations == 1  # only the storage-backed rec
-    assert findings.total_monthly_savings == pytest.approx(expected, abs=0.001)
-    # counted == rendered: headline dollar equals the one counted card's dollar.
-    counted = [r for r in findings.sources["enhanced_checks"].recommendations if r.get("Counted") is not False]
-    assert sum(r["EstimatedMonthlySavings"] for r in counted) == pytest.approx(
-        findings.total_monthly_savings, abs=0.001
+    assert findings.total_monthly_savings == 0.0
+    assert all(r["Counted"] is False for r in findings.sources["enhanced_checks"].recommendations)
+
+
+def test_no_pricing_lookup_is_performed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The adapter must not consult the pricing engine at all — there is no
+    quantity to price."""
+    calls: list[str] = []
+    engine = SimpleNamespace(
+        get_s3_monthly_price_per_gb=lambda *a, **k: calls.append("s3") or 0.023
     )
+    _patch_checks(monkeypatch, [{"ContainerName": "c1", "EstimatedStorageGB": 100.0}])
+    mediastore_adapter.MediastoreModule().scan(_ctx(pricing_engine=engine))
+    assert calls == []
 
 
-# --------------------------------------------------------------------------- #
-# Pure logic — fallback path (no pricing_engine) applies the region multiplier
-# --------------------------------------------------------------------------- #
-def test_fallback_path_applies_pricing_multiplier(monkeypatch: pytest.MonkeyPatch) -> None:
-    recs = [{"ContainerName": "c", "EstimatedStorageGB": 100.0, "CheckCategory": "Unused Resource Cleanup"}]
-    monkeypatch.setattr(
-        mediastore_adapter,
-        "get_enhanced_mediastore_checks",
-        lambda ctx: {"recommendations": [dict(r) for r in recs]},
-    )
-    findings = mediastore_adapter.MediastoreModule().scan(_ctx(pricing_engine=None, pricing_multiplier=1.25))
-    expected = round(100.0 * (S3_STANDARD_RATE * 1.25), 2)
-    assert findings.total_monthly_savings == pytest.approx(expected, abs=0.001)
-    assert findings.total_recommendations == 1
-    # immutability: the shim's source rec list is untouched by scan().
-    assert "Counted" not in recs[0]
-
-
-# --------------------------------------------------------------------------- #
-# Pure logic — immutability: scan() must not mutate the shim's rec dicts
-# --------------------------------------------------------------------------- #
 def test_scan_does_not_mutate_source_recs(monkeypatch: pytest.MonkeyPatch) -> None:
     source = {"ContainerName": "z", "EstimatedStorageGB": 0, "CheckCategory": "Unused Resource Cleanup"}
     monkeypatch.setattr(
@@ -237,18 +184,21 @@ def _client_factory(mediastore_client, cloudwatch_client):
     return factory
 
 
-def test_scan_path_counts_storage_backed_container() -> None:
+def test_scan_path_emits_an_uncounted_advisory() -> None:
     ms = _FakeMediaStore([{"Name": "live", "Status": "ACTIVE"}])
     cw = _FakeCloudWatch(size_average_gb=10.0)  # 10 GB stored
     ctx = _ctx(client=_client_factory(ms, cw))
     findings = mediastore_adapter.MediastoreModule().scan(ctx)
-    expected = round(10.0 * S3_STANDARD_RATE, 2)  # $0.23
-    assert findings.total_recommendations == 1
-    assert findings.total_monthly_savings == pytest.approx(expected, abs=0.001)
+    # The fake CloudWatch answers BucketSizeBytes; the real AWS/MediaStore
+    # namespace does not publish it, which is why this path counted nothing in
+    # production and counts nothing here now.
+    assert findings.total_recommendations == 0
+    assert findings.total_monthly_savings == 0.0
     rec = findings.sources["enhanced_checks"].recommendations[0]
     assert rec["ContainerName"] == "live"
-    assert rec.get("Counted") is not False
-    assert "AuditBasis" in rec
+    assert rec["Counted"] is False
+    assert rec["EstimatedMonthlySavings"] == 0.0
+    assert "cannot be measured" in rec["EstimatedSavings"]
 
 
 def test_scan_path_demotes_zero_storage_container() -> None:
@@ -285,9 +235,9 @@ def test_scan_path_follows_pagination_across_pages() -> None:
     findings = mediastore_adapter.MediastoreModule().scan(ctx)
     names = {r["ContainerName"] for r in findings.sources["enhanced_checks"].recommendations}
     assert names == {"page1-c", "page2-c"}  # second page is NOT dropped
-    per_container = round(10.0 * S3_STANDARD_RATE, 2)  # $0.23
-    assert findings.total_recommendations == 2
-    assert findings.total_monthly_savings == pytest.approx(2 * per_container, abs=0.001)
+    # MS-1: no counted dollar exists for MediaStore any more, on either page.
+    assert findings.total_recommendations == 0
+    assert findings.total_monthly_savings == 0.0
 
 
 if __name__ == "__main__":  # pragma: no cover
