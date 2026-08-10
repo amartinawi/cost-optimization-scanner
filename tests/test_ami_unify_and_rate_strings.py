@@ -152,7 +152,7 @@ def test_network_rate_string_recs_marked_advisory(monkeypatch):
     monkeypatch.setattr(
         net, "get_nat_gateway_checks", lambda c, **kw: {"recommendations": [], "nat_vpc_map": {}}
     )
-    monkeypatch.setattr(net, "get_vpc_endpoints_checks", lambda c: {"recommendations": vpc})
+    monkeypatch.setattr(net, "get_vpc_endpoints_checks", lambda c, **_k: {"recommendations": vpc})
     monkeypatch.setattr(net, "get_load_balancer_checks", lambda c: {"recommendations": []})
     monkeypatch.setattr(net, "get_auto_scaling_checks", lambda c: {"recommendations": []})
 

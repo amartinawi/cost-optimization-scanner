@@ -1445,7 +1445,6 @@ def get_enhanced_s3_checks(
         "storage_class_optimization": [],
         "intelligent_tiering_missing": [],
         "unused_buckets": [],
-        "versioning_growth": [],
         "request_heavy_buckets": [],
         "static_website_optimization": [],
     }
@@ -1550,32 +1549,22 @@ def get_enhanced_s3_checks(
                         ctx, bucket_name, e, action="s3:GetLifecycleConfiguration"
                     )
 
-            try:
-                versioning_response = bucket_s3_client.get_bucket_versioning(Bucket=bucket_name)
-                if versioning_response.get("Status") == "Enabled":
-                    checks["versioning_growth"].append(
-                        {
-                            "BucketName": bucket_name,
-                            "VersioningStatus": "Enabled",
-                            "Recommendation": (
-                                "Monitor versioning growth and configure lifecycle for old versions"
-                            ),
-                            "CheckCategory": "Versioning Optimization",
-                            "EstimatedSavings": (
-                                "$0.00/month - quantify via S3 Storage Lens (noncurrent-version bytes)"
-                            ),
-                        }
-                    )
-            except Exception as e:
-                _route_bucket_error(ctx, bucket_name, e, action="s3:GetBucketVersioning")
-
-            # Cross-region-replication and server-access-logging checks removed:
-            # both emitted a "review necessity / review if still needed" nudge with
-            # an explicit $0.00 saving — a best-practice/housekeeping recommendation
-            # with no concrete account-specific dollar, which is outside the scanner's
-            # strictly-cost scope. Dropping them also removes a get_bucket_replication
-            # + get_bucket_logging call per bucket. (Noncurrent-version growth — a
-            # real storage cost — is still surfaced via "Versioning Optimization".)
+            # Cross-region-replication, server-access-logging and versioning
+            # checks removed: each emitted a "review necessity / monitor growth"
+            # nudge with an explicit $0.00 saving — a best-practice recommendation
+            # with no concrete account-specific dollar, which is outside the
+            # scanner's strictly-cost scope. Dropping them also removes a
+            # get_bucket_replication + get_bucket_logging + get_bucket_versioning
+            # call per bucket.
+            #
+            # The versioning one (LS-4) went last and needs the reasoning kept:
+            # it fired on versioning being ENABLED, never on any measured
+            # noncurrent bytes, so it could not tell a bucket wasting money on
+            # old versions from one with none. Noncurrent bytes are not exposed
+            # by any free API — CloudWatch BucketSizeBytes folds them into the
+            # per-storage-class totals, and only S3 Storage Lens ADVANCED metrics
+            # break them out — so the card could only ever say "go measure this
+            # yourself", which delegates the analysis rather than performing it.
 
             try:
                 objects_response = bucket_s3_client.list_objects_v2(Bucket=bucket_name, MaxKeys=1)

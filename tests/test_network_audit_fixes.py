@@ -546,7 +546,7 @@ def test_network_scan_asg_is_advisory_and_excluded_from_total(monkeypatch: pytes
     monkeypatch.setattr(
         network_mod, "get_nat_gateway_checks", lambda c, **kw: {"recommendations": [], "nat_vpc_map": {}}
     )
-    monkeypatch.setattr(network_mod, "get_vpc_endpoints_checks", lambda c: {"recommendations": []})
+    monkeypatch.setattr(network_mod, "get_vpc_endpoints_checks", lambda c, **_k: {"recommendations": []})
     monkeypatch.setattr(network_mod, "get_load_balancer_checks", lambda c: {"recommendations": []})
     monkeypatch.setattr(network_mod, "get_auto_scaling_checks", lambda c: {"recommendations": [
         {"EstimatedSavings": "$50.00/month per node if rightsized", "CheckCategory": "Oversized ASG Instances"}
