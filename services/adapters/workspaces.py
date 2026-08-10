@@ -6,6 +6,7 @@ from typing import Any
 
 from core.contracts import ServiceFindings, SourceBlock
 from services._base import BaseServiceModule
+from services._coh_dedup import coh_key, coh_savings, is_renderable_coh_rec, normalize_resource_id
 from services._savings import mark_zero_savings_advisory
 from services.workspaces import (
     WORKSPACE_AUTOSTOP_PRICING,
@@ -73,6 +74,33 @@ class WorkspacesModule(BaseServiceModule):
         recs = result.get("recommendations", [])
         multiplier = ctx.pricing_multiplier
 
+        # Cost Optimization Hub is the authority: AWS computes its own WorkSpaces
+        # savings, and a CoH-covered WorkSpace suppresses this tab's local levers
+        # for that id so the same saving is never counted twice (CoH >
+        # heuristic). Before this bucket existed the WorkSpaces ResourceType fell
+        # through to unbucketed_types and AWS's dollars were dropped.
+        coh_recs = [
+            r
+            for r in (getattr(ctx, "cost_hub_splits", {}) or {}).get("workspaces", [])
+            if is_renderable_coh_rec(r)
+        ]
+        coh_keys = {coh_key(r) for r in coh_recs} - {""}
+        if coh_keys:
+            recs = [
+                r
+                for r in recs
+                if normalize_resource_id(str(r.get("WorkspaceId") or "")) not in coh_keys
+            ]
+        for rec in coh_recs:
+            rec.setdefault("CheckCategory", "WorkSpace (Cost Optimization Hub)")
+            rec.setdefault("WorkspaceId", rec.get("resourceId") or rec.get("resourceArn") or "")
+            rec.setdefault("EstimatedMonthlySavings", coh_savings(rec))
+            rec.setdefault(
+                "Recommendation",
+                str(rec.get("actionType") or "Rightsize") + " (AWS Cost Optimization Hub)",
+            )
+            rec.setdefault("EstimatedSavings", f"${coh_savings(rec):,.2f}/month")
+
         savings = 0.0
         for rec in recs:
             category = rec.get("CheckCategory", "")
@@ -111,10 +139,25 @@ class WorkspacesModule(BaseServiceModule):
 
         # Count hygiene: $0 (metric-gated / abstained) recs are shown but excluded
         # from the counted total AND the rec-count headline (mirrors lambda_svc).
-        mark_zero_savings_advisory(recs, lambda r: float(r.get("EstimatedMonthlySavings", 0) or 0))
-        counted_recs = sum(1 for r in recs if r.get("Counted") is not False)
+        # D4 — the CoH recs must go through the same $0 gate as the local ones.
+        # A CoH payload with no estimatedMonthlySavings would otherwise be
+        # counted in the rec headline while contributing $0 to the dollar total.
+        mark_zero_savings_advisory(
+            recs + coh_recs, lambda r: float(r.get("EstimatedMonthlySavings", 0) or 0)
+        )
+        counted_recs = sum(1 for r in recs + coh_recs if r.get("Counted") is not False)
+        savings += sum(
+            float(r.get("EstimatedMonthlySavings", 0.0) or 0.0)
+            for r in coh_recs
+            if r.get("Counted") is not False
+        )
 
-        sources = {"enhanced_checks": SourceBlock(count=len(recs), recommendations=tuple(recs))}
+        sources = {
+            "enhanced_checks": SourceBlock(count=len(recs), recommendations=tuple(recs)),
+            "cost_optimization_hub": SourceBlock(
+                count=len(coh_recs), recommendations=tuple(coh_recs)
+            ),
+        }
 
         return ServiceFindings(
             service_name="WorkSpaces",

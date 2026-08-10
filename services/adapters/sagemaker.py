@@ -9,12 +9,13 @@ Analyzes SageMaker resources for:
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from core.contracts import GroupingSpec, ServiceFindings, SourceBlock, StatCardSpec
 from services._aws_errors import record_aws_error
 from services._base import BaseServiceModule
+from services._coh_dedup import coh_key, coh_savings, is_renderable_coh_rec, normalize_resource_id
 from services._savings import mark_zero_savings_advisory
 from services.commitment_coverage import demote_recs_in_place
 
@@ -99,7 +100,7 @@ def _variant_invocations_sum(
     """
     if not variants:
         return None
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     start = now - timedelta(days=days)
     total = 0.0
     for variant in variants:
@@ -236,7 +237,7 @@ def _check_idle_endpoints(
                     aged_out = True
                     break
                 try:
-                    if (datetime.now(timezone.utc) - ts).days < IDLE_ENDPOINT_DAYS:
+                    if (datetime.now(UTC) - ts).days < IDLE_ENDPOINT_DAYS:
                         aged_out = True
                         break
                 except TypeError:
@@ -633,13 +634,42 @@ class SageMakerModule(BaseServiceModule):
         idle_ep_recs, active_ep_count = _check_idle_endpoints(sm, cw, ctx, multiplier, fast_mode)
         notebook_recs, notebook_count = _check_idle_notebooks(sm, ctx, multiplier)
         spot_recs = _check_spot_training(sm, ctx)
+        # Cost Optimization Hub is the authority: it re-surfaces AWS's own
+        # endpoint findings with a computed dollar. A CoH-covered endpoint
+        # suppresses this tab's local idle lever for that endpoint so the same
+        # saving is never counted twice (CoH > heuristic). This runs BEFORE the
+        # consolidation grouping so a suppressed endpoint is excluded from both.
+        coh_recs = [
+            r
+            for r in (getattr(ctx, "cost_hub_splits", {}) or {}).get("sagemaker", [])
+            if is_renderable_coh_rec(r)
+        ]
+        coh_keys = {coh_key(r) for r in coh_recs} - {""}
+        if coh_keys:
+            idle_ep_recs = [
+                r
+                for r in idle_ep_recs
+                if normalize_resource_id(str(r.get("endpoint_name") or "")) not in coh_keys
+            ]
+
         # sagemaker H2 — feed the idle-endpoint names into consolidation so an
         # idle endpoint (already counted at full cost for deletion) is excluded
-        # from the consolidation grouping and never counted twice.
-        idle_endpoint_names = {r["endpoint_name"] for r in idle_ep_recs}
+        # from the consolidation grouping and never counted twice. CoH-owned
+        # endpoints are excluded for the same reason, via coh_keys.
+        idle_endpoint_names = {r["endpoint_name"] for r in idle_ep_recs} | coh_keys
         consolidation_recs = _check_multi_model_consolidation(sm, ctx, multiplier, idle_endpoint_names)
 
-        all_recs = idle_ep_recs + notebook_recs + spot_recs + consolidation_recs
+        for rec in coh_recs:
+            rec.setdefault("CheckCategory", "SageMaker Endpoint (Cost Optimization Hub)")
+            rec.setdefault("EstimatedMonthlySavings", coh_savings(rec))
+            rec.setdefault("endpoint_name", rec.get("resourceId") or rec.get("resourceArn") or "")
+            rec.setdefault(
+                "Recommendation",
+                str(rec.get("actionType") or "Rightsize") + " (AWS Cost Optimization Hub)",
+            )
+            rec.setdefault("EstimatedSavings", f"${coh_savings(rec):,.2f}/month")
+
+        all_recs = idle_ep_recs + notebook_recs + spot_recs + consolidation_recs + coh_recs
 
         # sagemaker C2 — gate any $0 rec as advisory (Counted=False) so $0
         # placeholders are excluded from BOTH the dollar total and the counted
@@ -665,6 +695,10 @@ class SageMakerModule(BaseServiceModule):
             total_recommendations=total_recs,
             total_monthly_savings=round(total_savings, 2),
             sources={
+                "cost_optimization_hub": SourceBlock(
+                    count=len(coh_recs),
+                    recommendations=tuple(coh_recs),
+                ),
                 "idle_endpoints": SourceBlock(
                     count=len(idle_ep_recs),
                     recommendations=tuple(idle_ep_recs),

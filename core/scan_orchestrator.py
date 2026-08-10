@@ -97,6 +97,11 @@ class ScanOrchestrator:
             # commitment_analysis adapter renders them alongside its own CE
             # API-derived SP / RI data.
             "commitment_analysis",
+            # AWS-computed endpoint / WorkSpace savings. Both are real CoH
+            # ResourceTypes whose recs were dropped for want of a bucket; both
+            # adapters de-duplicate them against their own local levers below.
+            "sagemaker",
+            "workspaces",
         }
         needs_hub = _HUB_SERVICES & selected
         if not needs_hub:
@@ -138,13 +143,14 @@ class ScanOrchestrator:
             # "shrink this volume" does not replace "disable this Multi-AZ".
             "RdsDbInstanceStorage": "rds",
             "AuroraDbClusterStorage": "rds",
-            # Real enum types STILL with no bucket (AWS-computed dollars we drop
-            # today): MemoryDBCluster, DocumentDBCluster, SageMakerEndpoint,
-            # WorkSpaces. Each needs a consuming adapter that can de-duplicate
-            # the rec against that tab's local levers, which is a feature
-            # change tracked in docs/audits/SWEEP-FALSE-NEGATIVES-2026-08-09.md
-            # (rank 7) — an unbucketed type surfaces the honest "dropped type"
-            # warning today rather than being silently routed nowhere.
+            "SageMakerEndpoint": "sagemaker",
+            "WorkSpaces": "workspaces",
+            # Real enum types STILL with no bucket: MemoryDBCluster and
+            # DocumentDBCluster. Neither has an adapter or a report tab, so
+            # routing them would land AWS's dollars in a bucket nothing renders
+            # — the dead-data shape the "S3Bucket" note above describes. They
+            # keep surfacing the honest "dropped type" warning until a MemoryDB
+            # / DocumentDB adapter exists to consume and de-duplicate them.
             # Reservation / Savings Plans recommendations all live under
             # the commitment_analysis tab from now on.
             "EC2ReservedInstances": "commitment_analysis",
