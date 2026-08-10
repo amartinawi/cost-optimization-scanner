@@ -351,6 +351,37 @@ will eventually both count it. This is the single most common real finding.
   one screen. Replacing a hidden fabrication with a visible contradiction is not
   a fix. *Real: the rejected half of the LS-2 repair.*
 
+- **C16 — Being in the API's enum is not the same as being for sale. Check the
+  OFFERING, not the parameter.** A request enum tells you what the API will
+  *accept*, not what AWS will *sell* you, and the two drift apart the moment a
+  product launches with a restricted catalogue. Worse, the API may not tell you:
+  `ce:GetSavingsPlansPurchaseRecommendation` accepts `DATABASE_SP` with
+  `THREE_YEARS`/`ALL_UPFRONT` and answers **empty** rather than raising — so a
+  blind fan-out looks like it works, quietly burns a $0.01 call per impossible
+  cell, and stands ready to render a purchase card for a plan nobody can buy the
+  day CE starts answering. `savingsplans:DescribeSavingsPlansOfferings` is free
+  and authoritative: per plan type it returns the real `(durationSeconds,
+  paymentOption)` set — 6 combos for Compute/EC2Instance/SageMaker, exactly 1
+  (1yr, No Upfront) for Database. Derive the matrix from that probe rather than
+  hardcoding today's answer (C14), and fail **open** — an unresolvable probe
+  should cost calls, never drop the recommendation. *Real: LS-7 (2026-08-10).*
+
+- **C17 — After fixing a check, verify the GATE that decides whether it runs.
+  A correct fix behind a wrong gate is inert, and every test still passes.**
+  Prefetches and reads are usually gated on the set of selected services, and
+  that gate was written for whatever the feature originally covered. Extend the
+  check to a new service family and the gate silently excludes it: the new code
+  is unreachable on exactly the accounts it targets, the flag keeps its safe
+  default, and unit tests that call the inner function directly never notice.
+  Always add a test that drives the PUBLIC entry point with a `selected` set
+  containing only the newly-covered services, and assert the underlying read
+  actually happened. *Real: LS-8 (2026-08-10) — `want_sp` was
+  `selected & {"ec2","lambda","containers","sagemaker"}`, but a Database SP
+  matters to rds/aurora/elasticache/opensearch/dynamodb, none of them in that
+  set. Caught only because a mock-driven infinite loop crashed an unrelated test;
+  the same widening then exposed an unterminated pager that had been latent
+  behind the narrow gate — widening a gate makes latent bugs on that path real.*
+
 ## D. Render / tab / count semantics (`counted == rendered`, both directions)
 
 - **D1 — Counted-but-invisible (render desync).** Savings summed into the headline
