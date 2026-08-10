@@ -24,14 +24,13 @@ from botocore.exceptions import ClientError  # type: ignore[import-untyped]
 
 from core.scan_context import ScanContext
 from services.file_systems_logic import (
-    EFS_IA_TRANSITION_FRACTION,
     EFS_METRIC_WINDOW_DAYS,
     EFS_MIN_LIFECYCLE_GB,
     EFS_ONE_ZONE_MIN_GB,
     FSX_SSD_TO_HDD_MIN_GB,
+    efs_ia_breakeven_file_kib,
     efs_idle_savings,
-    efs_lifecycle_net_savings,
-    efs_lifecycle_savings,
+    efs_lifecycle_ceiling,
     efs_one_zone_savings,
     fsx_ssd_to_hdd_savings,
 )
@@ -468,96 +467,74 @@ def get_efs_findings(
                             )
                             monthly_access_gb = None
 
-                    if monthly_access_gb is not None:
-                        ia_access_rate = _efs_ia_access_rate(ctx, pricing_multiplier)
-                        est = efs_lifecycle_net_savings(
-                            standard_gb, monthly_access_gb, std_rate, ia_rate, ia_access_rate
-                        )
-                        if est.net_savings > 0 and est.cold_gb >= EFS_MIN_LIFECYCLE_GB:
-                            counted.append(
-                                {
-                                    "FileSystemId": fs_id, "Name": name, "SizeGB": round(total_gb, 2),
-                                    "StorageClass": std_class, "HasIAPolicy": False,
-                                    "CheckCategory": "EFS No Lifecycle",
-                                    "Recommendation": "Enable IA lifecycle policy for infrequently accessed data",
-                                    "EstimatedSavings": f"${est.net_savings:.2f}/month",
-                                    "_savings": est.net_savings, "Counted": True,
-                                    "AuditBasis": {
-                                        "metric": f"DataReadIOBytes+DataWriteIOBytes over {EFS_METRIC_WINDOW_DAYS}d",
-                                        "region": region, "standard_gb": round(standard_gb, 2),
-                                        "monthly_access_gb": round(monthly_access_gb, 2),
-                                        "cold_gb": round(est.cold_gb, 2),
-                                        "standard_rate_per_gb_month": round(std_rate, 6),
-                                        "ia_rate_per_gb_month": round(ia_rate, 6),
-                                        "ia_access_rate_per_gb": round(ia_access_rate, 6),
-                                        "gross_savings": round(est.gross_savings, 2),
-                                        # FS-4 — always 0.0. The accessed bytes
-                                        # are already excluded from cold_gb, so
-                                        # they never transition to IA and cannot
-                                        # generate an IA access charge; levying
-                                        # one penalised the same fact twice. The
-                                        # rate is recorded below as the exposure
-                                        # on any FUTURE access to today's cold
-                                        # bytes, which the window cannot see.
-                                        "ia_access_charge": round(est.access_charge, 2),
-                                        "basis": (
-                                            "cold_gb = Standard - bytes accessed in window; "
-                                            "net = cold_gb x (Standard-IA) - accessed x IA-access rate"
-                                        ),
-                                    },
-                                }
-                            )
-                        else:
-                            advisory.append(
-                                {
-                                    "FileSystemId": fs_id, "Name": name, "SizeGB": round(total_gb, 2),
-                                    "StorageClass": std_class, "HasIAPolicy": False,
-                                    "CheckCategory": "EFS No Lifecycle", "Counted": False,
-                                    "Recommendation": "Enable IA lifecycle policy for infrequently accessed data",
-                                    "EstimatedSavings": (
-                                        f"not cost-effective: {est.cold_gb:.0f} GB cold but net "
-                                        f"${est.net_savings:.2f}/month after IA access charges "
-                                        f"(over {EFS_METRIC_WINDOW_DAYS}d)"
-                                    ),
-                                    "AuditBasis": {
-                                        "metric": f"DataReadIOBytes+DataWriteIOBytes over {EFS_METRIC_WINDOW_DAYS}d",
-                                        "region": region, "standard_gb": round(standard_gb, 2),
-                                        "monthly_access_gb": round(monthly_access_gb, 2),
-                                        "cold_gb": round(est.cold_gb, 2),
-                                        "net_savings": round(est.net_savings, 2),
-                                        "basis": "net <= $0 after IA access charges; not counted",
-                                    },
-                                }
-                            )
-                    else:
-                        # No evidence (fast mode, no CloudWatch client, or no
-                        # datapoints): indicative GROSS only, never counted.
-                        gross = efs_lifecycle_savings(standard_gb, std_rate, ia_rate)
-                        if gross > 0:
-                            advisory.append(
-                                {
-                                    "FileSystemId": fs_id, "Name": name, "SizeGB": round(total_gb, 2),
-                                    "StorageClass": std_class, "HasIAPolicy": False,
-                                    "CheckCategory": "EFS No Lifecycle", "Counted": False,
-                                    "Recommendation": "Enable IA lifecycle policy for infrequently accessed data",
-                                    "EstimatedSavings": (
-                                        f"up to ~${gross:.2f}/mo-gross before IA read-access charges "
-                                        f"(net depends on access patterns; enable CloudWatch metrics to quantify)"
-                                    ),
-                                    "AuditBasis": {
-                                        "metric": "measured Standard-class bytes x (Standard-IA rate) x transition fraction",
-                                        "region": region, "standard_gb": round(standard_gb, 2),
-                                        "standard_rate_per_gb_month": round(std_rate, 6),
-                                        "ia_rate_per_gb_month": round(ia_rate, 6),
-                                        "transition_fraction": EFS_IA_TRANSITION_FRACTION,
-                                        "basis": (
-                                            "indicative gross only; assumes ~50% of Standard data is infrequently "
-                                            "accessed and does NOT subtract the $0.01/GB IA access charge — "
-                                            "not counted toward savings"
-                                        ),
-                                    },
-                                }
-                            )
+                    # FS-2 — this lever no longer counts. It used to compute
+                    # cold_gb = standard_gb - monthly_access_gb, subtracting a
+                    # 30-day I/O FLOW from a byte STOCK. That has no valid
+                    # interpretation, and the error is not bounded in the safe
+                    # direction: a partial read of a large file resets that
+                    # whole file's lifecycle clock while contributing only the
+                    # bytes read to the metric, so the difference can exceed the
+                    # true cold set without limit.
+                    #
+                    # Even a CORRECT cold figure would not settle it. EFS IA
+                    # bills a 128 KiB minimum per file, so the same GB is a
+                    # saving or a LOSS depending on the file-size distribution —
+                    # which no EFS API or metric reports. A lever whose SIGN is
+                    # unknown cannot count.
+                    #
+                    # Use a separate rate variable: `ia_rate` is the loop-local
+                    # that also prices the COUNTED idle-delete lever above.
+                    lifecycle_ia_rate = ia_rate
+                    ceiling = efs_lifecycle_ceiling(standard_gb, std_rate, lifecycle_ia_rate)
+                    breakeven_kib = efs_ia_breakeven_file_kib(std_rate, lifecycle_ia_rate)
+                    observed = (
+                        f"measured {monthly_access_gb:,.0f} GB read+written over "
+                        f"{EFS_METRIC_WINDOW_DAYS}d"
+                        if monthly_access_gb is not None
+                        else "no access metric available"
+                    )
+                    advisory.append(
+                        {
+                            "FileSystemId": fs_id, "Name": name, "SizeGB": round(total_gb, 2),
+                            "StorageClass": std_class, "HasIAPolicy": False,
+                            "CheckCategory": "EFS No Lifecycle", "Counted": False,
+                            "Recommendation": (
+                                "Enable IA lifecycle policy for infrequently accessed data"
+                            ),
+                            "EstimatedMonthlySavings": 0.0,
+                            "PotentialMonthlySavings": round(ceiling, 2),
+                            # The measured I/O goes in the RENDERED string, not
+                            # only the AuditBasis: a file system with proven heavy
+                            # traffic must not read as a bigger opportunity than
+                            # one we know nothing about.
+                            "EstimatedSavings": (
+                                f"$0.00/month - advisory: up to ${ceiling:,.2f}/month if every "
+                                f"Standard byte were cold and every file >= 128 KiB; {observed}"
+                            ),
+                            "AuditBasis": {
+                                "metric": (
+                                    f"DataReadIOBytes+DataWriteIOBytes over {EFS_METRIC_WINDOW_DAYS}d"
+                                ),
+                                "region": region,
+                                "standard_gb": round(standard_gb, 2),
+                                "monthly_access_gb": (
+                                    round(monthly_access_gb, 2) if monthly_access_gb is not None else None
+                                ),
+                                "ceiling_monthly": round(ceiling, 2),
+                                "ia_breakeven_mean_file_kib": round(breakeven_kib, 1),
+                                "counted": False,
+                                "reason": (
+                                    "I/O volume is a FLOW and cannot be subtracted from stored "
+                                    "bytes - a partial read resets a whole file's lifecycle clock, "
+                                    "so non-zero I/O does not bound the cold set. A measured ZERO "
+                                    "series would settle coldness but still not the SIGN: IA bills "
+                                    f"a 128 KiB minimum per file, so below ~{breakeven_kib:.1f} KiB "
+                                    "mean file size the transition LOSES money, and EFS publishes "
+                                    "neither a file count nor a size distribution."
+                                ),
+                            },
+                        }
+                    )
 
                 # One Zone migration — a DURABILITY tradeoff (single AZ), so it is
                 # advisory rather than a counted saving even though the price delta

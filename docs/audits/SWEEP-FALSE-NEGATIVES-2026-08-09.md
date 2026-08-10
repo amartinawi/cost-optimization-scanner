@@ -72,6 +72,67 @@ The sweep confirms the verification's extrapolation: material false negatives ex
 - **monitoring/workspaces:** MON-3 CW Logs ingestion (the dominant CW cost) has no lever — Standard→IA class is measurable from `logGroupClass` + `IncomingBytes`; MON-4 CloudTrail stub reserves a client and renders an empty block while duplicate-trail charges are deterministic; MON-6 worst-in-repo D4 (advisory-heavy tab); MON-7 Route53 tier ladder never walks down (under-count above 25 zones); MON-8 duplicate-private-zone counted without the VPC-association evidence its own text asks for; WS-2 OS/BYOL caveat attached only to the advisory, not the two counted levers (~$4/WS/mo, contradicts CLAUDE.md's claim); WS-3 missing ComputeType silently defaults to STANDARD and counts $35 (highest-risk on ERROR-state WorkSpaces — the Unused check's own target); WS-4 AutoStop projection ignores the auto-stop timeout (can flip the saving's sign); WS-5 never-connected AlwaysOn gets only the AutoStop rec; WS-6 dead branches + rank-table gaps.
 - **[KNOWN] restatements** (blind agents independently rediscovering report/Pass-3 items — a useful convergence signal): aurora CW helpers, opensearch/msk/transfer/monitoring E1s, athena CW E1, lambda PC dimension, bedrock blended rate + KB Counted, network VPC-endpoint double-count (reproduced at 150% of pool).
 
+## Tranche 11 — the CRITICAL + HIGH block (2026-08-10)
+
+Investigated and adversarially refuted before implementation (five parallel
+investigators, each pipelined into a refuter that re-derived rates and metric
+semantics independently). **Every proposal took damage; three of the four
+implemented fixes changed materially as a result.**
+
+- **ATH-1 (CRITICAL) — closed.** `scanned_tb x $5.00 x pricing_multiplier x 0.75`
+  carried three defects at once. The 0.75 is a fabricated fraction and cannot be
+  otherwise: Athena's API exposes no table metadata, format lives per TABLE while
+  bytes are measured per WORKGROUP, and the ratio is query-shaped (AWS's own
+  example is 3x compression x 4x column pruning, the 4x existing only because
+  that query read 1 of 4 columns). The $5.00 was hardcoded — verified live at
+  $9.00/TB in sa-east-1 — and `pricing_multiplier` was applied on top although
+  Athena's scan surface does not track it (sa-east-1 is 1.80x on scanned TB while
+  its DPU-hour rate is identical to us-east-1). The lever now MEASURES and counts
+  nothing. **The refuter caught that the proposed pricing method would return
+  $5.00 in five regions** present in `REGIONAL_PRICING` but absent from
+  `REGION_DISPLAY_NAMES` (`_display_name` defaults to N. Virginia) and label it
+  with the real region name — so it abstains instead. It also caught that the
+  bare `WorkGroup` rollup includes FAILED queries AWS does not bill, so billed
+  bytes prefer `(WorkGroup, QueryState)` summing `SUCCEEDED`+`CANCELED`.
+- **FS-2 — the EFS IA-lifecycle lever counts nothing.** `standard_gb -
+  monthly_access_gb` subtracts a 30-day I/O FLOW from a byte STOCK, unbounded in
+  the UNSAFE direction because a partial read resets a whole file's lifecycle
+  clock while contributing only the bytes read. Even a correct cold figure leaves
+  the SIGN unknown (128 KiB per-file IA minimum, and EFS publishes no file-size
+  distribution). Now a ceiling advisory that puts the measured I/O **in the
+  rendered string** — otherwise a proven-hot file system would read as a BIGGER
+  opportunity than an unmeasured one, the one way a $0 change could still
+  backfire on a customer report. Coverage loss stated honestly: a MOUNTED file
+  system with cold data is now covered by nothing.
+- **MS-1/MS-3/MS-4 — the MediaStore counted path is deleted.** It priced
+  `EstimatedStorageGB`, which came from an `AWS/MediaStore BucketSizeBytes` read
+  — a metric MediaStore does not publish — so it was always 0 and the branch was
+  unreachable on every account. Six tests asserted its dollars and passed only
+  because their fakes supplied the field directly. **No replacement advisory**:
+  scope is strictly cost and an EOL notice carries no dollar (the refuter cited
+  the in-tree precedent at `services/opensearch.py:130-132`).
+- **RS-A / RS-1 — the one NEW counted lever.** The tab could not report a dollar
+  from either direction. Idle provisioned clusters now count their whole compute
+  spend, gated on 30 days of hourly `DatabaseConnections` with >=360 datapoints,
+  **RA3 only** (DC2/DS2 bundle local SSD into the node-hour and the paused-storage
+  treatment is unverified), and **pause-eligibility checked** because AWS refuses
+  to pause a cluster with automated snapshots off or an HSM cluster. **The refuter
+  caught three blocking defects**: the proposal reused the shim's defaulted
+  `NumberOfNodes, 1)` so its own abstain guard could never fire (the MSK-5 /
+  GL-4 / WS-3 bug for the fourth time), its advisory branch fired for healthy
+  clusters, and it counted DC2/DS2 on unverified storage treatment.
+
+**QS-1/2/3 — investigated, not yet implemented.** Verdict: ADVISORY NOW, COUNT
+LATER. `describe_spice_capacity` does not exist in boto3 (verified), so the only
+counted lever is unreachable and the tab is empty on every real scan; the SPICE
+rate is globally flat ($0.38 Enterprise / $0.25 Standard across five regions,
+verified) so `pricing_multiplier` fabricates a premium; and the whole-pool math
+would count bundled per-Author capacity that is neither billed nor releasable.
+The formula `min(unused, purchased)` is right, but the INPUT is not obtainable:
+the SPICE limit comes only from a CloudWatch metric **whose namespace AWS's own
+page states two ways** and which neither agent could confirm against a live
+account. Ships as advisory in tranche 12.
+
 ## Reconciled backlog (2026-08-10, after tranche 10)
 
 Counted by reading the three findings sections above and matching every id
