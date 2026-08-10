@@ -56,8 +56,16 @@ def _log_group_ingestion_gb(
 ) -> dict[str, float]:
     """{log group name: GB ingested over the window}, batched into one call.
 
-    Only groups CloudWatch actually reported are present; a missing name means
-    no data was returned, which the caller treats as "unknown", never as zero.
+    A name is present only when CloudWatch returned a ``Complete`` result row
+    for it; a missing name means the read did not answer, which the caller
+    treats as "unknown", never as zero.
+
+    A present ``0.0`` is the distinct, load-bearing case (LS-4): ``AWS/Logs
+    IncomingBytes`` publishes only when data arrives, so ``Complete`` with an
+    EMPTY ``Values`` list proves the group took nothing in over the window
+    (live-verified 2026-08-10). That is the evidence the counted
+    never-expiring-log lever rests on, so it must not be collapsed into
+    "unknown" the way an unanswered query is.
     """
     if not log_group_names:
         return {}
@@ -97,7 +105,12 @@ def _log_group_ingestion_gb(
     out: dict[str, float] = {}
     for result in resp.get("MetricDataResults", []):
         values = result.get("Values") or []
-        if not values:
+        # Asymmetric on purpose: bytes are bytes whatever the status, but the
+        # EMPTY case is the one that underwrites a COUNTED dollar, so it demands
+        # an explicit ``Complete``. A PartialData / InternalError / Forbidden row
+        # — or one from a response that omits the field, which the botocore model
+        # permits — proves nothing and stays "unknown".
+        if not values and str(result.get("StatusCode") or "") != "Complete":
             continue
         try:
             index = int(str(result.get("Id", "q"))[1:])
@@ -251,38 +264,72 @@ def get_cloudwatch_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> 
 
             if retention_days is None:
                 stored_gb = stored_bytes / (1024**3)
+                storage_cost = stored_gb * CW_LOGS_GB_MONTH * pricing_multiplier
+                # LS-4 — a card whose own dollar renders as $0.00 refutes itself
+                # (LS-5). The live account's 21 never-expiring groups were Lambda
+                # logs of a few KB each, ~$0.0000006/mo: noise however labelled.
+                if round(storage_cost, 2) <= 0:
+                    continue
                 # H2 — setting a retention policy only deletes log data OLDER
-                # than the chosen window. describe_log_groups exposes only
-                # storedBytes (no age distribution), so the deletable fraction
-                # cannot be measured here; charging 100% of storedBytes
-                # fabricates a saving that scales with the largest groups.
-                # Emit a $0 advisory (S3-style: no evidence → not counted)
-                # rather than an unbacked counted dollar. Quantify via
-                # CloudWatch Logs Insights ("bytes older than N days") before
-                # counting.
+                # than the chosen window, and describe_log_groups exposes no age
+                # distribution, so charging 100% of storedBytes fabricates a
+                # saving that scales with the largest groups.
+                #
+                # LS-4 — with ONE exception, which is measured rather than
+                # assumed: if the ingestion read answered for this group and
+                # reported no bytes at all across the window, every stored byte
+                # already predates that window, so setting retention to it
+                # deletes all of them and the whole storage cost IS realizable.
+                # `monthly_gb is None` means the read did not answer (not
+                # probed, throttled, --fast) — absence of evidence, never
+                # evidence of silence.
+                proven_silent = monthly_gb is not None and monthly_gb <= 0
                 checks["never_expiring_logs"].append(
                     {
                         "LogGroupName": log_group_name,
                         "StoredBytes": stored_bytes,
                         "StoredGB": round(stored_gb, 2),
-                        "Recommendation": "Set retention policy to prevent unlimited log growth",
-                        "EstimatedSavings": (
-                            "$0.00/month — advisory: deletable bytes (older than "
-                            "retention) not measurable from describe_log_groups; "
-                            "quantify via CloudWatch Logs Insights before counting"
+                        "Recommendation": (
+                            f"No bytes ingested in {_INGESTION_WINDOW_DAYS} days and no "
+                            f"retention policy - set retention to {_INGESTION_WINDOW_DAYS} "
+                            f"days to release all {stored_gb:,.2f} GB"
+                            if proven_silent
+                            else "Set retention policy to prevent unlimited log growth"
                         ),
-                        "EstimatedMonthlySavings": 0.0,
-                        "Counted": False,
+                        "EstimatedSavings": (
+                            f"${storage_cost:,.2f}/month"
+                            if proven_silent
+                            else (
+                                f"$0.00/month - advisory: ceiling ${storage_cost:,.2f}/month "
+                                "(total stored-log cost); the deletable share is the bytes "
+                                "older than the retention you choose, which "
+                                "describe_log_groups cannot age"
+                            )
+                        ),
+                        "EstimatedMonthlySavings": round(storage_cost, 2) if proven_silent else 0.0,
+                        "PotentialMonthlySavings": round(storage_cost, 2),
+                        "Counted": proven_silent,
                         "CheckCategory": "Never-Expiring Log Groups",
                         "AuditBasis": {
                             "stored_gb": round(stored_gb, 2),
                             "rate_per_gb_month": CW_LOGS_GB_MONTH,
                             "region_multiplier": round(pricing_multiplier, 4),
+                            "metric": "AWS/Logs IncomingBytes (Sum), dimension LogGroupName",
+                            "metric_window_days": _INGESTION_WINDOW_DAYS,
+                            "counted": proven_silent,
                             "reason": (
-                                "no measured bytes-older-than-retention signal; "
+                                f"ingestion read returned Complete with no bytes over "
+                                f"{_INGESTION_WINDOW_DAYS} days, so every stored byte "
+                                "predates that window and 100% is deletable"
+                                if proven_silent
+                                else "no measured bytes-older-than-retention signal; "
                                 "100%-of-storedBytes saving is unbacked"
                             ),
-                            "formula": "advisory $0 (requires age-of-bytes evidence)",
+                            "formula": (
+                                "stored GB x $/GB-month x region multiplier"
+                                if proven_silent
+                                else "advisory $0 (requires age-of-bytes evidence)"
+                            ),
                         },
                     }
                 )

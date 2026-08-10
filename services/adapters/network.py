@@ -107,7 +107,7 @@ def _coh_nat_recs(ctx: Any) -> list[dict[str, Any]]:
 def _collect_nat_with_topology(
     ctx: Any,
     exclude_nat_ids: set[str],
-) -> tuple[list[dict[str, Any]], dict[str, str]]:
+) -> tuple[list[dict[str, Any]], dict[str, str] | None]:
     """Run the NAT shim once, excluding CoH-owned NATs, returning ``(recs, map)``.
 
     ``exclude_nat_ids`` are the NATs a Cost Optimization Hub finding already counts,
@@ -116,13 +116,16 @@ def _collect_nat_with_topology(
     over-suppression of independent NATs). ``_safe_collect`` would discard the
     topology map, so the shim is called directly with the same error-classification
     contract.
+
+    The map is ``None`` — not ``{}`` — when enumeration FAILED, so the LS-3 gate
+    can tell "this account has no NAT gateways" from "we could not find out".
     """
     try:
         result = get_nat_gateway_checks(ctx, exclude_nat_ids=exclude_nat_ids)
         return list(result.get("recommendations", [])), dict(result.get("nat_vpc_map", {}))
     except Exception as e:
         record_aws_error(ctx, e, service="network", context="nat_gateway sub-check failed")
-        return [], {}
+        return [], None
 
 
 def _normalize_coh_nat(
@@ -197,9 +200,19 @@ class NetworkModule(BaseServiceModule):
         coh_nat_ids = {coh_key(r) for r in coh_nat_raw}
         local_nat_recs, nat_vpc_map = _collect_nat_with_topology(ctx, coh_nat_ids)
         nat_recs = _annotate_severity(local_nat_recs) + _annotate_severity(
-            _normalize_coh_nat(coh_nat_raw, nat_vpc_map)
+            _normalize_coh_nat(coh_nat_raw, nat_vpc_map or {})
         )
-        vpc_recs = _annotate_severity(_safe_collect("vpc_endpoints", get_vpc_endpoints_checks, ctx))
+        # LS-3 — the NAT->VPC topology is already resolved above for CoH
+        # attribution, so gating the missing-gateway-endpoint check on it costs
+        # no extra API call. None (enumeration failed) leaves the check ungated.
+        nat_vpc_ids = {v for v in nat_vpc_map.values() if v} if nat_vpc_map is not None else None
+        vpc_recs = _annotate_severity(
+            _safe_collect(
+                "vpc_endpoints",
+                lambda c: get_vpc_endpoints_checks(c, nat_vpc_ids=nat_vpc_ids),
+                ctx,
+            )
+        )
         lb_recs = _annotate_severity(_safe_collect("load_balancer", get_load_balancer_checks, ctx))
         # ASG rightsizing is owned by the EC2 tab (Compute Optimizer + member dedup);
         # surface it here as advisory only so it is visible but never double-counted.

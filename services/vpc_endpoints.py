@@ -26,8 +26,18 @@ def _interface_az_count(endpoint: dict[str, Any]) -> int:
     return max(1, len(subnets))
 
 
-def get_vpc_endpoints_checks(ctx: ScanContext) -> dict[str, Any]:
-    """Category 3: VPC Endpoints optimization checks."""
+def get_vpc_endpoints_checks(
+    ctx: ScanContext, nat_vpc_ids: set[str] | None = None
+) -> dict[str, Any]:
+    """Category 3: VPC Endpoints optimization checks.
+
+    Args:
+        ctx: Scan context.
+        nat_vpc_ids: VPC ids holding at least one available NAT Gateway, used to
+            gate the missing-gateway-endpoint check (LS-3). ``None`` means the
+            NAT topology could not be resolved and the check is not gated —
+            fail-open, because a failed read is not evidence of absence.
+    """
     vpc_ep_monthly = (
         ctx.pricing_engine.get_vpc_endpoint_monthly_price()
         if ctx.pricing_engine is not None
@@ -54,6 +64,13 @@ def get_vpc_endpoints_checks(ctx: ScanContext) -> dict[str, Any]:
 
         for vpc in vpcs:
             vpc_id = vpc["VpcId"]
+            # LS-3 — the saving from a Gateway endpoint IS avoided NAT
+            # data-processing ($0.045/GB); the endpoint itself is free. With no
+            # NAT in the VPC there is no such charge, so the recommendation's own
+            # stated mechanism does not exist and the saving is structurally $0.
+            # Ungated, this fired on every account's default VPC forever.
+            if nat_vpc_ids is not None and vpc_id not in nat_vpc_ids:
+                continue
             vpc_endpoints_in_vpc = [ep for ep in endpoints if ep.get("VpcId") == vpc_id]
 
             has_s3_gateway = any(
