@@ -302,6 +302,23 @@ FALLBACK_FSX_MULTI_AZ_GB_MONTH: dict[tuple[str, str], float] = {
     ("ONTAP", "SSD"): 0.250,
     ("OPENZFS", "SSD"): 0.18,
 }
+
+# FSx provisioned THROUGHPUT capacity, $/MBps-month, keyed by (fileSystemType,
+# deploymentOption). Validated against the live Pricing API 2026-08-10
+# (AmazonFSx, us-east-1, productFamily "Provisioned Throughput", unit MiBps-Mo).
+# Throughput is billed alongside storage and bills 24/7 whether or not anyone
+# mounts the file system, so an idle file system wastes BOTH legs (FS-7).
+# Lustre is deliberately absent: its classic persistent throughput is sold in
+# per-TiB-of-storage tiers rather than a flat MBps rate, so there is no single
+# defensible constant — the caller omits the leg instead of guessing.
+FALLBACK_FSX_THROUGHPUT_MBPS_MONTH: dict[tuple[str, str], float] = {
+    ("WINDOWS", "SINGLE-AZ"): 2.20,
+    ("WINDOWS", "MULTI-AZ"): 4.50,
+    ("ONTAP", "SINGLE-AZ"): 0.72,
+    ("ONTAP", "MULTI-AZ"): 1.20,
+    ("OPENZFS", "SINGLE-AZ"): 0.26,
+    ("OPENZFS", "MULTI-AZ"): 0.87,
+}
 # AWS Pricing API ``fileSystemType`` attribute values, keyed by the upper-cased
 # token the adapter passes. ``str.capitalize()`` mangles ONTAP -> "Ontap" and
 # OPENZFS -> "Openzfs", which never match, so the live lookup must use this map.
@@ -941,6 +958,38 @@ class PricingEngine:
             price = self._use_fallback(
                 fallback * self._fallback_multiplier,
                 f"Pricing API unavailable for FSx {fs_type} {st} ({deployment_option}) in {self._region}; using fallback",
+            )
+        self._cache.set(key, price)
+        return price
+
+    def get_fsx_throughput_price_per_mbps(
+        self, file_system_type: str, deployment_option: str = "Single-AZ"
+    ) -> float:
+        """$/MBps/month for FSx provisioned throughput capacity in self._region.
+
+        Returns ``0.0`` when neither the live SKU nor a fallback constant covers
+        the (type, deployment) pair — Lustre in particular, whose persistent
+        throughput is sold in per-TiB-of-storage tiers rather than a flat MBps
+        rate. The caller must omit the throughput leg rather than guess.
+        """
+        fs_type = file_system_type.strip().upper()
+        key = ("fsx_throughput", fs_type, deployment_option)
+        if (cached := self._get_cached(key)) is not None:
+            return cached
+        price = self._fetch_fsx_throughput_price(fs_type, deployment_option)
+        if price is None:
+            az = "MULTI-AZ" if "MULTI" in deployment_option.upper() else "SINGLE-AZ"
+            fallback = FALLBACK_FSX_THROUGHPUT_MBPS_MONTH.get((fs_type, az))
+            if fallback is None:
+                # No defensible constant for this pair (Lustre): 0.0 so the
+                # caller omits the leg. Not a fallback event — nothing was
+                # substituted.
+                self._cache.set(key, 0.0)
+                return 0.0
+            price = self._use_fallback(
+                fallback * self._fallback_multiplier,
+                f"Pricing API unavailable for FSx {fs_type} throughput "
+                f"({deployment_option}) in {self._region}; using fallback",
             )
         self._cache.set(key, price)
         return price
@@ -1890,6 +1939,36 @@ class PricingEngine:
             {"Type": "TERM_MATCH", "Field": "deploymentOption", "Value": deployment_option},
         ]
         return self._call_pricing_api("AmazonFSx", filters)
+
+    def _fetch_fsx_throughput_price(
+        self, file_system_type: str, deployment_option: str
+    ) -> float | None:
+        """Live $/MBps-month for FSx provisioned throughput, or None.
+
+        ``deploymentOption`` values on this productFamily are finer-grained than
+        the storage ones (ONTAP publishes Single-AZ_2N / Single-AZ_2N-2 /
+        Multi-AZ / Multi-AZ-2; OpenZFS adds the _HA variants), so an exact match
+        is tried first and a coarse Single-AZ / Multi-AZ prefix match second.
+        """
+        fs_label = _FSX_FILE_SYSTEM_TYPE_LABELS.get(file_system_type.strip().upper(), file_system_type)
+        base = [
+            {"Type": "TERM_MATCH", "Field": "location", "Value": self._display_name},
+            {"Type": "TERM_MATCH", "Field": "productFamily", "Value": "Provisioned Throughput"},
+            {"Type": "TERM_MATCH", "Field": "fileSystemType", "Value": fs_label},
+        ]
+        exact = self._call_pricing_api(
+            "AmazonFSx",
+            [*base, {"Type": "TERM_MATCH", "Field": "deploymentOption", "Value": deployment_option}],
+        )
+        if exact is not None:
+            return exact
+        coarse = "Multi-AZ" if "MULTI" in deployment_option.upper() else "Single-AZ"
+        if coarse == deployment_option:
+            return None
+        return self._call_pricing_api(
+            "AmazonFSx",
+            [*base, {"Type": "TERM_MATCH", "Field": "deploymentOption", "Value": coarse}],
+        )
 
     def _fetch_eip_price(self) -> float | None:
         # EIP pricing lives in AmazonVPC (not AmazonEC2) since AWS rebilled all
