@@ -42,18 +42,31 @@ class TestFileSystemsLogic:
         assert efs_lifecycle_savings(100, 0.02, 0.30) == 0.0
 
     def test_efs_lifecycle_net_cold(self):
-        # 100 GB Standard, 1 GB accessed -> cold 99, net = 99*0.275 - 1*0.01
+        # 100 GB Standard, 1 GB accessed -> cold 99. FS-4: the accessed GB is
+        # already EXCLUDED from the cold set, so it never transitions to IA and
+        # can never incur an IA access charge — levying one was a double
+        # penalty for a single fact.
         est = efs_lifecycle_net_savings(100, 1, 0.30, 0.025, 0.01)
         assert est.cold_gb == pytest.approx(99.0)
         assert est.gross_savings == pytest.approx(99 * 0.275)
-        assert est.access_charge == pytest.approx(0.01)
-        assert est.net_savings == pytest.approx(99 * 0.275 - 0.01)
+        assert est.access_charge == 0.0
+        assert est.net_savings == pytest.approx(99 * 0.275)
 
-    def test_efs_lifecycle_net_hot_is_negative(self):
-        # Access exceeds storage -> cold 0, net negative (drops the finding).
+    def test_efs_lifecycle_hot_file_system_yields_nothing(self):
+        # Access exceeds storage -> nothing is cold -> no saving. The caller
+        # gates on `net_savings > 0`, so a zero net drops the finding.
         est = efs_lifecycle_net_savings(100, 5000, 0.30, 0.025, 0.01)
         assert est.cold_gb == 0.0
-        assert est.net_savings < 0
+        assert est.net_savings == 0.0
+
+    def test_efs_lifecycle_access_fee_is_not_charged_twice(self):
+        """The accessed bytes are penalised once, by exclusion from the cold
+        set — not a second time by a fee they cannot generate."""
+        with_access = efs_lifecycle_net_savings(100, 10, 0.30, 0.025, 0.01)
+        # Same cold population, expressed with a zero access rate.
+        without_rate = efs_lifecycle_net_savings(100, 10, 0.30, 0.025, 0.0)
+        assert with_access.net_savings == pytest.approx(without_rate.net_savings)
+        assert with_access.cold_gb == pytest.approx(90.0)
 
     def test_efs_idle_savings(self):
         assert efs_idle_savings(200, 0.30) == pytest.approx(60.0)
@@ -304,12 +317,13 @@ class TestEfsFindings:
         counted = [c for c in out["counted"] if c["CheckCategory"] == "EFS No Lifecycle"]
         assert len(counted) == 1
         assert counted[0]["Counted"] is True
-        # cold_gb=99, net = 99*(0.30-0.025) - 1*0.01 = 27.225 - 0.01
-        assert counted[0]["_savings"] == pytest.approx(99 * 0.275 - 0.01)
+        # cold_gb = 99, net = 99 x (0.30 - 0.025) = 27.225.
+        # FS-4: no IA access charge against bytes excluded from the cold set.
+        assert counted[0]["_savings"] == pytest.approx(99 * 0.275)
         ab = counted[0]["AuditBasis"]
         assert ab["cold_gb"] == pytest.approx(99.0)
         assert ab["monthly_access_gb"] == pytest.approx(1.0)
-        assert ab["ia_access_charge"] == pytest.approx(0.01)
+        assert ab["ia_access_charge"] == 0.0
 
     def test_lifecycle_advisory_when_metrics_show_hot(self):
         # B: heavy access -> cold_gb 0 / net <= 0 -> advisory "not cost-effective".
