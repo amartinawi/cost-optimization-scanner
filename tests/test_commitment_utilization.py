@@ -108,8 +108,10 @@ def test_sp_coverage_rate_uses_real_covered_key():
     recs, rate = mod._check_sp_coverage(ctx, _CovCe(), {"Start": "2026-07-10", "End": "2026-08-09"})
     # covered/(od+covered) = 1610.74/(554.36+1610.74) ~= 0.744 (was 0.0 via "CoveredCost")
     assert rate == pytest.approx(1610.74 / (554.36 + 1610.74), abs=0.01)
-    # Lambda gap rec now emits (SERVICE attribute finally read)
-    assert any(r["resource_id"] == "AWS Lambda" for r in recs)
+    # LS-2 — the per-service gap CARD is gone (it could carry no defensible
+    # dollar), but both services' spend must still reach the rate above: the
+    # denominator includes AWS Lambda's $354.36.
+    assert recs == []
 
 
 def test_ri_coverage_rate_from_coverage_hours():

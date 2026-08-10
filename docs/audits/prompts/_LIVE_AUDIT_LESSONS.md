@@ -318,6 +318,39 @@ will eventually both count it. This is the single most common real finding.
   `(EndpointName, VariantName)`). *Real: tranche 5 shipped both polarities in one
   run (TR-1 on Transfer, MSK-1 on Kafka); SM-1 was the dimension-set form.*
 
+- **C14 — An AWS coverage/eligibility matrix is a DATED fact. Verify it against a
+  live enum or offering query before gating on it, and never widen a gate from
+  memory.** Which services a commitment product covers, which regions have a SKU,
+  which instance families a reservation is flexible across — all of these change
+  under you, and a stale matrix used as an ALLOWLIST fails in the silent
+  direction: the check simply stops firing, and an allowlist key that never
+  matches is indistinguishable from "nothing found" forever. Cheap live probes
+  beat recall: send a deliberately invalid enum value and read the valid set back
+  out of the `ValidationException` (`ce:GetSavingsPlansPurchaseRecommendation`
+  with a bogus `SavingsPlansType` returns `[DATABASE_SP, SAGEMAKER_SP,
+  COMPUTE_SP, EC2_INSTANCE_SP]`), or count live offering rates per `serviceCode`.
+  Before adding a filter at all, check whether **AWS already filters for you** —
+  `ce:GetSavingsPlansCoverage` returns only SP-eligible services (23 SERVICE
+  values in the account, 3 returned), so an allowlist there is pure recall loss
+  with no precision gain. *Real: LS-1 (2026-08-10) was raised as a HIGH on the
+  premise "Savings Plans cover EC2/Fargate/Lambda/SageMaker only" and was
+  WITHDRAWN — Database Savings Plans went GA 2025-12. The proposed allowlist
+  would have silently disabled the check for RDS and Aurora, the largest
+  uncovered spend in most accounts. The finding, the fix, and one investigating
+  agent all carried the same stale matrix; only the live enum caught it.*
+
+- **C15 — Before promoting a measured number onto a card, check what the API says
+  it MEASURES, and whether the same tab already shows a different number for the
+  same-sounding thing.** `Coverage.OnDemandCost` from `ce:GetSavingsPlansCoverage`
+  is documented as usage priced at the **public On-Demand rate** — a rate
+  equivalent, not billed spend — and that query takes no region filter. Live it
+  read $13.37 for EC2 while actual unblended on-demand was ~$0.0000009 (free
+  tier). The commitment tab *already* carries an "Uncovered On-Demand ($/mo)"
+  stat built from `UnblendedCost` + REGION + PURCHASE_TYPE, so rendering the
+  first beside the second puts two contradictory dollars for the same label on
+  one screen. Replacing a hidden fabrication with a visible contradiction is not
+  a fix. *Real: the rejected half of the LS-2 repair.*
+
 ## D. Render / tab / count semantics (`counted == rendered`, both directions)
 
 - **D1 — Counted-but-invisible (render desync).** Savings summed into the headline
@@ -445,9 +478,14 @@ assert abs(tot - d["summary"]["total_monthly_savings"]) < 0.5, (tot, d["summary"
 #    (a) the numeric field name varies — EstimatedMonthlySavings, estimatedMonthlySavings (CoH),
 #        or snake_case monthly_savings (network_cost, commitment_analysis, …); check ALL.
 #    (b) EXCEPTION — a PROJECTION/what-if advisory legitimately carries a non-zero numeric: an
-#        SP/RI purchase or coverage-gap rec in commitment_analysis projects "you'd save $X IF you
-#        buy", it is NOT a counted resource saving the headline excludes by accident. Exclude those
-#        projection sources; everything else with a non-zero numeric is a real leak.
+#        SP/RI PURCHASE rec in commitment_analysis projects "you'd save $X IF you buy", it is NOT
+#        a counted resource saving the headline excludes by accident. Exclude those projection
+#        sources; everything else with a non-zero numeric is a real leak.
+#        NARROWED 2026-08-10 (LS-2): "coverage-gap" is no longer in this exception — that source
+#        emits nothing now. Its projection was a flat 0.30 x spend with no account-specific input,
+#        i.e. a C-class fabrication wearing a projection's clothes. A projection earns this
+#        exception only when its dollar comes from AWS (CE/CoH) or from live offering rates —
+#        never from a hardcoded average. A non-zero numeric under sp_coverage_gaps is now a leak.
 def _num(r):
     return (float(r.get("EstimatedMonthlySavings") or 0)
             or float(r.get("estimatedMonthlySavings") or 0)
