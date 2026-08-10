@@ -120,7 +120,11 @@ def test_ri_services_match_doc_confirmed_strings():
 
 
 def test_sp_types_match_doc_confirmed_enum():
-    assert SP_TYPES == ("COMPUTE_SP", "EC2_INSTANCE_SP", "SAGEMAKER_SP")
+    # DATABASE_SP joined the CE enum with the Database Savings Plan (GA
+    # 2025-12) and was missing here until LS-7; the fan-out restriction that
+    # keeps it to its one purchasable combo lives in
+    # tests/test_commitment_database_sp_purchase.py.
+    assert SP_TYPES == ("COMPUTE_SP", "EC2_INSTANCE_SP", "SAGEMAKER_SP", "DATABASE_SP")
 
 
 def test_ri_cells_dynamodb_uses_reserved_capacity_details():

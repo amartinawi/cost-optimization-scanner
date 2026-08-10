@@ -52,8 +52,11 @@ CE API docs on 2026-08-08 (Task 1 Step 0), via ``aws-knowledge``
   ``EstimatedSavingsPercentage``, ``UpfrontCost``, ``EstimatedOnDemandCost``
   (detail-level) / ``EstimatedOnDemandCostWithCurrentCommitment``
   (summary-level, preferred — read with an ``EstimatedOnDemandCost``
-  fallback). ``SavingsPlansType`` enum confirmed as exactly
-  ``COMPUTE_SP | EC2_INSTANCE_SP | SAGEMAKER_SP``.
+  fallback). ``SavingsPlansType`` enum re-verified live 2026-08-10 (botocore
+  1.43.47 service model) as ``COMPUTE_SP | EC2_INSTANCE_SP | SAGEMAKER_SP |
+  DATABASE_SP`` — the fourth member arrived with the Database Savings Plan
+  (GA 2025-12) and was missing here until LS-7. Note the CE enum is WIDER than
+  what AWS actually sells: see ``SP_MATRIX_PROBE_TYPES``.
 """
 
 from __future__ import annotations
@@ -74,7 +77,32 @@ RI_SERVICES: tuple[tuple[str, str], ...] = (
     # Live-verified: the API's supported-values error names this exact string.
     ("Amazon DynamoDB Service", "DynamoDB"),
 )
-SP_TYPES: tuple[str, ...] = ("COMPUTE_SP", "EC2_INSTANCE_SP", "SAGEMAKER_SP")
+SP_TYPES: tuple[str, ...] = ("COMPUTE_SP", "EC2_INSTANCE_SP", "SAGEMAKER_SP", "DATABASE_SP")
+
+# CE's SavingsPlansType -> the savingsplans API's own planType spelling, used to
+# ask DescribeSavingsPlansOfferings which term/payment combos AWS actually sells.
+SP_PLAN_TYPES: dict[str, str] = {
+    "COMPUTE_SP": "Compute",
+    "EC2_INSTANCE_SP": "EC2Instance",
+    "SAGEMAKER_SP": "SageMaker",
+    "DATABASE_SP": "Database",
+}
+
+# Plan types whose purchasable matrix must be resolved live before fan-out.
+#
+# CE's enum is wider than AWS's catalogue: a live offerings probe (2026-08-10)
+# returns all six term/payment combos for Compute, EC2Instance and SageMaker,
+# but exactly ONE for Database — 1yr, No Upfront. CE does not reject the other
+# five; it accepts them and answers empty. So an unrestricted fan-out would burn
+# 5 x $0.01 per scan, and — worse — would render a purchase card for a plan
+# nobody can buy if CE ever did answer.
+#
+# Only Database is probed. The other three already fan out fully today and the
+# probe could not change that, while EC2Instance alone enumerates ~19k offerings
+# (they are listed per usage type), which is not worth paging through. A dated
+# fact is not hardcoded here: the combos come from the API, and Database picks
+# up any term AWS adds later without a code change (lesson C14).
+SP_MATRIX_PROBE_TYPES: frozenset[str] = frozenset({"DATABASE_SP"})
 
 TERMS: tuple[tuple[str, str], ...] = (("ONE_YEAR", "1yr"), ("THREE_YEARS", "3yr"))
 PAYMENTS: tuple[tuple[str, str], ...] = (
@@ -82,6 +110,37 @@ PAYMENTS: tuple[tuple[str, str], ...] = (
     ("PARTIAL_UPFRONT", "Partial Upfront"),
     ("ALL_UPFRONT", "All Upfront"),
 )
+
+# Savings Plan product types the Database plan covers, per the live offering
+# record (LS-8). Redshift is absent, which is why it stays a separate,
+# additive term in ``projected_savings``.
+DATABASE_SP_RI_SERVICES: frozenset[str] = frozenset(
+    {"RDS", "ElastiCache", "OpenSearch", "DynamoDB"}
+)
+
+
+def sp_fanout_cells(
+    offered: dict[str, frozenset[tuple[str, str]]],
+) -> list[tuple[str, str, str, str, str]]:
+    """The SP purchase cells to request, as (sp_type, term_api, term_label,
+    payment_api, payment_label).
+
+    ``offered`` maps an SP type to the ``(term_api, payment_api)`` combos AWS
+    sells, as resolved by the live offerings probe. A type ABSENT from the
+    mapping is unresolved and fans out across the full matrix — fail-open, so a
+    denied or failed probe costs CE calls rather than losing a recommendation.
+    A type present with an EMPTY set fans out to nothing: that is a resolved
+    answer meaning AWS currently sells none, not a missing one.
+    """
+    cells: list[tuple[str, str, str, str, str]] = []
+    for sp_type in SP_TYPES:
+        allowed = offered.get(sp_type)
+        for term_api, term_label in TERMS:
+            for payment_api, payment_label in PAYMENTS:
+                if allowed is not None and (term_api, payment_api) not in allowed:
+                    continue
+                cells.append((sp_type, term_api, term_label, payment_api, payment_label))
+    return cells
 
 # Per-service nested identity keys inside RecommendationDetails: (outer key,
 # inner key). DynamoDB is the odd one out — its detail lives under
@@ -403,6 +462,10 @@ _COH_RI_MATCH = {
 # Which CoH savings-plan resource-type substrings concur with which SP card type.
 # Maps sp_type to tuple of acceptable currentResourceType substrings.
 # Source: core/scan_orchestrator.py type_map lines 132-134 (savings-plan types).
+# DATABASE_SP is deliberately absent: the Cost Optimization Hub ResourceType
+# enum has no DatabaseSavingsPlans member (botocore 1.43.47, checked 2026-08-10),
+# so a key here would be a bucket that can never receive a rec. Add one only
+# when the enum gains the member.
 _COH_SP_MATCH = {
     "COMPUTE_SP": ("ComputeSavingsPlans",),
     "EC2_INSTANCE_SP": ("EC2InstanceSavingsPlans", "Ec2InstanceSavingsPlans"),
@@ -489,10 +552,17 @@ def projected_savings(ri_cards: list[dict[str, Any]],
     """Best non-overlapping purchase path across instruments (spec section
     "Projected figure + non-overlap rule").
 
-    SP and RI discount the SAME on-demand spend, so within the compute group
-    the winner is max(best SP type, sum of EC2 RI cards) — never the sum.
-    Disjoint RI services (RDS/ElastiCache/Redshift/OpenSearch/DynamoDB) sum
-    safely; SageMaker SP overlaps nothing else and adds on top.
+    SP and RI discount the SAME on-demand spend, so within a group the winner
+    is max(best SP type, sum of that group's RI cards) — never the sum.
+
+    Three disjoint groups:
+
+    * **compute** — EC2 RIs vs Compute/EC2-Instance SP.
+    * **database** — RDS/ElastiCache/OpenSearch/DynamoDB RIs vs the Database SP
+      (LS-7). Redshift is ABSENT from the Database plan's productTypes, so its
+      RI overlaps nothing here and stays additive; folding it into the max()
+      would under-count a real saving.
+    * **sagemaker** — SageMaker SP overlaps nothing else and adds on top.
     """
     ec2_ri_total = sum(c["monthly_savings"] for c in ri_cards if c["service"] == "EC2")
     ec2_eligible_sp = [c for c in sp_cards if c["sp_type"] in ("COMPUTE_SP", "EC2_INSTANCE_SP")]
@@ -510,8 +580,18 @@ def projected_savings(ri_cards: list[dict[str, Any]],
     else:
         group1, group1_basis = ec2_ri_total, "EC2 RI path"
 
-    group2 = sum(c["monthly_savings"] for c in ri_cards
-                 if c["service"] in ("RDS", "ElastiCache", "Redshift", "OpenSearch", "DynamoDB"))
+    db_ri_total = sum(c["monthly_savings"] for c in ri_cards
+                      if c["service"] in DATABASE_SP_RI_SERVICES)
+    database_sp_best = max((c["monthly_savings"] for c in sp_cards
+                            if c["sp_type"] == "DATABASE_SP"), default=0.0)
+    redshift_ri_total = sum(c["monthly_savings"] for c in ri_cards
+                            if c["service"] == "Redshift")
+    if database_sp_best > db_ri_total:
+        group2, group2_basis = database_sp_best, "Database SP path"
+    else:
+        group2, group2_basis = db_ri_total, "service RIs (RDS/ElastiCache/OpenSearch/DynamoDB)"
+    group2 += redshift_ri_total
+
     group3 = max((c["monthly_savings"] for c in sp_cards if c["sp_type"] == "SAGEMAKER_SP"),
                  default=0.0)
 
@@ -519,8 +599,10 @@ def projected_savings(ri_cards: list[dict[str, Any]],
     parts = []
     if group1 > 0:
         parts.append(group1_basis)
-    if group2 > 0:
-        parts.append("service RIs (RDS/ElastiCache/Redshift/OpenSearch/DynamoDB)")
+    if database_sp_best > 0 or db_ri_total > 0:
+        parts.append(group2_basis)
+    if redshift_ri_total > 0:
+        parts.append("Redshift RI")
     if group3 > 0:
         parts.append("SageMaker SP")
     return total, " + ".join(parts) if parts else "no purchase recommendations"
