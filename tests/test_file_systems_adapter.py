@@ -18,7 +18,8 @@ from services.efs_fsx import get_efs_findings, get_fsx_findings
 from services.file_systems_logic import (
     dedupe_counted,
     efs_idle_savings,
-    efs_lifecycle_net_savings,
+    efs_ia_breakeven_file_kib,
+    efs_lifecycle_ceiling,
     efs_lifecycle_savings,
     efs_one_zone_savings,
     fs_id,
@@ -41,32 +42,21 @@ class TestFileSystemsLogic:
     def test_efs_lifecycle_never_negative(self):
         assert efs_lifecycle_savings(100, 0.02, 0.30) == 0.0
 
-    def test_efs_lifecycle_net_cold(self):
-        # 100 GB Standard, 1 GB accessed -> cold 99. FS-4: the accessed GB is
-        # already EXCLUDED from the cold set, so it never transitions to IA and
-        # can never incur an IA access charge — levying one was a double
-        # penalty for a single fact.
-        est = efs_lifecycle_net_savings(100, 1, 0.30, 0.025, 0.01)
-        assert est.cold_gb == pytest.approx(99.0)
-        assert est.gross_savings == pytest.approx(99 * 0.275)
-        assert est.access_charge == 0.0
-        assert est.net_savings == pytest.approx(99 * 0.275)
+    def test_efs_lifecycle_ceiling_is_an_upper_bound(self):
+        # FS-2: the old model computed cold_gb = standard_gb - monthly_access_gb,
+        # subtracting a 30-day I/O FLOW from a byte STOCK. What survives is an
+        # explicit CEILING that is never counted.
+        assert efs_lifecycle_ceiling(100, 0.30, 0.025) == pytest.approx(27.5)
+        assert efs_lifecycle_ceiling(0, 0.30, 0.025) == 0.0
+        # A non-positive delta cannot produce a negative ceiling.
+        assert efs_lifecycle_ceiling(100, 0.025, 0.30) == 0.0
 
-    def test_efs_lifecycle_hot_file_system_yields_nothing(self):
-        # Access exceeds storage -> nothing is cold -> no saving. The caller
-        # gates on `net_savings > 0`, so a zero net drops the finding.
-        est = efs_lifecycle_net_savings(100, 5000, 0.30, 0.025, 0.01)
-        assert est.cold_gb == 0.0
-        assert est.net_savings == 0.0
-
-    def test_efs_lifecycle_access_fee_is_not_charged_twice(self):
-        """The accessed bytes are penalised once, by exclusion from the cold
-        set — not a second time by a fee they cannot generate."""
-        with_access = efs_lifecycle_net_savings(100, 10, 0.30, 0.025, 0.01)
-        # Same cold population, expressed with a zero access rate.
-        without_rate = efs_lifecycle_net_savings(100, 10, 0.30, 0.025, 0.0)
-        assert with_access.net_savings == pytest.approx(without_rate.net_savings)
-        assert with_access.cold_gb == pytest.approx(90.0)
+    def test_ia_breakeven_file_size(self):
+        # IA bills a 128 KiB minimum per file, so below this mean file size the
+        # transition LOSES money. EFS reports no file-size distribution, which is
+        # why the SIGN of this lever is unknown and it cannot count.
+        assert efs_ia_breakeven_file_kib(0.30, 0.025) == pytest.approx(128.0 * (0.025 / 0.30))
+        assert efs_ia_breakeven_file_kib(0.0, 0.025) == 0.0
 
     def test_efs_idle_savings(self):
         assert efs_idle_savings(200, 0.30) == pytest.approx(60.0)
@@ -295,56 +285,47 @@ class TestEfsFindings:
         assert counted[0]["_savings"] == pytest.approx(60.0)  # 200 × 0.30
         assert "AuditBasis" in counted[0]
 
-    def test_lifecycle_advisory_when_no_cloudwatch(self):
-        # No CloudWatch client -> no usage evidence -> advisory indicative gross,
-        # never counted.
-        fs = _efs_fs("fs-life", total_gb=100, standard_gb=100, mount_targets=2)
-        out = get_efs_findings(_ctx(efs=_FakeEfs([fs])), 1.0)
-        assert out["counted"] == []
-        life = [a for a in out["advisory"] if a["CheckCategory"] == "EFS No Lifecycle"]
-        assert len(life) == 1
-        assert life[0]["Counted"] is False
-        assert "gross" in life[0]["EstimatedSavings"]
-        assert "_savings" not in life[0]  # never feeds counted totals
-        # One Zone migration also advisory.
-        assert any(a["CheckCategory"] == "EFS One Zone Migration" for a in out["advisory"])
-
-    def test_lifecycle_counted_when_metrics_prove_cold(self):
-        # B: CloudWatch shows little access -> cold set -> net-positive COUNTED.
+    def test_lifecycle_never_counts_however_cold(self):
+        """FS-2: even a proven-cold file system does not count. The quantity was
+        derived by subtracting an I/O FLOW from a byte STOCK, and even a correct
+        cold figure leaves the SIGN unknown (128 KiB per-file IA minimum)."""
         fs = _efs_fs("fs-cold", total_gb=100, standard_gb=100, mount_targets=2)
-        cw = _FakeCw({"DataReadIOBytes": [{"Sum": float(1 * GB)}]})  # 1 GB read, no writes
+        cw = _FakeCw({"DataReadIOBytes": [{"Sum": float(1 * GB)}]})
         out = get_efs_findings(_ctx(efs=_FakeEfs([fs]), cloudwatch=cw), 1.0)
-        counted = [c for c in out["counted"] if c["CheckCategory"] == "EFS No Lifecycle"]
-        assert len(counted) == 1
-        assert counted[0]["Counted"] is True
-        # cold_gb = 99, net = 99 x (0.30 - 0.025) = 27.225.
-        # FS-4: no IA access charge against bytes excluded from the cold set.
-        assert counted[0]["_savings"] == pytest.approx(99 * 0.275)
-        ab = counted[0]["AuditBasis"]
-        assert ab["cold_gb"] == pytest.approx(99.0)
-        assert ab["monthly_access_gb"] == pytest.approx(1.0)
-        assert ab["ia_access_charge"] == 0.0
+        assert [r for r in out["counted"] if r["CheckCategory"] == "EFS No Lifecycle"] == []
+        adv = [r for r in out["advisory"] if r["CheckCategory"] == "EFS No Lifecycle"]
+        assert len(adv) == 1
+        assert adv[0]["Counted"] is False
+        assert adv[0]["EstimatedMonthlySavings"] == 0.0
+        assert adv[0]["PotentialMonthlySavings"] == pytest.approx(27.5)
 
-    def test_lifecycle_advisory_when_metrics_show_hot(self):
-        # B: heavy access -> cold_gb 0 / net <= 0 -> advisory "not cost-effective".
+    def test_lifecycle_advisory_names_the_measured_io_in_the_string(self):
+        """A file system with proven heavy traffic must not read as a BIGGER
+        opportunity than one we know nothing about, so the measured I/O goes in
+        the rendered string, not only the AuditBasis."""
         fs = _efs_fs("fs-hot", total_gb=100, standard_gb=100, mount_targets=2)
         cw = _FakeCw({"DataReadIOBytes": [{"Sum": float(500 * GB)}]})
         out = get_efs_findings(_ctx(efs=_FakeEfs([fs]), cloudwatch=cw), 1.0)
-        assert all(c["CheckCategory"] != "EFS No Lifecycle" for c in out["counted"])
-        adv = [a for a in out["advisory"] if a["CheckCategory"] == "EFS No Lifecycle"]
-        assert len(adv) == 1
-        assert "not cost-effective" in adv[0]["EstimatedSavings"]
+        adv = [r for r in out["advisory"] if r["CheckCategory"] == "EFS No Lifecycle"][0]
+        assert "500 GB read+written" in adv["EstimatedSavings"]
+        assert "up to $27.50/month" in adv["EstimatedSavings"]
 
-    def test_lifecycle_fast_mode_skips_metrics_and_warns(self):
-        # B: fast_mode -> no metric read -> advisory + one fast-mode warning.
-        fs = _efs_fs("fs-fast", total_gb=100, standard_gb=100, mount_targets=2)
-        cw = _FakeCw({"DataReadIOBytes": [{"Sum": float(1 * GB)}]})
-        ctx = _ctx(efs=_FakeEfs([fs]), cloudwatch=cw)
-        out = get_efs_findings(ctx, 1.0, fast_mode=True)
-        assert all(c["CheckCategory"] != "EFS No Lifecycle" for c in out["counted"])
-        adv = [a for a in out["advisory"] if a["CheckCategory"] == "EFS No Lifecycle"]
-        assert len(adv) == 1 and "gross" in adv[0]["EstimatedSavings"]
-        assert any("fast mode" in m for _s, m in ctx._warns)
+    def test_lifecycle_advisory_when_no_cloudwatch(self):
+        fs = _efs_fs("fs-nocw", total_gb=100, standard_gb=100, mount_targets=2)
+        out = get_efs_findings(_ctx(efs=_FakeEfs([fs]), cloudwatch=None), 1.0)
+        adv = [r for r in out["advisory"] if r["CheckCategory"] == "EFS No Lifecycle"]
+        assert len(adv) == 1
+        assert "no access metric available" in adv[0]["EstimatedSavings"]
+        assert adv[0]["Counted"] is False
+
+    def test_lifecycle_basis_names_the_sign_as_the_blocker(self):
+        fs = _efs_fs("fs-x", total_gb=100, standard_gb=100, mount_targets=2)
+        cw = _FakeCw({"DataReadIOBytes": [{"Sum": 0.0}]})
+        out = get_efs_findings(_ctx(efs=_FakeEfs([fs]), cloudwatch=cw), 1.0)
+        basis = [r for r in out["advisory"] if r["CheckCategory"] == "EFS No Lifecycle"][0]["AuditBasis"]
+        assert "FLOW" in basis["reason"]
+        assert "128 KiB minimum" in basis["reason"]
+        assert basis["ia_breakeven_mean_file_kib"] > 0
 
     def test_lifecycle_metric_access_denied_to_permission_issue(self):
         # M2/B: a denied GetMetricStatistics -> permission_issue, then advisory.

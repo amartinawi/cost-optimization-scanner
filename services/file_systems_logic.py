@@ -7,7 +7,7 @@ findings so one file system's savings is never stacked across checks.
 
 from __future__ import annotations
 
-from typing import Any, NamedTuple
+from typing import Any
 
 # Conservative, LABELED assumption used ONLY for the advisory (no-evidence)
 # indicative figure: the share of an un-tiered EFS file system's Standard data
@@ -47,41 +47,45 @@ def efs_lifecycle_savings(
     return max(standard_gb, 0.0) * delta * max(fraction, 0.0)
 
 
-class EfsLifecycleEstimate(NamedTuple):
-    """Evidence-based EFS IA-lifecycle saving breakdown (all monthly $)."""
+# FS-2 — `efs_lifecycle_net_savings` and its `EfsLifecycleEstimate` are gone.
+# They computed
+#     cold_gb = standard_gb - monthly_access_gb
+# which subtracts a 30-day I/O FLOW from a byte STOCK. That has no valid
+# interpretation, and its error is not bounded in the safe direction: a partial
+# read of a large file resets that whole file's lifecycle clock while
+# contributing only the bytes read to the metric, so the difference can exceed
+# the true cold set without limit.
+#
+# The lever it fed is now an advisory (see services/efs_fsx.py), so what remains
+# here is an upper BOUND on that advisory, plus the break-even file size that
+# explains why even a correct cold figure would not settle the question.
 
-    cold_gb: float          # Standard bytes not accessed in the metric window
-    gross_savings: float    # cold_gb x (Standard - IA) rate delta
-    access_charge: float    # always 0.0 — see FS-4 in efs_lifecycle_net_savings
-    net_savings: float      # gross_savings - access_charge
+# EFS IA and Archive bill a MINIMUM of 128 KiB per file. Below that mean file
+# size the transition LOSES money, and EFS publishes neither a file count nor a
+# size distribution — so the SIGN of this lever is unknown, not just its
+# magnitude.
+EFS_IA_MIN_BILLED_FILE_KIB: float = 128.0
 
 
-def efs_lifecycle_net_savings(
-    standard_gb: float,
-    monthly_access_gb: float,
-    standard_rate: float,
-    ia_rate: float,
-    ia_access_rate: float,
-) -> EfsLifecycleEstimate:
-    """NET monthly saving from enabling EFS IA lifecycle, from measured access.
+def efs_lifecycle_ceiling(standard_gb: float, standard_rate: float, ia_rate: float) -> float:
+    """Upper bound on an IA-lifecycle saving: every Standard byte cold, every file large.
 
-    ``cold_gb`` is the measured Standard bytes MINUS the bytes actually read or
-    written over the metric window: anything touched in the window is treated as
-    hot and excluded from the saving entirely. That exclusion is the model's
-    conservative margin.
-
-    FS-4 — the IA per-GB access charge used to be levied on those same accessed
-    bytes, which is a DOUBLE penalty for one fact. Bytes excluded from the cold
-    set never transition to IA, so they can never generate an IA access charge:
-    the fee priced an event that cannot occur under this model. It is therefore
-    zero here, and ``ia_access_rate`` is retained in the signature so callers
-    keep recording the rate they would pay on any FUTURE access to bytes that
-    are cold today — the residual risk the 30-day window cannot see.
+    Deliberately a CEILING, not an estimate. It is rendered as "up to $X if
+    realizable" on a $0 advisory and is never counted.
     """
-    cold_gb = max(standard_gb - max(monthly_access_gb, 0.0), 0.0)
-    gross = cold_gb * max(standard_rate - ia_rate, 0.0)
-    _ = ia_access_rate  # see FS-4 above: not charged against excluded bytes
-    return EfsLifecycleEstimate(cold_gb, gross, 0.0, gross)
+    return max(standard_gb, 0.0) * max(standard_rate - ia_rate, 0.0)
+
+
+def efs_ia_breakeven_file_kib(standard_rate: float, ia_rate: float) -> float:
+    """Mean file size below which moving to IA COSTS money.
+
+    A file smaller than the 128 KiB minimum still bills 128 KiB in IA, so the
+    per-file cost ratio is `128 / size_kib`. Break-even is where the IA bill for
+    a padded file equals the Standard bill for the real one.
+    """
+    if standard_rate <= 0 or ia_rate <= 0:
+        return 0.0
+    return EFS_IA_MIN_BILLED_FILE_KIB * (ia_rate / standard_rate)
 
 
 def efs_one_zone_savings(total_gb: float, regional_rate: float, one_zone_rate: float) -> float:
