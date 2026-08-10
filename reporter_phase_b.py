@@ -2366,11 +2366,15 @@ _SP_LABELS: Dict[str, Tuple[str, str]] = {
     "COMPUTE_SP": ("Compute Savings Plan", "EC2 + Lambda + Fargate"),
     "EC2_INSTANCE_SP": ("EC2 Instance Savings Plan", "EC2 (family-locked)"),
     "SAGEMAKER_SP": ("SageMaker Savings Plan", "SageMaker only"),
+    # Services taken from the live offering's productTypes (LS-8); Redshift is
+    # not among them, so it must not appear in this line.
+    "DATABASE_SP": ("Database Savings Plan",
+                    "RDS + Aurora + ElastiCache + OpenSearch + DynamoDB + DocDB + Neptune"),
 }
 
 _INSTRUMENT_ORDER = [
     "EC2", "RDS", "ElastiCache", "OpenSearch", "Redshift", "DynamoDB",
-    "COMPUTE_SP", "EC2_INSTANCE_SP", "SAGEMAKER_SP",
+    "COMPUTE_SP", "EC2_INSTANCE_SP", "SAGEMAKER_SP", "DATABASE_SP",
 ]
 
 _COMMITMENT_TERMS: Tuple[str, ...] = ("1yr", "3yr")
@@ -2575,6 +2579,13 @@ def _render_sp_commitment_card(card: Rec) -> str:
     if services:
         out += f"<p class='muted'>Services spanned: {html.escape(services)}</p>"
     out += _COMMITMENT_ADVISORY_CHIP
+    # The scenario grid always draws 2 terms x 3 payments, so a plan type AWS
+    # sells in fewer combos renders mostly em-dashes. This note (stamped by the
+    # fetch layer from the live offerings probe) says they are unpurchasable
+    # rather than unknown.
+    grid_note = str(card.get("scenario_grid_note") or "")
+    if grid_note:
+        out += f"<p class='muted'>{html.escape(grid_note)}</p>"
     out += _render_scenario_table(card)
     out += _render_break_even_risk_line(card)
     if "coh_concurs_monthly" in card:
