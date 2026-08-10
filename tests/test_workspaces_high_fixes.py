@@ -105,14 +105,26 @@ def _ws(
     return {
         "WorkspaceId": workspace_id,
         "State": state,
-        "WorkspaceProperties": {"RunningMode": running_mode, "ComputeTypeName": compute},
+        "WorkspaceProperties": {
+            "RunningMode": running_mode,
+            "ComputeTypeName": compute,
+            # Real payloads carry the AutoStop timeout; WS-4 charges for it.
+            "RunningModeAutoStopTimeoutInMinutes": 60,
+        },
     }
 
 
-def _expected_billing_saving(compute_type: str, hours: float, mult: float = 1.0) -> float:
+def _expected_billing_saving(
+    compute_type: str, hours: float, mult: float = 1.0, timeout_minutes: float = 60.0
+) -> float:
+    """WS-4 — AutoStop bills the timeout window after every disconnect, so the
+    projection charges connected hours PLUS one timeout per assumed session."""
+    from services.adapters.workspaces import _ASSUMED_MONTHLY_SESSIONS
+
     always_on = WORKSPACE_BUNDLE_MONTHLY[compute_type]
     fee, hourly = WORKSPACE_AUTOSTOP_PRICING[compute_type]
-    return (always_on - (fee + hourly * hours)) * mult
+    billed = hours + _ASSUMED_MONTHLY_SESSIONS * (timeout_minutes / 60.0)
+    return (always_on - (fee + hourly * billed)) * mult
 
 
 def _patch_shim(monkeypatch: pytest.MonkeyPatch, recs: list[dict[str, Any]]) -> None:
@@ -141,18 +153,21 @@ def test_c2_billing_mode_counted_from_measured_hours(monkeypatch: pytest.MonkeyP
         "WorkspaceId": "ws-1",
         "ComputeType": "STANDARD",
         "MeasuredMonthlyHours": 40.0,
+        "AutoStopTimeoutMinutes": 60,
         "CheckCategory": "Billing Mode Optimization",
     }
     _patch_shim(monkeypatch, [rec])
     findings = WorkspacesModule().scan(_recording_ctx())
 
-    expected = _expected_billing_saving("STANDARD", 40.0)  # 35 - (9.75 + 0.30*40) = 13.25
-    assert expected == pytest.approx(13.25, abs=0.001)
+    # WS-4: 35 - (9.75 + 0.30 x (40 connected + 30 x 1h timeout)) = $4.25.
+    # Before the timeout was charged this claimed $13.25.
+    expected = _expected_billing_saving("STANDARD", 40.0)
+    assert expected == pytest.approx(4.25, abs=0.001)
     assert findings.total_monthly_savings == pytest.approx(expected, abs=0.01)
     emitted = findings.sources["enhanced_checks"].recommendations[0]
-    assert emitted["EstimatedMonthlySavings"] == pytest.approx(13.25, abs=0.01)
+    assert emitted["EstimatedMonthlySavings"] == pytest.approx(4.25, abs=0.01)
     assert emitted.get("Counted") is not False
-    assert emitted["EstimatedSavings"].startswith("$13.25")
+    assert emitted["EstimatedSavings"].startswith("$4.25")
     basis = emitted["AuditBasis"]
     assert basis["always_on_monthly"] == 35.0
     assert basis["autostop_fee_monthly"] == 9.75
@@ -167,6 +182,7 @@ def test_c2_billing_mode_wrong_signed_is_advisory(monkeypatch: pytest.MonkeyPatc
         "WorkspaceId": "ws-heavy",
         "ComputeType": "STANDARD",
         "MeasuredMonthlyHours": 120.0,
+        "AutoStopTimeoutMinutes": 60,
         "CheckCategory": "Billing Mode Optimization",
     }
     _patch_shim(monkeypatch, [rec])
@@ -201,6 +217,7 @@ def test_c2_billing_mode_unknown_bundle_is_advisory(monkeypatch: pytest.MonkeyPa
         "WorkspaceId": "ws-gfx",
         "ComputeType": "GRAPHICS",
         "MeasuredMonthlyHours": 10.0,
+        "AutoStopTimeoutMinutes": 60,
         "CheckCategory": "Billing Mode Optimization",
     }
     _patch_shim(monkeypatch, [rec])
@@ -214,21 +231,23 @@ def test_c2_billing_mode_unknown_bundle_is_advisory(monkeypatch: pytest.MonkeyPa
 # C3 — recs price the actual bundle, not the STANDARD default
 # --------------------------------------------------------------------------- #
 def test_c3_billing_mode_prices_actual_bundle(monkeypatch: pytest.MonkeyPatch) -> None:
-    # VALUE bundle: AlwaysOn $25 (not the old STANDARD $35 default). At 40 hrs:
-    # 25 - (7.25 + 0.22*40) = 25 - 16.05 = $8.95.
+    # VALUE bundle: AlwaysOn $25 (not the old STANDARD $35 default). At 40
+    # connected hrs plus 30 x 1h of AutoStop timeout (WS-4):
+    # 25 - (7.25 + 0.22 x 70) = 25 - 22.65 = $2.35.
     rec = {
         "WorkspaceId": "ws-value",
         "ComputeType": "VALUE",
         "MeasuredMonthlyHours": 40.0,
+        "AutoStopTimeoutMinutes": 60,
         "CheckCategory": "Billing Mode Optimization",
     }
     _patch_shim(monkeypatch, [rec])
     findings = WorkspacesModule().scan(_recording_ctx())
 
     expected = _expected_billing_saving("VALUE", 40.0)
-    assert expected == pytest.approx(8.95, abs=0.001)
-    assert findings.total_monthly_savings == pytest.approx(8.95, abs=0.01)
-    # Had it defaulted to STANDARD ($35) the saving would have been 13.25, not 8.95.
+    assert expected == pytest.approx(2.35, abs=0.001)
+    assert findings.total_monthly_savings == pytest.approx(2.35, abs=0.01)
+    # Had it defaulted to STANDARD ($35) the saving would have been $4.25, not $2.35.
     assert findings.total_monthly_savings != pytest.approx(13.25, abs=0.01)
 
 
@@ -238,11 +257,12 @@ def test_c3_compute_type_from_workspace_properties_fallback(monkeypatch: pytest.
         "WorkspaceId": "ws-props",
         "WorkspaceProperties": {"ComputeTypeName": "VALUE"},
         "MeasuredMonthlyHours": 40.0,
+        "AutoStopTimeoutMinutes": 60,
         "CheckCategory": "Billing Mode Optimization",
     }
     _patch_shim(monkeypatch, [rec])
     findings = WorkspacesModule().scan(_recording_ctx())
-    assert findings.total_monthly_savings == pytest.approx(8.95, abs=0.01)
+    assert findings.total_monthly_savings == pytest.approx(2.35, abs=0.01)
 
 
 # --------------------------------------------------------------------------- #
@@ -531,3 +551,84 @@ def test_ws1_general_purpose_4xlarge_is_priced(monkeypatch: pytest.MonkeyPatch) 
 
     assert findings.total_monthly_savings == pytest.approx(295.0)
     assert WORKSPACE_AUTOSTOP_PRICING["GENERALPURPOSE_4XLARGE"] == (19.0, 2.28)
+
+
+# --------------------------------------------------------------------------- #
+# WS-4 — AutoStop keeps billing for the configured timeout after EVERY
+# disconnect. Projecting from connected hours alone understates the AutoStop
+# cost, overstates the saving, and with a long timeout flips the sign — the
+# rec would recommend a switch that costs money.
+# --------------------------------------------------------------------------- #
+def _billing_rec(hours: float, timeout: Any = 60, compute: str = "STANDARD") -> dict[str, Any]:
+    rec = {
+        "WorkspaceId": "ws-t",
+        "ComputeType": compute,
+        "MeasuredMonthlyHours": hours,
+        "CheckCategory": "Billing Mode Optimization",
+    }
+    if timeout is not None:
+        rec["AutoStopTimeoutMinutes"] = timeout
+    return rec
+
+
+def test_timeout_hours_are_charged_in_the_projection(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_shim(monkeypatch, [_billing_rec(40.0, timeout=60)])
+    findings = WorkspacesModule().scan(_recording_ctx())
+    basis = findings.sources["enhanced_checks"].recommendations[0]["AuditBasis"]
+    assert basis["autostop_timeout_minutes"] == 60
+    assert basis["post_disconnect_billed_hours"] == pytest.approx(30.0)
+    # 9.75 fee + 0.30 x (40 + 30) = $30.75 projected, vs $21.75 without the timeout.
+    assert basis["projected_autostop_monthly"] == pytest.approx(30.75, abs=0.01)
+
+
+def test_a_long_timeout_flips_the_sign_to_advisory(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The headline defect: at 40 connected hrs a 3-hour timeout makes AutoStop
+    cost MORE than AlwaysOn. Charging only connected hours would still have
+    recommended the switch."""
+    _patch_shim(monkeypatch, [_billing_rec(40.0, timeout=180)])
+    findings = WorkspacesModule().scan(_recording_ctx())
+
+    assert findings.total_monthly_savings == 0.0
+    rec = findings.sources["enhanced_checks"].recommendations[0]
+    assert rec["Counted"] is False
+    assert "not cheaper" in rec["EstimatedSavings"]
+    assert "180-minute" in rec["EstimatedSavings"]
+
+
+def test_missing_timeout_abstains(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without the timeout the post-disconnect hours cannot be projected."""
+    _patch_shim(monkeypatch, [_billing_rec(40.0, timeout=None)])
+    findings = WorkspacesModule().scan(_recording_ctx())
+
+    assert findings.total_monthly_savings == 0.0
+    rec = findings.sources["enhanced_checks"].recommendations[0]
+    assert rec["Counted"] is False
+    assert "no AutoStop timeout" in rec["EstimatedSavings"]
+
+
+def test_unreadable_timeout_abstains(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_shim(monkeypatch, [_billing_rec(40.0, timeout="soon")])
+    findings = WorkspacesModule().scan(_recording_ctx())
+    assert findings.total_monthly_savings == 0.0
+    assert findings.sources["enhanced_checks"].recommendations[0]["Counted"] is False
+
+
+def test_a_very_light_user_still_counts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The lever survives where the saving is robust: 8 connected hrs with a
+    30-minute timeout is 9.75 + 0.30 x (8 + 15) = $16.65 vs $35."""
+    _patch_shim(monkeypatch, [_billing_rec(8.0, timeout=30)])
+    findings = WorkspacesModule().scan(_recording_ctx())
+    assert findings.total_monthly_savings == pytest.approx(35.0 - 16.65, abs=0.01)
+
+
+def test_shim_publishes_the_timeout_from_workspace_properties() -> None:
+    ws = _ws("ws-1")
+    ws["WorkspaceProperties"]["RunningModeAutoStopTimeoutInMinutes"] = 120
+    client = _FakeWorkspacesClient([ws])
+    cw = _FakeCloudWatch(datapoints=[{"Sum": 10.0}])
+    ctx = _recording_ctx()
+    ctx.client = _client_factory(client, cw)
+
+    out = get_enhanced_workspaces_checks(ctx)
+    rec = out["checks"]["billing_mode_optimization"][0]
+    assert rec["AutoStopTimeoutMinutes"] == 120
