@@ -175,20 +175,48 @@ same account-wide recommendations again** — this operator has already run one
 (`afs-prod_eu-west-1_20260808.md`), so adding the two projections would double
 count.
 
-- Suspect: `reporter_phase_b.py` commitment card/summary copy.
-- Fix: label the projection "account-wide (all regions)" wherever the aggregate
-  is shown, and optionally break out the scan region's share.
-- Predicted delta: **$0.00** (counted total unaffected — disclosure only).
+- Suspect: `html_report_generator.py` executive-summary projection fact.
+- **FIXED 2026-08-11.** New pure `projected_region_split(cards, scan_region)`
+  publishes the scan region's share, the RI total, and which other regions
+  appear; the summary renders them. The "account-wide, all regions" label is
+  **unconditional** — it is a property of the SOURCE (CE's purchase APIs are
+  account-scoped) rather than of a particular estate, so it must not depend on
+  this account happening to span regions. Only `ri_type` cards carry a region;
+  SP cards are deliberately excluded from the split rather than guessed at,
+  because CE reports an SP bundle account-wide and attributing one to the scan
+  region would invent precision the data does not have — hence the copy says
+  "of the reserved-instance portion".
+- Rendered against this scan's real numbers:
 
-### AFS-4 — counted cards worth cents (LOW)
+  > Projected commitment — up to $18,653.58/mo (EC2 Instance SP path + service
+  > RIs (…); **account-wide, all regions — $6,370.75/mo of the reserved-instance
+  > portion is in this report's region; the rest is in eu-west-1**; requires
+  > purchase — not in the counted total)
 
-`containers` emits 4 counted "ECR Lifecycle Management" cards totalling **$0.15**
-($0.01, $0.01, $0.06, $0.07). Each renders as a recommendation whose dollar
-rounds to a cent. Same principle as the LS-4 materiality floor just added to the
-never-expiring-log-group check (a card whose own figure rounds to $0.00 refutes
-itself); these clear $0.00 but not by enough to be a recommendation.
+- Delta: **$0.00** (counted total unaffected — disclosure only), as predicted.
 
-- Predicted delta if floored: **−$0.15**.
+### AFS-4 — WITHDRAWN 2026-08-11. Not a defect.
+
+Raised as "4 counted ECR Lifecycle Management cards totalling $0.15 ($0.01,
+$0.01, $0.06, $0.07) are noise below the materiality of a recommendation".
+
+**Withdrawn on two independent grounds:**
+
+1. **The dollars are correct.** Each is `reclaimable_gib × rate` on
+   deduplicated layer bytes referenced only by untagged images
+   (0.6638 GiB × $0.10 = $0.07, etc.). The rate was verified live: ECR storage
+   in af-south-1 is **$0.10/GB-Mo**, identical to us-east-1 — a flat global
+   rate that the scanner correctly does **not** region-scale (a C1 violation
+   avoided).
+2. **Flooring them would contradict the repo's own convention.** The existing
+   render-noise floor (`_ADVISORY_RENDER_MIN_GB`, `services/adapters/s3.py:29`)
+   suppresses **advisory** cards only — `if SavingsDelta > 0: return True` means
+   a COUNTED bucket always renders however small. Applying a floor to counted
+   savings would be under-counting by fiat against an arbitrary threshold, and
+   would invert that rule.
+
+A small real saving, correctly derived and correctly rendered, is the system
+working. No change made.
 
 ## Coverage gaps (savings ABSENT from the $6,818.16)
 
@@ -237,10 +265,11 @@ One command settles it:
 |----|-------|----------|-------|--------|
 | AFS-1 | C10 | HIGH | $2,682.34 counted on CPU-only evidence for memory-halving downsizes of r-family instances | **FIXED 2026-08-11** — simulated delta −$2,682.34 exactly; RECONCILED pending re-scan |
 | AFS-2 | NEW | HIGH | $281.26 counted against AWS Backup recovery points; gate structurally always-true, action unsafe | **FIXED 2026-08-11** — AMI tab → $20.99; also fixed a reconciliation-ceiling defect the repair would have caused |
-| AFS-3 | NEW | MEDIUM | $18,653.58 projection is account-wide (65% eu-west-1) in an af-south-1 report, undisclosed | CANDIDATE |
-| AFS-4 | B3-adjacent | LOW | 4 counted cards totalling $0.15 | CANDIDATE |
+| AFS-3 | NEW | MEDIUM | $18,653.58 projection is account-wide (65% eu-west-1) in an af-south-1 report, undisclosed | **FIXED 2026-08-11** — scope + local share now rendered; $0.00 delta |
+| AFS-4 | — | — | 4 counted cards totalling $0.15 | **WITHDRAWN** — dollars verified correct; flooring counted savings would contradict the S3 advisory-only floor |
 | — | — | — | gp3 unattached pricing | REFUTED (pending the describe-volumes check above) |
 
-If AFS-1, AFS-2 and AFS-4 are all fixed, the predicted headline is
-**$3,854.41/mo** (from $6,818.16) — a 43% reduction, all of it removal of
-dollars that were not defensible rather than newly-found savings.
+With AFS-1 and AFS-2 fixed (AFS-3 is disclosure-only, AFS-4 withdrawn), the
+predicted headline is **$3,854.57/mo**, down from $6,818.16 — a 43% reduction,
+all of it removal of dollars that were not defensible rather than newly-found
+savings. Re-scan to reconcile.

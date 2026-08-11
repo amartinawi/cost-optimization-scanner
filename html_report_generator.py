@@ -2353,11 +2353,29 @@ class HTMLReportGenerator:
         projected_fact = ""
         if projected > 0:
             basis = html.escape(str(summary.get("projected_commitment_basis", "")))
+            # AFS-3 — Cost Explorer's purchase-recommendation APIs are
+            # ACCOUNT-scoped and take no region filter, so this figure covers the
+            # whole account however narrow the report's region is. Said
+            # unconditionally because it is a property of the SOURCE, not of a
+            # particular estate. Without it the reader credits the scanned region
+            # and, worse, may add a second region's report to this one — they are
+            # the same account-wide recommendations counted twice.
+            offregion = summary.get("projected_commitment_offregion") or []
+            local_share = summary.get("projected_commitment_scan_region_share")
+            scope_note = "account-wide, all regions"
+            if offregion and local_share is not None:
+                regions = html.escape(", ".join(str(r) for r in offregion))
+                scope_note = (
+                    f"account-wide, all regions &mdash; ${float(local_share):,.2f}/mo of the "
+                    f"reserved-instance portion is in this report's region; the rest is in "
+                    f"{regions}"
+                )
             projected_fact = (
                 '<div class="summary-fact">'
                 "<dt>Projected commitment</dt>"
                 f'<dd>up to ${projected:,.2f}/mo <span class="fact-note">'
-                f"({basis}; requires purchase &mdash; not in the counted total)</span></dd>"
+                f"({basis}; {scope_note}; requires purchase &mdash; not in the counted total)"
+                "</span></dd>"
                 "</div>"
             )
 

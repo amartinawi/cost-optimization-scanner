@@ -33,6 +33,7 @@ from core.contracts import GroupingSpec, ServiceFindings, SourceBlock, StatCardS
 from services._base import BaseServiceModule
 from services.commitment_logic import DEFAULT_COVERAGE_RATIO, fargate_sp_analysis
 from services.commitment_purchase_fetch import fetch_purchase_cards
+from services.commitment_scenarios import projected_region_split
 
 # Compute Savings Plans cover Fargate (ECS + EKS); ECS-on-EC2 bills as EC2.
 # Ephemeral storage and data transfer are NOT SP-eligible.
@@ -138,6 +139,9 @@ class CommitmentAnalysisModule(BaseServiceModule):
         ri_cov_recs, ri_cov_rate = self._check_ri_coverage(ctx, ce, tp)
         expiry_recs = self._check_expiring(ctx, ce, tp)
         purchase_cards, projected, basis, cost_hub_recs = self._fetch_purchase_cards(ctx, ce)
+        region_share, region_total, offregion = projected_region_split(
+            purchase_cards, getattr(ctx, "region", "")
+        )
         fargate_sp_recs, fargate_sp_extras = self._check_fargate_savings_plan(ctx, ce, tp)
 
         # Commitment "buy" recs (CE matrix + unmatched CoH RI/SP recs) and
@@ -206,6 +210,14 @@ class CommitmentAnalysisModule(BaseServiceModule):
                 "ri_coverage_rate": ri_cov_rate,
                 "projected_commitment_monthly_savings": projected,
                 "projected_commitment_basis": basis,
+                # AFS-3 — CE's purchase-recommendation APIs are ACCOUNT-scoped
+                # and take no region filter, so this projection routinely covers
+                # regions this report does not. Publish the scan region's share
+                # and which other regions appear, so the summary can say so and
+                # a reader cannot add two regions' projections together.
+                "projected_commitment_scan_region_share": region_share,
+                "projected_commitment_total_ri": region_total,
+                "projected_commitment_offregion": list(offregion),
                 # None (JSON null) — not 0.0 — when there is no coverage data
                 # to sum: a measured $0 must mean "zero uncovered on-demand",
                 # never "coverage was unavailable".
