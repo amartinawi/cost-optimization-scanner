@@ -205,6 +205,72 @@ def _one_size_down(instance_type: str) -> str | None:
     return f"{family}.{_SIZE_LADDER[idx - 1]}"
 
 
+# EC2 families whose BINDING dimension is memory rather than CPU (lesson C10).
+# AWS's naming convention is deliberate and stable: r = memory optimized,
+# x / u = high memory, z = high-frequency memory optimized. Every family under
+# these prefixes is memory-optimized, and no other family uses them.
+#
+# Storage-optimized (i, d) and accelerated (g, p, inf, trn) families also have a
+# non-CPU binding dimension, and the same argument applies to them. They are
+# deliberately NOT listed here: that case has no live evidence yet, and widening
+# the rule would suppress real savings on estates this finding never examined.
+_MEMORY_OPTIMIZED_PREFIXES: tuple[str, ...] = ("r", "x", "z", "u")
+
+
+def _is_memory_optimized(instance_type: str) -> bool:
+    """True if this instance's family is memory-optimized (r/x/z/u)."""
+    family = (instance_type or "").split(".")[0].strip().lower()
+    if len(family) < 2:
+        return False
+    return family[0] in _MEMORY_OPTIMIZED_PREFIXES and any(c.isdigit() for c in family)
+
+
+def _rightsize_evidence_ok(instance_type: str, mem_pct: float | None) -> bool:
+    """True if a downsize verdict on this instance may be COUNTED.
+
+    On a memory-optimized instance, low CPU is the *expected* signature of a
+    correctly-sized memory-bound workload — the 256 GiB is precisely why an
+    r6i.8xlarge was chosen — and every one-size-down step halves RAM. Without a
+    memory reading there is no evidence for the recommendation, so counting it
+    resolves ambiguity toward OVER-counting, which this project never does.
+
+    ``mem_pct`` comes from ``CWAgent mem_used_percent`` and is absent unless the
+    CloudWatch agent is installed, so this returns False on most such instances.
+    That is the point: the finding still renders as a $0 advisory carrying its
+    figure, it simply stops entering the headline (AFS-1, af-south-1 2026-08-11
+    — $2,682.34 of counted dollars, 39% of that report's total).
+
+    Other families are unaffected: there, low CPU IS evidence of
+    over-provisioning.
+    """
+    if not _is_memory_optimized(instance_type):
+        return True
+    return mem_pct is not None
+
+
+def _demote_for_missing_memory(
+    rec: dict[str, Any], gross: float, instance_type: str
+) -> None:
+    """Turn a CPU-only verdict on a memory-optimized instance into a $0 advisory.
+
+    Mirrors the C8 ASG fail-closed demotion in ``services/adapters/ec2.py``:
+    ``Counted=False``, the figure preserved in ``AdvisoryEstimate``, and BOTH the
+    numeric and the string zeroed — the EC2 tab totals by parsing
+    ``EstimatedSavings``, so a demotion that only set the numeric would leave the
+    dollar in the headline (B2/B3 lockstep).
+    """
+    family = instance_type.split(".")[0]
+    rec["Counted"] = False
+    rec["AdvisoryEstimate"] = round(gross, 2)
+    rec["EstimatedMonthlySavings"] = 0.0
+    rec["EstimatedSavings"] = (
+        f"$0.00/month - advisory: ${gross:,.2f}/month if resized, but {family} is "
+        "memory-optimized and this downsize halves its RAM. No memory metric is "
+        "available (CWAgent mem_used_percent), and low CPU is the expected profile "
+        "of a memory-bound workload - install the CloudWatch agent to qualify it."
+    )
+
+
 def _classify_utilization(
     avg_cpu: float,
     max_cpu: float,
@@ -610,32 +676,39 @@ def get_enhanced_ec2_checks(
                                     if mem_pct is not None:
                                         evidence["AvgMemory"] = f"{mem_pct:.1f}%"
 
+                                    # C10 / AFS-1 — a downsize or terminate verdict on a
+                                    # memory-optimized instance rests on memory evidence
+                                    # this scan usually cannot obtain. The card still
+                                    # renders; it just stops entering the headline.
+                                    evidence_ok = _rightsize_evidence_ok(instance_type, mem_pct)
+
                                     if verdict == "idle":
                                         idle_savings, idle_basis = _compute_ec2_savings(
                                             ctx, instance_type, "Idle Instances", os_name, license_model
                                         )
                                         if idle_savings > 0:
-                                            checks["idle_instances"].append(
-                                                {
-                                                    "InstanceId": instance_id,
-                                                    "InstanceType": instance_type,
-                                                    **evidence,
-                                                    "Recommendation": (
-                                                        f"Instance shows very low utilization"
-                                                        f" (avg CPU: {avg_cpu:.1f}%,"
-                                                        f" max: {max_cpu:.1f}%)"
-                                                        " - consider terminating or"
-                                                        " downsizing"
-                                                    ),
-                                                    "EstimatedSavings": f"${idle_savings:.2f}/month if terminated",
-                                                    # Numeric mirror of the string (B2/B3
-                                                    # lockstep); the tab total parses the
-                                                    # string, so this never re-sums.
-                                                    "EstimatedMonthlySavings": round(idle_savings, 2),
-                                                    "PricingBasis": idle_basis,
-                                                    "CheckCategory": "Idle Instances",
-                                                }
-                                            )
+                                            rec = {
+                                                "InstanceId": instance_id,
+                                                "InstanceType": instance_type,
+                                                **evidence,
+                                                "Recommendation": (
+                                                    f"Instance shows very low utilization"
+                                                    f" (avg CPU: {avg_cpu:.1f}%,"
+                                                    f" max: {max_cpu:.1f}%)"
+                                                    " - consider terminating or"
+                                                    " downsizing"
+                                                ),
+                                                "EstimatedSavings": f"${idle_savings:.2f}/month if terminated",
+                                                # Numeric mirror of the string (B2/B3
+                                                # lockstep); the tab total parses the
+                                                # string, so this never re-sums.
+                                                "EstimatedMonthlySavings": round(idle_savings, 2),
+                                                "PricingBasis": idle_basis,
+                                                "CheckCategory": "Idle Instances",
+                                            }
+                                            if not evidence_ok:
+                                                _demote_for_missing_memory(rec, idle_savings, instance_type)
+                                            checks["idle_instances"].append(rec)
                                     elif verdict == "rightsize":
                                         rs_target = _one_size_down(instance_type)
                                         rs_savings, rs_basis = (
@@ -647,24 +720,25 @@ def get_enhanced_ec2_checks(
                                             else (0.0, "")
                                         )
                                         if rs_savings > 0:
-                                            checks["rightsizing_opportunities"].append(
-                                                {
-                                                    "InstanceId": instance_id,
-                                                    "InstanceType": instance_type,
-                                                    **evidence,
-                                                    "Recommendation": (
-                                                        f"Low utilization"
-                                                        f" (avg CPU: {avg_cpu:.1f}%,"
-                                                        f" max: {max_cpu:.1f}%)"
-                                                        f" - consider downsizing to {rs_target}"
-                                                    ),
-                                                    "EstimatedSavings": f"${rs_savings:.2f}/month if rightsized",
-                                                    # Numeric mirror of the string (B2/B3).
-                                                    "EstimatedMonthlySavings": round(rs_savings, 2),
-                                                    "PricingBasis": rs_basis,
-                                                    "CheckCategory": ("Rightsizing Opportunities"),
-                                                }
-                                            )
+                                            rec = {
+                                                "InstanceId": instance_id,
+                                                "InstanceType": instance_type,
+                                                **evidence,
+                                                "Recommendation": (
+                                                    f"Low utilization"
+                                                    f" (avg CPU: {avg_cpu:.1f}%,"
+                                                    f" max: {max_cpu:.1f}%)"
+                                                    f" - consider downsizing to {rs_target}"
+                                                ),
+                                                "EstimatedSavings": f"${rs_savings:.2f}/month if rightsized",
+                                                # Numeric mirror of the string (B2/B3).
+                                                "EstimatedMonthlySavings": round(rs_savings, 2),
+                                                "PricingBasis": rs_basis,
+                                                "CheckCategory": ("Rightsizing Opportunities"),
+                                            }
+                                            if not evidence_ok:
+                                                _demote_for_missing_memory(rec, rs_savings, instance_type)
+                                            checks["rightsizing_opportunities"].append(rec)
 
                             except ClientError as ce:
                                 code = ce.response.get("Error", {}).get("Code", "")

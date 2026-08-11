@@ -107,12 +107,16 @@ def _ec2_ctx(instances, prices):
     )
 
 
-def _run_enhanced(monkeypatch, verdict):
+def _run_enhanced(monkeypatch, verdict, mem_pct=35.0):
     import services.ec2 as ec2_mod
 
     monkeypatch.setattr(ec2_mod, "_classify_utilization", lambda *a, **k: verdict)
     monkeypatch.setattr(ec2_mod, "_network_bytes_per_hour", lambda *a, **k: None)
-    monkeypatch.setattr(ec2_mod, "_memory_used_percent", lambda *a, **k: None)
+    # r6i is memory-optimized, so AFS-1 requires a memory reading before the
+    # dollar may be COUNTED. These tests are about B2/B3 string<->numeric
+    # lockstep, so they supply the evidence and keep their original figures; the
+    # missing-evidence case is pinned in tests/test_ec2_memory_evidence.py.
+    monkeypatch.setattr(ec2_mod, "_memory_used_percent", lambda *a, **k: mem_pct)
     ctx = _ec2_ctx(
         [{"InstanceId": "i-afs1", "InstanceType": "r6i.4xlarge",
           "State": {"Name": "running"}, "PlatformDetails": "Windows", "Tags": []}],
@@ -137,6 +141,22 @@ def test_idle_rec_numeric_mirrors_string(monkeypatch):
     # Idle = full on-demand cost: 1.864 x 730 = 1360.72.
     assert recs[0]["EstimatedSavings"].startswith("$1360.72/month")
     assert recs[0]["EstimatedMonthlySavings"] == pytest.approx(1360.72, abs=0.005)
+
+
+def test_lockstep_holds_through_the_afs1_demotion(monkeypatch):
+    """B2/B3 must survive the AFS-1 demotion: when the memory evidence is absent
+    the string and the numeric both go to $0 together. A demotion that zeroed
+    only the numeric would leave the dollar in the tab total, which sums by
+    parsing the string."""
+    from services._savings import parse_dollar_savings
+
+    recs = [r for r in _run_enhanced(monkeypatch, "rightsize", mem_pct=None)
+            if r["CheckCategory"] == "Rightsizing Opportunities"]
+    assert len(recs) == 1
+    assert recs[0]["Counted"] is False
+    assert recs[0]["EstimatedMonthlySavings"] == 0.0
+    assert parse_dollar_savings(recs[0]["EstimatedSavings"]) == 0.0
+    assert recs[0]["AdvisoryEstimate"] == pytest.approx(680.36, abs=0.005)
 
 
 # --------------------------------------------------------------------------- #
