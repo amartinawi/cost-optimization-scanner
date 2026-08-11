@@ -60,11 +60,26 @@ def _pricing():
     return pe
 
 
-def _cw(avg, peak):
+_GIB = 1024 ** 3
+
+
+def _cw(avg, peak, freeable_gib=220.0):
+    """CloudWatch fake serving CPUUtilization and FreeableMemory.
+
+    M360-1 — an Aurora downsize now needs measured memory headroom as well as
+    low CPU, so these fixtures must supply FreeableMemory or the lever correctly
+    withholds. 220 GiB free on a db.r5.8xlarge (256 GiB) leaves ~36 GiB in use,
+    which fits db.r5.2xlarge (64 GiB) with headroom — preserving each test's
+    original target and dollar figures.
+    """
     cw = MagicMock()
-    cw.get_metric_statistics.return_value = {
-        "Datapoints": [{"Average": avg, "Maximum": peak}]
-    }
+
+    def _stats(**kw):
+        if kw.get("MetricName") == "FreeableMemory":
+            return {"Datapoints": [{"Minimum": freeable_gib * _GIB}]}
+        return {"Datapoints": [{"Average": avg, "Maximum": peak}]}
+
+    cw.get_metric_statistics.side_effect = _stats
     return cw
 
 

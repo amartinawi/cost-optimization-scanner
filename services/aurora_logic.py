@@ -51,6 +51,77 @@ _GRAVITON_FAMILY: dict[str, str] = {"r": "r6g", "m": "m6g", "c": "c6g", "t": "t4
 
 RIGHTSIZE_HEADROOM: float = 1.2  # safety margin over measured peak CPU
 
+# M360-1 / C18 — RAM per vCPU by DB family. Memory scales linearly with size
+# WITHIN a family (db.r6g.large 2 vCPU/16 GiB … db.r6g.4xlarge 16 vCPU/128 GiB),
+# so the ratio plus the vCPU count gives the class's memory without a per-size
+# table or a pricing lookup.
+#
+# Burstable (t) and compute (c) are deliberately ABSENT: t-family memory is not
+# linear in vCPU (t3.micro 1 GiB and t3.large 8 GiB both have 2 vCPU), so there
+# is no honest ratio. An absent family returns None and the caller withholds the
+# lever rather than guessing — the whole point of this fix.
+_FAMILY_GIB_PER_VCPU: dict[str, float] = {
+    "r": 8.0,    # memory optimized — r5/r6g/r6i/r7g/r8g
+    "m": 4.0,    # general purpose  — m5/m6g/m6i/m7g
+    "x": 16.0,   # high memory      — x2g
+}
+RIGHTSIZE_MEMORY_HEADROOM: float = 1.2  # safety margin over measured memory in use
+
+
+def instance_memory_gib(family: str, vcpu: int) -> float | None:
+    """Total RAM (GiB) for a DB class, or None when the family has no ratio.
+
+    ``family`` is the ``db.<fam>`` prefix from :func:`parse_instance_class`.
+    """
+    parts = str(family or "").split(".")
+    fam = parts[1] if len(parts) > 1 else ""
+    ratio = _FAMILY_GIB_PER_VCPU.get(fam[:1]) if fam else None
+    if ratio is None or vcpu <= 0:
+        return None
+    return round(vcpu * ratio, 2)
+
+
+def memory_floor_size(
+    used_gib: float, *, gib_per_vcpu: float, headroom: float = RIGHTSIZE_MEMORY_HEADROOM
+) -> str | None:
+    """Smallest size whose RAM covers ``used_gib`` x headroom, or None if none does.
+
+    The memory counterpart of :func:`rightsize_target_size`. Unlike the CPU
+    floor this never returns "smaller than current" logic — the caller composes
+    the two floors and decides whether the winner is actually a downsize.
+    """
+    required = max(0.0, used_gib) * headroom
+    for size in _SNAP_SIZES:
+        if _SIZE_VCPU[size] * gib_per_vcpu >= required:
+            return size
+    return None
+
+
+def combined_rightsize_target(
+    current_vcpu: int, peak_cpu_pct: float, family: str, used_memory_gib: float | None
+) -> str | None:
+    """The smallest size that satisfies BOTH the CPU and the memory floor.
+
+    Returns None when there is no safe downsize — including when memory could
+    not be established at all (metric unreadable, or a family with no ratio).
+    Falling back to the CPU-only answer in that case is precisely the M360-1
+    defect: it recommended db.r6g.4xlarge → db.r6g.large, an 8x RAM cut on a
+    production writer, from a 2% CPU reading.
+    """
+    cpu_target = rightsize_target_size(current_vcpu, peak_cpu_pct)
+    if cpu_target is None:
+        return None
+    if used_memory_gib is None:
+        return None
+    ratio_probe = instance_memory_gib(family, 1)
+    if ratio_probe is None:
+        return None
+    mem_target = memory_floor_size(used_memory_gib, gib_per_vcpu=ratio_probe)
+    if mem_target is None:
+        return None
+    winner = max(cpu_target, mem_target, key=lambda s: _SIZE_VCPU[s])
+    return winner if _SIZE_VCPU[winner] < current_vcpu else None
+
 
 def parse_instance_class(instance_class: str) -> tuple[str, str, int] | None:
     """Split 'db.r5.8xlarge' → ('db.r5', '8xlarge', 32 vCPU). None if unparseable."""
