@@ -122,6 +122,37 @@ def _get_cloudwatch_avg(
     return None
 
 
+def _get_cloudwatch_min(
+    cw: Any, namespace: str, metric: str, dimensions: list[dict[str, str]], days: int = 14
+) -> float | None:
+    """Lowest per-day Minimum of a CW metric over the window, or None.
+
+    The MINIMUM is what matters for FreeableMemory (M360-1): the safe target is
+    the one that still fits at the instance's most memory-hungry moment, so an
+    average would understate the working set. None means the metric could not be
+    read — the caller then withholds the lever rather than assuming headroom
+    (lesson C8/C18).
+    """
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(days=days)
+    try:
+        resp = cw.get_metric_statistics(
+            Namespace=namespace,
+            MetricName=metric,
+            Dimensions=dimensions,
+            StartTime=start,
+            EndTime=now,
+            Period=_CW_PERIOD_1D,
+            Statistics=["Minimum"],
+        )
+        dps = resp.get("Datapoints", [])
+        if dps:
+            return min(d["Minimum"] for d in dps)
+    except Exception:  # noqa: BLE001 — absence of evidence, not evidence of headroom
+        pass
+    return None
+
+
 def _get_cloudwatch_sum(
     cw: Any, namespace: str, metric: str, dimensions: list[dict[str, str]], days: int = 14
 ) -> float | None:
@@ -206,7 +237,9 @@ def _check_provisioned_instances(
     instance SKU rather than the Standard SKU (aurora L3).
     """
     from services.aurora_logic import (
+        combined_rightsize_target,
         graviton_equivalent,
+        instance_memory_gib,
         is_graviton_family,
         parse_instance_class,
         rightsize_target_size,
@@ -275,7 +308,34 @@ def _check_provisioned_instances(
                 )
             else:
                 avg_cpu, peak_cpu = metrics
-                target_size = rightsize_target_size(vcpu, peak_cpu)
+                # M360-1 / C18 — CPU alone cannot justify shrinking a database's
+                # RAM. Aurora's buffer pool holds the working set, so low CPU
+                # beside a large pool is the signature of a well-cached DB, not
+                # an idle one; the CPU-only path took a 128 GiB production writer
+                # to 16 GiB on a 2% reading. AWS/RDS FreeableMemory needs no
+                # agent, so this GATES on measured memory rather than merely
+                # demoting: the target must clear the CPU and the memory floor.
+                # An unreadable metric yields no target at all (absent evidence
+                # must not resolve toward counting), which the warning discloses.
+                total_mem_gib = instance_memory_gib(family, vcpu)
+                freeable_min = _get_cloudwatch_min(
+                    cw, "AWS/RDS", "FreeableMemory",
+                    [{"Name": "DBInstanceIdentifier", "Value": instance_id}],
+                )
+                used_mem_gib = (
+                    None if (total_mem_gib is None or freeable_min is None)
+                    else max(0.0, total_mem_gib - freeable_min / (1024 ** 3))
+                )
+                target_size = combined_rightsize_target(vcpu, peak_cpu, family, used_mem_gib)
+                if target_size is None and rightsize_target_size(vcpu, peak_cpu) and avg_cpu < 50:
+                    ctx.warn(
+                        f"[aurora] {instance_id}: CPU suggests a downsize but the memory "
+                        f"floor does not permit one"
+                        + ("" if used_mem_gib is not None
+                           else " (FreeableMemory unreadable or family memory ratio unknown)")
+                        + " — not counted",
+                        "aurora",
+                    )
                 if target_size and avg_cpu < 50:
                     cand_class = f"{family}.{target_size}"
                     try:
@@ -296,7 +356,15 @@ def _check_provisioned_instances(
                                 "CheckCategory": "Aurora Instance Rightsizing",
                                 "CurrentSize": cls,
                                 "TargetSize": cand_class,
-                                "current_value": f"{cls} (avg CPU {avg_cpu:.0f}%, peak {peak_cpu:.0f}% / 14d)",
+                                "current_value": (
+                                    f"{cls} (avg CPU {avg_cpu:.0f}%, peak {peak_cpu:.0f}% / 14d; "
+                                    f"{used_mem_gib:.0f} of {total_mem_gib:.0f} GiB memory in use)"
+                                ),
+                                # The memory evidence that permits this downsize,
+                                # on the card — a reader must be able to see WHY
+                                # shrinking a database's RAM is safe here (C18).
+                                "PeakMemoryUsedGiB": round(used_mem_gib, 1),
+                                "TotalMemoryGiB": total_mem_gib,
                                 "recommended_value": f"Downsize to {cand_class}",
                                 "monthly_savings": round(cur_price - cand_price, 2),
                                 # F4 — carry the numeric counted dollar + Counted flag
@@ -308,8 +376,12 @@ def _check_provisioned_instances(
                                 "Recommendation": f"Downsize {cls} → {cand_class} (peak-aware)",
                                 "EstimatedSavings": f"${cur_price - cand_price:.2f}/mo",
                                 "reason": (
-                                    f"{instance_id} averages {avg_cpu:.0f}% CPU (peak {peak_cpu:.0f}%) over 14d; "
-                                    f"{cand_class} covers the peak with headroom — saves ${cur_price - cand_price:.2f}/mo"
+                                    f"{instance_id} averages {avg_cpu:.0f}% CPU "
+                                    f"(peak {peak_cpu:.0f}%) over 14d and holds "
+                                    f"{used_mem_gib:.0f} of {total_mem_gib:.0f} GiB in memory; "
+                                    f"{cand_class} covers both the CPU peak and the "
+                                    f"working set — saves "
+                                    f"${cur_price - cand_price:.2f}/mo"
                                 ),
                             }
                         )
