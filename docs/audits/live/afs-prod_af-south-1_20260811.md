@@ -273,3 +273,34 @@ With AFS-1 and AFS-2 fixed (AFS-3 is disclosure-only, AFS-4 withdrawn), the
 predicted headline is **$3,854.57/mo**, down from $6,818.16 — a 43% reduction,
 all of it removal of dollars that were not defensible rather than newly-found
 savings. Re-scan to reconcile.
+
+
+## Reconciliation — re-scan 2026-08-11 14:56 (protocol fix-loop step 3)
+
+| | Baseline | Re-scan | Delta |
+|---|---|---|---|
+| **Headline** | $6,818.16 | **$3,854.58** | −$2,963.58 |
+| EC2 | 3,725.56 | 1,043.22 | **−2,682.34** (AFS-1, exact) |
+| AMI | 302.24 | 21.00 | **−281.24** (AFS-2, predicted $20.99) |
+| EBS / RDS / CloudFront / Containers | — | — | **$0.00 each** |
+
+Predicted **$3,854.57**, landed **$3,854.58** — 1 cent of rounding. The protocol
+requires the headline to move by exactly the predicted amount; it did, and every
+untouched tab is unchanged to the cent, so there was no collateral. Counted recs
+149 → 95 with advisories 93 → 147: the 54 demoted recs render rather than vanish.
+
+- **Layer 1: 0 FAIL**, and **S15 is silent** where it flagged 3 recs on the
+  baseline — the sweep works against real output, not just the fixture.
+- Demotions render with their evidence: each EC2 card carries its figure in
+  `AdvisoryEstimate` plus the reason ("r6i is memory-optimized and this downsize
+  halves its RAM"), and the AWS Backup cards name the source instance and point
+  at the plan's retention.
+- **The estate-drift concern was unfounded.** EBS is unchanged at $2,160.27, so
+  the 5 extra `available` volumes seen in the live describe are attached to
+  stopped instances and correctly excluded.
+- **The gp3 refutation is CONFIRMED against the account**: 18 volumes at
+  6,000 IOPS / 250 MB/s reproduce $28.6675 exactly. No $468.90 phantom; the
+  free-baseline subtraction was right.
+
+**Status: RECONCILED.** AFS-1, AFS-2 and AFS-3 verified on live output; AFS-4
+withdrawn.
