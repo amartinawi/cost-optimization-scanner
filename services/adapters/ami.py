@@ -57,7 +57,17 @@ class AmiModule(BaseServiceModule):
         # held 744 of 3,003 snapshots = 23.7% of the estate, yet the un-shared cap
         # credited 100% of the $5,124.78/mo bill — $3,911.50/mo that survives the
         # deletion, since 2,259 other snapshots remain.
-        flagged_gib = sum(float(r.get("SnapshotSizeGB") or 0) for r in old_recs + unused_recs)
+        # Only recs that can actually be COUNTED contribute to the share: an
+        # already-demoted rec frees nothing in the headline, so its GB must not
+        # buy ceiling headroom for the recs that do count. This was latent until
+        # AFS-2 — the pre-existing shared-snapshot advisories carry
+        # SnapshotSizeGB 0.0 and so contributed nothing — but AWS Backup recovery
+        # points are demoted WITH their real size, and including them would have
+        # held the ceiling at its old value while the upper bound collapsed,
+        # letting the surviving AMIs rise to their full uncapped bound (on the
+        # audited account: $20.98 -> $141.28, a phantom introduced by the fix).
+        countable = [r for r in old_recs + unused_recs if r.get("Counted", True) is not False]
+        flagged_gib = sum(float(r.get("SnapshotSizeGB") or 0) for r in countable)
         total_gib = region_snapshot_footprint_gib(ctx)
         pool_share = (flagged_gib / total_gib) if (total_gib and flagged_gib > 0) else None
 

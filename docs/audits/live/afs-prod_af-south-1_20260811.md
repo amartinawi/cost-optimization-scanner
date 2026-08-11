@@ -124,11 +124,30 @@ Two structural problems:
 there is no AWS Backup awareness anywhere in the codebase.
 
 - Suspect: `services/adapters/ami.py` / `services/ami.py` unused/old AMI gates.
-- Fix: detect AWS Backup-managed images (tag `aws:backup:source-resource`, more
-  robust than the name prefix) and either exclude them or re-target the
-  recommendation at the backup plan's retention. Note the C11 reconciliation is
-  working correctly and is not implicated.
-- Predicted delta on re-scan if excluded: **−$281.26** → AMI tab $20.98.
+- **FIXED 2026-08-11.** `_is_aws_backup_managed` detects the `aws:backup:` TAG
+  NAMESPACE (not one exact key, so a new AWS Backup tag cannot silently re-open
+  this), with the `AwsBackup_` name prefix as a fallback for images whose tags
+  did not survive a copy. Such an AMI is **retargeted, not deleted**: it renders
+  as a `$0` advisory carrying the measured storage in `AdvisoryEstimate` and
+  names the source resource, pointing the operator at the backup plan's
+  RETENTION — matching how the repo already handles "real lever, cannot act on
+  it here" (FSx SSD→HDD, CloudWatch log-class migration). Detection runs BEFORE
+  the launch-permission read (51 wasted `describe_image_attribute` calls on this
+  account) and sizes against a COPY of the claimed-snapshot set, so a demoted
+  AMI never steals a snapshot id from a genuinely deletable one sharing it.
+- **A second defect surfaced while fixing it, and it would have been caused BY
+  the fix.** `services/adapters/ami.py` computed `flagged_gib` from *every* rec's
+  `SnapshotSizeGB`. Demoting the backup AMIs collapses the upper bound
+  ($2,035.46 → $141.32) while that ceiling stays put, so the reconciliation
+  factor goes to 1.0 and the five surviving AMIs jump to their **full uncapped
+  bound of $141.32** instead of $20.99 — a $120.33 phantom introduced by the
+  repair. `flagged_gib` now sums only recs that can actually be COUNTED: a
+  demoted rec frees nothing in the headline, so its GB must not buy ceiling
+  headroom for the recs that do count. Latent before AFS-2 only because the
+  pre-existing shared-snapshot advisories carry `SnapshotSizeGB` 0.0.
+- Verified delta, simulated against this scan's JSON: share 0.0684 → 0.004749,
+  ceiling $302.36 → $20.99, **AMI tab $302.24 → $20.99**, headline (post-AFS-1)
+  **$4,135.82 → $3,854.57**.
 
 ### AFS-3 — a region-scoped report carries an account-wide projection (NEW) — MEDIUM
 
@@ -217,7 +236,7 @@ One command settles it:
 | ID | Class | Severity | Claim | Status |
 |----|-------|----------|-------|--------|
 | AFS-1 | C10 | HIGH | $2,682.34 counted on CPU-only evidence for memory-halving downsizes of r-family instances | **FIXED 2026-08-11** — simulated delta −$2,682.34 exactly; RECONCILED pending re-scan |
-| AFS-2 | NEW | HIGH | $281.26 counted against AWS Backup recovery points; gate structurally always-true, action unsafe | CANDIDATE |
+| AFS-2 | NEW | HIGH | $281.26 counted against AWS Backup recovery points; gate structurally always-true, action unsafe | **FIXED 2026-08-11** — AMI tab → $20.99; also fixed a reconciliation-ceiling defect the repair would have caused |
 | AFS-3 | NEW | MEDIUM | $18,653.58 projection is account-wide (65% eu-west-1) in an af-south-1 report, undisclosed | CANDIDATE |
 | AFS-4 | B3-adjacent | LOW | 4 counted cards totalling $0.15 | CANDIDATE |
 | — | — | — | gp3 unattached pricing | REFUTED (pending the describe-volumes check above) |

@@ -20,6 +20,45 @@ OLD_SNAPSHOT_DAYS: int = 90
 UNUSED_MIN_DAYS: int = 30
 
 
+# AWS Backup stamps its own tag namespace on everything it creates. Keyed on the
+# NAMESPACE rather than one exact key so a new AWS Backup tag cannot silently
+# re-open AFS-2.
+_AWS_BACKUP_TAG_PREFIX: str = "aws:backup:"
+# Fallback for images whose tags did not survive a copy; AWS Backup names its
+# EC2 recovery points ``AwsBackup_<instance-id>_<uuid>``.
+_AWS_BACKUP_NAME_PREFIX: str = "AwsBackup_"
+
+
+def _is_aws_backup_managed(ami: dict[str, Any]) -> bool:
+    """True if this AMI is a recovery point owned by an AWS Backup plan.
+
+    Such an image is never "referenced by a running instance" — that is what a
+    backup IS — so the unused-AMI gate can never be false for it, and
+    deregistering it would circumvent the plan that owns its lifecycle (AFS-2).
+    """
+    for tag in ami.get("Tags") or []:
+        if isinstance(tag, dict) and str(tag.get("Key") or "").startswith(_AWS_BACKUP_TAG_PREFIX):
+            return True
+    return str(ami.get("Name") or "").startswith(_AWS_BACKUP_NAME_PREFIX)
+
+
+def _aws_backup_source(ami: dict[str, Any]) -> str:
+    """The resource this recovery point was taken from, or "" if unknown."""
+    for tag in ami.get("Tags") or []:
+        if not isinstance(tag, dict):
+            continue
+        if str(tag.get("Key") or "").startswith(_AWS_BACKUP_TAG_PREFIX):
+            value = str(tag.get("Value") or "")
+            if value:
+                return value.rsplit("/", 1)[-1]
+    name = str(ami.get("Name") or "")
+    if name.startswith(_AWS_BACKUP_NAME_PREFIX):
+        parts = name.split("_")
+        if len(parts) > 1 and parts[1]:
+            return parts[1]
+    return ""
+
+
 def _snapshot_storage_gb(
     ec2: Any, ami: dict[str, Any], counted_snapshot_ids: set[str]
 ) -> tuple[float, list[str], list[str], bool]:
@@ -303,6 +342,67 @@ def compute_ami_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> dic
             # running/stopped instance, launch template, or ASG must not be
             # flagged for deletion. Age below the floor is too new to action.
             if ami_id in running_amis or age_days <= UNUSED_MIN_DAYS:
+                continue
+
+            # AFS-2 — an AWS Backup recovery point is never referenced by a
+            # running instance; that is what a backup IS, so the unused-AMI gate
+            # can never be false for it. Deregistering it would also circumvent
+            # the backup plan that owns its retention, and this scan cannot see
+            # that plan: a 40-day-old image under a 90-day policy is doing
+            # exactly its job. Retarget rather than delete — the storage IS real
+            # money, but the lever is the plan's retention, so the figure renders
+            # as a $0 advisory. Checked BEFORE the launch-permission read (which
+            # it does not need) and sized against a COPY of the claimed-snapshot
+            # set, so a demoted AMI never steals a snapshot id from a genuinely
+            # deletable one sharing it.
+            if _is_aws_backup_managed(ami):
+                backup_gb, backup_snaps, _shared, backup_est = _snapshot_storage_gb(
+                    ec2, ami, set(counted_snapshot_ids)
+                )
+                if not backup_snaps:
+                    continue
+                source = _aws_backup_source(ami)
+                source_note = f" of {source}" if source else ""
+                gross = round(backup_gb * snapshot_rate, 2)
+                checks["old_amis" if age_days > OLD_SNAPSHOT_DAYS else "unused_amis"].append(
+                    {
+                        "ImageId": ami_id,
+                        "Name": ami.get("Name", "N/A"),
+                        "AgeDays": age_days,
+                        "CreationDate": ami["CreationDate"],
+                        "SnapshotSizeGB": round(backup_gb, 2),
+                        "SnapshotIds": backup_snaps,
+                        "SizeEstimated": backup_est,
+                        "ManagedBy": "AWS Backup",
+                        "BackupSourceResource": source,
+                        "Counted": False,
+                        "AdvisoryEstimate": gross,
+                        "Recommendation": (
+                            f"AWS Backup recovery point{source_note} ({age_days} days old,"
+                            f" {backup_gb:,.1f} GB of snapshot storage). Its lifecycle belongs"
+                            f" to the backup plan that created it — review that plan's"
+                            f" RETENTION rather than removing the image, which would"
+                            f" circumvent the plan and destroy the recovery point."
+                        ),
+                        "EstimatedSavings": (
+                            f"$0.00/month - advisory: ${gross:,.2f}/month of snapshot storage"
+                            " is held by this AWS Backup recovery point, realizable only by"
+                            " shortening the backup plan's retention (this scan cannot read"
+                            " the plan, so it cannot tell whether the image is past its"
+                            " intended retention)"
+                        ),
+                        "EstimatedMonthlySavings": 0.0,
+                        "AuditBasis": (
+                            f"{backup_gb:,.1f}GB stored snapshot blocks x"
+                            f" ${snapshot_rate:.4f}/GB-Mo. Not counted: the recommended"
+                            " action targets the AWS Backup plan's retention, not this"
+                            " image, and the plan's retention setting is not readable here."
+                        ),
+                        "CheckCategory": (
+                            "Old Unused AMIs" if age_days > OLD_SNAPSHOT_DAYS else "Unused AMIs"
+                        ),
+                    }
+                )
                 continue
 
             # Cross-account / public sharing (ami H3): an AMI shared via
