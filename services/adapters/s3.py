@@ -20,9 +20,10 @@ logger = logging.getLogger(__name__)
 # These records exist for visibility only; the dollars are counted by
 # bucket_analysis. Filtered out of `total_recommendations` to keep counts
 # honest (audit L2-S3-002 + L3-S3-002).
+# "Static Website Optimization" left this set with the category itself (LS-9):
+# the lifecycle-gap card it labelled now files under Storage Class Optimization.
 _DEDICATED_CATEGORIES: frozenset[str] = frozenset({
     "Storage Class Optimization",
-    "Static Website Optimization",
 })
 
 # F2 — render-noise floor for the bucket_analysis source. A bucket with no counted
@@ -66,7 +67,7 @@ class S3Module(BaseServiceModule):
           informational ``$0.00/month - <reason>`` form means the bucket-level
           dollars are counted by ``s3_bucket_analysis``, not here. Categories
           overlapping with bucket_analysis (``Storage Class Optimization``,
-          ``Static Website Optimization``) are filtered out of
+          are filtered out of
           ``total_recommendations`` to avoid double-counting.
         """
         logger.debug("S3 adapter scan starting")

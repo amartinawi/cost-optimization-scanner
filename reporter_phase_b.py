@@ -815,7 +815,6 @@ def _render_s3_bucket_analysis(recommendations: List[Rec], source_name: str, ser
     grouped_s3: Dict[str, List[Rec]] = {
         "No Lifecycle Policy": [],
         "No Intelligent Tiering": [],
-        "Static Website Optimization": [],
         "Both Missing": [],
         "Other Optimizations": [],
     }
@@ -835,11 +834,12 @@ def _render_s3_bucket_analysis(recommendations: List[Rec], source_name: str, ser
 
         has_lifecycle = rec.get("HasLifecyclePolicy", False)
         has_tiering = rec.get("HasIntelligentTiering", False)
-        is_static_website = rec.get("IsStaticWebsite", False)
 
-        if is_static_website:
-            grouped_s3["Static Website Optimization"].append(rec)
-        elif not has_lifecycle and not has_tiering:
+        # LS-9 — an `is_static_website` branch stood first here, so a bucket
+        # with a real lifecycle/tiering gap was grouped under a CloudFront
+        # heading and shown that nudge instead of the recommendation that
+        # applied to it. Website hosting is not an optimization class.
+        if not has_lifecycle and not has_tiering:
             grouped_s3["Both Missing"].append(rec)
         elif not has_lifecycle:
             grouped_s3["No Lifecycle Policy"].append(rec)
@@ -867,8 +867,6 @@ def _render_s3_bucket_analysis(recommendations: List[Rec], source_name: str, ser
             content += (
                 "<p><strong>Recommendation:</strong> Enable Intelligent Tiering for automatic cost optimization</p>"
             )
-        elif group_name == "Static Website Optimization":
-            content += "<p><strong>Recommendation:</strong> Enable CloudFront CDN for reduced data transfer costs and improved performance</p>"
         elif group_name == "Both Missing":
             content += (
                 "<p><strong>Recommendation:</strong> Implement lifecycle policies AND enable Intelligent Tiering</p>"
@@ -879,10 +877,6 @@ def _render_s3_bucket_analysis(recommendations: List[Rec], source_name: str, ser
         if total_savings > 0:
             content += (
                 f'<p class="savings"><strong>Estimated Savings:</strong> ${total_savings:.2f}/month</p>'
-            )
-        elif group_name == "Static Website Optimization":
-            content += (
-                '<p class="savings"><strong>Estimated Savings:</strong> $0.00/month — data transfer dependent</p>'
             )
         else:
             # Honest advisory: a config gap with no cold-access evidence is not

@@ -56,7 +56,9 @@ class TestEvidenceGatedSavingsClasses:
         # S3-N4: existing-lifecycle buckets must not receive the IA-delta saving.
         assert "intelligent_tiering" not in _GAP_OPPORTUNITY_CLASSES
 
-    def test_static_website_is_not_a_gap_class(self):
+    def test_static_website_is_not_a_class_at_all(self):
+        # LS-9 — website hosting is a display attribute, not an optimization
+        # class; it no longer suppresses a bucket's real lifecycle/tiering gap.
         assert "static_website" not in _GAP_OPPORTUNITY_CLASSES
 
     def test_other_is_not_a_gap_class(self):
@@ -228,9 +230,11 @@ class TestColdnessAssessment:
 
 
 class TestClassifyOpportunities:
-    def test_static_website_takes_precedence(self):
+    def test_static_website_does_not_take_precedence(self):
+        # LS-9 — this used to return "static_website", which is NOT a gap class,
+        # so the bucket was silently excluded from the counted IA-delta saving.
         bucket = {"HasLifecyclePolicy": False, "HasIntelligentTiering": False, "IsStaticWebsite": True}
-        assert _classify_opportunities(bucket) == "static_website"
+        assert _classify_opportunities(bucket) == "both_missing"
 
     def test_both_missing(self):
         bucket = {"HasLifecyclePolicy": False, "HasIntelligentTiering": False, "IsStaticWebsite": False}
@@ -277,7 +281,9 @@ class TestDedicatedCategoriesDedup:
 
     def test_dedicated_set_contents(self):
         assert "Storage Class Optimization" in _DEDICATED_CATEGORIES
-        assert "Static Website Optimization" in _DEDICATED_CATEGORIES
+        # LS-9 — the "Static Website Optimization" category no longer exists;
+        # the lifecycle-gap card it labelled files under Storage Class now.
+        assert "Static Website Optimization" not in _DEDICATED_CATEGORIES
 
     def test_non_dedicated_categories_pass_through(self):
         # Replication/Logging "Optimization" were removed entirely (out-of-scope
