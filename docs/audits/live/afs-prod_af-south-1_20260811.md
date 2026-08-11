@@ -220,11 +220,23 @@ working. No change made.
 
 ## Coverage gaps (savings ABSENT from the $6,818.16)
 
-- **me-south-1 S3 buckets** — endpoint unreachable from the scan host (connect
-  timeout to `afs-ai-prod.s3.me-south-1.amazonaws.com`); their sizes and
-  lifecycle findings are missing. **Recurring** — the same gap was recorded in
-  the eu-west-1 audit three days earlier, so it is a scan-host networking issue,
-  not a transient.
+- **me-south-1 S3 buckets** — connect timeout to
+  `afs-ai-prod.s3.me-south-1.amazonaws.com`; their sizes and lifecycle findings
+  are missing.
+
+  **CORRECTED 2026-08-11 (operator report):** me-south-1 (Bahrain) and
+  me-central-1 (UAE) are in a **regional AWS outage**. This audit originally
+  concluded "recurring across two audits, so it is a scan-host networking issue,
+  not a transient" — that inference was **wrong**. Repetition across scans is not
+  evidence of a local cause; the same external outage reproduces identically, and
+  a connect timeout looks the same from either side. The scanner's own behaviour
+  was correct throughout: `_mark_s3_region_dead` retired the region once, warned,
+  and disclosed the gap rather than silently reporting a smaller S3 number.
+
+  **Implication:** these buckets' savings are absent from every afs-prod report
+  taken during the outage, and re-scanning will not recover them until the region
+  returns. Any figure for me-south-1 / me-central-1 resources gathered now should
+  be treated as unavailable, not as zero.
 - **3 volumes skipped IOPS rightsizing** — no CloudWatch IOPS data in the 14-day
   window (`vol-01d216bd0afc90172`, `vol-0f2fa1c25f16c30a9`,
   `vol-0d89d6f8c4462e430` — all three also appear in the CoH stale-delete list).

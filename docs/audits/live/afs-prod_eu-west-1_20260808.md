@@ -85,8 +85,11 @@ optionally move the figure to `PotentialMonthlySavings` for strict B1 hygiene.
 
 ## Coverage gaps (savings ABSENT from the $13,625.31)
 
-- **me-south-1 S3 buckets** — endpoint unreachable from scan host; sizes and
-  lifecycle findings missing. Re-scan from a host that can reach me-south-1 or
+- **me-south-1 S3 buckets** — endpoint unreachable; sizes and
+  lifecycle findings missing. **NOTE (added 2026-08-11):** me-south-1 (Bahrain)
+  and me-central-1 (UAE) were later reported in a regional AWS outage, so
+  "unreachable from scan host" is not an established diagnosis for this gap —
+  see the af-south-1 ledger. Re-scan when the region is healthy, or
   via `--scan-only s3` with connectivity.
 - **6 volumes skipped IOPS rightsizing** — no CloudWatch IOPS data in 14-day
   window (includes 5 of the CoH stale-delete volumes).
