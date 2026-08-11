@@ -608,6 +608,37 @@ def projected_savings(ri_cards: list[dict[str, Any]],
     return total, " + ".join(parts) if parts else "no purchase recommendations"
 
 
+def projected_region_split(
+    cards: list[dict[str, Any]], scan_region: str
+) -> tuple[float, float, tuple[str, ...]]:
+    """Split the RI purchase recommendations into (scan-region $, total $, other regions).
+
+    Cost Explorer's purchase-recommendation APIs are ACCOUNT-scoped and accept no
+    region filter, so a region-scoped report can present a projection whose work
+    lies mostly elsewhere (AFS-3: 65% of afs-prod's af-south-1 projection was
+    eu-west-1). Publishing the local share lets the report say so, and stops a
+    reader adding two regions' projections together — they would be the same
+    account-wide recommendations counted twice.
+
+    Only ``ri_type`` cards carry a region. SP cards are excluded rather than
+    guessed at: CE reports an SP bundle account-wide, so attributing one to the
+    scan region would invent precision this data does not have.
+    """
+    local = total = 0.0
+    others: set[str] = set()
+    for card in cards:
+        if card.get("card_kind") != "ri_type":
+            continue
+        amount = float(card.get("monthly_savings") or 0.0)
+        total += amount
+        region = str(card.get("region") or "")
+        if region == scan_region:
+            local += amount
+        elif region:
+            others.add(region)
+    return round(local, 2), round(total, 2), tuple(sorted(others))
+
+
 def merge_coh_concurrence(cards: list[dict[str, Any]],
                           coh_recs: list[dict[str, Any]]
                           ) -> tuple[list[dict[str, Any]], list[int]]:
