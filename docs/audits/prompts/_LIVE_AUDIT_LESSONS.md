@@ -382,6 +382,62 @@ will eventually both count it. This is the single most common real finding.
   the same widening then exposed an unterminated pager that had been latent
   behind the narrow gate — widening a gate makes latent bugs on that path real.*
 
+- **C18 — A corroborating signal that only ever SUPPRESSES is a fail-open.
+  Absent evidence must resolve toward NOT counting, not toward counting.**
+  The pattern reads as safe — "network/memory is only used to suppress a false
+  positive, never to invent one; when the data is unavailable the prior verdict
+  stands" — and it is exactly backwards for a COUNTED dollar. On the accounts
+  where the signal is missing, which is most of them, the check silently reverts
+  to the un-corroborated behaviour it was written to fix, and the docstring
+  reassures the next reader that this is deliberate. Ask of every corroborator:
+  *what happens on the account that does not emit it?* If the answer is "we
+  count anyway", the fix never shipped. Demote rather than suppress, so the card
+  still renders with its figure and the operator can go get the evidence.
+  *Real: AFS-1 (2026-08-11, afs-prod/af-south-1) — `memory_bound = mem_pct is not
+  None and mem_pct > 80`, where `mem_pct` needs the CloudWatch agent. All three
+  counted EC2 rightsizing recs, $2,682.34 = 39% of the report headline, were
+  memory-optimized r-family instances told to HALVE their RAM on CPU alone. Rates
+  and arithmetic verified EXACT — the defect was purely evidential. Low CPU on an
+  r6i is the EXPECTED signature of a memory-bound workload; 256 GiB is why that
+  instance was chosen. The prior audit of the same account had verified the same
+  family's arithmetic and not questioned the evidence either.*
+
+- **C19 — A gate that can never be FALSE for a resource class is not a check,
+  it is a generator. And a managed resource's lifecycle belongs to its
+  manager.** Before trusting an idleness/usage test, find the resource class for
+  which it is true by construction. "Unused AMI = not referenced by a running
+  instance" is true of *every* backup image, because a backup exists precisely so
+  that nothing references it until it is needed — so the check fires on 100% of
+  them, on every account, forever, and its output looks like a huge finding. The
+  second half matters as much: when a resource is created and owned by a managed
+  service (AWS Backup, ASG, EKS, an operator), acting on the artifact directly
+  circumvents the manager and is usually destructive. The cost lever lives on the
+  MANAGER — the plan's retention, the group's desired capacity — which is a
+  different action against a different resource, and often one this scan cannot
+  even read. Retarget the recommendation instead of deleting it: `$0` advisory,
+  measured figure retained, pointed at the thing the operator can actually
+  change. *Real: AFS-2 (2026-08-11) — 51 of 56 AMI recs, $281.26 of $302.24 and
+  31,834 of 34,209 snapshot GB, were `AwsBackup_*` recovery points. Detect by the
+  `aws:backup:` TAG NAMESPACE, not one exact key and not the name, so a new tag
+  cannot silently re-open it.*
+
+- **C20 — Demoting a rec must also withdraw its contribution to any SHARE or
+  CEILING computed across recs — otherwise the fix inflates its neighbours.**
+  Reconciliation caps counted savings at the flagged resources' share of a billed
+  pool, and that share is summed over the rec list. Demote some recs without
+  removing their size from the numerator and the ceiling holds while the upper
+  bound collapses, so the cap stops binding and the SURVIVING recs rise to their
+  full un-capped bound. The repair reads as pure removal and quietly hands the
+  remainder a raise. Whenever a change demotes recs, re-derive every aggregate
+  computed over that list and predict the survivors' new total explicitly — a
+  demoted rec frees nothing, so its size must not buy headroom for the ones that
+  count. *Real: AFS-2 (2026-08-11) — `flagged_gib` summed every rec's
+  `SnapshotSizeGB`. Demoting the 51 backup AMIs collapsed the bound
+  $2,035.46 → $141.32 while the ceiling stayed at $302.36, so the factor went to
+  1.0 and the five survivors would have jumped $20.99 → $141.32: a $120.33
+  phantom created BY the fix. Latent until then only because the pre-existing
+  shared-snapshot advisories carry `SnapshotSizeGB` 0.0.*
+
 ## D. Render / tab / count semantics (`counted == rendered`, both directions)
 
 - **D1 — Counted-but-invisible (render desync).** Savings summed into the headline
