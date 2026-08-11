@@ -67,6 +67,14 @@ def _ctx(s3: _S3) -> SimpleNamespace:
     ctx.warn = lambda msg, service="", **k: ctx.warnings.append(msg)
     ctx.permission_issue = lambda msg, service="", action=None, **k: ctx.permissions.append(msg)
     ctx.client = lambda name, region=None: s3
+    # See test_ls9_static_website._ctx: _bucket_s3_client needs this, and
+    # without it the whole bucket loop is swallowed and absence assertions pass
+    # for the wrong reason.
+    ctx.clients = SimpleNamespace(
+        _factory=SimpleNamespace(
+            session=lambda: SimpleNamespace(client=lambda *a, **k: s3)
+        )
+    )
     return ctx
 
 
@@ -77,6 +85,10 @@ def test_empty_bucket_card_and_its_api_call_are_gone() -> None:
 
     calls: list[str] = []
     out = get_enhanced_s3_checks(_ctx(_S3(calls)), pricing_multiplier=1.0)
+
+    # Proof the bucket loop actually ran (see the _ctx docstring): otherwise
+    # these absence assertions pass because nothing executed.
+    assert "list_multipart_uploads" in calls
 
     assert "unused_buckets" not in out
     assert not any(r.get("CheckCategory") == "Unused Resources"

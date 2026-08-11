@@ -20,7 +20,6 @@ from botocore.exceptions import (  # type: ignore[import-untyped]
 )
 
 from core.scan_context import ScanContext
-from services._aws_errors import record_aws_error
 
 logger = logging.getLogger(__name__)
 
@@ -708,28 +707,11 @@ def _calculate_s3_storage_cost(
         return round(size_gb * S3_STORAGE_COSTS["STANDARD"], 2)
 
 
-def _is_static_website_bucket(bucket_name: str, s3_client: Any, ctx: ScanContext | None = None) -> bool:
-    """Return True if ``bucket_name`` is configured for static-website hosting.
-
-    Result is intended to be cached on ``bucket_info`` by the caller so it is
-    not re-queried for every code path that needs it (audit L2-S3-007).
-    """
-    try:
-        s3_client.get_bucket_website(Bucket=bucket_name)
-        return True
-    except Exception as e:
-        # NoSuchWebsiteConfiguration is the normal "not a website" answer — not an
-        # error. Anything else (AccessDenied / throttle) was previously only
-        # debug-logged, so a permission gap silently classified the bucket as
-        # non-website; classify it so it surfaces in the report instead.
-        if "NoSuchWebsiteConfiguration" not in str(e):
-            if ctx is not None:
-                record_aws_error(
-                    ctx, e, service="s3", context=f"GetBucketWebsite on {bucket_name} failed"
-                )
-            else:
-                logger.debug("S3 GetBucketWebsite error on %s: %s", bucket_name, e)
-        return False
+# `_is_static_website_bucket` removed with LS-9. It probed GetBucketWebsite per
+# bucket to set a flag that steered the opportunity class (excluding those
+# buckets from a counted saving), the report grouping, and a CloudFront nudge
+# carrying no obtainable dollar. Nothing prices differently because a bucket
+# serves a website, so the probe had no cost consumer left.
 
 
 def _classify_opportunities(bucket_info: dict[str, Any]) -> str:
@@ -737,14 +719,21 @@ def _classify_opportunities(bucket_info: dict[str, Any]) -> str:
 
     Used to group buckets in the report and to decide which buckets are
     eligible for an evidence-gated saving (see ``_GAP_OPPORTUNITY_CLASSES``).
-    Returns ``static_website``, ``both_missing``, ``lifecycle_missing``,
-    ``intelligent_tiering``, or ``other`` (fully optimized).
+    Returns ``both_missing``, ``lifecycle_missing``, ``intelligent_tiering``,
+    or ``other`` (fully optimized).
+
+    LS-9 — this used to return ``static_website`` BEFORE either gap test, and
+    that class is not in ``_GAP_OPPORTUNITY_CLASSES``. So a static-website
+    bucket with no lifecycle policy could never set ``has_gap``, and was
+    excluded from the counted Standard->Standard-IA saving even with Standard
+    bytes, request metrics proving them cold, and an average object over the
+    128 KiB IA minimum. The two properties are independent: hosting a website
+    says nothing about whether cold bytes belong in IA, and a bucket with 0 GETs
+    over 30 days is not serving one. Website-ness remains on the rec as
+    ``IsStaticWebsite`` for display; it is not an optimization class.
     """
     has_lifecycle = bucket_info.get("HasLifecyclePolicy", False)
     has_tiering = bucket_info.get("HasIntelligentTiering", False)
-    is_static = bucket_info.get("IsStaticWebsite", False)
-    if is_static:
-        return "static_website"
     if not has_lifecycle and not has_tiering:
         return "both_missing"
     if not has_lifecycle:
@@ -1017,7 +1006,7 @@ def _assess_bucket_coldness(
 def _finalize_bucket_savings(
     bucket_info: dict[str, Any],
     savings: float,
-    opportunity_key: str,
+    _opportunity_key: str,
     has_gap: bool,
     standard_gb: float,
     fast_mode: bool,
@@ -1028,6 +1017,10 @@ def _finalize_bucket_savings(
     audit): a JSON consumer reading standard numeric fields must see the same
     figure the string carries, and must never mistake ``EstimatedMonthlyCost``
     (the bucket's COST) for it.
+
+    ``_opportunity_key`` is retained for call-site symmetry but no longer steers
+    the copy: its only use was the CloudFront branch removed in LS-9. What the
+    $0 string says now depends on the GAP, which is what the reader can act on.
     """
     if savings > 0:
         bucket_info["SavingsDelta"] = savings
@@ -1040,9 +1033,15 @@ def _finalize_bucket_savings(
     # Counted=False (the standard flag every other adapter uses) so the
     # reporter renders it as advisory and excludes it from the headline count.
     bucket_info["Counted"] = False
-    if opportunity_key == "static_website":
-        bucket_info["EstimatedSavings"] = "$0.00/month - data transfer dependent (CloudFront CDN)"
-    elif has_gap and (standard_gb > 0 or fast_mode):
+    # LS-9 — the "$0.00/month - data transfer dependent (CloudFront CDN)" branch
+    # that stood here is gone with its class. Neither half of that delta is
+    # obtainable: S3 publishes no egress metric (BytesDownloaded is an opt-in
+    # PAID request metric that cannot separate billed internet egress from free
+    # same-region egress), and the Pricing API's only AWS-Outbound-to-External
+    # SKU from us-east-1 reads $0.00/GB over 0-Inf while CloudFront's outbound
+    # rate varies by edge-location group. A static-website bucket now falls
+    # through to whichever branch its actual gap earns.
+    if has_gap and (standard_gb > 0 or fast_mode):
         # Real transition gap, but no counted dollar: either no cold-access
         # evidence (metrics off / fast-mode sample), or the 128 KiB IA
         # object-size gate blocked the transition (specific reason preferred).
@@ -1146,19 +1145,17 @@ def get_s3_bucket_analysis(
                 "Region": bucket_region,
                 "HasLifecyclePolicy": False,
                 "HasIntelligentTiering": False,
-                "IsStaticWebsite": False,
                 "EstimatedMonthlyCost": 0,
                 "SizeBytes": 0,
                 "SizeGB": 0,
                 "OptimizationOpportunities": [],
             }
 
-            # Resolve IsStaticWebsite exactly once per bucket and cache the
-            # result on bucket_info; downstream code paths and the enhanced
-            # checks no longer need to re-query (audit L2-S3-007).
-            bucket_info["IsStaticWebsite"] = _is_static_website_bucket(
-                bucket_name, bucket_s3_client, ctx
-            )
+            # LS-9 — the GetBucketWebsite probe that set IsStaticWebsite is
+            # gone. Nothing costs differently because a bucket serves a website:
+            # it steered the opportunity class (hiding a counted saving), the
+            # report grouping, and a CloudFront nudge with no obtainable dollar.
+            # All three are removed, so the call has no consumer left.
 
             if fast_mode:
                 try:
@@ -1294,27 +1291,20 @@ def get_s3_bucket_analysis(
                 if tiering_response.get("IntelligentTieringConfigurationList"):
                     bucket_info["HasIntelligentTiering"] = True
                 else:
-                    if bucket_info["IsStaticWebsite"]:
-                        bucket_info["OptimizationOpportunities"].append(
-                            "Static website: Consider CloudFront CDN for reduced data transfer costs"
-                        )
-                    else:
-                        bucket_info["OptimizationOpportunities"].append(
-                            "Enable S3 Intelligent-Tiering for automatic cost optimization"
-                        )
+                    # LS-9 — a static-website bucket used to get the CloudFront
+                    # nudge INSTEAD of this line, so the one suggestion with a
+                    # real storage lever was the one it lost.
+                    bucket_info["OptimizationOpportunities"].append(
+                        "Enable S3 Intelligent-Tiering for automatic cost optimization"
+                    )
                     analysis["buckets_without_intelligent_tiering"].append(bucket_name)
             except Exception as e:
                 _route_bucket_error(
                     ctx, bucket_name, e, action="s3:GetIntelligentTieringConfiguration"
                 )
-                if bucket_info["IsStaticWebsite"]:
-                    bucket_info["OptimizationOpportunities"].append(
-                        "Static website: Consider CloudFront CDN for reduced data transfer costs"
-                    )
-                else:
-                    bucket_info["OptimizationOpportunities"].append(
-                        "Enable S3 Intelligent-Tiering for automatic cost optimization"
-                    )
+                bucket_info["OptimizationOpportunities"].append(
+                    "Enable S3 Intelligent-Tiering for automatic cost optimization"
+                )
                 analysis["buckets_without_intelligent_tiering"].append(bucket_name)
 
             if not bucket_info["HasLifecyclePolicy"] and not bucket_info["HasIntelligentTiering"]:
@@ -1437,19 +1427,10 @@ def get_enhanced_s3_checks(
         "storage_class_optimization": [],
         "intelligent_tiering_missing": [],
         "request_heavy_buckets": [],
-        "static_website_optimization": [],
     }
-    # Per-bucket cache of _is_static_website_bucket so it's queried at most
-    # once per bucket inside this function (audit L2-S3-007).
-    static_cache: dict[str, bool] = {}
-
-    def _static(name: str, client: Any) -> bool:
-        if name not in static_cache:
-            # Forward ctx so an AccessDenied/throttle on GetBucketWebsite is
-            # classified here too, not silently debug-logged (the enhanced-checks
-            # path was missed in the first pass of this fix).
-            static_cache[name] = _is_static_website_bucket(name, client, ctx)
-        return static_cache[name]
+    # The `_static` helper and its per-bucket cache are gone with LS-9: no check
+    # in this function branches on website hosting any more, so the
+    # GetBucketWebsite call it memoised was pure cost with no output.
 
     try:
         # Paginate list_buckets: since the 2024 API change it returns at most
@@ -1506,24 +1487,18 @@ def get_enhanced_s3_checks(
                 bucket_s3_client.get_bucket_lifecycle_configuration(Bucket=bucket_name)
             except Exception as e:
                 if "NoSuchLifecycleConfiguration" in str(e):
-                    is_static_site = _static(bucket_name, bucket_s3_client)
-                    if is_static_site:
-                        recommendation = (
-                            "Static website detected: Configure lifecycle policies"
-                            " for logs/backups only. Consider CloudFront for"
-                            " reduced data transfer costs"
-                        )
-                        category = "Static Website Optimization"
-                    else:
-                        recommendation = (
-                            "Configure lifecycle policies for automatic tiering to reduce storage costs"
-                        )
-                        category = "Storage Class Optimization"
+                    # LS-9 — one recommendation, whatever the workload. The
+                    # website variant appended a CloudFront nudge with no
+                    # obtainable dollar and filed the card under a category of
+                    # its own, which is how a real lifecycle gap ended up
+                    # presented as a CDN suggestion.
+                    recommendation = (
+                        "Configure lifecycle policies for automatic tiering to reduce storage costs"
+                    )
                     checks["lifecycle_missing"].append(
                         {
                             "BucketName": bucket_name,
-                            "IsStaticWebsite": is_static_site,
-                            "CheckCategory": category,
+                            "CheckCategory": "Storage Class Optimization",
                             "Recommendation": recommendation,
                             "SizeGB": 0,
                             "EstimatedMonthlyCost": 0,
@@ -1567,21 +1542,17 @@ def get_enhanced_s3_checks(
             # which carries a real dollar. Dropping this also removes a
             # list_objects_v2 call per bucket that existed only to feed it.
 
-            if _static(bucket_name, bucket_s3_client):
-                checks["static_website_optimization"].append(
-                    {
-                        "BucketName": bucket_name,
-                        "IsStaticWebsite": True,
-                        "Recommendation": (
-                            "Static website detected: Enable CloudFront CDN"
-                            " for reduced data transfer costs and improved performance"
-                        ),
-                        "CheckCategory": "Static Website Optimization",
-                        "EstimatedSavings": (
-                            "$0.00/month - data transfer dependent (CloudFront CDN)"
-                        ),
-                    }
-                )
+            # Static-website CloudFront card removed (LS-9), with the per-bucket
+            # get_bucket_website call that fed it. Neither half of the delta is
+            # obtainable: S3 publishes no egress metric (BytesDownloaded is an
+            # opt-in PAID request metric that cannot separate billed internet
+            # egress from free same-region egress), and the Pricing API's only
+            # AWS-Outbound-to-External SKU from us-east-1 reads $0.00/GB over
+            # 0-Inf while CloudFront's outbound rate varies $0.06-$0.08+/GB by
+            # edge-location group, with per-request charges on top that can
+            # invert the sign for small objects. "improved performance" was also
+            # outside the strictly-cost scope, and was the half of the sentence
+            # actually justifying the change.
 
     except Exception as e:
         if _is_access_denied(e):

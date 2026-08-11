@@ -92,6 +92,16 @@ def _ctx(ec2: Any = None, clients: dict[str, Any] | None = None) -> SimpleNamesp
     if ec2 is not None:
         pool["ec2"] = ec2
     ctx.client = lambda name, region=None: pool.get(name)
+    # Required, not decorative: services/s3.py::_bucket_s3_client reaches through
+    # ctx.clients._factory for a region-scoped client. Without it the
+    # AttributeError escapes to the function's outer handler and every result is
+    # swallowed — so a test asserting a card is ABSENT passes because the bucket
+    # loop never ran at all.
+    ctx.clients = SimpleNamespace(
+        _factory=SimpleNamespace(
+            session=lambda: SimpleNamespace(client=lambda *a, **k: pool.get("s3"))
+        )
+    )
     return ctx
 
 
@@ -385,6 +395,10 @@ def test_versioning_nudge_and_its_api_call_are_both_gone() -> None:
     ctx = _ctx(clients={"s3": _S3(calls)})
     ctx.region = "us-east-1"
     out = get_enhanced_s3_checks(ctx, pricing_multiplier=1.0)
+
+    # Proof the bucket loop actually ran: without this the assertions below are
+    # satisfied by a swallowed exception rather than by the deletion.
+    assert "list_multipart_uploads" in calls
 
     assert "versioning_growth" not in out
     assert not any(r.get("CheckCategory") == "Versioning Optimization"
