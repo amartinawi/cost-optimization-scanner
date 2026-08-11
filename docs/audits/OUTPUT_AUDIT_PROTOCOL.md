@@ -25,6 +25,22 @@ reading adapter code. Complements the per-service code audits in
 
 Outputs contain account and resource identifiers — keep them local.
 
+**Operational notes (learned the hard way, 2026-08-11):**
+
+- Run scans with `.venv/bin/python cli.py …` — the system `python3` has no boto3.
+- **Preserve the baseline before re-scanning.** A re-scan overwrites
+  `<profile>_<region>.html` in place; copy it aside first or the reconciliation
+  compares the new report against itself.
+- **Wait for `Report generated` in the log, not for the log to be non-empty.**
+  Python buffers stdout to a file, so an early flushed line looks like
+  completion. A reconciliation run against a half-finished scan reported $0.00
+  deltas across every tab and looked like a total fix failure.
+- Assume-role profiles expire; `InvalidClientTokenId` means stale credentials,
+  not a permanent block. Build the session WITHOUT a region and pass
+  `region_name` to `.client()`.
+- A scan takes tens of minutes. Run it in the background and poll the report's
+  mtime.
+
 ## Layer 1 — deterministic sweeps (machine)
 
 Run the harness; it encodes lessons A/B/C11/D/E as hard invariants:
@@ -40,8 +56,18 @@ S3 counted-but-$0 (B3/C5) - S4 shared snapshot counted twice (A3) - S5
 string/numeric agreement (B2/B3) - S6 pool-cap-at-100% tell (C11) - S7
 counted-only / rendered-aware count semantics (D3/D4) - S8 negative/NaN -
 S9 tab/panel render gate (D2) - S10 log triage - S11 dropped CoH buckets (E2) -
-S12 permission gaps. Exit 1 on any FAIL. Tests:
+S12 permission gaps - S13 per-tab reconciliation - S14 projected-commitment
+recompute - **S15 binding-dimension evidence (C18)**. Exit 1 on any FAIL. Tests:
 `tests/test_output_audit.py` (one seeded violation per class).
+
+S15 is the machine-checkable half of lesson C18 and keys off
+`_BINDING_DIMENSION_LEVERS`: a COUNTED downsize must carry evidence for the
+dimension that actually binds it — EC2 `AvgMemory` (memory-optimized families
+only; CPU is fair evidence for a general-purpose instance), Aurora
+`PeakMemoryUsedGiB`, OpenSearch `PeakJVMMemoryPressure`. **Add a row whenever a
+new downsize lever ships.** It was verified against two real pre-fix reports,
+where it flagged exactly the 3 EC2 and 2 Aurora recs the audits had found by
+hand.
 
 ## Layer 2a — rate verification worklist (harness extracts, MCP verifies)
 
@@ -105,6 +131,20 @@ caught only by this pass.
 ## Findings ledger
 
 One file per audited scan: `docs/audits/live/<profile>_<region>_<YYYYMMDD>.md`.
+
+Completed ledgers (each carries its own reconciliation section):
+
+| Scan | Headline before → after | Outcome |
+|------|------------------------|---------|
+| `afs-prod_eu-west-1_20260808.md` | $13,625.31 | 3 fixed, 1 by-design |
+| `afs-prod_af-south-1_20260811.md` | $6,818.16 → **$3,854.58** | AFS-1/2/3 fixed, AFS-4 withdrawn, gp3 CRITICAL refuted |
+| `M360_ap-south-1_20260811.md` | $4,841.06 → **$2,468.62** | M360-1/3 fixed, M360-2 withdrawn |
+
+**Record withdrawals and refutations in the ledger, not just fixes.** Three of
+nine candidates across the two 2026-08-11 audits did not survive Layer 3, and
+two of those were killed only by checking before implementing. A ledger that
+lists only what was fixed teaches the next auditor nothing about what looked
+like a bug and wasn't.
 
 | Field | Meaning |
 |-------|---------|
