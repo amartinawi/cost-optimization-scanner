@@ -671,16 +671,8 @@ S3_OPTIMIZATION_DESCRIPTIONS: dict[str, dict[str, str]] = {
             "4. Estimated savings: 40-80% vs Standard storage"
         ),
     },
-    "unused_buckets": {
-        "title": "Delete Unused S3 Buckets",
-        "description": "Remove empty or unused S3 buckets to eliminate unnecessary costs.",
-        "action": (
-            "1. Identify buckets with no objects or minimal usage\n"
-            "2. Verify no applications depend on the bucket\n"
-            "3. Delete unused buckets via console or CLI\n"
-            "4. Estimated savings: 100% of bucket costs"
-        ),
-    },
+    # "unused_buckets" descriptor removed with its check (LS-5). It promised
+    # "100% of bucket costs" for deleting an EMPTY bucket, whose costs are $0.
     "multipart_cleanup": {
         "title": "Clean Up Incomplete Multipart Uploads",
         "description": ("Remove incomplete multipart uploads that continue to incur storage costs."),
@@ -1444,7 +1436,6 @@ def get_enhanced_s3_checks(
         "multipart_uploads": [],
         "storage_class_optimization": [],
         "intelligent_tiering_missing": [],
-        "unused_buckets": [],
         "request_heavy_buckets": [],
         "static_website_optimization": [],
     }
@@ -1566,26 +1557,15 @@ def get_enhanced_s3_checks(
             # break them out — so the card could only ever say "go measure this
             # yourself", which delegates the analysis rather than performing it.
 
-            try:
-                objects_response = bucket_s3_client.list_objects_v2(Bucket=bucket_name, MaxKeys=1)
-                if objects_response.get("KeyCount", 0) == 0:
-                    bucket_age = (datetime.now(bucket["CreationDate"].tzinfo) - bucket["CreationDate"]).days
-                    if bucket_age > 30:
-                        checks["unused_buckets"].append(
-                            {
-                                "BucketName": bucket_name,
-                                "AgeDays": bucket_age,
-                                "Recommendation": (
-                                    f"Empty bucket older than {bucket_age} days - consider deletion"
-                                ),
-                                "CheckCategory": "Unused Resources",
-                                "EstimatedSavings": (
-                                    "$0.00/month - empty bucket incurs no storage cost"
-                                ),
-                            }
-                        )
-            except Exception as e:
-                _route_bucket_error(ctx, bucket_name, e, action="s3:ListBucket")
+            # Empty-bucket check removed (LS-5): it emitted "Empty bucket older
+            # than N days - consider deletion. $0.00/month - empty bucket incurs
+            # no storage cost", a card refuting its own saving in its own text.
+            # An empty bucket bills nothing, so deleting it saves nothing —
+            # there is no lever here to gate or quantify, unlike LS-3/LS-4.
+            # Incomplete multipart-upload parts DO bill and are invisible to
+            # list_objects_v2, but those belong to the `multipart_uploads` check,
+            # which carries a real dollar. Dropping this also removes a
+            # list_objects_v2 call per bucket that existed only to feed it.
 
             if _static(bucket_name, bucket_s3_client):
                 checks["static_website_optimization"].append(
