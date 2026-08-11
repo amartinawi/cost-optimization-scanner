@@ -20,6 +20,7 @@ Sweeps (lesson class in parentheses):
     S12 permission-gaps    permission_issues, ce:GetCostAndUsage called out (C8)
     S13 tab-reconcile      each tab total == sum of its counted rec dollars
     S14 projected-commit   summary projected figure recomputes from commitment cards
+    S15 memory-evidence    counted downsize of a memory-optimized instance has memory data (C18)
 
 Usage:
     python3 tools/output_audit.py <report.html | scan.json> [--log console.log] [--json]
@@ -304,6 +305,48 @@ def sweep_tab_reconcile(data: dict[str, Any]) -> list[Finding]:
     return out
 
 
+# C18 / AFS-1 — EC2 families whose BINDING dimension is memory, not CPU. Mirrors
+# services/ec2.py::_MEMORY_OPTIMIZED_PREFIXES; kept as a literal here so the
+# harness stays importable without the services package.
+_MEMORY_OPTIMIZED_PREFIXES = ("r", "x", "z", "u")
+
+
+def _is_memory_optimized_type(instance_type: str) -> bool:
+    family = str(instance_type or "").split(".")[0].strip().lower()
+    if len(family) < 2:
+        return False
+    return family[0] in _MEMORY_OPTIMIZED_PREFIXES and any(c.isdigit() for c in family)
+
+
+def sweep_memory_evidence(data: dict[str, Any]) -> list[Finding]:
+    """S15 (C18) — a COUNTED downsize of a memory-optimized instance must carry
+    memory evidence.
+
+    Every one-size-down step halves RAM, and low CPU is the EXPECTED profile of a
+    memory-bound workload, so a counted r/x/z/u rightsizing or idle rec with no
+    memory reading is a CPU-only verdict counting a dollar it cannot defend.
+    Live: AFS-1 counted $2,682.34 this way — 39% of that report's headline.
+    """
+    out: list[Finding] = []
+    for key, src, rec in _iter_recs(data):
+        if not _is_counted(rec) or rec_dollar(rec) <= 0:
+            continue
+        category = str(rec.get("CheckCategory") or "")
+        if category not in ("Rightsizing Opportunities", "Idle Instances"):
+            continue
+        itype = str(rec.get("InstanceType") or "")
+        if not _is_memory_optimized_type(itype):
+            continue
+        if not str(rec.get("AvgMemory") or "").strip():
+            out.append(_finding(
+                "S15-memory-evidence", "FAIL", key,
+                f"{src}: {rec.get('InstanceId')} ({itype}) counts "
+                f"${rec_dollar(rec):,.2f} on a CPU-only verdict — {itype.split('.')[0]} is "
+                f"memory-optimized and this halves its RAM, but no AvgMemory evidence "
+                f"is attached (C18: absent evidence must not resolve toward counting)"))
+    return out
+
+
 def sweep_negative(data: dict[str, Any]) -> list[Finding]:
     """S8 — no savings field may be negative or NaN."""
     out: list[Finding] = []
@@ -463,6 +506,7 @@ def run_sweeps(data: dict[str, Any], html_text: str | None = None,
     findings += sweep_summary_semantics(data)
     findings += sweep_projected_commitment(data)
     findings += sweep_tab_reconcile(data)
+    findings += sweep_memory_evidence(data)
     findings += sweep_negative(data)
     findings += sweep_warnings(data)
     if html_text is not None:
