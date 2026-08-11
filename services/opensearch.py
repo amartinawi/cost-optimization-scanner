@@ -18,6 +18,55 @@ from core.scan_context import ScanContext
 
 LOW_CPU_THRESHOLD: int = 20
 
+# M360-3 / C18 — an OpenSearch data node is HEAP-bound, not CPU-bound: the JVM
+# holds field data, indices and caches, and a one-rung downsize halves the node's
+# RAM and therefore its heap. Low CPU is the normal profile of a search cluster
+# serving from a warm heap, so it cannot on its own justify shrinking one.
+#
+# The bound is derived, not invented: halving the heap roughly doubles pressure,
+# and AWS treats sustained JVMMemoryPressure above 75% as GC territory, so a node
+# may only be downsized while its observed MAXIMUM sits below half of that. Same
+# reasoning ElastiCache used for its 35% (services/elasticache.py:21).
+MAX_JVM_PRESSURE_PCT: float = 37.5
+
+
+def heap_headroom_ok(peak_jvm_pressure_pct: float | None) -> bool:
+    """True if a one-size-down node would still hold this domain's heap.
+
+    ``None`` (metric unreadable) returns False: absence of evidence is not
+    evidence of headroom, and this gates a COUNTED dollar (C18).
+    """
+    if peak_jvm_pressure_pct is None:
+        return False
+    return peak_jvm_pressure_pct <= MAX_JVM_PRESSURE_PCT
+
+
+def _es_max(
+    cloudwatch: Any, metric: str, domain_name: str, ctx: Any, start_time: Any, end_time: Any
+) -> float | None:
+    """Highest datapoint Maximum for an AWS/ES metric, or None if unreadable.
+
+    The MAXIMUM is what a downsize must survive: a node has to hold its heap at
+    the domain's most pressured moment, so an average would understate it.
+    """
+    try:
+        resp = cloudwatch.get_metric_statistics(
+            Namespace="AWS/ES",
+            MetricName=metric,
+            Dimensions=[
+                {"Name": "DomainName", "Value": domain_name},
+                {"Name": "ClientId", "Value": ctx.account_id},
+            ],
+            StartTime=start_time,
+            EndTime=end_time,
+            Period=3600,
+            Statistics=["Maximum"],
+        )
+        dps = resp.get("Datapoints", [])
+        return max(d["Maximum"] for d in dps) if dps else None
+    except Exception:  # noqa: BLE001 — absence of evidence, not evidence of headroom
+        return None
+
 
 def _is_graviton_search_type(instance_type: str) -> bool:
     """True if an OpenSearch instance type is a Graviton (ARM) family.
@@ -233,12 +282,38 @@ def get_enhanced_opensearch_checks(ctx: ScanContext) -> dict[str, Any]:
                                 }
                             )
                         elif avg_cpu < LOW_CPU_THRESHOLD:
+                            # M360-3 / C18 — low CPU alone cannot justify halving
+                            # a data node's heap. JVMMemoryPressure is published
+                            # free on AWS/ES, so this GATES on it; an unreadable
+                            # metric withholds the lever and says so rather than
+                            # counting a downsize it cannot defend.
+                            peak_jvm = _es_max(
+                                cloudwatch, "JVMMemoryPressure", domain_name,
+                                ctx, start_time, end_time,
+                            )
+                            if not heap_headroom_ok(peak_jvm):
+                                ctx.warn(
+                                    f"OpenSearch domain {domain_name}: CPU is low "
+                                    f"({avg_cpu:.0f}%) but "
+                                    + (
+                                        f"peak JVMMemoryPressure {peak_jvm:.0f}% exceeds "
+                                        f"the {MAX_JVM_PRESSURE_PCT:.0f}% a halved heap allows"
+                                        if peak_jvm is not None
+                                        else "JVMMemoryPressure could not be read"
+                                    )
+                                    + " — downsize not counted",
+                                    "opensearch",
+                                )
+                                continue
                             checks["underutilized_domains"].append(
                                 {
                                     "DomainName": domain_name,
                                     "InstanceType": instance_type,
                                     "InstanceCount": instance_count,
                                     "AvgCPU": round(avg_cpu, 2),
+                                    # The heap evidence that permits this downsize,
+                                    # on the card (C18 — a reader must see WHY).
+                                    "PeakJVMMemoryPressure": round(peak_jvm, 2),
                                     "Recommendation": "Downsize instance type",
                                     "EstimatedSavings": "30-50%",
                                     "CheckCategory": "Underutilized Domain",

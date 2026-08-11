@@ -318,32 +318,53 @@ def _is_memory_optimized_type(instance_type: str) -> bool:
     return family[0] in _MEMORY_OPTIMIZED_PREFIXES and any(c.isdigit() for c in family)
 
 
+# Downsize levers whose BINDING dimension is not CPU, and the rec field that must
+# carry the evidence. Each entry is (CheckCategory, evidence field, what it is).
+# Extended after M360 found the same class in two more adapters.
+_BINDING_DIMENSION_LEVERS: tuple[tuple[str, str, str], ...] = (
+    # AFS-1 — EC2, memory-optimized families only (checked separately below).
+    ("Rightsizing Opportunities", "AvgMemory", "memory"),
+    ("Idle Instances", "AvgMemory", "memory"),
+    # M360-1 — every Aurora class downsize halves RAM.
+    ("Aurora Instance Rightsizing", "PeakMemoryUsedGiB", "memory"),
+    # M360-3 — an OpenSearch data node is heap-bound.
+    ("Underutilized Domain", "PeakJVMMemoryPressure", "JVM heap"),
+)
+
+
 def sweep_memory_evidence(data: dict[str, Any]) -> list[Finding]:
-    """S15 (C18) — a COUNTED downsize of a memory-optimized instance must carry
-    memory evidence.
+    """S15 (C18) — a COUNTED downsize must carry evidence for its BINDING dimension.
 
     Every one-size-down step halves RAM, and low CPU is the EXPECTED profile of a
-    memory-bound workload, so a counted r/x/z/u rightsizing or idle rec with no
-    memory reading is a CPU-only verdict counting a dollar it cannot defend.
-    Live: AFS-1 counted $2,682.34 this way — 39% of that report's headline.
+    memory-bound workload, so a counted downsize with no memory reading is a
+    CPU-only verdict counting a dollar it cannot defend. Live: AFS-1 counted
+    $2,682.34 this way (39% of that report's headline) and M360 $2,372.50 (49%).
+
+    EC2 is filtered to memory-optimized families — there, CPU IS reasonable
+    evidence for a general-purpose instance. Aurora and OpenSearch are not
+    filtered: every class in those services is memory/heap-bound.
     """
     out: list[Finding] = []
     for key, src, rec in _iter_recs(data):
         if not _is_counted(rec) or rec_dollar(rec) <= 0:
             continue
         category = str(rec.get("CheckCategory") or "")
-        if category not in ("Rightsizing Opportunities", "Idle Instances"):
-            continue
-        itype = str(rec.get("InstanceType") or "")
-        if not _is_memory_optimized_type(itype):
-            continue
-        if not str(rec.get("AvgMemory") or "").strip():
+        for lever, field, dimension in _BINDING_DIMENSION_LEVERS:
+            if category != lever:
+                continue
+            itype = str(rec.get("InstanceType") or rec.get("CurrentSize") or "")
+            # EC2's two categories only bind on memory for r/x/z/u families.
+            if field == "AvgMemory" and not _is_memory_optimized_type(itype):
+                continue
+            if str(rec.get(field) or "").strip():
+                continue
+            rid = rec.get("InstanceId") or rec.get("resource_id") or rec.get("DomainName")
             out.append(_finding(
                 "S15-memory-evidence", "FAIL", key,
-                f"{src}: {rec.get('InstanceId')} ({itype}) counts "
-                f"${rec_dollar(rec):,.2f} on a CPU-only verdict — {itype.split('.')[0]} is "
-                f"memory-optimized and this halves its RAM, but no AvgMemory evidence "
-                f"is attached (C18: absent evidence must not resolve toward counting)"))
+                f"{src}: {rid} ({itype or 'n/a'}) counts ${rec_dollar(rec):,.2f} on a "
+                f"CPU-only verdict — this lever is bound by {dimension}, but no "
+                f"'{field}' evidence is attached (C18: absent evidence must not "
+                f"resolve toward counting)"))
     return out
 
 

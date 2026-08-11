@@ -386,8 +386,13 @@ class _FakeCloudWatch:
     def __init__(self, avg_cpu: float) -> None:
         self._avg = avg_cpu
 
-    def get_metric_statistics(self, **_kw: Any) -> dict[str, Any]:
-        return {"Datapoints": [{"Average": self._avg}]}
+    def get_metric_statistics(self, **kw: Any) -> dict[str, Any]:
+        # M360-3: the underutilized-domain lever now also requires heap evidence
+        # (JVMMemoryPressure), so this fake serves a cold heap to keep these
+        # tests exercising the pricing paths they were written for.
+        if kw.get("MetricName") == "JVMMemoryPressure":
+            return {"Datapoints": [{"Maximum": 12.0}]}
+        return {"Datapoints": [{"Average": self._avg, "Maximum": self._avg}]}
 
 
 def _shim_ctx(domain_status: dict[str, Any], avg_cpu: float) -> SimpleNamespace:
