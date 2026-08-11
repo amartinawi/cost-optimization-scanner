@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (live-output audits — afs-prod/af-south-1 + M360/ap-south-1, 2026-08-11)
+
+Two real scan reports audited end to end under `docs/audits/OUTPUT_AUDIT_PROTOCOL.md`
+(Layers 1-3) and reconciled against re-scans. Combined counted headline
+**$11,659.22 → $6,323.20** — a 46% reduction that is entirely removal of dollars
+that were never realizable, not lost savings.
+
+One bug class produced the largest finding on **both** accounts, and lesson
+**C18** was written from it: *a corroborating signal that only ever SUPPRESSES is
+a fail-open.* The pattern reads as safe — "memory/network is only used to
+suppress a false positive; when the data is unavailable the prior verdict
+stands" — and is exactly backwards for a COUNTED dollar, because on every account
+missing that signal the check silently reverts to the un-corroborated behaviour
+it was written to fix.
+
+- **EC2 (AFS-1)** — all three counted rightsizing recs, $2,682.34 = 39% of that
+  report's headline, were memory-optimized instances told to HALVE their RAM on a
+  CPU-only signal (`mem_used_percent` needs the CloudWatch agent, so absent
+  memory counted). `_rightsize_evidence_ok` now gates countability for r/x/z/u
+  families, demoting to a `$0` advisory that still renders with its figure.
+  Applied to the `idle` verdict too, where the dollar is the whole instance.
+- **Aurora (M360-1)** — both counted recs, $2,372.50 = 49% of that headline, cut
+  a memory-optimized DB class's RAM on CPU alone; one took a **128 GiB production
+  writer to 16 GiB** on a 2% reading. Here the evidence is FREE
+  (`AWS/RDS FreeableMemory`, no agent), so this GATES rather than demotes:
+  `combined_rightsize_target` takes the larger of the CPU and memory floors, and
+  the re-scan proved the memory is genuinely in use — the saving never existed.
+- **OpenSearch (M360-3)** — found by sweeping every adapter that decides a
+  downsize from CPU. A data node is heap-bound; now gated on peak
+  `JVMMemoryPressure` <= 37.5%, a bound DERIVED from AWS's own 75% GC guidance.
+  ElastiCache and ECS were confirmed already correct.
+- **AMI (AFS-2)** — 51 of 56 recs ($281.26) were AWS Backup recovery points. The
+  "not referenced by a running instance" gate is true of every backup by
+  construction, and deregistering the image circumvents the plan that owns its
+  retention. Retargeted to a `$0` advisory pointing at the plan. Fixing it also
+  exposed **C20**: the reconciliation share summed every rec's `SnapshotSizeGB`,
+  so demoting 51 of them would have let the 5 survivors rise $20.99 → $141.32 —
+  a phantom created BY the repair.
+- **Report copy (AFS-3)** — the commitment projection is account-wide (65% of it
+  was another region) and said so nowhere; the scan region's share is now
+  published beside it.
+
+Withdrawn after verification, recorded so they are not re-raised: a candidate
+CRITICAL on gp3 unattached-volume pricing (the free 3,000 IOPS / 125 MB/s
+baselines ARE subtracted; the volumes really are provisioned at 6,000/250 —
+confirmed live), cent-sized ECR cards (correct, and flooring counted savings
+would contradict the repo's advisory-only render floor), and an RDS rightsizing
+lever that turned out to be report copy rather than code.
+
+New lessons **C18/C19/C20** in `_LIVE_AUDIT_LESSONS.md`; new sweep **S15**
+(binding-dimension evidence) in `tools/output_audit.py`, verified to flag exactly
+the 5 recs the two audits found by hand.
+
+
 ### Added (commitment deep-dive — per-type RI/SP purchase matrix, projected savings fact)
 The Commitment Analysis tab's purchase recommendations expand from a single
 narrow matrix (RI: EC2 only; SP: `COMPUTE_SP` only — 12 CE calls) into a full
