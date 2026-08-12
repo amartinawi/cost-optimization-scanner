@@ -438,6 +438,47 @@ will eventually both count it. This is the single most common real finding.
   phantom created BY the fix. Latent until then only because the pre-existing
   shared-snapshot advisories carry `SnapshotSizeGB` 0.0.*
 
+- **C21 — When a fix replaces signal A with signal B, first ask whether the
+  truth is A AND B. Over-correction is its own bug class.** A phantom traced to
+  "we gated on the wrong field" invites swapping the field, and the swap looks
+  like a strict improvement because the original failing case now passes — and
+  the new gate's own docstring will confidently forbid the field it replaced. But
+  a billing condition is frequently a CONJUNCTION of a resource-state signal and
+  a configuration/policy signal, and either one alone admits a phantom in its own
+  direction. Before replacing a gate, enumerate the four cells of the truth
+  table and name a real resource in each. If two cells are "not billed", the gate
+  needs both terms. Machine-checkable: **S16** keys off
+  `_REQUIRED_EVIDENCE_CONJUNCTS` — a counted rec on such a lever must name both
+  halves in its `AuditBasis.evidence`, so a future single-signal rewrite trips
+  the harness instead of shipping. *Real: EKS Extended Support, the same lever on
+  the same account, twice in opposite directions. 2026-07-09 counted $730/mo on
+  `upgradePolicy.supportType == EXTENDED` while Kubernetes 1.33 was still in
+  standard support and AWS billed the plain $0.10/hr rate; the fix moved to
+  `versionStatus` alone, and on 2026-08-12 that counted $365/mo against a
+  STANDARD-policy cluster which AWS auto-upgrades and never surcharges. Cost
+  Explorer settled it: 522 `*-Hours:extendedSupport` hours against 783
+  `*:perCluster` hours over the same window — exactly 2 of 3 clusters.*
+
+- **C22 — Measured waste is not automatically a realizable saving. Name the
+  action and the resulting bill delta before counting it.** A figure can be
+  account-specific, measured from real billing, arithmetically exact, and still
+  belong nowhere near the counted headline — because the headline promises money
+  the operator can stop spending, and some correctly-measured waste is SUNK. The
+  tell is a recommendation whose `recommended_value` is a target ratio ("95%+")
+  rather than an action on a resource: there is no delete, resize, or migrate,
+  so there is no bill delta this month. Apply the standard treatment for "real
+  lever, cannot act on it here" — `$0` `Counted=False` advisory carrying the
+  measured figure and naming the lever that DOES exist (here: right-size the
+  commitment at renewal). *Real: bnc/ap-southeast-1 (2026-08-12) — SP
+  under-utilization counted $390.32/mo, 13.8% of the headline, as the unused
+  commitment on 4 EC2-Instance Savings Plans. A Savings Plan bills its hourly
+  commitment for the whole term regardless of usage, unused hourly benefit never
+  carries forward, and a plan is returnable only within 7 days of purchase. Even
+  the charitable "shift usage onto the plan" reading failed on the numbers: the
+  flagged plans were r5/t3/r6a while the account's only uncovered on-demand was
+  r4.large and m6i.large, so $0 of in-family usage existed to absorb it. The
+  identical RI lever was fixed with it.*
+
 ## D. Render / tab / count semantics (`counted == rendered`, both directions)
 
 - **D1 — Counted-but-invisible (render desync).** Savings summed into the headline

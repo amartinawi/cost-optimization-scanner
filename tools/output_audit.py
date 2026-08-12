@@ -368,6 +368,49 @@ def sweep_memory_evidence(data: dict[str, Any]) -> list[Finding]:
     return out
 
 
+# S16 (C21) — levers whose billing condition is a CONJUNCTION of two signals.
+# Each row: (check_type, required token in AuditBasis.evidence, what it proves).
+# A counted rec must name BOTH conjuncts, so replacing one signal with the other
+# in a later "fix" trips this rather than shipping the mirror-image phantom.
+_REQUIRED_EVIDENCE_CONJUNCTS: tuple[tuple[str, str, str], ...] = (
+    # bnc, twice. Billed only when the VERSION is past end-of-standard-support
+    # AND the CLUSTER's upgradePolicy lets it enter extended support: a
+    # STANDARD-policy cluster is auto-upgraded and never surcharged, while an
+    # EXTENDED-policy cluster on a supported version is not surcharged yet.
+    ("extended_support", "upgradePolicy", "the cluster may enter extended support"),
+    ("extended_support", "versionStatus", "the version is actually surcharged"),
+)
+
+
+def sweep_conjunct_evidence(data: dict[str, Any]) -> list[Finding]:
+    """S16 (C21) — a counted lever gated on a CONJUNCTION must name both halves.
+
+    When a fix replaces evidence A with evidence B, the truth is often "A AND B",
+    and swapping one for the other just moves the phantom. The EKS extended
+    support surcharge produced one in each direction on the same account: first
+    counted on upgradePolicy alone while the version was still in standard
+    support ($730/mo), then on versionStatus alone against a STANDARD-policy
+    cluster AWS auto-upgrades and never bills ($365/mo).
+    """
+    out: list[Finding] = []
+    for key, src, rec in _iter_recs(data):
+        if not _is_counted(rec) or rec_dollar(rec) <= 0:
+            continue
+        check_type = str(rec.get("check_type") or rec.get("CheckType") or "")
+        basis = rec.get("audit_basis") or rec.get("AuditBasis") or {}
+        evidence = str(basis.get("evidence") or "") if isinstance(basis, dict) else ""
+        for lever, token, proves in _REQUIRED_EVIDENCE_CONJUNCTS:
+            if check_type != lever or token.lower() in evidence.lower():
+                continue
+            rid = rec.get("resource_id") or rec.get("resourceId") or "?"
+            out.append(_finding(
+                "S16-conjunct-evidence", "FAIL", key,
+                f"{src}: {rid} counts ${rec_dollar(rec):,.2f} on lever '{lever}' "
+                f"without '{token}' evidence — this lever is billed only when BOTH "
+                f"conjuncts hold, and this one proves {proves} (C21)"))
+    return out
+
+
 def sweep_negative(data: dict[str, Any]) -> list[Finding]:
     """S8 — no savings field may be negative or NaN."""
     out: list[Finding] = []
@@ -528,6 +571,7 @@ def run_sweeps(data: dict[str, Any], html_text: str | None = None,
     findings += sweep_projected_commitment(data)
     findings += sweep_tab_reconcile(data)
     findings += sweep_memory_evidence(data)
+    findings += sweep_conjunct_evidence(data)
     findings += sweep_negative(data)
     findings += sweep_warnings(data)
     if html_text is not None:
