@@ -4,15 +4,18 @@ Analyzes AWS Cost Explorer data to surface under-utilized commitments,
 coverage gaps, expiring commitments, and purchase recommendations.
 
 AWS API cost: Cost Explorer charges $0.01 per API request. This adapter
-makes ~61 calls per scan (~$0.61/scan). The calls are:
+makes ~69 calls per scan (~$0.69/scan). The calls are:
 
 1. ``get_savings_plans_utilization`` — overall SP utilization rate (1 call)
 2. ``get_savings_plans_utilization_details`` — per-SP utilization (1 call).
    Expiry no longer reads CE at all: end timestamps are not on this shape, so
    _check_expiring uses savingsplans:DescribeSavingsPlans (free) — H3.
 3. ``get_savings_plans_coverage`` — SP coverage rate by service (1 call)
-4. ``get_reservation_utilization`` — RI utilization rate (1 call)
-5. ``get_reservation_coverage`` — RI coverage rate (1 call)
+4. ``get_reservation_utilization`` — RI utilization rate (5 calls: these APIs
+   accept ONE ``SERVICE`` per call and DEFAULT TO EC2 when unfiltered, so an
+   account-wide answer needs one call per reservable service — EC2-Compute,
+   RDS, ElastiCache, Redshift, OpenSearch)
+5. ``get_reservation_coverage`` — RI coverage rate (5 calls, same reason)
 6. ``get_savings_plans_purchase_recommendation`` — SP purchase matrix
    (18 calls: 3 SP types x 2 terms x 3 payment options)
 7. ``get_reservation_purchase_recommendation`` — RI purchase matrix
@@ -48,6 +51,31 @@ _SP_PAYMENT_OPTIONS: tuple[str, ...] = ("No Upfront", "Partial Upfront", "All Up
 # as an advisory and never summed into the counted headline (bnc /
 # ap-southeast-1, 2026-08-12: $390.32/mo, 13.8% of the headline, against $0 of
 # in-family uncovered on-demand that could have absorbed it).
+# Every SERVICE the RI Cost Explorer APIs support, in CE's own dimension values.
+# `GetReservationUtilization` / `GetReservationCoverage` accept ONE service per
+# call and **default to EC2 when unfiltered**, so an unfiltered read is an
+# EC2-only read wearing an account-wide label. bnc/ap-southeast-1 holds 3 active
+# Aurora RIs ($3,299.64/mo, 100% utilized) and reported "RI Utilization n/a" and
+# "RI Coverage 0.0" until these were looped.
+#
+# The API reference lists the legacy "Amazon Elasticsearch Service"; the modern
+# "Amazon OpenSearch Service" is what actually carries data (verified live —
+# the legacy name returns zeros where the modern one returns 5,019 hours), and
+# it matches `_CE_SERVICE_DIM` in services/commitment_coverage.py.
+_RI_SERVICES: tuple[str, ...] = (
+    "Amazon Elastic Compute Cloud - Compute",
+    "Amazon Relational Database Service",
+    "Amazon ElastiCache",
+    "Amazon Redshift",
+    "Amazon OpenSearch Service",
+)
+
+
+def _ri_service_filter(service: str) -> dict[str, Any]:
+    """CE Expression pinning an RI query to one service."""
+    return {"Dimensions": {"Key": "SERVICE", "Values": [service]}}
+
+
 _SUNK_COMMITMENT_NOTE: str = (
     "This is a sunk cost, not a realizable saving: the commitment bills for its full "
     "term whether or not it is used and cannot be cancelled, so it is shown as an "
@@ -425,7 +453,41 @@ class CommitmentAnalysisModule(BaseServiceModule):
             or None when no reservation is visible in the window).
         """
         recs: list[dict[str, Any]] = []
-        overall_rate: float | None = None
+        purchased_hours = 0.0
+        actual_hours = 0.0
+        saw_reservation = False
+
+        # ONE service per call: CE caps the SERVICE filter at a single value and
+        # defaults to EC2 when unfiltered, so the account-wide answer is the sum
+        # over every reservable service (_RI_SERVICES).
+        for service in _RI_SERVICES:
+            recs_svc, purch, actual = self._ri_utilization_for_service(ctx, ce, tp, service)
+            recs.extend(recs_svc)
+            purchased_hours += purch
+            actual_hours += actual
+            if purch > 0:
+                saw_reservation = True
+
+        # Zero purchased hours across every service (no RIs visible to this
+        # role/account view) -> None so the stat renders "n/a", never a
+        # fabricated 0%.
+        overall_rate = (actual_hours / purchased_hours) if saw_reservation and purchased_hours > 0 else None
+        return recs, overall_rate
+
+    def _ri_utilization_for_service(
+        self, ctx: Any, ce: Any, tp: dict[str, str], service: str
+    ) -> tuple[list[dict[str, Any]], float, float]:
+        """RI utilization for ONE Cost Explorer service.
+
+        Returns:
+            Tuple of (under-utilized recs, purchased hours, actually-used hours).
+            The hours are aggregated from the GROUPS rather than ``Total``:
+            ``Total`` comes back EMPTY whenever ``GroupBy`` is set, so reading it
+            reported "no reservations" on accounts that hold them.
+        """
+        recs: list[dict[str, Any]] = []
+        purchased_hours = 0.0
+        actual_hours = 0.0
 
         try:
             # GetReservationUtilization only supports SUBSCRIPTION_ID for a
@@ -434,6 +496,7 @@ class CommitmentAnalysisModule(BaseServiceModule):
             params: dict[str, Any] = {
                 "TimePeriod": tp,
                 "GroupBy": [{"Type": "DIMENSION", "Key": "SUBSCRIPTION_ID"}],
+                "Filter": _ri_service_filter(service),
             }
             while True:
                 resp = ce.get_reservation_utilization(**params)
@@ -443,6 +506,8 @@ class CommitmentAnalysisModule(BaseServiceModule):
                     for group in groups:
                         util = group.get("Utilization", {})
                         rate = self._parse_pct(util.get("UtilizationPercentage", "0"))
+                        purchased_hours += float(util.get("PurchasedHours", 0) or 0)
+                        actual_hours += float(util.get("TotalActualHours", 0) or 0)
                         attrs = group.get("Attributes", {})
                         rid = (
                             attrs.get("subscriptionId")
@@ -492,15 +557,10 @@ class CommitmentAnalysisModule(BaseServiceModule):
                     break
                 params["NextToken"] = next_token
 
-            total = resp.get("Total", {})
-            if float(total.get("PurchasedHours", 0) or 0) > 0:
-                overall_rate = self._parse_pct(total.get("UtilizationPercentage", "0"))
-            # Zero purchased hours (no RIs visible to this role/account view)
-            # -> None so the stat renders "n/a", never a fabricated 0%.
         except Exception as e:
-            _route_ce_error(ctx, "ce:GetReservationUtilization", e)
+            _route_ce_error(ctx, f"ce:GetReservationUtilization[{service}]", e)
 
-        return recs, overall_rate
+        return recs, purchased_hours, actual_hours
 
     # Coverage gap (intentional): this only ever returns recs=[] plus the
     # overall stat-card rate. GetReservationCoverage rejects a SERVICE DIMENSION
@@ -520,20 +580,34 @@ class CommitmentAnalysisModule(BaseServiceModule):
         recs: list[dict[str, Any]] = []
         overall_rate: float | None = None
 
-        try:
-            # GetReservationCoverage rejects a SERVICE DIMENSION groupBy (only
-            # AZ / INSTANCE_TYPE(_FAMILY) / REGION / PLATFORM / TENANCY etc. are
-            # valid). The per-service coverage-gap rec overlaps the purchase
-            # recommendations anyway, so we take the overall coverage rate only
-            # (used by the stat card) without a groupBy.
-            resp = ce.get_reservation_coverage(TimePeriod=tp)
-            # Real shape: Total.CoverageHours.CoverageHoursPercentage (the flat
-            # "CoveragePercentage" key never existed -> rate was stuck at 0.0).
-            hours = resp.get("Total", {}).get("CoverageHours", {})
-            if float(hours.get("TotalRunningHours", 0) or 0) > 0:
-                overall_rate = self._parse_pct(hours.get("CoverageHoursPercentage", "0"))
-        except Exception as e:
-            _route_ce_error(ctx, "ce:GetReservationCoverage", e)
+        # GetReservationCoverage rejects a SERVICE DIMENSION groupBy (only
+        # AZ / INSTANCE_TYPE(_FAMILY) / REGION / PLATFORM / TENANCY etc. are
+        # valid) AND defaults to EC2 when unfiltered, so the account-wide rate
+        # is one FILTERED call per reservable service, summed. Unfiltered, bnc
+        # reported 0.0 coverage while its RDS book sat at 74.7% — a figure that
+        # reads as "you own no reservations" on an account that owns three.
+        # The per-service coverage-gap rec overlaps the purchase
+        # recommendations anyway, so only the stat-card rate is produced here.
+        reserved_hours = 0.0
+        running_hours = 0.0
+        for service in _RI_SERVICES:
+            try:
+                resp = ce.get_reservation_coverage(
+                    TimePeriod=tp, Filter=_ri_service_filter(service)
+                )
+                # Real shape: Total.CoverageHours.{ReservedHours,TotalRunningHours}
+                # (the flat "CoveragePercentage" key never existed -> rate was
+                # stuck at 0.0). Hours are summed rather than averaging the
+                # per-service percentages, which would weight a service with 3
+                # running hours the same as one with 3,000.
+                hours = resp.get("Total", {}).get("CoverageHours", {})
+                reserved_hours += float(hours.get("ReservedHours", 0) or 0)
+                running_hours += float(hours.get("TotalRunningHours", 0) or 0)
+            except Exception as e:
+                _route_ce_error(ctx, f"ce:GetReservationCoverage[{service}]", e)
+
+        if running_hours > 0:
+            overall_rate = reserved_hours / running_hours
 
         return recs, overall_rate
 

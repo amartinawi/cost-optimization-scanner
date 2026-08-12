@@ -206,10 +206,18 @@ def test_ri_utilization_uses_subscription_id_groupby():
 
     def util(**kw):
         captured.update(kw)
+        # One SERVICE per call — answer only for RDS so the single reservation
+        # is not reported once per reservable service.
+        if (kw.get("Filter") or {}).get("Dimensions", {}).get("Values", [""])[0] != (
+            "Amazon Relational Database Service"
+        ):
+            return {"UtilizationsByTime": [{"Groups": []}], "Total": {}}
         return {"UtilizationsByTime": [{"Groups": [
             {"Attributes": {"subscriptionId": "ri-abc"},
              "Utilization": {
                  "UtilizationPercentage": "40",
+                 "PurchasedHours": "730",
+                 "TotalActualHours": "292",
                  "TotalAmortizedFee": "100",
                  "RICostForUnusedHours": "60",
              }},
@@ -258,14 +266,20 @@ def test_ri_coverage_no_groupby_returns_overall_rate():
 
     def cov(**kw):
         captured.update(kw)
-        return {"Total": {"CoverageHours": {"CoverageHoursPercentage": "85", "TotalRunningHours": "730"}}}
+        return {"Total": {"CoverageHours": {
+            "CoverageHoursPercentage": "85", "ReservedHours": "620.5",
+            "TotalRunningHours": "730"}}}
 
     ce.get_reservation_coverage.side_effect = cov
     ctx = SimpleNamespace()
     ctx.warn = MagicMock(); ctx.permission_issue = MagicMock()
     recs, rate = CommitmentAnalysisModule()._check_ri_coverage(ctx, ce, {"Start": "x", "End": "y"})
     assert "GroupBy" not in captured  # SERVICE groupBy removed (API rejects it)
-    assert rate == 0.85 and recs == []
+    # ...but a SERVICE *Filter* is required: unfiltered, CE answers for EC2 only.
+    assert captured["Filter"]["Dimensions"]["Key"] == "SERVICE"
+    # This stub returns the same 620/730 hours for all 5 reservable services,
+    # so the summed rate is still 85%.
+    assert rate == pytest.approx(0.85) and recs == []
 
 
 def test_cost_hub_commitment_recs_are_advisory_not_counted():
