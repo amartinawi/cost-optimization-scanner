@@ -219,7 +219,17 @@ def downsize_target(node_type: str) -> str | None:
         return None
     if idx == 0:
         return None
-    return f"cache.{family}.{_NODE_SIZE_ORDER[idx - 1]}"
+    target = _NODE_SIZE_ORDER[idx - 1]
+    # Size floor: every ElastiCache family EXCEPT the burstable t-series starts
+    # at `large`. Stepping below it probes a SKU that does not exist, which
+    # costs a Pricing API call and prints a "Live pricing unavailable — used
+    # fallback rate" warning that reads like a pricing outage when nothing is
+    # wrong (level-Shoes-prod: cache.m6g.large -> cache.m6g.medium -> $0.000000).
+    # The lever already abstained correctly; this just stops asking.
+    # Mirrors _LARGE_FLOOR_FAMILIES in the OpenSearch adapter.
+    if not family.startswith("t") and _NODE_SIZE_ORDER.index(target) < _NODE_SIZE_ORDER.index("large"):
+        return None
+    return f"cache.{family}.{target}"
 
 
 class ElasticacheModule(BaseServiceModule):

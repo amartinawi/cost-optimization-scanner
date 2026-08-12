@@ -276,7 +276,12 @@ def test_graviton_lever_advisory_when_target_unpriceable(monkeypatch: pytest.Mon
     [
         ("cache.r5.xlarge", "cache.r5.large"),
         ("cache.m6g.2xlarge", "cache.m6g.xlarge"),
-        ("cache.r6g.large", "cache.r6g.medium"),
+        # cache.r6g.medium is NOT a real SKU — every non-burstable ElastiCache
+        # family floors at `large`. The old assertion pinned a nonexistent
+        # downsize target (level-Shoes-prod live audit), the same defect the
+        # OpenSearch ladder had with c5.medium.search.
+        ("cache.r6g.large", None),
+        ("cache.t4g.medium", "cache.t4g.small"),  # burstable DOES go below large
         ("cache.t3.micro", None),  # smallest size — no target
         ("cache.r5", None),  # unparseable (no size)
         ("r5.large", None),  # not a cache. node type
@@ -507,3 +512,40 @@ def test_evictions_block_the_downsize(monkeypatch):
     findings = _scan_with(_underutilized(MemoryHeadroomOk=False, PeakMemoryUsagePct=10.0, Evictions=41.0), monkeypatch)
     assert findings.total_monthly_savings == 0.0
     assert list(findings.sources["enhanced_checks"].recommendations)[0]["Counted"] is False
+
+
+# --------------------------------------------------------------------------- #
+# level-Shoes-prod live regression (2026-08-12): don't probe sizes that do not
+# exist. `cache.m6g.large` is the SMALLEST m6g node — there is no
+# `cache.m6g.medium` — so walking one rung down produced:
+#
+#   pricing fallback [eu-west-1] Pricing API returned no result for
+#   AmazonElastiCache cache.m6g.medium in eu-west-1 -> $0.000000
+#   Warning: Live pricing unavailable — used fallback rate: ...
+#
+# The lever correctly abstained ($0 advisory, no phantom), but the operator is
+# shown a scary "Live pricing unavailable" line that reads like a pricing
+# outage when nothing is wrong. OpenSearch already carries this guard
+# (_LARGE_FLOOR_FAMILIES); ElastiCache did not.
+# --------------------------------------------------------------------------- #
+def test_downsize_target_respects_the_family_size_floor() -> None:
+    from services.adapters.elasticache import downsize_target
+
+    # m/r/c families floor at `large` — never probe a nonexistent medium.
+    assert downsize_target("cache.m6g.large") is None
+    assert downsize_target("cache.r6g.large") is None
+    assert downsize_target("cache.m5.large") is None
+    assert downsize_target("cache.c7gn.large") is None
+    # ...but a real rung above the floor still steps down.
+    assert downsize_target("cache.m6g.xlarge") == "cache.m6g.large"
+    assert downsize_target("cache.r6g.xlarge") == "cache.r6g.large"
+
+
+def test_burstable_families_keep_their_small_sizes() -> None:
+    """t2/t3/t4g genuinely offer micro/small/medium — the floor must not
+    suppress a real downsize there."""
+    from services.adapters.elasticache import downsize_target
+
+    assert downsize_target("cache.t4g.medium") == "cache.t4g.small"
+    assert downsize_target("cache.t3.small") == "cache.t3.micro"
+    assert downsize_target("cache.t4g.micro") is None  # smallest rung
