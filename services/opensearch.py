@@ -170,6 +170,20 @@ def get_enhanced_opensearch_checks(ctx: ScanContext) -> dict[str, Any]:
                             "DomainName": domain_name,
                             "InstanceType": instance_type,
                             "InstanceCount": instance_count,
+                            # The master/warm tiers bill on top of the data nodes
+                            # and migrate to Graviton independently, so the
+                            # Graviton lever needs them for the same reason the
+                            # idle-domain lever does (OS-7). Omitting them
+                            # under-counted every domain whose master tier shares
+                            # the data tier's x86 family — bnc production-bnc:
+                            # 3 data + 3 master m5.xlarge.search, half the
+                            # migration missing. The adapter prices each tier
+                            # against its OWN Graviton counterpart and omits any
+                            # tier that does not price.
+                            "DedicatedMasterType": master_type,
+                            "DedicatedMasterCount": master_count,
+                            "WarmType": warm_type,
+                            "WarmCount": warm_count,
                             "Recommendation": "Migrate to Graviton instances",
                             "EstimatedSavings": "Estimated: 20-40% price-performance improvement",
                             "CheckCategory": "Graviton Migration",

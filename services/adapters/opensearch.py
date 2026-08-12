@@ -530,13 +530,39 @@ class OpensearchModule(BaseServiceModule):
                 # Abstains to a $0 advisory when no Graviton counterpart prices.
                 per_node_delta, target = _graviton_node_delta(ctx, instance_type)
                 value = per_node_delta * instance_count
+                # The dedicated-master and UltraWarm tiers bill on top of the
+                # data nodes and migrate independently, so each is priced
+                # against its OWN Graviton counterpart (the idle-domain lever
+                # already does this — OS-7). A tier whose counterpart does not
+                # price (UltraWarm has none) is OMITTED, never guessed.
+                tier_basis: dict[str, Any] = {}
+                for label, type_key, count_key in (
+                    ("master", "DedicatedMasterType", "DedicatedMasterCount"),
+                    ("warm", "WarmType", "WarmCount"),
+                ):
+                    node_type = rec.get(type_key)
+                    node_count = int(rec.get(count_key) or 0)
+                    if not node_type or node_count <= 0:
+                        continue
+                    tier_delta, tier_target = _graviton_node_delta(ctx, node_type)
+                    if tier_delta <= 0 or tier_target is None:
+                        continue
+                    value += tier_delta * node_count
+                    tier_basis[f"{label}_type"] = node_type
+                    tier_basis[f"{label}_target_type"] = tier_target
+                    tier_basis[f"{label}_count"] = node_count
+                    tier_basis[f"{label}_per_node_delta_monthly"] = round(tier_delta, 4)
                 if value > 0:
                     audit_basis = {
                         "current_type": instance_type,
                         "target_type": target,
                         "per_node_delta_monthly": round(per_node_delta, 4),
                         "instance_count": instance_count,
-                        "formula": "(current_node_monthly - same_size_graviton_node_monthly) x count",
+                        **tier_basis,
+                        "formula": (
+                            "(current_node_monthly - same_size_graviton_node_monthly) x count, "
+                            "summed over the data, dedicated-master and UltraWarm tiers"
+                        ),
                     }
             rec["EstimatedMonthlySavings"] = round(value, 2)
             if audit_basis is not None:
