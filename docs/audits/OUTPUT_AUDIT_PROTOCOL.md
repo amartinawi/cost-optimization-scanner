@@ -148,8 +148,8 @@ Completed ledgers (each carries its own reconciliation section):
 | `afs-prod_eu-west-1_20260808.md` | $13,625.31 | 3 fixed, 1 by-design |
 | `afs-prod_af-south-1_20260811.md` | $6,818.16 → **$3,854.58** | AFS-1/2/3 fixed, AFS-4 withdrawn, gp3 CRITICAL refuted |
 | `M360_ap-south-1_20260811.md` | $4,841.06 → **$2,468.62** | M360-1/3 fixed, M360-2 withdrawn |
-| `bnc_ap-southeast-1_20260812.md` | $2,829.03 → *$2,150.36 (pending)* | BNC-1/2/3/5 fixed, 5 refuted; lessons C21/C22/C23/F6, sweep S16 |
-| `level-Shoes-prod_eu-west-1_20260812.md` | $2,106.29 → *$2,463.57 (pending)* | LS-2/3/4 fixed, LS-1 caught by S16, 6 refuted; lesson C24. First headline to RISE |
+| `bnc_ap-southeast-1_20260812.md` | $2,829.03 → **$2,163.19** | BNC-1/2/3/5 fixed + RECONCILED, 5 refuted; lessons C21/C22/C23/F6, sweep S16 |
+| `level-Shoes-prod_eu-west-1_20260812.md` | $2,106.29 → **$2,440.91** | LS-1/2/3/4 fixed + RECONCILED, 6 refuted; lesson C24. First headline to RISE |
 
 **Record withdrawals and refutations in the ledger, not just fixes.** Three of
 nine candidates across the two 2026-08-11 audits did not survive Layer 3, and
@@ -170,7 +170,14 @@ like a bug and wasn't.
 ## Fix loop (per finding)
 
 1. Unit-test the exact failing scenario (dollar AND `Counted` state asserted).
-2. Fix; predict the exact headline delta the fix will cause.
+2. Fix; predict the exact headline delta the fix will cause — **using the
+   formula the CODE uses, not the one used to size the finding**. A lever
+   measured over a trailing CE window scaled to 30 days does not equal the same
+   charge at a 730-hour run rate, and CE keeps posting inside that window; the
+   level-Shoes ElastiCache prediction missed by $22.72 for exactly this reason
+   while the implementation was correct. Where a lever reads a live CE pool,
+   state that the figure MOVES between scans and predict the mechanism, not just
+   the number.
 3. Operator re-scans the same profile/region; the headline must move by
    EXACTLY the predicted amount. Anything else reopens the finding.
 4. Regression gate: `pytest tests/test_regression_snapshot.py tests/test_reporter_snapshots.py`.

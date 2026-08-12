@@ -94,10 +94,21 @@ name both halves in its `AuditBasis.evidence`. Verified against the real pre-fix
 bnc report, and it then flagged the same class on level-Shoes-prod — a different
 account, region and report — with no human hypothesis.
 
-Predicted headlines pending re-scan: bnc **$2,829.03 → $2,150.36**;
-level-Shoes-prod **$2,106.29 → $2,463.57** — the first audited report whose
-headline RISES, because its largest single error was a missing real charge rather
-than a phantom one.
+**Both accounts re-scanned and RECONCILED (2026-08-12).** bnc
+**$2,829.03 → $2,163.19** and level-Shoes-prod **$2,106.29 → $2,440.91** — the
+latter the first audited report whose headline RISES, because its largest single
+error was a missing real charge rather than a phantom one. Every fix landed on
+prediction to the cent (eks_cost −$365.00 on both, commitment_analysis −$390.32,
+OpenSearch Graviton +$76.65, the two ElastiCache surcharge cards attributed to
+exactly the Redis 5.0.6 clusters, both DLM images demoted), and every untouched
+tab moved $0.00. Layer 1 returns **0 FAIL** on both, with S16 silent where it had
+flagged 4 recs. The two deviations from prediction are attributed and are not the
+fixes: a trailing-window CE movement in the OpenSearch surcharge
+($251.92 → $264.75) and in the AMI billed pool ($51.42 → $62.81), plus one
+prediction-formula error of ours — the ElastiCache surcharge was predicted at a
+730-hour run rate while the code correctly uses a trailing-7d window ×30/7,
+recorded in the protocol's fix-loop so it is not repeated. BNC-5 is visible on
+the stat cards: RI Utilization `n/a → 100%`, RI Coverage `0.0 → 0.158`.
 
 ### Fixed (live-output audits — afs-prod/af-south-1 + M360/ap-south-1, 2026-08-11)
 

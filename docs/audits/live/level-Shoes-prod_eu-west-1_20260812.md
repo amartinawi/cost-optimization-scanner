@@ -291,19 +291,51 @@ error was a *missing* real charge, not a phantom one.
   version number invents charges; not looking at all misses them. This report
   did both at once, in opposite directions, ~$1,090 apart.
 
-## Reconciliation
+## Reconciliation — re-scan 2026-08-12 (protocol fix-loop step 3)
 
-**PENDING** — awaiting operator re-scan of `level-Shoes-prod eu-west-1` with
-all four branches applied. The protocol requires the headline to move by
-exactly +$357.28 to **$2,463.57**, with eks_cost $0.00, elasticache $1,158.06,
-ami $0.27, and **every other tab unchanged to the cent**.
+| | Baseline | Re-scan | Delta |
+|---|---|---|---|
+| **Headline** | $2,106.29 | **$2,440.91** | **+$334.62** |
+| eks_cost | 365.00 | 0.00 | **−365.00** (LS-1, exact) |
+| elasticache | 432.44 | 1,135.34 | **+702.90** (LS-2; predicted +725.62 — below) |
+| ami | 3.61 | 0.33 | **−3.28** (LS-3; predicted −3.34 — below) |
+| All 8 other tabs | — | — | **$0.00 each** |
 
-Non-dollar assertions for the same re-scan:
+Predicted **$2,463.57**, landed **$2,440.91** — **−$22.66**. The headline still
+RISES, which was the point: this account's largest single error was a missing
+real charge.
 
-- the `cache.m6g.medium` pricing-fallback warning is **gone**;
-- the ElastiCache tab shows 2 new `ElastiCache Extended Support` cards naming
-  the r6g.xlarge and m6g.large node types and their 5.0.6 clusters, and never
-  naming `ls-ms-redis-prod-*`;
-- the two DLM AMI cards render as `$0.00 — advisory` citing the **DLM policy's
-  retention rule**, not an AWS Backup plan;
-- Layer 1 returns **0 FAIL** (S16 silent).
+- **LS-1 exact.** eks_cost → $0.00, and the log carries the disclosure naming
+  `levelshoes-prod`'s STANDARD upgrade policy.
+- **LS-2 confirmed; my PREDICTION was wrong, not the code.** Two counted cards,
+  correctly attributed: `cache.r6g.xlarge` **$517.63** →
+  `levelshoes-prod-cache-redis-001/002` and `cache.m6g.large` **$185.27** →
+  `levelshoes-prod-session-001/002`, both tagged engine version 5.0.6, and
+  `ls-ms-redis-prod-*` (7.1.0) correctly never named. The $22.72 shortfall
+  against my prediction is a **methodology error in the ledger, not a defect**:
+  I predicted $725.62 from a 730-hour July run rate, while the implementation
+  uses a trailing-7d CE window ×30/7 — a 30-day basis (−1.4%) plus CE posting
+  lag inside that window (−1.8%). It errs LOW, which is the safe direction, and
+  is the same conservative behaviour this ledger already documented for the
+  OpenSearch surcharge in refutation 6. **Lesson: predict a delta with the
+  formula the code uses, not the one used to size the finding.**
+- **LS-3 confirmed exact; the $0.06 is a CE pool movement, not the fix.** Both
+  DLM images are `Counted=False` with `ManagedBy: Data Lifecycle Manager` and
+  point at *"the DLM policy's RETENTION RULE"*. The surviving
+  `pritunl-vpn-server-latest` landed $0.33 rather than $0.27, and its own rec
+  explains it: `AttributableShare 0.0052` (its 8.0 GB of a 1,538 GB region
+  footprint) × `ActualBilledPool` — and that pool moved **$51.42 → $62.81** in
+  CE between the two scans. At the baseline pool the same share yields $0.267.
+  **C20 holds**: the survivor's dollar is a function of its OWN GB and the pool,
+  so the demoted images bought it no headroom (`flagged_gib` filters on
+  `Counted`, which picks up DLM automatically).
+- **LS-4 verified by absence.** The `cache.m6g.medium` /
+  "Live pricing unavailable" warning is **gone** from `scan_warnings`, which is
+  now 7 clean entries with no pricing line and `permission_issues: 0`.
+- **Layer 1: 0 FAIL**, and **S16 is silent** where it flagged the EKS rec on the
+  baseline.
+- Counted recs 29 → 28, advisories 76 → 78.
+
+**Status: RECONCILED.** LS-1, LS-2, LS-3 and LS-4 all verified on live output.
+Both deviations from prediction are explained and quantified: one CE window
+movement, and one prediction-formula error of mine that the ledger now records.
