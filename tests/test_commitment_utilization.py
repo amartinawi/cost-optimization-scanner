@@ -59,10 +59,88 @@ def test_sp_underutilization_rec_emitted_with_unused_commitment_dollars():
     assert len(recs) == 1
     rec = recs[0]
     # Waste = the window's UnusedCommitment (30-day tp ~= monthly), not an
-    # hourly reconstruction from fields that do not exist.
-    assert rec["monthly_savings"] == pytest.approx(342.49, abs=0.01)
-    assert rec.get("Counted", True) is not False       # existing-commitment waste is counted
+    # hourly reconstruction from fields that do not exist. The figure is real
+    # and still published — as an ADVISORY, see the sunk-cost tests below.
+    assert rec["AdvisoryEstimate"] == pytest.approx(342.49, abs=0.01)
     assert "82.5%" in rec["current_value"] or "82.4" in rec["current_value"]
+
+
+# --------------------------------------------------------------------------- #
+# bnc live regression (2026-08-12): unused commitment is a SUNK cost
+#
+# A Savings Plan bills its hourly commitment for the whole 1- or 3-year term
+# whether or not usage consumes it, and "if you don't use all the benefits,
+# then AWS doesn't apply them to the next hour" — the waste is unrecoverable.
+# A plan can only be returned within 7 days of purchase, in the same calendar
+# month, at a commitment of $100/hr or less. So no action available to the
+# operator this month reduces the bill by the unused-commitment figure, and it
+# must not sit in a headline that reads "potential monthly savings".
+#
+# Observed on bnc / ap-southeast-1: $390.32/mo counted across 4 plans (13.8% of
+# the headline). The plans are r5/t3/r6a EC2-Instance SPs, while the account's
+# only uncovered on-demand is r4.large and m6i.large — so even the charitable
+# "shift usage onto the plan" reading has provably $0 of in-family usage to
+# shift. Same shape as the RI lever below.
+#
+# The figure is still published (AdvisoryEstimate) because the waste is real
+# and worth acting on at renewal — this mirrors FSx SSD->HDD and the AWS Backup
+# AMI retarget: real lever, not realizable here, so $0 counted.
+# --------------------------------------------------------------------------- #
+def test_sp_underutilization_is_advisory_not_counted():
+    mod, ctx = _mod_and_ctx()
+    recs, _ = mod._check_sp_utilization(ctx, _UtilCe(), {"Start": "2026-07-10", "End": "2026-08-09"})
+    rec = recs[0]
+    assert rec["Counted"] is False, "unused SP commitment cannot be recovered"
+    assert rec["monthly_savings"] == 0.0
+    assert rec["AdvisoryEstimate"] == pytest.approx(342.49, abs=0.01)
+    # The card must say why it is $0, not silently drop the dollar.
+    assert "sunk" in rec["reason"].lower() or "cannot be recovered" in rec["reason"].lower()
+
+
+def test_sp_underutilization_excluded_from_tab_total():
+    """End-to-end: the waste must not reach total_monthly_savings."""
+    mod = CommitmentAnalysisModule()
+    ctx = SimpleNamespace(
+        region="ap-southeast-1", warn=MagicMock(), permission_issue=MagicMock(),
+        client=lambda name, region=None: _UtilCe() if name == "ce" else None,
+        commitment_coverage=None,
+    )
+    findings = mod.scan(ctx)
+    util = list(findings.sources["sp_utilization"].recommendations)
+    assert len(util) == 1 and util[0]["Counted"] is False
+    assert findings.total_monthly_savings == 0.0
+
+
+class _RiUtilCe(_UtilCe):
+    """RI utilization with a measured RICostForUnusedHours."""
+
+    def get_reservation_utilization(self, **kwargs):
+        return {
+            "UtilizationsByTime": [{"Groups": [{
+                "Value": "ri-abc123",
+                "Attributes": {"subscriptionId": "ri-abc123"},
+                "Utilization": {"UtilizationPercentage": "40.0",
+                                "RICostForUnusedHours": "215.00",
+                                "TotalAmortizedFee": "358.33"},
+            }]}],
+            "Total": {"UtilizationPercentage": "40.0", "PurchasedHours": "744"},
+        }
+
+
+def test_ri_underutilization_is_advisory_not_counted():
+    """Reserved Instances are equally non-cancellable — same sunk cost.
+
+    Did not fire on bnc (no RIs held), so this fix carries a $0 delta there;
+    it closes the identical phantom for any account that does hold RIs.
+    """
+    mod, ctx = _mod_and_ctx()
+    recs, rate = mod._check_ri_utilization(ctx, _RiUtilCe(), {"Start": "2026-07-10", "End": "2026-08-09"})
+    assert len(recs) == 1
+    rec = recs[0]
+    assert rec["Counted"] is False
+    assert rec["monthly_savings"] == 0.0
+    assert rec["AdvisoryEstimate"] == pytest.approx(215.00, abs=0.01)
+    assert rate == pytest.approx(0.40, abs=0.01)
 
 
 def test_sp_rate_none_when_no_commitment_held():

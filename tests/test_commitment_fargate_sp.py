@@ -220,8 +220,11 @@ def test_ri_utilization_uses_subscription_id_groupby():
     ctx.warn = MagicMock(); ctx.permission_issue = MagicMock()
     recs, rate = CommitmentAnalysisModule()._check_ri_utilization(ctx, ce, {"Start": "x", "End": "y"})
     assert captured["GroupBy"] == [{"Type": "DIMENSION", "Key": "SUBSCRIPTION_ID"}]
-    # Measured unused-hours cost wins over the derived fee x (1 - rate).
-    assert recs[0]["resource_id"] == "ri-abc" and recs[0]["monthly_savings"] == 60.0
+    # Measured unused-hours cost wins over the derived fee x (1 - rate). The
+    # figure rides on AdvisoryEstimate — unused reservation is a sunk cost and
+    # is never counted (see test_commitment_utilization).
+    assert recs[0]["resource_id"] == "ri-abc" and recs[0]["AdvisoryEstimate"] == 60.0
+    assert recs[0]["monthly_savings"] == 0.0 and recs[0]["Counted"] is False
     assert rate == 0.40
 
 
@@ -233,7 +236,8 @@ def test_ri_waste_falls_back_to_amortized_fee_when_unused_cost_absent():
     ]}], "Total": {"UtilizationPercentage": "40", "PurchasedHours": "730"}}
     ctx = SimpleNamespace(warn=MagicMock(), permission_issue=MagicMock())
     recs, _ = CommitmentAnalysisModule()._check_ri_utilization(ctx, ce, {"Start": "x", "End": "y"})
-    assert recs[0]["monthly_savings"] == pytest.approx(60.0)  # 100 * (1 - 0.40)
+    assert recs[0]["AdvisoryEstimate"] == pytest.approx(60.0)  # 100 * (1 - 0.40)
+    assert recs[0]["monthly_savings"] == 0.0
 
 
 def test_ri_underutilized_with_no_cost_fields_emits_no_counted_zero_row():
