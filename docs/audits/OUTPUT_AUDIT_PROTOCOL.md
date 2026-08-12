@@ -148,6 +148,8 @@ Completed ledgers (each carries its own reconciliation section):
 | `afs-prod_eu-west-1_20260808.md` | $13,625.31 | 3 fixed, 1 by-design |
 | `afs-prod_af-south-1_20260811.md` | $6,818.16 → **$3,854.58** | AFS-1/2/3 fixed, AFS-4 withdrawn, gp3 CRITICAL refuted |
 | `M360_ap-south-1_20260811.md` | $4,841.06 → **$2,468.62** | M360-1/3 fixed, M360-2 withdrawn |
+| `bnc_ap-southeast-1_20260812.md` | $2,829.03 → *$2,150.36 (pending)* | BNC-1/2/3/5 fixed, 5 refuted; lessons C21/C22/C23/F6, sweep S16 |
+| `level-Shoes-prod_eu-west-1_20260812.md` | $2,106.29 → *$2,463.57 (pending)* | LS-2/3/4 fixed, LS-1 caught by S16, 6 refuted; lesson C24. First headline to RISE |
 
 **Record withdrawals and refutations in the ledger, not just fixes.** Three of
 nine candidates across the two 2026-08-11 audits did not survive Layer 3, and

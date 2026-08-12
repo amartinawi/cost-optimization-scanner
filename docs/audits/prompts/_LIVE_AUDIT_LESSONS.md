@@ -499,6 +499,25 @@ will eventually both count it. This is the single most common real finding.
   `describe_reserved_db_instances` directly — which is exactly why this stayed a
   stat defect instead of a dollar phantom.*
 
+- **C24 — A billed surcharge is a first-class cost lever, and the ONLY way to
+  know whether AWS is charging one is to read the usage type.** Surcharges
+  (extended support, licensing, dedicated-IP SSL) are removable, recurring, and
+  attributable — everything a counted saving should be — but they are invisible
+  to resource describes, so the two failure modes are symmetrical and both are
+  live: **inferring** one from a version number invents charges AWS is not
+  billing, while **not looking** misses charges it is. Whenever a service
+  publishes an end-of-support policy, ask BOTH "does an adapter read the usage
+  type?" and "does any adapter infer it instead?". `grep -rn extended_support
+  services/adapters/` is the whole audit. *Real: level-Shoes-prod/eu-west-1
+  (2026-08-12) did both in the same report, ~$1,090 apart and in opposite
+  directions — EKS counted a $365/mo surcharge that has no eu-west-1
+  `:extendedSupport` line at all, while $725.62/mo of billed
+  `EU-ExtendedSupportYr1_Yr2-NodeUsage:cache.*` (34% of the headline) went
+  unreported because no ElastiCache check existed. Bonus: the ElastiCache usage
+  type embeds the NODE TYPE, so unlike OpenSearch's it is attributable without
+  CE resource-level granularity — read the usage-type STRING before concluding
+  a charge cannot be attributed.*
+
 ## D. Render / tab / count semantics (`counted == rendered`, both directions)
 
 - **D1 — Counted-but-invisible (render desync).** Savings summed into the headline
