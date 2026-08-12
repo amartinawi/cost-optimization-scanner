@@ -40,6 +40,21 @@ from services.commitment_scenarios import projected_region_split
 _SP_DURATION_TO_TERM: dict[int, str] = {31536000: "1yr", 94608000: "3yr"}
 _SP_PAYMENT_OPTIONS: tuple[str, ...] = ("No Upfront", "Partial Upfront", "All Upfront")
 
+# Under-utilised commitment is measured waste, but it is SUNK: the commitment
+# bills for its whole 1- or 3-year term regardless of usage, unused hourly
+# benefit never carries into the next hour, and a plan is returnable only
+# within 7 days of purchase, in the same calendar month, at <= $100/hr. No
+# action taken this month reduces the bill by this figure, so it is published
+# as an advisory and never summed into the counted headline (bnc /
+# ap-southeast-1, 2026-08-12: $390.32/mo, 13.8% of the headline, against $0 of
+# in-family uncovered on-demand that could have absorbed it).
+_SUNK_COMMITMENT_NOTE: str = (
+    "This is a sunk cost, not a realizable saving: the commitment bills for its full "
+    "term whether or not it is used and cannot be cancelled, so it is shown as an "
+    "advisory and excluded from the counted total. The lever is to right-size the "
+    "commitment at renewal, or to move matching on-demand usage onto it."
+)
+
 
 def _route_ce_error(ctx: Any, action: str, exc: Exception) -> None:
     """Classify Cost Explorer errors into ctx.permission_issue vs ctx.warn.
@@ -148,10 +163,10 @@ class CommitmentAnalysisModule(BaseServiceModule):
         # coverage gaps are a SEPARATE lever from rightsizing — they overlap
         # per-service rightsizing/Graviton recs on the SAME resource (e.g. an
         # RDS RI vs downsizing it), so summing both double-counts. Advisory
-        # (Counted=False): shown, never summed. Existing-commitment waste
-        # (under-utilization, expiring) stays counted. CoH recs merged into a
-        # card's coh_concurs_monthly by _fetch_purchase_cards are not
-        # re-emitted here.
+        # (Counted=False): shown, never summed. Under-utilization is likewise
+        # advisory — it is measured waste but a SUNK cost (_SUNK_COMMITMENT_NOTE),
+        # and marks itself Counted=False at emit. CoH recs merged into a card's
+        # coh_concurs_monthly by _fetch_purchase_cards are not re-emitted here.
         for r in sp_cov_recs + ri_cov_recs + cost_hub_recs:
             r["Counted"] = False
 
@@ -278,9 +293,19 @@ class CommitmentAnalysisModule(BaseServiceModule):
                                 "check_category": "SP Under-utilization",
                                 "current_value": f"{rate:.1%}",
                                 "recommended_value": f"{self.UTILIZATION_THRESHOLD:.0%}+",
-                                "monthly_savings": round(waste, 2),
+                                # SUNK COST — advisory, never counted. See
+                                # _SUNK_COMMITMENT_NOTE.
+                                "monthly_savings": 0.0,
+                                "Counted": False,
+                                "AdvisoryEstimate": round(waste, 2),
+                                "EstimatedSavings": "$0.00/month — advisory (not counted toward total)",
                                 "severity": "HIGH" if rate < 0.50 else "MEDIUM",
-                                "reason": f"Savings Plan utilized at {rate:.1%} (below {self.UTILIZATION_THRESHOLD:.0%} threshold)",
+                                "reason": (
+                                    f"Savings Plan utilized at {rate:.1%} (below "
+                                    f"{self.UTILIZATION_THRESHOLD:.0%} threshold): "
+                                    f"${waste:,.2f}/mo of commitment is going unused. "
+                                    + _SUNK_COMMITMENT_NOTE
+                                ),
                             }
                         )
                 next_token = details.get("NextToken")
@@ -446,9 +471,19 @@ class CommitmentAnalysisModule(BaseServiceModule):
                                     "check_category": "RI Under-utilization",
                                     "current_value": f"{rate:.1%}",
                                     "recommended_value": f"{self.UTILIZATION_THRESHOLD:.0%}+",
-                                    "monthly_savings": round(waste, 2),
+                                    # SUNK COST — advisory, never counted. An RI
+                                    # is as non-cancellable as a Savings Plan.
+                                    "monthly_savings": 0.0,
+                                    "Counted": False,
+                                    "AdvisoryEstimate": round(waste, 2),
+                                    "EstimatedSavings": "$0.00/month — advisory (not counted toward total)",
                                     "severity": "HIGH" if rate < 0.50 else "MEDIUM",
-                                    "reason": f"Reserved Instance {rid} utilized at {rate:.1%} (below {self.UTILIZATION_THRESHOLD:.0%} threshold)",
+                                    "reason": (
+                                        f"Reserved Instance {rid} utilized at {rate:.1%} (below "
+                                        f"{self.UTILIZATION_THRESHOLD:.0%} threshold): "
+                                        f"${waste:,.2f}/mo of reservation is going unused. "
+                                        + _SUNK_COMMITMENT_NOTE
+                                    ),
                                 }
                             )
 
