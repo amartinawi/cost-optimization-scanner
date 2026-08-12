@@ -57,7 +57,8 @@ string/numeric agreement (B2/B3) - S6 pool-cap-at-100% tell (C11) - S7
 counted-only / rendered-aware count semantics (D3/D4) - S8 negative/NaN -
 S9 tab/panel render gate (D2) - S10 log triage - S11 dropped CoH buckets (E2) -
 S12 permission gaps - S13 per-tab reconciliation - S14 projected-commitment
-recompute - **S15 binding-dimension evidence (C18)**. Exit 1 on any FAIL. Tests:
+recompute - **S15 binding-dimension evidence (C18)** - **S16 conjunct evidence
+(C21)**. Exit 1 on any FAIL. Tests:
 `tests/test_output_audit.py` (one seeded violation per class).
 
 S15 is the machine-checkable half of lesson C18 and keys off
@@ -68,6 +69,14 @@ only; CPU is fair evidence for a general-purpose instance), Aurora
 new downsize lever ships.** It was verified against two real pre-fix reports,
 where it flagged exactly the 3 EC2 and 2 Aurora recs the audits had found by
 hand.
+
+S16 is the machine-checkable half of lesson C21 and keys off
+`_REQUIRED_EVIDENCE_CONJUNCTS`: a lever billed only when TWO signals hold must
+name both in its `AuditBasis.evidence`, so a later "fix" that swaps one signal
+for the other trips the harness instead of shipping the mirror-image phantom.
+**Add a row whenever a counted lever's billing condition is a conjunction.** It
+was verified against the real pre-fix bnc report, where it flagged all 3 EKS
+extended-support recs.
 
 ## Layer 2a — rate verification worklist (harness extracts, MCP verifies)
 

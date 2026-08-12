@@ -22,6 +22,7 @@ from tools.output_audit import (  # noqa: E402
     rec_dollar,
     run_sweeps,
     sweep_advisory_leak,
+    sweep_conjunct_evidence,
     sweep_counted_zero,
     sweep_headline,
     sweep_html_render,
@@ -242,6 +243,59 @@ def test_scanned_services_mismatch_flagged():
     data = make_report()
     data["summary"]["total_services_scanned"] = 7
     assert _fails(sweep_summary_semantics(data))
+
+
+# ------------------------------------------ S16 conjunct evidence (C21)
+
+
+def _eks_service(evidence: str, dollars: float = 365.0) -> dict:
+    return {
+        "total_monthly_savings": dollars,
+        "sources": {"cluster_costs": {"recommendations": [{
+            "resource_id": "prod-cluster",
+            "check_type": "extended_support",
+            "Counted": True,
+            "monthly_savings": dollars,
+            "audit_basis": {"evidence": evidence},
+        }]}},
+    }
+
+
+def test_conjunct_evidence_missing_policy_flagged():
+    """bnc 2026-08-12: counted on versionStatus alone against a STANDARD-policy
+    cluster AWS auto-upgrades and never surcharges."""
+    data = make_report()
+    data["services"]["eks_cost"] = _eks_service(
+        "eks:DescribeClusterVersions[1.33].versionStatus == EXTENDED_SUPPORT")
+    assert _fails(sweep_conjunct_evidence(data))
+
+
+def test_conjunct_evidence_missing_version_status_flagged():
+    """bnc 2026-07-09: the mirror image — counted on upgradePolicy alone while
+    the version was still in standard support."""
+    data = make_report()
+    data["services"]["eks_cost"] = _eks_service(
+        "cluster.upgradePolicy.supportType == EXTENDED")
+    assert _fails(sweep_conjunct_evidence(data))
+
+
+def test_conjunct_evidence_both_halves_passes():
+    data = make_report()
+    data["services"]["eks_cost"] = _eks_service(
+        "eks:DescribeClusterVersions[1.33].versionStatus == EXTENDED_SUPPORT "
+        "AND eks:DescribeCluster.upgradePolicy.supportType == EXTENDED")
+    assert _fails(sweep_conjunct_evidence(data)) == []
+
+
+def test_conjunct_evidence_ignores_advisory_recs():
+    """A $0 advisory asserts no dollar, so it needs no conjunct proof."""
+    data = make_report()
+    svc = _eks_service("versionStatus == EXTENDED_SUPPORT", dollars=0.0)
+    rec = svc["sources"]["cluster_costs"]["recommendations"][0]
+    rec["Counted"] = False
+    rec["AdvisoryEstimate"] = 365.0
+    data["services"]["eks_cost"] = svc
+    assert _fails(sweep_conjunct_evidence(data)) == []
 
 
 # ------------------------------------------------------- S8 negative / NaN

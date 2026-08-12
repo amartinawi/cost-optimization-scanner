@@ -438,6 +438,67 @@ will eventually both count it. This is the single most common real finding.
   phantom created BY the fix. Latent until then only because the pre-existing
   shared-snapshot advisories carry `SnapshotSizeGB` 0.0.*
 
+- **C21 — When a fix replaces signal A with signal B, first ask whether the
+  truth is A AND B. Over-correction is its own bug class.** A phantom traced to
+  "we gated on the wrong field" invites swapping the field, and the swap looks
+  like a strict improvement because the original failing case now passes — and
+  the new gate's own docstring will confidently forbid the field it replaced. But
+  a billing condition is frequently a CONJUNCTION of a resource-state signal and
+  a configuration/policy signal, and either one alone admits a phantom in its own
+  direction. Before replacing a gate, enumerate the four cells of the truth
+  table and name a real resource in each. If two cells are "not billed", the gate
+  needs both terms. Machine-checkable: **S16** keys off
+  `_REQUIRED_EVIDENCE_CONJUNCTS` — a counted rec on such a lever must name both
+  halves in its `AuditBasis.evidence`, so a future single-signal rewrite trips
+  the harness instead of shipping. *Real: EKS Extended Support, the same lever on
+  the same account, twice in opposite directions. 2026-07-09 counted $730/mo on
+  `upgradePolicy.supportType == EXTENDED` while Kubernetes 1.33 was still in
+  standard support and AWS billed the plain $0.10/hr rate; the fix moved to
+  `versionStatus` alone, and on 2026-08-12 that counted $365/mo against a
+  STANDARD-policy cluster which AWS auto-upgrades and never surcharges. Cost
+  Explorer settled it: 522 `*-Hours:extendedSupport` hours against 783
+  `*:perCluster` hours over the same window — exactly 2 of 3 clusters.*
+
+- **C22 — Measured waste is not automatically a realizable saving. Name the
+  action and the resulting bill delta before counting it.** A figure can be
+  account-specific, measured from real billing, arithmetically exact, and still
+  belong nowhere near the counted headline — because the headline promises money
+  the operator can stop spending, and some correctly-measured waste is SUNK. The
+  tell is a recommendation whose `recommended_value` is a target ratio ("95%+")
+  rather than an action on a resource: there is no delete, resize, or migrate,
+  so there is no bill delta this month. Apply the standard treatment for "real
+  lever, cannot act on it here" — `$0` `Counted=False` advisory carrying the
+  measured figure and naming the lever that DOES exist (here: right-size the
+  commitment at renewal). *Real: bnc/ap-southeast-1 (2026-08-12) — SP
+  under-utilization counted $390.32/mo, 13.8% of the headline, as the unused
+  commitment on 4 EC2-Instance Savings Plans. A Savings Plan bills its hourly
+  commitment for the whole term regardless of usage, unused hourly benefit never
+  carries forward, and a plan is returnable only within 7 days of purchase. Even
+  the charitable "shift usage onto the plan" reading failed on the numbers: the
+  flagged plans were r5/t3/r6a while the account's only uncovered on-demand was
+  r4.large and m6i.large, so $0 of in-family usage existed to absorb it. The
+  identical RI lever was fixed with it.*
+
+- **C23 — An API that silently DEFAULTS a dimension answers a narrower question
+  than the one you asked, and returns it without complaint.** No error, no empty
+  response, no warning — just a confident number scoped to something you did not
+  choose. Cost Explorer's RI operations are the sharp case: both
+  `GetReservationUtilization` and `GetReservationCoverage` **default `SERVICE` to
+  Amazon EC2** when unfiltered AND cap the filter at ONE value, so an unfiltered
+  read is an EC2-only read wearing an account-wide label, and covering the
+  account means looping the services. Read the "if not specified" sentence of
+  every API reference you depend on. The same call carries a second trap worth
+  remembering as a pair: **`Total` comes back EMPTY whenever `GroupBy` is set**,
+  so aggregate figures must be summed from the groups. *Real: BNC-5
+  (2026-08-12, bnc/ap-southeast-1) — the account holds 3 Aurora RIs worth
+  $3,299.64/mo at 100% utilization and 74.7% RDS coverage; the report rendered
+  "RI Utilization n/a" and "RI Coverage 0.0". The second reads as "you own no
+  reservations, buy some" on an account three-quarters covered, on the same tab
+  as a CoH card recommending an RI purchase. Both defects had to be fixed for
+  either to work. The C6 DEMOTION layer was unaffected — it reads
+  `describe_reserved_db_instances` directly — which is exactly why this stayed a
+  stat defect instead of a dollar phantom.*
+
 ## D. Render / tab / count semantics (`counted == rendered`, both directions)
 
 - **D1 — Counted-but-invisible (render desync).** Savings summed into the headline
@@ -536,6 +597,22 @@ These caused *false positives* in our own sweeps — check them before reporting
   that disagrees ~1pp with `savings/cost` is AWS's rounding; we display the actual
   `$`. Synthetic Snapshots/AMIs tabs (D3) and the RDS-snapshots-stay-counted (cap
   makes them defensible) vs EBS-snapshots-advisory distinction are by design.
+- **F6 — A NEGATIVE claim about an account needs the enumeration that covers
+  it, and "the scanner reported none" is not that enumeration.** Writing "the
+  account has no X" into a ledger's context section makes it load-bearing for
+  every finding that follows — it decides which sweeps are moot. Prove it by
+  enumerating every surface X can live on, and never from a single API call on
+  one service. Worse, the scanner's own silence is the least admissible evidence
+  available: if the check you are auditing is broken, its silence is the
+  SYMPTOM, and citing it closes the loop on yourself. Cross-check against
+  billing, where the resource cannot hide. *Real: bnc/ap-southeast-1
+  (2026-08-12) — the ledger's first pass asserted "**No RIs of any kind**",
+  generalised from `describe_reserved_instances` on **OpenSearch alone** and
+  "confirmed" by the absence of RI recommendations, which was itself BNC-5.
+  The account holds 3 Aurora RIs worth $3,299.64/mo, and the disconfirming
+  `APS1-HeavyUsage:db.r5.4xl $3,217.06` was already sitting in the Layer-2a
+  usage-type table, read past. `HeavyUsage` IS the RI recurring-fee usage type.
+  The operator caught it, not the audit.*
 
 ---
 
