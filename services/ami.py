@@ -20,42 +20,82 @@ OLD_SNAPSHOT_DAYS: int = 90
 UNUSED_MIN_DAYS: int = 30
 
 
-# AWS Backup stamps its own tag namespace on everything it creates. Keyed on the
-# NAMESPACE rather than one exact key so a new AWS Backup tag cannot silently
-# re-open AFS-2.
-_AWS_BACKUP_TAG_PREFIX: str = "aws:backup:"
-# Fallback for images whose tags did not survive a copy; AWS Backup names its
-# EC2 recovery points ``AwsBackup_<instance-id>_<uuid>``.
-_AWS_BACKUP_NAME_PREFIX: str = "AwsBackup_"
+# AWS-native services that CREATE AMIs on a schedule and own their retention.
+# Each stamps its own tag NAMESPACE — keyed on the namespace rather than one
+# exact key so a new tag cannot silently re-open AFS-2 — with a name prefix as
+# the fallback for images whose tags did not survive a copy.
+#
+# AFS-2 shipped with AWS Backup only. Data Lifecycle Manager is the OTHER
+# AWS-native AMI manager and was missed until level-Shoes-prod (2026-08-12),
+# where 2 of 3 counted AMI recs were `DLM_policy-*` images tagged
+# `aws:dlm:lifecycle-policy-id`. Same C19 shape: a scheduled backup is never
+# referenced by a running instance BY CONSTRUCTION, so the gate can never be
+# false, and deregistering one circumvents the policy that owns it. The lever
+# is that policy's retention.
+#
+# (label, tag namespace, name prefix, the operator's actual lever)
+_MANAGED_AMI_SERVICES: tuple[tuple[str, str, str, str], ...] = (
+    ("AWS Backup", "aws:backup:", "AwsBackup_", "the backup plan's RETENTION"),
+    ("Data Lifecycle Manager", "aws:dlm:", "DLM_policy-", "the DLM policy's RETENTION RULE"),
+)
+
+
+def _managed_ami_service(ami: dict[str, Any]) -> tuple[str, str, str] | None:
+    """The AWS service that owns this AMI's lifecycle, or None.
+
+    Returns ``(label, tag_prefix, lever)`` — the caller uses the label to name
+    the right manager, so an operator is never pointed at an AWS Backup plan
+    that does not exist for a DLM-created image.
+    """
+    tags = [t for t in (ami.get("Tags") or []) if isinstance(t, dict)]
+    name = str(ami.get("Name") or "")
+    for label, tag_prefix, name_prefix, lever in _MANAGED_AMI_SERVICES:
+        if any(str(t.get("Key") or "").startswith(tag_prefix) for t in tags):
+            return label, tag_prefix, lever
+        if name.startswith(name_prefix):
+            return label, tag_prefix, lever
+    return None
 
 
 def _is_aws_backup_managed(ami: dict[str, Any]) -> bool:
-    """True if this AMI is a recovery point owned by an AWS Backup plan.
+    """True if this AMI's lifecycle is owned by an AWS service, not by a human.
 
     Such an image is never "referenced by a running instance" — that is what a
-    backup IS — so the unused-AMI gate can never be false for it, and
-    deregistering it would circumvent the plan that owns its lifecycle (AFS-2).
+    scheduled backup IS — so the unused-AMI gate can never be false for it, and
+    deregistering it would circumvent the plan/policy that owns it (AFS-2, C19).
     """
-    for tag in ami.get("Tags") or []:
-        if isinstance(tag, dict) and str(tag.get("Key") or "").startswith(_AWS_BACKUP_TAG_PREFIX):
-            return True
-    return str(ami.get("Name") or "").startswith(_AWS_BACKUP_NAME_PREFIX)
+    return _managed_ami_service(ami) is not None
 
 
 def _aws_backup_source(ami: dict[str, Any]) -> str:
     """The resource this recovery point was taken from, or "" if unknown."""
+    managed = _managed_ami_service(ami)
+    if managed is None:
+        return ""
+    _label, tag_prefix, _lever = managed
     for tag in ami.get("Tags") or []:
         if not isinstance(tag, dict):
             continue
-        if str(tag.get("Key") or "").startswith(_AWS_BACKUP_TAG_PREFIX):
+        key = str(tag.get("Key") or "")
+        # DLM stamps the source instance under a plain `instance-id` tag; its
+        # own namespace carries the POLICY id, which is not the source resource.
+        if key == "instance-id" and str(tag.get("Value") or ""):
+            return str(tag["Value"]).rsplit("/", 1)[-1]
+        if tag_prefix == "aws:backup:" and key.startswith(tag_prefix):
             value = str(tag.get("Value") or "")
             if value:
                 return value.rsplit("/", 1)[-1]
+    # Name conventions: `AwsBackup_<instance-id>_<uuid>` and
+    # `DLM_policy-<policy-id>_<instance-id>_<timestamp>` both put the source
+    # instance in the second underscore-separated field.
     name = str(ami.get("Name") or "")
-    if name.startswith(_AWS_BACKUP_NAME_PREFIX):
-        parts = name.split("_")
-        if len(parts) > 1 and parts[1]:
-            return parts[1]
+    for _label, _tp, name_prefix, _lv in _MANAGED_AMI_SERVICES:
+        if name.startswith(name_prefix):
+            parts = name.split("_")
+            if len(parts) > 2 and parts[2].startswith("i-"):
+                return parts[2]
+            if len(parts) > 1 and parts[1].startswith("i-"):
+                return parts[1]
     return ""
 
 
@@ -355,7 +395,9 @@ def compute_ami_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> dic
             # it does not need) and sized against a COPY of the claimed-snapshot
             # set, so a demoted AMI never steals a snapshot id from a genuinely
             # deletable one sharing it.
-            if _is_aws_backup_managed(ami):
+            managed_by = _managed_ami_service(ami)
+            if managed_by is not None:
+                manager_label, _tag_prefix, manager_lever = managed_by
                 backup_gb, backup_snaps, _shared, backup_est = _snapshot_storage_gb(
                     ec2, ami, set(counted_snapshot_ids)
                 )
@@ -373,30 +415,30 @@ def compute_ami_checks(ctx: ScanContext, pricing_multiplier: float = 1.0) -> dic
                         "SnapshotSizeGB": round(backup_gb, 2),
                         "SnapshotIds": backup_snaps,
                         "SizeEstimated": backup_est,
-                        "ManagedBy": "AWS Backup",
+                        "ManagedBy": manager_label,
                         "BackupSourceResource": source,
                         "Counted": False,
                         "AdvisoryEstimate": gross,
                         "Recommendation": (
-                            f"AWS Backup recovery point{source_note} ({age_days} days old,"
+                            f"{manager_label} scheduled image{source_note} ({age_days} days old,"
                             f" {backup_gb:,.1f} GB of snapshot storage). Its lifecycle belongs"
-                            f" to the backup plan that created it — review that plan's"
-                            f" RETENTION rather than removing the image, which would"
-                            f" circumvent the plan and destroy the recovery point."
+                            f" to the {manager_label} configuration that created it — review"
+                            f" {manager_lever} rather than removing the image, which would"
+                            f" circumvent it and destroy the recovery point."
                         ),
                         "EstimatedSavings": (
                             f"$0.00/month - advisory: ${gross:,.2f}/month of snapshot storage"
-                            " is held by this AWS Backup recovery point, realizable only by"
-                            " shortening the backup plan's retention (this scan cannot read"
-                            " the plan, so it cannot tell whether the image is past its"
+                            f" is held by this {manager_label} image, realizable only by"
+                            f" shortening {manager_lever} (this scan cannot read that"
+                            " configuration, so it cannot tell whether the image is past its"
                             " intended retention)"
                         ),
                         "EstimatedMonthlySavings": 0.0,
                         "AuditBasis": (
                             f"{backup_gb:,.1f}GB stored snapshot blocks x"
                             f" ${snapshot_rate:.4f}/GB-Mo. Not counted: the recommended"
-                            " action targets the AWS Backup plan's retention, not this"
-                            " image, and the plan's retention setting is not readable here."
+                            f" action targets {manager_lever}, not this image, and that"
+                            " setting is not readable here."
                         ),
                         "CheckCategory": (
                             "Old Unused AMIs" if age_days > OLD_SNAPSHOT_DAYS else "Unused AMIs"

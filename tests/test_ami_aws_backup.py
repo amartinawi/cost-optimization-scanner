@@ -257,3 +257,74 @@ def test_demoted_amis_do_not_inflate_the_reconciliation_ceiling() -> None:
 
 if __name__ == "__main__":  # pragma: no cover
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+# --------------------------------------------------------------------------- #
+# level-Shoes-prod live regression (2026-08-12): DLM is the OTHER AWS-native
+# AMI manager, and AFS-2 keyed on `aws:backup:` alone.
+#
+# EBS Data Lifecycle Manager creates AMIs on a schedule with its own retention
+# policy and stamps `aws:dlm:lifecycle-policy-id` /
+# `aws:dlm:lifecycle-schedule-name` (plus `dlm:managed`). They are never
+# referenced by a running instance — that is what a scheduled backup IS — so
+# the unused-AMI gate can never be false for them either (C19), and
+# deregistering one circumvents the policy that owns its lifecycle.
+#
+# Live: 2 of the 3 counted AMI recs ($3.34 of $3.61) were
+# `DLM_policy-005c32eff971bbaee_i-05da5bbda9bad482b_*`, tagged exactly so.
+# --------------------------------------------------------------------------- #
+def _dlm_ami(image_id: str, age_days: int, snapshot_id: str = "snap-1",
+             source: str = "i-05da5bbda9bad482b") -> dict:
+    return _ami(
+        image_id, age_days, snapshot_id,
+        name=f"DLM_policy-005c32eff971bbaee_{source}_03.17.2024T02.04.02.801 UTC",
+        tags=[
+            {"Key": "aws:dlm:lifecycle-policy-id", "Value": "policy-005c32eff971bbaee"},
+            {"Key": "aws:dlm:lifecycle-schedule-name", "Value": "Schedule 1"},
+            {"Key": "dlm:managed", "Value": "true"},
+            {"Key": "instance-id", "Value": source},
+        ],
+    )
+
+
+def test_dlm_managed_ami_detected() -> None:
+    assert _is_aws_backup_managed(_dlm_ami("ami-d1", 900)) is True
+
+
+def test_any_dlm_tag_namespace_key_counts() -> None:
+    for key in ("aws:dlm:lifecycle-policy-id", "aws:dlm:lifecycle-schedule-name"):
+        assert _is_aws_backup_managed(_ami("ami-d", 900, tags=[{"Key": key, "Value": "v"}])) is True
+
+
+def test_dlm_name_prefix_is_the_fallback() -> None:
+    ami = _ami("ami-d2", 900, name="DLM_policy-0abc_i-0def_03.17.2024T02.04.02.801 UTC")
+    assert "Tags" not in ami
+    assert _is_aws_backup_managed(ami) is True
+
+
+def test_dlm_ami_is_advisory_not_counted() -> None:
+    ctx, _ = _make_ctx([_dlm_ami("ami-d3", 900)])
+    recs = _all(compute_ami_checks(ctx))
+    assert len(recs) == 1
+    rec = recs[0]
+    assert rec["Counted"] is False
+    assert rec["EstimatedMonthlySavings"] == 0.0
+    assert rec["AdvisoryEstimate"] > 0
+    # Names the RIGHT manager, so the operator is pointed at the DLM policy
+    # rather than at an AWS Backup plan that does not exist.
+    assert rec["ManagedBy"] == "Data Lifecycle Manager"
+    assert "i-05da5bbda9bad482b" in rec["Recommendation"]
+
+
+def test_dlm_and_backup_amis_both_demoted_alongside_a_real_one() -> None:
+    """level-Shoes-prod exactly: 2 DLM images plus 1 genuinely unused AMI."""
+    ctx, _ = _make_ctx([
+        _dlm_ami("ami-d4", 878, snapshot_id="snap-a"),
+        _dlm_ami("ami-d5", 877, snapshot_id="snap-b"),
+        _ami("ami-real", 917, snapshot_id="snap-c", name="pritunl-vpn-server-latest", tags=[]),
+    ])
+    recs = {r["ImageId"]: r for r in _all(compute_ami_checks(ctx))}
+    assert recs["ami-d4"]["Counted"] is False
+    assert recs["ami-d5"]["Counted"] is False
+    assert recs["ami-real"].get("Counted") is not False
+    assert recs["ami-real"]["EstimatedMonthlySavings"] > 0
