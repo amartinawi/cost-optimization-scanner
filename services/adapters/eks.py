@@ -172,6 +172,7 @@ class EksCostModule(BaseServiceModule):
                 is_idle=is_candidate_idle,
                 owned_node_count=owned_node_count,
                 version_support=version_support,
+                ctx=ctx,
             )
             cluster_recs.extend(cr)
 
@@ -288,6 +289,7 @@ class EksCostModule(BaseServiceModule):
         is_idle: bool,
         owned_node_count: int | None = None,
         version_support: dict[str, dict[str, Any]] | None = None,
+        ctx: Any = None,
     ) -> list[dict[str, Any]]:
         """Cluster-level control-plane findings: Extended Support + idle control plane.
 
@@ -311,19 +313,54 @@ class EksCostModule(BaseServiceModule):
         version = cluster.get("version", "Unknown")
         monthly_control_plane = control_plane_rate * HOURS_PER_MONTH
 
-        # Extended Support surcharge — counted ONLY when AWS reports the cluster's
-        # Kubernetes version is *currently* in extended support (and therefore
-        # surcharged). `upgradePolicy.supportType == "EXTENDED"` is a policy, not a
-        # billing state: it says what happens when standard support ends. Counting
-        # it billed $365/mo/cluster on Kubernetes 1.33 while AWS charged only the
-        # standard $0.10/hr control-plane rate (bnc: $0.098/cluster-hour observed).
+        # Extended Support surcharge — billed only when BOTH halves hold, and
+        # neither alone is sufficient:
+        #
+        #   1. `DescribeClusterVersions[v].versionStatus == EXTENDED_SUPPORT`
+        #      — the version is actually past end-of-standard-support. Policy
+        #      alone counted $365/mo/cluster on Kubernetes 1.33 while the
+        #      version was still in standard support and AWS billed the plain
+        #      $0.10/hr rate (bnc, 2026-07-09: $730 phantom).
+        #   2. `cluster.upgradePolicy.supportType == "EXTENDED"` — the cluster
+        #      is allowed to ENTER extended support. A STANDARD-policy cluster
+        #      is auto-upgraded by AWS at end of standard support and is never
+        #      surcharged: "You will not incur extended support charges with
+        #      this setting" (EKS User Guide, view-upgrade-policy). Gating on
+        #      versionStatus alone counted $365/mo against exactly such a
+        #      cluster (bnc, 2026-08-12: 3 clusters on 1.33 in extended
+        #      support, Cost Explorer billing `*-Hours:extendedSupport` for
+        #      only the 2 with an EXTENDED policy).
+        #
+        # An unreadable policy withholds the lever and warns (C18 fail-closed)
+        # rather than assuming AWS's documented EXTENDED default — the project
+        # resolves ambiguity toward under-counting.
         support_entry = (version_support or {}).get(version) or {}
         version_status = str(support_entry.get("versionStatus") or support_entry.get("status") or "")
         std_support_end = support_entry.get("endOfStandardSupportDate")
-        policy_extended = (cluster.get("upgradePolicy", {}) or {}).get("supportType", "") == "EXTENDED"
+        support_type = str((cluster.get("upgradePolicy") or {}).get("supportType") or "")
+        policy_extended = support_type == "EXTENDED"
         monthly_surcharge = extended_support_rate * HOURS_PER_MONTH
 
-        if version_status == "EXTENDED_SUPPORT" and extended_support_rate > 0:
+        if version_status == "EXTENDED_SUPPORT" and extended_support_rate > 0 and not policy_extended:
+            # Version is surcharge-eligible but this cluster is not billed it.
+            # Affirmatively wrong rather than merely unproven, so no card is
+            # emitted at all — disclosed through a warning instead.
+            if ctx is not None:
+                if support_type == "STANDARD":
+                    ctx.warn(
+                        f"EKS cluster '{name}' runs Kubernetes {version} (extended support), but its "
+                        f"upgradePolicy is STANDARD — AWS auto-upgrades it and bills no extended-support "
+                        f"surcharge, so ${monthly_surcharge:.2f}/mo is not counted.",
+                        "eks_cost",
+                    )
+                else:
+                    ctx.warn(
+                        f"EKS cluster '{name}' runs Kubernetes {version} (extended support) but its "
+                        f"upgradePolicy.supportType could not be read — the ${monthly_surcharge:.2f}/mo "
+                        f"surcharge cannot be substantiated and is not counted.",
+                        "eks_cost",
+                    )
+        elif version_status == "EXTENDED_SUPPORT" and extended_support_rate > 0:
             recs.append(
                 {
                     "resource_id": name,
@@ -338,7 +375,11 @@ class EksCostModule(BaseServiceModule):
                         "rate": extended_support_rate,
                         "unit": "USD/cluster-hour",
                         "formula": f"{extended_support_rate} x {HOURS_PER_MONTH} hr",
-                        "evidence": f"eks:DescribeClusterVersions[{version}].versionStatus == EXTENDED_SUPPORT",
+                        "evidence": (
+                            f"eks:DescribeClusterVersions[{version}].versionStatus == EXTENDED_SUPPORT "
+                            f"AND eks:DescribeCluster.upgradePolicy.supportType == EXTENDED "
+                            f"(both required: a STANDARD-policy cluster is auto-upgraded, never surcharged)"
+                        ),
                     },
                     "reason": (
                         f"EKS cluster '{name}' runs Kubernetes {version}, which AWS reports is in "

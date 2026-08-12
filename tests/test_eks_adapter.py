@@ -333,3 +333,94 @@ def test_version_support_lookup_failure_counts_nothing():
     recs = _recs(EksCostModule().scan(ctx), "cluster_costs")
     assert [r for r in recs if r["check_type"] == "extended_support"] == []
     assert ctx.warn.called
+
+
+# --------------------------------------------------------------------------- #
+# bnc live regression (2026-08-12): supportType STANDARD is never surcharged
+#
+# The 2026-07-09 fix moved the gate off `upgradePolicy.supportType` and onto
+# `versionStatus` alone. That closed the "policy EXTENDED but version still in
+# standard support" phantom, but opened its mirror image: a cluster whose
+# version IS past end-of-standard-support while its policy is STANDARD is
+# AUTO-UPGRADED by AWS and never billed the surcharge.
+#
+#   STANDARD - "You will not incur extended support charges with this setting
+#              but your EKS cluster will automatically upgrade to the next
+#              supported Kubernetes version in standard support."
+#   EXTENDED - "You will incur extended support charges with this setting."
+#   (https://docs.aws.amazon.com/eks/latest/userguide/view-upgrade-policy.html)
+#
+# Both halves are NECESSARY; neither alone is sufficient. Confirmed on bnc /
+# ap-southeast-1: 3 clusters on Kubernetes 1.33 (EXTENDED_SUPPORT since
+# 2026-07-29), but Cost Explorer bills `APS1-AmazonEKS-Hours:extendedSupport`
+# for exactly 2 of them (Aug 1-12: 522 surcharge-hours vs 783 cluster-hours =
+# 2/3), and the unbilled one is precisely the STANDARD-policy cluster.
+# --------------------------------------------------------------------------- #
+def test_standard_policy_on_extended_version_is_not_counted():
+    eks = _FakeEks({
+        "IBIS_Prod_EKS_Cluster": {
+            "cluster": {"status": "ACTIVE", "version": "1.27",
+                        "upgradePolicy": {"supportType": "STANDARD"}},
+            "nodegroups": {"ng1": {"instanceTypes": ["m6g.large"], "capacityType": "SPOT"}},
+        },
+    })
+    ctx = _ctx(eks)
+    findings = EksCostModule().scan(ctx)
+    recs = _recs(findings, "cluster_costs")
+    assert [r for r in recs if r["check_type"] == "extended_support"] == [], (
+        "a STANDARD-policy cluster is auto-upgraded and never billed the surcharge"
+    )
+    assert findings.total_monthly_savings == 0.0
+    # Disclosed, not silent.
+    assert ctx.warn.called
+    assert "STANDARD" in " ".join(str(c) for c in ctx.warn.call_args_list)
+
+
+def test_extended_policy_on_extended_version_still_counted():
+    """The genuine surcharge must survive the new gate."""
+    eks = _FakeEks({
+        "mta-prod-cluster": {
+            "cluster": {"status": "ACTIVE", "version": "1.27",
+                        "upgradePolicy": {"supportType": "EXTENDED"}},
+            "nodegroups": {"ng1": {"instanceTypes": ["m6g.large"], "capacityType": "SPOT"}},
+        },
+    })
+    recs = _recs(EksCostModule().scan(_ctx(eks)), "cluster_costs")
+    ext = [r for r in recs if r["check_type"] == "extended_support"]
+    assert len(ext) == 1
+    assert ext[0]["monthly_savings"] == 365.0
+    assert ext[0]["Counted"] is True
+    assert "upgradePolicy.supportType == EXTENDED" in ext[0]["audit_basis"]["evidence"]
+
+
+def test_missing_upgrade_policy_withholds_the_surcharge():
+    """Unreadable policy -> withhold + warn (C18 fail-closed), never assume billed."""
+    eks = _FakeEks({
+        "c1": {"cluster": {"status": "ACTIVE", "version": "1.27"},
+               "nodegroups": {"ng1": {"instanceTypes": ["m6g.large"], "capacityType": "SPOT"}}},
+    })
+    ctx = _ctx(eks)
+    findings = EksCostModule().scan(ctx)
+    recs = _recs(findings, "cluster_costs")
+    assert [r for r in recs if r["check_type"] == "extended_support"] == []
+    assert findings.total_monthly_savings == 0.0
+    assert ctx.warn.called
+
+
+def test_idle_standard_policy_cluster_counts_only_the_base_rate():
+    """bnc IBIS_Prod_EKS_Cluster exactly: idle AND on an extended-support version
+    with a STANDARD policy. The control plane bills $0.10/hr, so deleting it
+    saves $73.00 -- and nothing more."""
+    eks = _FakeEks({
+        "IBIS_Prod_EKS_Cluster": {
+            "cluster": {"status": "ACTIVE", "version": "1.27",
+                        "upgradePolicy": {"supportType": "STANDARD"}},
+            "nodegroups": {}, "fargate": [],
+        },
+    })
+    findings = EksCostModule().scan(_ctx(eks))
+    recs = _recs(findings, "cluster_costs")
+    assert [r for r in recs if r["check_type"] == "extended_support"] == []
+    idle = [r for r in recs if r["check_type"] == "idle_cluster"]
+    assert len(idle) == 1 and idle[0]["monthly_savings"] == 73.0
+    assert findings.total_monthly_savings == 73.0
