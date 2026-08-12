@@ -5,12 +5,34 @@
   `bnc_ap-southeast-1_baseline.html`
 - **Headline**: $2,829.03/mo counted, 320 recs + 133 advisories, 16 services
   with findings of 34 scanned
-- **Account context**: **14 active EC2-Instance Savings Plans** ($2.9066/hr =
-  $2,163/mo total commitment, all No Upfront, expiring Nov/Dec 2026), so the C6
-  commitment sweeps are live and load-bearing. **No RIs of any kind.** The role
-  (`MS-Expert`) DOES have CE access on this run — a change from the earlier
-  finding that bnc's MS-Expert role was SCP-denied `ce:*`, and the reason the
-  commitment layers work at all here.
+- **Account context**: a genuinely MIXED commitment account — both Savings
+  Plans and Reserved Instances are active, which is why it was chosen:
+  - **14 EC2-Instance Savings Plans**, $2.9066/hr = **$2,163/mo**, all No
+    Upfront, expiring Nov/Dec 2026 (reconciles exactly against CE "Savings
+    Plans for AWS Compute usage" $2,162.51 in July).
+  - **3 Aurora PostgreSQL Reserved DB Instances**, **$3,299.64/mo** —
+    `db.r5.4xlarge` ×2 at $2.162/hr and `db.t3.medium` ×1 at $0.111/hr, both No
+    Upfront, started 2025-11-28. These reconcile to the cent against CE
+    `APS1-HeavyUsage:db.r5.4xl` $3,217.06 (= 2 × 2.162 × 744) and
+    `APS1-HeavyUsage:db.t3.medium` $82.58 (= 0.111 × 744).
+  - None on EC2, ElastiCache, Redshift or OpenSearch.
+
+  So the **RI book is larger than the SP book**, and both C6 layers are live.
+  The role (`MS-Expert`) DOES have CE access on this run — a change from the
+  earlier finding that bnc's MS-Expert role was SCP-denied `ce:*`, and the
+  reason the commitment layers work at all here.
+
+  > **Correction (2026-08-12, after operator challenge).** The first pass of
+  > this ledger stated "**No RIs of any kind**". That was wrong, and wrong by
+  > method rather than by luck: I ran `describe_reserved_instances` on
+  > **OpenSearch only**, saw `NONE`, and generalised it to every service — then
+  > read the absence of RI recommendations as confirmation, when that absence
+  > was itself the symptom of BNC-5 below. The disconfirming evidence was
+  > already in my own Layer-2a output: `APS1-HeavyUsage:db.r5.4xl $3,217.06`
+  > sat in the RDS usage-type table I had pulled, and `HeavyUsage` **is** the
+  > RI recurring-fee usage type. A negative claim about an account needs the
+  > enumeration that covers it, and a $3,217/mo line item is not something to
+  > skim past. Logged as lesson **F6**.
 - **Method**: OUTPUT_AUDIT_PROTOCOL Layers 1–3. Layer 1 harness; Layer 2a rate
   verification against the live AWS Pricing API **and against Cost Explorer
   usage types**, which proved decisive twice; Layer 3 refute before listing —
@@ -213,6 +235,62 @@ HIGH, and because the fix is the same one OS-7 already made next door.
 - Predicted delta: **+$76.65** (3 master nodes × $25.55) → opensearch
   **$344.63 → $421.28**.
 
+### BNC-5 — RI utilization and coverage are EC2-only unless filtered per service (NEW) — MEDIUM
+
+The two RI stat readers call Cost Explorer with **no `SERVICE` filter**. Per
+the `GetReservationUtilization` API reference:
+
+> "If not specified, the `SERVICE` filter **defaults to Amazon Elastic Compute
+> Cloud - Compute**. Supported values for `SERVICE` are [EC2-Compute, RDS,
+> ElastiCache, Redshift, Elasticsearch]. The value for the `SERVICE` filter
+> should not exceed '1'."
+
+So an unfiltered read is an **EC2-only read wearing an account-wide label**.
+On bnc, whose entire RI book is Aurora, that is the difference between a
+correct answer and no answer at all — verified live:
+
+| Call | `PurchasedHours` | Utilization | Reserved hrs | On-demand hrs |
+|------|------------------|-------------|--------------|---------------|
+| unfiltered | **0** | 0% | **0** | 2,862.08 |
+| `SERVICE=RDS` | **2,088** | **100%** | **2,149** | 726.23 |
+
+The report therefore rendered **"RI Utilization: n/a"** and **"RI Coverage:
+0.0"** against $3,299.64/mo of reservations at 100% utilization. The coverage
+figure is the more harmful of the two: `0.0` reads as *"you own no
+reservations, buy some"* on an account already 74.7% covered on its largest
+service — and it sits on the same tab as a Cost Optimization Hub card
+recommending an OpenSearch RI purchase.
+
+A **second, independent** defect surfaced in the same function: the overall
+rate was read from `Total.PurchasedHours`, but **`Total` comes back empty
+whenever `GroupBy` is set** (confirmed live — filtered+grouped returns
+populated `Groups` and `Total: {}`). So even with the filter fixed, the rate
+would still have collapsed to `n/a`. Both had to be repaired for either to work.
+
+- Suspect: `services/adapters/commitment_analysis.py` `_check_ri_utilization`
+  and `_check_ri_coverage`.
+- **FIXED** on `fix/ri-stats-service-scope` (stacked on
+  `fix/sp-utilization-sunk-cost`, since it edits the same function). Both
+  readers loop the five reservable services, one call each. Utilization
+  aggregates `PurchasedHours`/`TotalActualHours` from the **groups**; coverage
+  sums `ReservedHours`/`TotalRunningHours` rather than averaging per-service
+  percentages, which would weight a service with 3 running hours the same as
+  one with 3,000. Zero purchased hours across every service still yields `None`
+  (n/a), never a fabricated 0%. Uses the modern `Amazon OpenSearch Service`
+  dimension — the reference lists the legacy Elasticsearch name, but only the
+  modern one carries data (verified live: 5,019 hours vs 0).
+- **The C6 demotion layer is unaffected.** `commitment_coverage.py:690` reads
+  `rds:describe_reserved_db_instances` directly, not CE, so the Aurora RIs were
+  always visible to the layer that demotes counted dollars — which is why this
+  is a MEDIUM stat defect and not a dollar phantom. `_fetch_dynamodb_reserved`
+  already passed its SERVICE filter correctly; only the two stat readers were
+  unfiltered.
+- CE cost rises from ~61 to ~69 calls/scan (~$0.61 → ~$0.69).
+- Predicted delta: **$0.00 counted** — RDS RI utilization is 100%, so no
+  under-utilization rec fires either way. Stats change: RI Utilization
+  `n/a → 100%`, RI Coverage `0.0 → ~0.158` account-wide (2,149 reserved of
+  13,624 total running hours across the five services).
+
 ## Refuted during Layer 3 (recorded so they are not re-raised)
 
 **1. EKS `extended_support` + `idle_cluster` on the same cluster looked like a
@@ -311,6 +389,7 @@ LOW attribution improvement below, not a dollar finding.
 | BNC-2 | C22 (NEW) | CRITICAL | $390.32 of unused SP commitment counted as savings; sunk and unrecoverable, with $0 of in-family on-demand to absorb it | **FIXED** — `fix/sp-utilization-sunk-cost`, predicted −$390.32 |
 | BNC-3 | NEW (OS-7 class) | HIGH | OpenSearch Graviton prices data nodes only, missing 3 dedicated master nodes | **FIXED** — `fix/opensearch-graviton-master-nodes`, predicted +$76.65 |
 | BNC-4 | — | LOW | OpenSearch extended-support surcharge rendered unattributed though determinable | OPEN — enhancement, $0 |
+| BNC-5 | NEW | MEDIUM | RI utilization/coverage read CE unfiltered = EC2-only; "n/a" and "0.0" against $3,299.64/mo of Aurora RIs at 100% utilization | **FIXED** — `fix/ri-stats-service-scope`, predicted $0.00 counted, stats corrected |
 | — | — | — | EKS surcharge + idle rec on one cluster | REFUTED — coherent decomposition, $365 + $73 = full cluster cost |
 | — | — | — | m6i CoH rec escaping C6 demotion | REFUTED — CE headroom $83.81 > $17.52 counted |
 | — | — | — | OpenSearch $76.65 missing from HTML | REFUTED — F3 grouping |
@@ -329,6 +408,15 @@ restores dollars that were real and unclaimed.
 - **Lesson C22** — *Measured waste is not automatically a realizable saving.*
   Written from BNC-2. The tell: a `recommended_value` that is a target ratio
   rather than an action on a resource.
+- **Lesson C23** — *A CE API that silently defaults a dimension answers a
+  narrower question than you asked.* Written from BNC-5: `GetReservationUtilization`
+  and `GetReservationCoverage` default `SERVICE` to EC2 and cap it at one value
+  per call, so an unfiltered read is an EC2-only read wearing an account-wide
+  label. Pairs with the `Total`-is-empty-under-`GroupBy` trap in the same call.
+- **Lesson F6** (audit-method) — *A negative claim about an account needs the
+  enumeration that covers it.* Written from this ledger's own error: "no RIs of
+  any kind" was generalised from a single OpenSearch `describe`, and the
+  disconfirming `HeavyUsage` line was already in my Layer-2a output.
 - **S16 conjunct-evidence sweep** (`tools/output_audit.py`), keyed off
   `_REQUIRED_EVIDENCE_CONJUNCTS`, the machine-checkable half of C21: a counted
   rec on a conjunction-gated lever must name both halves in
@@ -343,8 +431,18 @@ restores dollars that were real and unclaimed.
 
 ## Reconciliation
 
-**PENDING** — awaiting operator re-scan of `bnc ap-southeast-1` with all three
+**PENDING** — awaiting operator re-scan of `bnc ap-southeast-1` with all
 branches applied. The protocol requires the headline to move by exactly
 $678.67 to **$2,150.36**, with eks_cost $803.00, commitment_analysis $0.00,
 opensearch $421.28, and **every other tab unchanged to the cent**. Anything else
 reopens the finding.
+
+Non-dollar assertions to check on the same re-scan (BNC-5):
+
+- stat card **RI Utilization** reads `100%`, not `n/a`;
+- stat card **RI Coverage** reads `~15.8%`, not `0.0`;
+- the log carries the two new EKS warnings — one naming
+  `IBIS_Prod_EKS_Cluster`'s STANDARD policy, and the OpenSearch/Aurora memory
+  gates as before;
+- `commitment_analysis` renders 4 SP under-utilization cards as `$0.00 —
+  advisory` with the waste named in each reason, and the tab total is $0.00.
