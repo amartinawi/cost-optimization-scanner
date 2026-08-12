@@ -166,6 +166,89 @@ def test_graviton_default_count_is_one_when_absent(monkeypatch: pytest.MonkeyPat
     assert rec["EstimatedMonthlySavings"] == pytest.approx(10.0)  # delta x 1 node
 
 
+# --------------------------------------------------------------------------- #
+# bnc live regression (2026-08-12): Graviton must price the MASTER tier too
+#
+# OS-7 taught the IDLE-DOMAIN lever that dedicated-master and UltraWarm nodes
+# bill on top of the data nodes. The Graviton lever never learned it: it priced
+# `ClusterConfig.InstanceCount` alone, so a domain whose master tier is the same
+# x86 family as its data tier had that half of the migration silently omitted.
+#
+# bnc production-bnc: 3 data + 3 dedicated master m5.xlarge.search. Cost
+# Explorer bills 4,464 `APS1-ESInstance:m5.xlarge` hours in July = 6 nodes x 744,
+# confirming all six bill. The report counted 3 nodes x $25.55 = $76.65 and
+# missed the other $76.65.
+# --------------------------------------------------------------------------- #
+def test_graviton_prices_dedicated_master_tier(monkeypatch: pytest.MonkeyPatch) -> None:
+    recs = [
+        {
+            "DomainName": "production-bnc",
+            "InstanceType": "m5.xlarge.search",
+            "InstanceCount": 3,
+            "DedicatedMasterType": "m5.xlarge.search",
+            "DedicatedMasterCount": 3,
+            "CheckCategory": "Graviton Migration",
+        }
+    ]
+    # Live ap-southeast-1 rates: m5.xlarge.search $0.354/hr, m6g.xlarge.search
+    # $0.319/hr -> $25.55/node/mo.
+    pricing = _FakePricing({"m5.xlarge.search": 258.42, "m6g.xlarge.search": 232.87})
+    findings = _scan_with(recs, monkeypatch, pricing_engine=pricing)
+    rec = _by_category(findings)["Graviton Migration"]
+    assert rec["EstimatedMonthlySavings"] == pytest.approx(153.30, abs=0.01)  # 6 nodes
+    assert rec["Counted"] is True
+    basis = rec["AuditBasis"]
+    assert basis["instance_count"] == 3
+    assert basis["master_count"] == 3
+    assert basis["master_type"] == "m5.xlarge.search"
+    assert basis["master_target_type"] == "m6g.xlarge.search"
+
+
+def test_graviton_master_tier_omitted_when_already_graviton(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A Graviton master tier has no migration left — count the data tier only."""
+    recs = [
+        {
+            "DomainName": "d", "InstanceType": "m5.xlarge.search", "InstanceCount": 2,
+            "DedicatedMasterType": "m6g.large.search", "DedicatedMasterCount": 3,
+            "CheckCategory": "Graviton Migration",
+        }
+    ]
+    pricing = _FakePricing({"m5.xlarge.search": 258.42, "m6g.xlarge.search": 232.87})
+    findings = _scan_with(recs, monkeypatch, pricing_engine=pricing)
+    rec = _by_category(findings)["Graviton Migration"]
+    assert rec["EstimatedMonthlySavings"] == pytest.approx(51.10, abs=0.01)  # 2 data nodes only
+    assert "master_count" not in rec["AuditBasis"]
+
+
+def test_graviton_warm_tier_omitted_when_unpriceable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """UltraWarm types have no Graviton counterpart — omit the leg, never guess."""
+    recs = [
+        {
+            "DomainName": "d", "InstanceType": "m5.xlarge.search", "InstanceCount": 2,
+            "WarmType": "ultrawarm1.medium.search", "WarmCount": 2,
+            "CheckCategory": "Graviton Migration",
+        }
+    ]
+    pricing = _FakePricing({"m5.xlarge.search": 258.42, "m6g.xlarge.search": 232.87}, default=0.0)
+    findings = _scan_with(recs, monkeypatch, pricing_engine=pricing)
+    rec = _by_category(findings)["Graviton Migration"]
+    assert rec["EstimatedMonthlySavings"] == pytest.approx(51.10, abs=0.01)
+    assert "warm_count" not in rec["AuditBasis"]
+
+
+def test_shim_carries_master_and_warm_onto_graviton_rec() -> None:
+    """The adapter can only price what the shim attaches (the H1 lesson)."""
+    import inspect
+
+    src = inspect.getsource(opensearch_shim)
+    graviton_block = src.split('"CheckCategory": "Graviton Migration"')[0].rsplit(
+        'checks["graviton_migration"].append', 1
+    )[-1]
+    assert "DedicatedMasterType" in graviton_block
+    assert "DedicatedMasterCount" in graviton_block
+    assert "WarmType" in graviton_block
+
+
 def test_graviton_equivalent_maps_x86_family_same_size() -> None:
     assert _graviton_equivalent("r5.xlarge.search") == "r6g.xlarge.search"
     assert _graviton_equivalent("m5.large.search") == "m6g.large.search"
