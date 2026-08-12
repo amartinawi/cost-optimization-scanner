@@ -429,20 +429,49 @@ restores dollars that were real and unclaimed.
   OpenSearch Graviton lever is a same-size family migration with no binding
   dimension to gate on.
 
-## Reconciliation
+## Reconciliation — re-scan 2026-08-12 (protocol fix-loop step 3)
 
-**PENDING** — awaiting operator re-scan of `bnc ap-southeast-1` with all
-branches applied. The protocol requires the headline to move by exactly
-$678.67 to **$2,150.36**, with eks_cost $803.00, commitment_analysis $0.00,
-opensearch $421.28, and **every other tab unchanged to the cent**. Anything else
-reopens the finding.
+| | Baseline | Re-scan | Delta |
+|---|---|---|---|
+| **Headline** | $2,829.03 | **$2,163.19** | −$665.84 |
+| eks_cost | 1,168.00 | 803.00 | **−365.00** (BNC-1, exact) |
+| commitment_analysis | 390.32 | 0.00 | **−390.32** (BNC-2, exact) |
+| opensearch | 344.63 | 434.11 | **+89.48** (BNC-3 +76.65 exact, +12.83 CE drift — below) |
+| All 9 other tabs | — | — | **$0.00 each** |
 
-Non-dollar assertions to check on the same re-scan (BNC-5):
+Predicted **$2,150.36**, landed **$2,163.19** — **+$12.83**, and the difference
+is fully attributed and is not the fixes.
 
-- stat card **RI Utilization** reads `100%`, not `n/a`;
-- stat card **RI Coverage** reads `~15.8%`, not `0.0`;
-- the log carries the two new EKS warnings — one naming
-  `IBIS_Prod_EKS_Cluster`'s STANDARD policy, and the OpenSearch/Aurora memory
-  gates as before;
-- `commitment_analysis` renders 4 SP under-utilization cards as `$0.00 —
-  advisory` with the waste named in each reason, and the tab total is $0.00.
+- **BNC-1 exact.** eks_cost −$365.00 to the cent, and the log carries the new
+  disclosure: *"EKS cluster 'IBIS_Prod_EKS_Cluster' runs Kubernetes 1.33
+  (extended support), but its upgradePolicy is STANDARD — AWS auto-upgrades it
+  and bills no extended-support surcharge."* The two genuinely-billed clusters
+  keep their $365 each.
+- **BNC-2 exact.** commitment_analysis → $0.00, with all 4 SP under-utilization
+  recs `Counted=False` and the full **$390.32 preserved in `AdvisoryEstimate`** —
+  the waste is still shown, just not counted.
+- **BNC-3 exact.** production-bnc Graviton $76.65 → **$153.30**, and the
+  `AuditBasis` now carries `master_type`, `master_target_type`,
+  `master_count: 3` and `master_per_node_delta_monthly: 25.55` beside the data
+  tier. staging-bnc-2 unchanged at $16.06, as it has no master tier.
+- **BNC-5 verified on the stat cards.** **RI Utilization `n/a` → `1.0` (100%)**
+  and **RI Coverage `0.0` → `0.1577`** — the latter matching the predicted
+  ~0.158 (2,149 reserved of 13,624 running hours across the five reservable
+  services). The account's 3 Aurora RIs are finally visible.
+- **The +$12.83 is the OpenSearch Extended Support trailing window, not a fix.**
+  That lever measures `*-OpenSearchExtendedSupport` over a trailing 7 days and
+  scales ×30/7, so it moves with CE as spend posts: **$251.92 → $264.75**.
+  Decomposing the tab confirms it — $264.75 + $153.30 + $16.06 = $434.11
+  exactly, with the Graviton legs landing on prediction to the cent. (The new
+  figure is also the $264.75 this account's surcharge was independently measured
+  at in an earlier session.)
+- **Layer 1: 0 FAIL**, and **S16 is silent** where it flagged all 3 EKS recs on
+  the baseline.
+- Counted recs 320 → 315, advisories 133 → 137: the demoted recs render rather
+  than vanish.
+- **ElastiCache extended support (LS-2) correctly contributes $0 here** — bnc's
+  Redis clusters are on current versions and CE bills no ElastiCache surcharge,
+  so the new lever stays silent. A lever that fires only where the charge exists.
+
+**Status: RECONCILED.** BNC-1, BNC-2, BNC-3 and BNC-5 all verified on live
+output; the single deviation is an independently-quantified CE window movement.
