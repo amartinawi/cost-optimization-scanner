@@ -112,19 +112,123 @@ def test_sp_underutilization_excluded_from_tab_total():
 
 
 class _RiUtilCe(_UtilCe):
-    """RI utilization with a measured RICostForUnusedHours."""
+    """RI utilization with a measured RICostForUnusedHours, on RDS only.
+
+    Service-aware because the reader queries one SERVICE per call: a stub that
+    answered every call identically would report the same reservation five
+    times over.
+    """
 
     def get_reservation_utilization(self, **kwargs):
+        svc = (kwargs.get("Filter") or {}).get("Dimensions", {}).get("Values", [""])[0]
+        if svc != "Amazon Relational Database Service":
+            return {"UtilizationsByTime": [{"Groups": []}], "Total": {}}
         return {
             "UtilizationsByTime": [{"Groups": [{
                 "Value": "ri-abc123",
                 "Attributes": {"subscriptionId": "ri-abc123"},
                 "Utilization": {"UtilizationPercentage": "40.0",
+                                "PurchasedHours": "744", "TotalActualHours": "297.6",
                                 "RICostForUnusedHours": "215.00",
                                 "TotalAmortizedFee": "358.33"},
             }]}],
-            "Total": {"UtilizationPercentage": "40.0", "PurchasedHours": "744"},
+            "Total": {},
         }
+
+
+# --------------------------------------------------------------------------- #
+# bnc live regression (2026-08-12): RI stats are EC2-only unless filtered
+#
+# "If not specified, the SERVICE filter defaults to Amazon Elastic Compute
+# Cloud - Compute. Supported values for SERVICE are [EC2-Compute, RDS,
+# ElastiCache, Redshift, Elasticsearch]. The value for the SERVICE filter
+# should not exceed '1'." — GetReservationUtilization API reference.
+#
+# Both RI stat readers called CE with no filter, so on any account whose RI
+# book is not EC2 they reported a confident wrong answer. bnc holds 3 active
+# Aurora PostgreSQL RIs ($3,299.64/mo, 100% utilized, 74.7% RDS coverage) and
+# the report showed "RI Utilization n/a" and "RI Coverage 0.0" — the latter
+# reads as "you own no reservations, buy some" on an account already
+# three-quarters covered on its largest service.
+#
+# One SERVICE per call, so the readers must loop. Verified live on bnc:
+# unfiltered PurchasedHours 0; SERVICE=RDS PurchasedHours 2088 (= 1392 + 696
+# across two subscriptions), coverage 2149 reserved vs 726 on-demand hours.
+# --------------------------------------------------------------------------- #
+class _PerServiceRiCe(_UtilCe):
+    """CE stub that answers RI calls per SERVICE, like the real API."""
+
+    def __init__(self):
+        self.util_services: list[str] = []
+        self.cov_services: list[str] = []
+
+    @staticmethod
+    def _svc(kwargs) -> str:
+        return (kwargs.get("Filter") or {}).get("Dimensions", {}).get("Values", ["<none>"])[0]
+
+    def get_reservation_utilization(self, **kwargs):
+        svc = self._svc(kwargs)
+        self.util_services.append(svc)
+        if svc != "Amazon Relational Database Service":
+            # Every other service: no reservations. Unfiltered lands here too.
+            return {"UtilizationsByTime": [{"Groups": []}], "Total": {}}
+        return {"UtilizationsByTime": [{"Groups": [
+            {"Value": "22318905360", "Attributes": {"subscriptionId": "22318905360"},
+             "Utilization": {"UtilizationPercentage": "100", "PurchasedHours": "1392",
+                             "TotalActualHours": "1392"}},
+            {"Value": "22318917985", "Attributes": {"subscriptionId": "22318917985"},
+             "Utilization": {"UtilizationPercentage": "100", "PurchasedHours": "696",
+                             "TotalActualHours": "696"}},
+        ]}], "Total": {}}
+
+    def get_reservation_coverage(self, **kwargs):
+        svc = self._svc(kwargs)
+        self.cov_services.append(svc)
+        if svc == "Amazon Relational Database Service":
+            hours = {"ReservedHours": "2149", "OnDemandHours": "726.23472",
+                     "TotalRunningHours": "2875.23472", "CoverageHoursPercentage": "74.7417"}
+        elif svc == "Amazon Elastic Compute Cloud - Compute":
+            hours = {"ReservedHours": "0", "OnDemandHours": "2862.08",
+                     "TotalRunningHours": "2862.08", "CoverageHoursPercentage": "0"}
+        else:
+            hours = {"ReservedHours": "0", "OnDemandHours": "0",
+                     "TotalRunningHours": "0", "CoverageHoursPercentage": "0"}
+        return {"Total": {"CoverageHours": hours}}
+
+
+def test_ri_utilization_queries_every_reservable_service():
+    mod, ctx = _mod_and_ctx()
+    ce = _PerServiceRiCe()
+    recs, rate = mod._check_ri_utilization(ctx, ce, {"Start": "2026-07-13", "End": "2026-08-12"})
+    # One call per SERVICE — the API caps the filter at a single value.
+    assert "Amazon Relational Database Service" in ce.util_services
+    assert "Amazon Elastic Compute Cloud - Compute" in ce.util_services
+    assert len(ce.util_services) >= 5
+    # Rate aggregated from the GROUPS: Total is empty when GroupBy is set.
+    assert rate == pytest.approx(1.0)          # 2088/2088, was None
+    assert recs == []                          # 100% utilized -> nothing to flag
+
+
+def test_ri_coverage_aggregates_across_services():
+    mod, ctx = _mod_and_ctx()
+    ce = _PerServiceRiCe()
+    _, rate = mod._check_ri_coverage(ctx, ce, {"Start": "2026-07-13", "End": "2026-08-12"})
+    assert len(ce.cov_services) >= 5
+    # 2149 reserved / (2149 + 726.23472 + 2862.08) running hours, was 0.0.
+    assert rate == pytest.approx(2149 / (2149 + 726.23472 + 2862.08), abs=0.001)
+    assert rate > 0.0
+
+
+def test_ri_utilization_none_when_no_service_holds_reservations():
+    """No RIs anywhere -> n/a, never a fabricated 0%."""
+    class _NoRis(_PerServiceRiCe):
+        def get_reservation_utilization(self, **kwargs):
+            self.util_services.append(self._svc(kwargs))
+            return {"UtilizationsByTime": [{"Groups": []}], "Total": {}}
+
+    mod, ctx = _mod_and_ctx()
+    recs, rate = mod._check_ri_utilization(ctx, _NoRis(), {"Start": "x", "End": "y"})
+    assert rate is None and recs == []
 
 
 def test_ri_underutilization_is_advisory_not_counted():
