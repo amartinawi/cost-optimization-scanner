@@ -7,6 +7,98 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (live-output audits — bnc/ap-southeast-1 + level-Shoes-prod/eu-west-1, 2026-08-12)
+
+Two more real reports audited end to end under `docs/audits/OUTPUT_AUDIT_PROTOCOL.md`
+(Layers 1-3). Seven findings fixed, **eleven candidates refuted** in Layer 3 —
+more refutations than fixes, which is the point of the layer.
+
+The round's spine is **extended support**, which the same level-Shoes-prod report
+got wrong in BOTH directions, ~$1,090 apart, and which lesson **C24** was written
+from: *a billed surcharge is a first-class cost lever, and the only way to know
+whether AWS is charging one is to read the usage type — inferring invents charges,
+not looking misses them.*
+
+- **EKS (BNC-1 / LS-1)** — the surcharge is billed only when the Kubernetes
+  version is past end-of-standard-support **AND** the cluster's
+  `upgradePolicy.supportType` is `EXTENDED`; a `STANDARD`-policy cluster is
+  auto-upgraded by AWS and never charged. The 2026-07-09 fix had moved the gate
+  off `upgradePolicy` (which alone counted a surcharge on a still-supported
+  version) onto `versionStatus` alone — and so shipped the mirror-image phantom.
+  $365/mo on each of two accounts. Cost Explorer settled both: bnc billed
+  `:extendedSupport` for exactly 2 of 3 clusters (522 of 783 cluster-hours), and
+  level-Shoes-prod has **no eu-west-1 `:extendedSupport` line at all** while a
+  sibling region does. Lesson **C21**: *when a fix replaces signal A with signal
+  B, first ask whether the truth is A AND B.*
+- **ElastiCache (LS-2)** — the converse, and larger. level-Shoes-prod pays
+  **$725.62/mo** of billed `*-ExtendedSupportYr1_Yr2-NodeUsage:cache.*` on four
+  Redis 5.0.6 nodes — **34% of that report's headline** — and no adapter checked
+  for it. New counted lever, measured from CE, region-scoped, fail-closed.
+  Attribution is better than OpenSearch's: the usage type embeds the NODE TYPE,
+  so the clusters are named without CE resource-level granularity, and it is
+  summed rather than entered into the best-lever dedup because it is additive to
+  the NodeUsage-only levers.
+- **Commitment analysis (BNC-2)** — SP/RI under-utilization counted the unused
+  commitment as realizable savings: $390.32/mo, 13.8% of the bnc headline. It is
+  measured and genuinely wasted, but SUNK — the commitment bills for its whole
+  term regardless of use, unused hourly benefit never carries forward, and a plan
+  is returnable only within 7 days of purchase. The charitable "shift usage onto
+  it" reading also failed on the numbers: the flagged plans were r5/t3/r6a while
+  the only uncovered on-demand was r4/m6i, so $0 was available to absorb it. Now
+  a `$0` advisory naming the real lever. Lesson **C22**.
+- **Commitment analysis (BNC-5)** — `GetReservationUtilization` /
+  `GetReservationCoverage` **default `SERVICE` to EC2** when unfiltered and cap
+  the filter at one value, so both stat readers were EC2-only. bnc holds 3 Aurora
+  RIs worth $3,299.64/mo at 100% utilization and 74.7% coverage; the report showed
+  "RI Utilization n/a" and "RI Coverage 0.0". A second defect in the same
+  function: `Total` is EMPTY whenever `GroupBy` is set, so the rate had to be
+  aggregated from the groups. Lesson **C23**.
+- **OpenSearch (BNC-3)** — the Graviton lever priced `InstanceCount` alone, so a
+  domain whose dedicated-master tier shares the data tier's x86 family had half
+  its migration omitted (bnc: 3 data + 3 master m5.xlarge.search, $76.65 missed).
+  OS-7 had already taught the idle-domain lever about the master tier; now the
+  Graviton lever prices each tier against its own counterpart.
+- **AMI (LS-3)** — AFS-2 established that an AMI owned by an AWS lifecycle
+  service is never "referenced by a running instance" by construction, but keyed
+  on `aws:backup:` alone. **Data Lifecycle Manager** is the other AWS-native AMI
+  creator; detection is now table-driven and each rec names the right manager's
+  retention setting.
+- **ElastiCache (LS-4)** — every family but burstable `t` starts at `large`, so
+  the downsize lever probed a nonexistent `cache.m6g.medium` and printed a
+  "Live pricing unavailable" warning that reads like a pricing outage. The lever
+  had abstained correctly; it just should not have asked.
+
+Refuted after verification, recorded so they are not re-raised: the ElastiCache
+Valkey flat-20% factor (AWS's published `cacheEngine=Valkey` rate really is
+exactly 80% of Redis on every node type checked), a `$0.000000` pricing fallback
+suspected of inflating a downsize (the lever abstained; no counted dollar was
+touched), Aurora Graviton priced off the wrong storage SKU (the cluster is
+standard storage and the Standard SKUs were used), RDS snapshot savings at 94-99%
+of the billed backup pool on both accounts (CE-anchored to the cent and
+conservative), an EKS surcharge/idle pair that looked like a double count (it is
+a coherent decomposition — $365 + $73 is exactly the cluster's full cost), a CoH
+Graviton rec that appeared to escape commitment demotion (the CE headroom cap
+legitimately permitted it), and three display false alarms traced to an
+incomplete key list in the auditor's own dump script.
+
+**The ledger's own account context was corrected after operator challenge**, and
+became lesson **F6**: "no RIs of any kind" had been generalised from a single
+OpenSearch `describe` and "confirmed" by the absence of RI recommendations — which
+was itself the BNC-5 symptom. A negative claim about an account needs the
+enumeration that covers it, and the scanner's own silence is the least admissible
+evidence available.
+
+New sweep **S16** (conjunct evidence) in `tools/output_audit.py`, the
+machine-checkable half of C21: a counted rec on a conjunction-gated lever must
+name both halves in its `AuditBasis.evidence`. Verified against the real pre-fix
+bnc report, and it then flagged the same class on level-Shoes-prod — a different
+account, region and report — with no human hypothesis.
+
+Predicted headlines pending re-scan: bnc **$2,829.03 → $2,150.36**;
+level-Shoes-prod **$2,106.29 → $2,463.57** — the first audited report whose
+headline RISES, because its largest single error was a missing real charge rather
+than a phantom one.
+
 ### Fixed (live-output audits — afs-prod/af-south-1 + M360/ap-south-1, 2026-08-11)
 
 Two real scan reports audited end to end under `docs/audits/OUTPUT_AUDIT_PROTOCOL.md`
