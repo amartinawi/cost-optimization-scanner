@@ -10,6 +10,116 @@ from services._coh_dedup import coh_key, coh_savings, is_renderable_coh_rec
 from services.commitment_coverage import demote_coh_by_commitment, demote_covered_in_place
 from services.elasticache import MAX_MEMORY_HEADROOM_PCT, get_enhanced_elasticache_checks
 
+_CE_ELASTICACHE_SERVICE = "Amazon ElastiCache"
+
+# Trailing window used to measure the billed Extended Support surcharge (mirrors
+# the OpenSearch reader and the commitment headroom read).
+_SURCHARGE_WINDOW_DAYS: int = 7
+
+
+def _is_elasticache_extended_support_usage_type(usage_type: str) -> bool:
+    """True for the ElastiCache Extended Support node-usage billing lines.
+
+    AWS bills two tiers as their own usage types — ``ExtendedSupportYr1_Yr2`` and
+    ``ExtendedSupportYr3`` — e.g.
+    ``EU-ExtendedSupportYr1_Yr2-NodeUsage:cache.r6g.xlarge``. Plain
+    ``NodeUsage`` and ``SyncDurability-NodeUsage`` are the node cost itself and
+    must NOT match: counting them would price the whole cluster as a saving.
+    """
+    return "extendedsupport" in usage_type.replace("-", "").replace("_", "").lower()
+
+
+def _node_type_from_usage_type(usage_type: str) -> str:
+    """``…-NodeUsage:cache.r6g.xlarge`` -> ``cache.r6g.xlarge`` (``""`` if absent).
+
+    Unlike the OpenSearch surcharge — which CE reports with no resource
+    dimension at all — the ElastiCache line embeds the node type, so the charge
+    is attributable to the clusters running that node type WITHOUT requiring
+    Cost Explorer resource-level granularity.
+    """
+    return usage_type.split(":", 1)[1].strip() if ":" in usage_type else ""
+
+
+def _extended_support_breakdown(ctx: Any) -> tuple[float, dict[str, float]]:
+    """The billed ElastiCache Extended Support surcharge, and which node types pay it.
+
+    MEASURED from Cost Explorer, never inferred from engine-version numbers —
+    inferring is exactly the EKS Extended-Support defect, which produced a
+    phantom in each direction on two different accounts. A version-based guess
+    cannot know whether AWS is actually charging.
+
+    Returns:
+        ``(monthly_total, {node_type: monthly_amount})`` scaled to a 30-day run
+        rate. ``(0.0, {})`` when the read fails or nothing is billed (fail
+        closed — never invent a surcharge).
+    """
+    def _warn(message: str) -> None:
+        warn = getattr(ctx, "warn", None)
+        if callable(warn):
+            warn(message, "elasticache")
+
+    region = str(getattr(ctx, "region", "") or "")
+    if not region:
+        # OS-1 — the CE client is account-global, so a SERVICE-only filter would
+        # return the ACCOUNT-WIDE surcharge and re-count it in every scanned
+        # region. This feeds a COUNTED lever: no region means no measurement.
+        _warn(
+            "ElastiCache Extended Support read skipped: ctx.region unset "
+            "(an account-wide CE read would re-count the surcharge per region)"
+        )
+        return 0.0, {}
+    try:
+        ce = ctx.client("ce")
+    except Exception:  # noqa: BLE001 — fail closed
+        return 0.0, {}
+    if ce is None:
+        return 0.0, {}
+
+    from datetime import UTC, datetime, timedelta
+
+    end = datetime.now(UTC).date()
+    start = end - timedelta(days=_SURCHARGE_WINDOW_DAYS)
+    scale = 30.0 / _SURCHARGE_WINDOW_DAYS
+    try:
+        resp = ce.get_cost_and_usage(
+            TimePeriod={"Start": start.isoformat(), "End": end.isoformat()},
+            Granularity="MONTHLY",
+            Metrics=["UnblendedCost"],
+            GroupBy=[{"Type": "DIMENSION", "Key": "USAGE_TYPE"}],
+            Filter={
+                "And": [
+                    {"Dimensions": {"Key": "SERVICE", "Values": [_CE_ELASTICACHE_SERVICE]}},
+                    {"Dimensions": {"Key": "REGION", "Values": [region]}},
+                ]
+            },
+        )
+    except Exception as e:  # noqa: BLE001 — fail closed
+        _warn(f"Could not read ElastiCache Extended Support spend: {e}")
+        return 0.0, {}
+
+    per_type: dict[str, float] = {}
+    total = 0.0
+    for bucket in resp.get("ResultsByTime", []) or []:
+        for grp in bucket.get("Groups", []) or []:
+            usage_type = str((grp.get("Keys") or [""])[0])
+            if not _is_elasticache_extended_support_usage_type(usage_type):
+                continue
+            try:
+                amount = float(grp.get("Metrics", {}).get("UnblendedCost", {}).get("Amount") or 0)
+            except (TypeError, ValueError):
+                continue
+            if amount <= 0:
+                continue
+            monthly = amount * scale
+            total += monthly
+            node_type = _node_type_from_usage_type(usage_type)
+            if node_type:
+                per_type[node_type] = per_type.get(node_type, 0.0) + monthly
+
+    if total <= 0:
+        return 0.0, {}
+    return total, per_type
+
 # x86/Intel ElastiCache node family -> its same-size Graviton (ARM) equivalent.
 # The realizable Graviton saving is the exact per-node price delta, NOT a flat
 # 20-40% price-performance figure (that is a perf-per-dollar metric, not a cost
@@ -360,9 +470,87 @@ class ElasticacheModule(BaseServiceModule):
         if coh_out:
             sources["cost_optimization_hub"] = SourceBlock(count=len(coh_out), recommendations=tuple(coh_out))
 
+        # Extended Support surcharge — an ADDITIVE charge on top of node usage,
+        # removed by upgrading the engine version. It never overlaps the
+        # downsize/Graviton/Valkey levers (those price the NodeUsage leg only),
+        # so it is summed rather than competing in the per-cluster best-lever
+        # dedup: current-size surcharge removal + NodeUsage-only downsize is
+        # exactly the both-actions saving, with no double count.
+        surcharge_recs = self._extended_support_recs(ctx, recs)
+        if surcharge_recs:
+            sources["extended_support"] = SourceBlock(
+                count=len(surcharge_recs), recommendations=tuple(surcharge_recs)
+            )
+            savings += sum(r["EstimatedMonthlySavings"] for r in surcharge_recs)
+
         return ServiceFindings(
             service_name="ElastiCache",
-            total_recommendations=len(recs) + len(coh_counted),
+            total_recommendations=len(recs) + len(coh_counted) + len(surcharge_recs),
             total_monthly_savings=round(savings, 2),
             sources=sources,
         )
+
+    def _extended_support_recs(self, ctx: Any, recs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """One counted rec per node type paying the Extended Support surcharge.
+
+        The dollar is the MEASURED billed surcharge (never inferred from engine
+        version numbers — that is the EKS defect). Attribution is by node type,
+        which the usage type carries, narrowed to the clusters on that node type
+        whose engine version is actually behind: a cluster already on a current
+        version shares the node type but not the charge, and must never be named.
+        A node type no live cluster reports is still counted — it is billed —
+        with an empty cluster list rather than a guess.
+        """
+        total, per_type = _extended_support_breakdown(ctx)
+        if total <= 0:
+            return []
+
+        by_node_type: dict[str, list[tuple[str, str]]] = {}
+        for rec in recs:
+            node_type = str(rec.get("NodeType") or "")
+            cluster_id = str(rec.get("ClusterId") or "")
+            version = str(rec.get("EngineVersion") or "")
+            if not node_type or not cluster_id or not version:
+                continue
+            seen = by_node_type.setdefault(node_type, [])
+            if cluster_id not in [c for c, _ in seen]:
+                seen.append((cluster_id, version))
+
+        out: list[dict[str, Any]] = []
+        for node_type, monthly in sorted(per_type.items(), key=lambda kv: -kv[1]):
+            candidates = by_node_type.get(node_type, [])
+            clusters = [c for c, _ in candidates]
+            versions = sorted({v for _, v in candidates})
+            named = ", ".join(f"{c} ({v})" for c, v in candidates) or "not identified in this region"
+            out.append(
+                {
+                    "ClusterId": clusters[0] if clusters else node_type,
+                    "Clusters": clusters,
+                    "NodeType": node_type,
+                    "EngineVersions": versions,
+                    "CheckCategory": "ElastiCache Extended Support",
+                    "Recommendation": (
+                        "Upgrade the engine version to remove the Extended Support surcharge"
+                    ),
+                    "EstimatedMonthlySavings": round(monthly, 2),
+                    "EstimatedSavings": f"${monthly:,.2f}/month",
+                    "Counted": True,
+                    "Severity": "HIGH",
+                    "AuditBasis": {
+                        "metric": (
+                            "Cost Explorer usage type *-ExtendedSupport*-NodeUsage:"
+                            f"{node_type}, trailing {_SURCHARGE_WINDOW_DAYS}d"
+                        ),
+                        "formula": f"billed surcharge / {_SURCHARGE_WINDOW_DAYS}d x 30",
+                        "evidence": "measured from actual billing, not inferred from engine-version numbers",
+                        "node_type": node_type,
+                        "clusters": clusters,
+                    },
+                    "Reason": (
+                        f"AWS is billing an ElastiCache Extended Support surcharge of "
+                        f"~${monthly:,.2f}/mo on {node_type} nodes. Upgrading removes it. "
+                        f"Clusters on this node type: {named}."
+                    ),
+                }
+            )
+        return out
